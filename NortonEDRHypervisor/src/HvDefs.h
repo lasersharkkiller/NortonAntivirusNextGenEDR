@@ -234,6 +234,7 @@
 #define EXIT_REASON_INVALID_STATE      33
 #define EXIT_REASON_EPT_VIOLATION      48
 #define EXIT_REASON_EPT_MISCONFIG      49
+#define EXIT_REASON_MONITOR_TRAP_FLAG  37
 #define EXIT_REASON_XSETBV             55
 
 // ---------------------------------------------------------------------------

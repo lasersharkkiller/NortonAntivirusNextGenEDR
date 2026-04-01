@@ -1,4 +1,5 @@
 #include "Globals.h"
+#include "Deception.h"
 
 PSSDT_TABLE SyscallsUtils::ssdtTable = nullptr;
 PFUNCTION_MAP SyscallsUtils::exportsMap = nullptr;
@@ -894,6 +895,20 @@ VOID SyscallsUtils::NtReadVmHandler(
 		targetProcess,
 		isSensitive  // lsass read = Critical
 	);
+
+	// Deception: if the caller provided a kernel-accessible output buffer,
+	// patch any NTLM-hash-like sequences with the canary hash.
+	// This pre-call handler fires before the actual memory copy; for post-read
+	// buffer corruption the HookDll's ReadProcessMemory hook is the primary path.
+	// Here we handle the case where Buffer is already a kernel-mode address
+	// (e.g., a kernel component reading LSASS on behalf of a user request).
+	if (isSensitive && Buffer && NumberOfBytesToRead > 0) {
+		if ((ULONG_PTR)Buffer > (ULONG_PTR)MmHighestUserAddress) {
+			// Kernel-mode buffer — safe to write directly
+			DeceptionEngine::PatchLsassReadBuffer(Buffer, NumberOfBytesToRead);
+		}
+		// User-mode buffer is handled post-read by HookDll's ReadProcessMemory hook.
+	}
 
 	ObDereferenceObject(targetProcess);
 }

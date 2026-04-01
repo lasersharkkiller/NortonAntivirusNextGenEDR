@@ -1,4 +1,5 @@
 #include "Globals.h"
+#include "Deception.h"
 
 LARGE_INTEGER RegistryUtils::cookie = { 0 };
 
@@ -57,7 +58,17 @@ NTSTATUS RegistryUtils::RegOpNotifyCallback(
 		}
 
 		else {
-		
+
+			// Honeypot check — any access to our fake credential keys is a
+			// high-confidence indicator of a credential-hunting tool.
+			// Access is ALLOWED so the attacker receives the canary data.
+			if (DeceptionEngine::IsHoneypotRegistryAccess(regPath)) {
+				DeceptionEngine::HandleHoneypotRegistryAccess(
+					regPath,
+					PsGetProcessId(IoGetCurrentProcess()),
+					FALSE);
+			}
+
 			if (isRegistryPersistenceBehavior((PUNICODE_STRING)regPath)) {
 
 				PKERNEL_STRUCTURED_NOTIFICATION kernelNotif = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');

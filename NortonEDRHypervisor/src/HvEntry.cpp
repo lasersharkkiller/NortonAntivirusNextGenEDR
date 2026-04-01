@@ -36,6 +36,8 @@
 extern NTSTATUS HvSetupVmcs(_In_ PVCPU vcpu);
 extern NTSTATUS HvEptSetup(_Inout_ PVCPU vcpu);
 extern VOID     HvEptFree(_In_ PVCPU vcpu);
+extern VOID     HvDeceptionInit();
+extern VOID     HvDeceptionCleanup();
 
 // ---------------------------------------------------------------------------
 // Global per-CPU array — one VCPU structure per logical processor
@@ -255,6 +257,8 @@ static VOID HvUnload(_In_ PDRIVER_OBJECT DriverObject)
     if (g_VcpuArray) {
         KeIpiGenericCall(HvDeinitOnProcessor, 0);
 
+        HvDeceptionCleanup();
+
         for (ULONG i = 0; i < g_ProcessorCount; i++) {
             FreeVcpuRegions(&g_VcpuArray[i]);
         }
@@ -317,7 +321,11 @@ extern "C" NTSTATUS DriverEntry(
         }
     }
 
-    // 5. Broadcast IPI to virtualize all logical processors simultaneously.
+    // 5. Initialize the shadow-page deception subsystem (before guests launch).
+    //    Non-fatal: deception is best-effort on top of core hypervisor function.
+    HvDeceptionInit();
+
+    // 6. Broadcast IPI to virtualize all logical processors simultaneously.
     //    KeIpiGenericCall raises IRQL to IPI_LEVEL, calls the routine on every
     //    CPU, and waits for all to complete before returning.
     DbgPrint("[NortonHV] Broadcasting VMXON + VMLAUNCH to all CPUs...\n");

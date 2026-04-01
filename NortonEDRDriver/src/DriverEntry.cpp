@@ -10,6 +10,7 @@
 
 
 #include "Globals.h"
+#include "Deception.h"
 #include <wdf.h>
 
 PDEVICE_OBJECT DeviceObject = NULL;
@@ -45,6 +46,7 @@ VOID UnloadDriver(PDRIVER_OBJECT DriverObject) {
 
 	g_callbackObjects->unsetNotificationsGlobal();
 
+	DeceptionEngine::Cleanup();
 	FsFilter::Cleanup();
 	EtwProvider::Cleanup();
 	HookDetector::Cleanup();
@@ -381,6 +383,10 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	} else {
 		DbgPrint("[-] Failed to allocate WdfTcpipUtils\n");
 	}
+
+	// Initialize deception engine — honeypot registry keys and file traps.
+	// Non-fatal: the driver functions normally if SECURITY hive is inaccessible.
+	DeceptionEngine::Init(g_hashQueue);
 
 	// Register filesystem minifilter — non-fatal if it fails (e.g. Filter Manager not present)
 	NTSTATUS fsStatus = FsFilter::Init(DriverObject, g_hashQueue);

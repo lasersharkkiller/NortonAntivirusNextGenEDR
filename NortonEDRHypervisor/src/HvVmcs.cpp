@@ -27,6 +27,10 @@
 // Forward declarations from HvEpt.cpp
 extern VOID HvEptHandleViolation(_In_ PVCPU vcpu);
 
+// Forward declarations from HvDeception.cpp
+extern BOOLEAN HvDeceptionHandleEptReadViolation(_In_ PVCPU vcpu, _In_ ULONG64 gpa);
+extern VOID    HvDeceptionHandleMtfExit(_In_ PVCPU vcpu);
+
 // ---------------------------------------------------------------------------
 // MSR bitmap helpers
 // ---------------------------------------------------------------------------
@@ -549,10 +553,25 @@ extern "C" VOID HvHandleVmExit(_In_ PGUEST_REGISTERS regs)
         HandleVmcall(vcpu, regs);
         break;
 
-    case EXIT_REASON_EPT_VIOLATION:
+    case EXIT_REASON_EPT_VIOLATION: {
+        // Check shadow-protected pages first — if this is a read on a decoy
+        // page, HvDeceptionHandleEptReadViolation maps the decoy and enables MTF.
+        // It returns TRUE and we must NOT call the general handler (which would
+        // advance RIP or restore permissions prematurely).
+        ULONG64 gpa  = HvVmRead(VMCS_RO_GUEST_PHYS_ADDR);
+        ULONG64 qual = HvVmRead(VMCS_RO_EXIT_QUAL);
+        if ((qual & EPT_VIOL_READ) && HvDeceptionHandleEptReadViolation(vcpu, gpa)) {
+            break;  // decoy served; MTF will restore real mapping after one instruction
+        }
         HvEptHandleViolation(vcpu);
         // RIP is NOT advanced — the guest retries the faulting instruction
         // after EPT permissions are restored in HvEptHandleViolation.
+        break;
+    }
+
+    case EXIT_REASON_MONITOR_TRAP_FLAG:
+        HvDeceptionHandleMtfExit(vcpu);
+        // RIP is already at the next instruction (MTF fires after the instruction completes)
         break;
 
     case EXIT_REASON_EPT_MISCONFIG:

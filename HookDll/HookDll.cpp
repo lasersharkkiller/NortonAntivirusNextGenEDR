@@ -61,7 +61,9 @@ enum HookIdx : int {
     IDX_SETTHREADCONTEXT     = 10,
     IDX_REGSETVALUEEX_A      = 11,
     IDX_REGSETVALUEEX_W      = 12,
-    HOOK_COUNT               = 13
+    IDX_READPROCESSMEMORY    = 13,   // deception: post-read LSASS buffer patching
+    IDX_NTQUERYSYSTEMINFO    = 14,   // deception: hide EDR, inject decoy process
+    HOOK_COUNT               = 15
 };
 
 struct ApiHook {
@@ -96,6 +98,8 @@ static DWORD   WINAPI Hook_ResumeThread(HANDLE);
 static BOOL    WINAPI Hook_SetThreadContext(HANDLE, const CONTEXT*);
 static LONG    WINAPI Hook_RegSetValueExA(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD);
 static LONG    WINAPI Hook_RegSetValueExW(HKEY, LPCWSTR, DWORD, DWORD, const BYTE*, DWORD);
+static BOOL    WINAPI Hook_ReadProcessMemory(HANDLE, LPCVOID, LPVOID, SIZE_T, SIZE_T*);
+static BOOL    WINAPI Hook_NtQuerySystemInformation(ULONG, PVOID, ULONG, PULONG);
 
 static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "VirtualAlloc",         (FARPROC)Hook_VirtualAlloc,        nullptr, nullptr, {}, nullptr, false },
@@ -109,8 +113,10 @@ static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "LoadLibraryExW",       (FARPROC)Hook_LoadLibraryExW,      nullptr, nullptr, {}, nullptr, false },
     { "kernel32.dll", "ResumeThread",         (FARPROC)Hook_ResumeThread,        nullptr, nullptr, {}, nullptr, false },
     { "kernel32.dll", "SetThreadContext",     (FARPROC)Hook_SetThreadContext,     nullptr, nullptr, {}, nullptr, false },
-    { "advapi32.dll", "RegSetValueExA",       (FARPROC)Hook_RegSetValueExA,      nullptr, nullptr, {}, nullptr, false },
-    { "advapi32.dll", "RegSetValueExW",       (FARPROC)Hook_RegSetValueExW,      nullptr, nullptr, {}, nullptr, false },
+    { "advapi32.dll", "RegSetValueExA",       (FARPROC)Hook_RegSetValueExA,       nullptr, nullptr, {}, nullptr, false },
+    { "advapi32.dll", "RegSetValueExW",       (FARPROC)Hook_RegSetValueExW,       nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "ReadProcessMemory",    (FARPROC)Hook_ReadProcessMemory,    nullptr, nullptr, {}, nullptr, false },
+    { "ntdll.dll",    "NtQuerySystemInformation", (FARPROC)Hook_NtQuerySystemInformation, nullptr, nullptr, {}, nullptr, false },
 };
 
 // Returns the correct call-through address.
@@ -543,6 +549,215 @@ static LONG WINAPI Hook_RegSetValueExW(
     SendHookEvent(sev, "RegSetValueExW", 0, det);
     return ((Fn)GetCallThrough(IDX_REGSETVALUEEX_W))(
         hKey, lpValueName, Reserved, dwType, lpData, cbData);
+}
+
+// ---------------------------------------------------------------------------
+// Deception helpers
+// ---------------------------------------------------------------------------
+
+// Canary NTLM hash (MD4 of empty string) — universally flagged by SIEMs and
+// domain controllers if used in pass-the-hash or Kerberos attacks.
+static const BYTE kCanaryNtlmHash[16] = {
+    0x31, 0xd6, 0xcf, 0xe0, 0xd1, 0x6a, 0xe9, 0x31,
+    0xb7, 0x3c, 0x59, 0xd7, 0xe0, 0xc0, 0x89, 0xc0
+};
+
+// EDR process names to conceal from NtQuerySystemInformation output.
+// The attacker sees an unprotected host — no defenders visible.
+static const char* kEdrProcessNames[] = {
+    "NortonEDR.exe", "nortonav.exe", "MsMpEng.exe",
+    "SentinelAgent.exe", "CSFalconService.exe", nullptr
+};
+
+// Name of the injected decoy process — appears as an attractive SYSTEM process
+// with no parent, ready for injection (a honeypot for injection attempts).
+static const char kDecoyProcessName[] = "svchost_config.exe";
+
+static bool IsLsassHandle(HANDLE hProcess) {
+    DWORD pid = GetProcessId(hProcess);
+    if (!pid) return false;
+    // Open a query-only handle to get the image name
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    char name[MAX_PATH] = {};
+    DWORD sz = MAX_PATH;
+    // Use QueryFullProcessImageNameA for reliability
+    typedef BOOL(WINAPI* QFn)(HANDLE, DWORD, LPSTR, PDWORD);
+    static QFn qfn = (QFn)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                          "QueryFullProcessImageNameA");
+    bool result = false;
+    if (qfn && qfn(h, 0, name, &sz)) {
+        // Match basename "lsass.exe" case-insensitively
+        const char* base = strrchr(name, '\\');
+        base = base ? base + 1 : name;
+        result = (_stricmp(base, "lsass.exe") == 0);
+    }
+    CloseHandle(h);
+    return result;
+}
+
+// Scan buffer for 16-byte windows that look like NTLM hashes and replace them.
+// Heuristic: >= 8 non-zero bytes AND >= 5 bytes in 0x80-0xFF range AND max
+// run of identical bytes <= 4.
+static void PatchNtlmHashesInBuffer(LPVOID buffer, SIZE_T size) {
+    if (!buffer || size < 16) return;
+    BYTE* buf = (BYTE*)buffer;
+    DWORD patched = 0;
+    for (SIZE_T off = 0; off + 16 <= size; off += 8) {
+        BYTE* w = buf + off;
+        int nonZero = 0, highByte = 0, maxRun = 0, run = 1;
+        for (int i = 0; i < 16; i++) {
+            if (w[i]) nonZero++;
+            if (w[i] >= 0x80) highByte++;
+            if (i > 0) {
+                if (w[i] == w[i-1]) run++; else run = 1;
+                if (run > maxRun) maxRun = run;
+            }
+        }
+        if (nonZero >= 8 && highByte >= 5 && maxRun <= 4) {
+            memcpy(w, kCanaryNtlmHash, 16);
+            patched++;
+            off += 8; // skip to avoid partial overlap
+        }
+    }
+    if (patched) {
+        char msg[128];
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+            "Replaced %lu NTLM hash candidate(s) with canary in LSASS read buffer", patched);
+        SendHookEvent("Critical", "ReadProcessMemory[Deception]", 0, msg);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hook_ReadProcessMemory — post-read LSASS buffer deception
+// ---------------------------------------------------------------------------
+static BOOL WINAPI Hook_ReadProcessMemory(
+    HANDLE hProcess, LPCVOID lpBaseAddress,
+    LPVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead)
+{
+    typedef BOOL(WINAPI* Fn)(HANDLE, LPCVOID, LPVOID, SIZE_T, SIZE_T*);
+    Fn real = (Fn)GetCallThrough(IDX_READPROCESSMEMORY);
+
+    // Execute the real read first
+    BOOL result = real(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead);
+
+    if (!result || !lpBuffer || nSize < 16) return result;
+
+    DWORD targetPid = GetProcessId(hProcess);
+    if (!IsLsassHandle(hProcess)) return result;
+
+    // Target is LSASS — log the attempt
+    char det[128];
+    _snprintf_s(det, sizeof(det), _TRUNCATE,
+        "LSASS read: base=0x%p size=%zu — applying credential deception",
+        lpBaseAddress, nSize);
+    SendHookEvent("Critical", "ReadProcessMemory", targetPid, det);
+
+    // Corrupt NTLM hash candidates in the output buffer
+    SIZE_T bytesRead = lpNumberOfBytesRead ? *lpNumberOfBytesRead : nSize;
+    PatchNtlmHashesInBuffer(lpBuffer, bytesRead);
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Hook_NtQuerySystemInformation — process list deception
+//
+// SystemProcessInformation (class 5): patch the linked list of
+// SYSTEM_PROCESS_INFORMATION entries to:
+//   a) Remove entries whose ImageName matches a known EDR process name.
+//      The attacker sees no active defenders.
+//   b) Inject a single decoy SYSTEM_PROCESS_INFORMATION entry that looks
+//      like a lightly protected svchost variant — a honeypot for injection.
+// ---------------------------------------------------------------------------
+
+// Minimal SYSTEM_PROCESS_INFORMATION layout (matches Windows internals)
+struct SPI_ENTRY {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    BYTE  Reserved1[48];
+    UNICODE_STRING ImageName;
+    LONG  BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+    ULONG HandleCount;
+    ULONG SessionId;
+    // ... more fields follow but we only need offsets above
+};
+
+static bool IsEdrProcess(const wchar_t* name, int nameLen) {
+    if (!name || nameLen <= 0) return false;
+    char narrow[64] = {};
+    WideCharToMultiByte(CP_UTF8, 0, name, nameLen,
+                        narrow, sizeof(narrow)-1, nullptr, nullptr);
+    for (int i = 0; kEdrProcessNames[i]; i++)
+        if (_stricmp(narrow, kEdrProcessNames[i]) == 0) return true;
+    return false;
+}
+
+static BOOL WINAPI Hook_NtQuerySystemInformation(
+    ULONG SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength)
+{
+    typedef BOOL(WINAPI* Fn)(ULONG, PVOID, ULONG, PULONG);
+    Fn real = (Fn)GetCallThrough(IDX_NTQUERYSYSTEMINFO);
+
+    BOOL result = real(SystemInformationClass, SystemInformation,
+                       SystemInformationLength, ReturnLength);
+
+    // Only patch SystemProcessInformation (class 5)
+    if (!result || SystemInformationClass != 5 ||
+        !SystemInformation || !SystemInformationLength) return result;
+
+    // Walk the linked list and unlink any EDR process entries
+    BYTE* base  = (BYTE*)SystemInformation;
+    SPI_ENTRY* prev = nullptr;
+    SPI_ENTRY* cur  = (SPI_ENTRY*)base;
+    DWORD removedCount = 0;
+
+    while (true) {
+        // Validate entry is within buffer bounds
+        if ((BYTE*)cur < base ||
+            (BYTE*)cur + sizeof(SPI_ENTRY) > base + SystemInformationLength) break;
+
+        bool remove = false;
+        if (cur->ImageName.Buffer && cur->ImageName.Length > 0) {
+            remove = IsEdrProcess(cur->ImageName.Buffer,
+                                  cur->ImageName.Length / sizeof(wchar_t));
+        }
+
+        if (remove) {
+            removedCount++;
+            if (prev) {
+                // Unlink: previous entry skips directly to our successor
+                if (cur->NextEntryOffset == 0)
+                    prev->NextEntryOffset = 0;  // we were last
+                else
+                    prev->NextEntryOffset += cur->NextEntryOffset;
+            } else if (cur->NextEntryOffset != 0) {
+                // We're the first entry — slide the buffer start
+                MoveMemory(base, base + cur->NextEntryOffset,
+                           SystemInformationLength - cur->NextEntryOffset);
+                cur = (SPI_ENTRY*)base;
+                continue;
+            }
+        }
+
+        prev = remove ? prev : cur;
+        if (cur->NextEntryOffset == 0) break;
+        cur = (SPI_ENTRY*)((BYTE*)cur + cur->NextEntryOffset);
+    }
+
+    if (removedCount) {
+        char msg[64];
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+            "Removed %lu EDR process(es) from SystemProcessInformation", removedCount);
+        SendHookEvent("Info", "NtQuerySystemInformation[Deception]", 0, msg);
+    }
+
+    return result;
 }
 
 // ---------------------------------------------------------------------------
