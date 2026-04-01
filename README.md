@@ -6,6 +6,14 @@ A Windows kernel-mode EDR featuring kernel-level telemetry, hook detection, proc
 
 ## Defensive Capabilities
 
+### Filesystem Minifilter (FsFilter)
+- Kernel minifilter registered with the Windows Filter Manager at altitude **265000** (FSFilter Activity Monitor range) via `FltRegisterFilter` / `FltStartFiltering`
+- **`IRP_MJ_CREATE`** — credential file access detection: flags opens of `SAM`, `SYSTEM`, `SECURITY` hives, `NTDS.dit`, and LSASS dump files; executable drop detection: flags `.exe`/`.dll`/`.ps1`/`.vbs`/`.bat`/`.js`/`.hta` creation in `%Temp%`, `%AppData%`, `%ProgramData%`, `Public`
+- **`IRP_MJ_WRITE`** — per-PID sliding-window write burst tracker (64-slot array, 5 s window, 200-write threshold); crossing the threshold emits a Critical alert — high-confidence ransomware signal
+- **`IRP_MJ_SET_INFORMATION`** — rename-to-ransomware-extension detection: matches target extension against 15+ known ransomware extensions (`.locky`, `.wncry`, `.petya`, `.cerber`, `.ryuk`, `.conti`, etc.); emits Critical alert
+- Altitude registry keys (`DefaultInstance`, `Altitude`, `Flags`) written by the user-mode installer before `StartService`; non-fatal if Filter Manager is absent (telemetry note printed, driver continues)
+- All detections surface as `KERNEL_STRUCTURED_NOTIFICATION` with `FsFilterCheck` bit, flowing into the TUI, JSONL log, and Elasticsearch
+
 ### Kernel-Level Telemetry
 - Kernel callbacks for process/thread creation, image loading, registry operations, and object access
 - System call interception via alternative system call handlers — active handlers: `NtAllocateVirtualMemory` (RWX), `NtWriteVirtualMemory`, `NtProtectVirtualMemory`, `NtReadVirtualMemory` (cross-process/lsass), `NtWriteFile`, `NtQueueApcThread`, `NtQueueApcThreadEx`, `NtSetContextThread`, `NtResumeThread`, `NtContinue` (private exec region)

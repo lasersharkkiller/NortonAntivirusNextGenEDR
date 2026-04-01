@@ -45,6 +45,7 @@ VOID UnloadDriver(PDRIVER_OBJECT DriverObject) {
 
 	g_callbackObjects->unsetNotificationsGlobal();
 
+	FsFilter::Cleanup();
 	EtwProvider::Cleanup();
 	HookDetector::Cleanup();
 
@@ -379,6 +380,12 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 		}
 	} else {
 		DbgPrint("[-] Failed to allocate WdfTcpipUtils\n");
+	}
+
+	// Register filesystem minifilter — non-fatal if it fails (e.g. Filter Manager not present)
+	NTSTATUS fsStatus = FsFilter::Init(DriverObject, g_hashQueue);
+	if (!NT_SUCCESS(fsStatus)) {
+		DbgPrint("[-] FsFilter::Init failed: 0x%x — filesystem monitoring disabled\n", fsStatus);
 	}
 
 	DbgPrint("[+] Driver loaded\n");

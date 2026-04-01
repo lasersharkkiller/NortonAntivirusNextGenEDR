@@ -5,6 +5,7 @@
 
 #include <fwpmk.h>
 #include <fwpsk.h>
+#include <fltKernel.h>
 #define INITGUID
 #include <guiddef.h>
 
@@ -984,6 +985,23 @@ public:
 		HANDLE,
 		PPS_CREATE_NOTIFY_INFO
 	);
+};
+
+class FsFilter {
+public:
+    static NTSTATUS Init(PDRIVER_OBJECT DriverObject, NotifQueue* queue);
+    static VOID     Cleanup();
+
+    static FLT_PREOP_CALLBACK_STATUS FLTAPI PreCreate(
+        PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
+
+    static FLT_PREOP_CALLBACK_STATUS FLTAPI PreWrite(
+        PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
+
+    static FLT_PREOP_CALLBACK_STATUS FLTAPI PreSetInformation(
+        PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
+
+    static NTSTATUS FLTAPI FilterUnloadCallback(FLT_FILTER_UNLOAD_FLAGS Flags);
 };
 
 class DllInjector {

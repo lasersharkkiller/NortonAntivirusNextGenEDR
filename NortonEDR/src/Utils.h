@@ -73,8 +73,9 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
 
     union {
         struct {
-            unsigned char NetworkCheck : 1;
-            unsigned char Reserved3   : 7;
+            unsigned char NetworkCheck  : 1;
+            unsigned char FsFilterCheck : 1;
+            unsigned char Reserved3     : 6;
         };
         unsigned char method3;
     };

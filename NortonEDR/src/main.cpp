@@ -2539,6 +2539,9 @@ int Notify(PKERNEL_STRUCTURED_NOTIFICATION notif, char* msg) {
     else if (notif->NetworkCheck) {
         method = "Method: Network Traffic Inspection";
     }
+    else if (notif->FsFilterCheck) {
+        method = "Method: Filesystem Activity Monitor";
+    }
 
     if (notif->Critical) {
 
@@ -3252,6 +3255,30 @@ bool InstallNortonEDRDriver(
             std::wcerr << L"Failed to create service. Error: " << GetLastError() << std::endl;
             CloseServiceHandle(hSCManager);
             return false;
+        }
+    }
+
+    // Write minifilter altitude registry keys so the Filter Manager can find the driver.
+    // These must exist before the driver is started.
+    {
+        wchar_t instRoot[300], instKey[356];
+        swprintf_s(instRoot, L"SYSTEM\\CurrentControlSet\\Services\\%s\\Instances", drvName.c_str());
+        swprintf_s(instKey,  L"SYSTEM\\CurrentControlSet\\Services\\%s\\Instances\\NortonEDRDrvInstance", drvName.c_str());
+
+        HKEY hk = nullptr;
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, instRoot, 0, nullptr, 0, KEY_WRITE, nullptr, &hk, nullptr) == ERROR_SUCCESS) {
+            const wchar_t* defInst = L"NortonEDRDrvInstance";
+            RegSetValueExW(hk, L"DefaultInstance", 0, REG_SZ,
+                           (const BYTE*)defInst, (DWORD)((wcslen(defInst) + 1) * sizeof(wchar_t)));
+            RegCloseKey(hk);
+        }
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, instKey, 0, nullptr, 0, KEY_WRITE, nullptr, &hk, nullptr) == ERROR_SUCCESS) {
+            const wchar_t* altitude = L"265000";
+            RegSetValueExW(hk, L"Altitude", 0, REG_SZ,
+                           (const BYTE*)altitude, (DWORD)((wcslen(altitude) + 1) * sizeof(wchar_t)));
+            DWORD flags = 0;
+            RegSetValueExW(hk, L"Flags", 0, REG_DWORD, (const BYTE*)&flags, sizeof(DWORD));
+            RegCloseKey(hk);
         }
     }
 
