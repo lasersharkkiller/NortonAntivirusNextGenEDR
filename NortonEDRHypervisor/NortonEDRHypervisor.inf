@@ -1,0 +1,48 @@
+; NortonEDRHypervisor.inf
+; Intel VT-x Type-1 style hypervisor (thin VMM) — for defensive lab use
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = NortonEDRHypervisor.cat
+DriverVer   = 04/01/2026, 1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+NortonEDRHypervisor.sys = 1,,
+
+[DefaultInstall.NTamd64]
+CopyFiles = HV.CopyFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService = NortonEDRHypervisor, 0x00000002, HV.Service
+
+[DefaultUninstall.NTamd64]
+DelFiles   = HV.CopyFiles
+DelService = NortonEDRHypervisor, 0x00000200
+
+[HV.CopyFiles]
+NortonEDRHypervisor.sys
+
+[HV.Service]
+DisplayName    = %ServiceName%
+Description    = %ServiceDescription%
+ServiceBinary  = %12%\NortonEDRHypervisor.sys
+ServiceType    = 1                   ; SERVICE_KERNEL_DRIVER
+StartType      = 3                   ; SERVICE_DEMAND_START (manual load for lab)
+ErrorControl   = 1                   ; SERVICE_ERROR_NORMAL
+LoadOrderGroup = System Bus Extender
+
+[Strings]
+ManufacturerName   = "NortonNextGenEDR"
+DiskName           = "Norton NextGen EDR Hypervisor Disk"
+ServiceName        = "NortonEDRHypervisor"
+ServiceDescription = "Norton NextGen EDR Intel VT-x Hypervisor"

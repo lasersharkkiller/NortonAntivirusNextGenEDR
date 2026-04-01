@@ -6,6 +6,26 @@ A Windows kernel-mode EDR featuring kernel-level telemetry, hook detection, proc
 
 ## Defensive Capabilities
 
+### Hypervisor (Intel VT-x)
+- Standalone pure-WDM kernel driver (`NortonEDRHypervisor.sys`) implementing a thin Type-1 style VMM using Intel VT-x; the existing Windows kernel becomes the guest and runs unmodified in VMX non-root operation
+- **Initialization** — `KeIpiGenericCall` broadcasts per-CPU VMX setup atomically: CPUID vendor check → `IA32_FEATURE_CONTROL` lock verification → CR0/CR4 fixed-bit adjustment → VMXON region + VMCS + MSR bitmap + EPT allocation → `VMXON` → VMCS configuration → `VMLAUNCH`; guest resumes at the captured `GUEST_RIP` continuation label in the MASM stub
+- **VM exit handler** — `HvVmExitStub` (MASM) captures all 15 GPRs on the per-CPU host stack and calls `HvHandleVmExit` (C++) which dispatches on `VM_EXIT_REASON`:
+  - **CPUID** — hides VMX capability (CPUID.1:ECX bit 5), sets hypervisor-present bit, exposes custom HV leaf at `0x40000000` with "NortonEDR HV" signature
+  - **CR3 access** — every CR3 write (process switch) is intercepted and logged: `(old CR3 → new CR3, CPU, RIP)` — foundation for per-process policy enforcement
+  - **CR0 write** — alerts if `CR0.WP` (Write Protect) is being cleared by the guest (kernel DKOM defense)
+  - **MSR write (IA32_LSTAR)** — detects writes to the SYSCALL target MSR at the hardware level, below all kernel hooks; emits a Critical alert with old/new values and RIP
+  - **MSR write (IA32_EFER)** — alerts if `NXE` (No-Execute Enable) bit is being cleared
+  - **MSR write (IA32_DEBUGCTL)** — logs branch-tracing enable/disable
+  - **VMCALL** — hypercall interface: `PING (0)`, `GET_STATS (1)` (returns per-CPU exit/EPT/MSR counts), `PROTECT_PAGE (2)` (restrict a GPA to EPT read+execute — anti-tamper), `UNPROTECT_PAGE (3)`
+  - **EPT violation** — delegates to `HvEptHandleViolation`: logs read/write/execute fault with GPA, GVA, and RIP; detects **write-then-execute** pattern (page was writable but not executable → execute attempt fires → shellcode staging alert)
+  - **INVD** — emulated as `WBINVD` to prevent cache corruption
+  - **XSETBV** — forwarded to hardware after logging
+  - **#GP exception** — re-injected into guest (guest VMX instructions cause #GP)
+- **Extended Page Tables (EPT)** — 4-level identity map over all physical memory ranges (`MmGetPhysicalMemoryRanges`); initially uses 2 MB large pages for low overhead; `HvEptSplitPage` promotes a 2 MB PDE to a 512-entry 4 KB PT for page-granular monitoring; `HvEptSetPagePermissions` adjusts R/W/X bits and issues `INVEPT` (single-context); write-then-execute detection wired into the violation handler
+- **MSR bitmap** — 4 KB intercept table; selected MSRs cause VM exits without touching all MSR accesses: `IA32_LSTAR` (read+write), `IA32_SYSENTER_EIP` (write), `IA32_DEBUGCTL` (write), `IA32_EFER` (write)
+- **MASM stubs** (`HvAsm.asm`) — `VMXON/VMXOFF/VMCLEAR/VMPTRLD/VMREAD/VMWRITE/VMLAUNCH/VMRESUME/INVEPT/VMCALL` wrappers; `HvLaunchVm` captures live RSP/RIP into VMCS then executes `VMLAUNCH`; `HvVmExitStub` is HOST_RIP — saves 15 GPRs, calls C handler, restores registers, `VMRESUME`
+- **Unload** — IPI broadcast sets `g_HvShutdown`, triggers VMCALL exit in which the handler issues `VMXOFF` before returning, restoring VMX root operation; all VMX regions and EPT tables freed per-CPU
+
 ### Early Launch Anti-Malware (ELAM)
 - Standalone pure-WDM kernel driver (`NortonEDRElam.sys`) registered with `StartType=0` and `LoadOrderGroup=Early-Launch` — loaded by the Windows boot loader before every other boot-start driver
 - **Boot driver callback** — `IoRegisterBootDriverCallback` registers `NortonElamBootDriverCallback`; called once per boot-start driver before the loader initialises it
