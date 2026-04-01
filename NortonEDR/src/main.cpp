@@ -18,6 +18,10 @@
 #include <winevt.h>
 #include <aclapi.h>
 #include <sddl.h>
+#include <evntrace.h>
+#include <evntcons.h>
+
+#pragma comment(lib, "sechost.lib")
 
 using namespace ftxui;
 using namespace std;
@@ -141,6 +145,31 @@ static std::atomic<bool> g_sysmonStop(false);
 static EVT_HANDLE        g_saclSubscription = nullptr;
 static std::atomic<bool> g_saclStop(false);
 static bool              g_saclReady = false;
+
+// ---------------------------------------------------------------------------
+// ETW-TI (Microsoft-Windows-Threat-Intelligence) real-time session
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_tiSessionHandle  = 0;
+static TRACEHANDLE       g_tiTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+static std::atomic<bool> g_tiStop(false);
+
+// ---------------------------------------------------------------------------
+// PowerShell script-block logging subscription
+// ---------------------------------------------------------------------------
+static EVT_HANDLE        g_psSubscription = nullptr;
+static std::atomic<bool> g_psStop(false);
+
+// ---------------------------------------------------------------------------
+// DNS-Client query subscription
+// ---------------------------------------------------------------------------
+static EVT_HANDLE        g_dnsSubscription = nullptr;
+static std::atomic<bool> g_dnsStop(false);
+
+// ---------------------------------------------------------------------------
+// WinRM operational subscription
+// ---------------------------------------------------------------------------
+static EVT_HANDLE        g_winrmSubscription = nullptr;
+static std::atomic<bool> g_winrmStop(false);
 
 struct TraceRuntimeConfig {
     std::vector<std::string> targetProcessNamesLower;
@@ -3212,6 +3241,411 @@ static void SecurityAuditSubscriberThread() {
     g_saclSubscription = nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// ETW-TI real-time consumer
+// Provider: Microsoft-Windows-Threat-Intelligence
+// GUID:     {F4E1897C-BB5D-5668-F1D8-040F4D8DD344}
+//
+// Requires SeSystemEnvironmentPrivilege + SeDebugPrivilege, or a PPL process.
+// Falls back gracefully if access is denied (non-PPL user-mode process).
+//
+// Remote task IDs surfaced as injection indicators:
+//   2  ProtectVM-Remote      4  MapView-Remote
+//   5  QueueUserAPC-Remote   6  SetThreadContext-Remote
+//   8  AllocVM-Remote       10  ReadVM-Remote   12  WriteVM-Remote
+// ---------------------------------------------------------------------------
+
+static const GUID kTiProviderGuid = {
+    0xF4E1897C, 0xBB5D, 0x5668,
+    {0xF1, 0xD8, 0x04, 0x0F, 0x4D, 0x8D, 0xD3, 0x44}
+};
+
+static const wchar_t* TiTaskName(USHORT task) {
+    switch (task) {
+    case  2: return L"ProtectVM-Remote";
+    case  4: return L"MapView-Remote";
+    case  5: return L"QueueUserAPC-Remote";
+    case  6: return L"SetThreadContext-Remote";
+    case  8: return L"AllocVM-Remote";
+    case 10: return L"ReadVM-Remote";
+    case 12: return L"WriteVM-Remote";
+    default: return nullptr;
+    }
+}
+
+static void WINAPI TiEventCallback(PEVENT_RECORD pEvent) {
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kTiProviderGuid)) return;
+
+    USHORT task = pEvent->EventHeader.EventDescriptor.Task;
+    const wchar_t* taskNameW = TiTaskName(task);
+    if (!taskNameW) return; // local ops or unrecognised — skip
+
+    UINT32 callerPid = pEvent->EventHeader.ProcessId;
+    if (callerPid == 0 || callerPid == curPid) return;
+
+    // Extract TargetProcessId from UserData when present (first UINT32 after
+    // two FILETIME fields = 8 bytes header + 8 bytes CallerCreateTime = offset 12).
+    // Layout: CallerPid(4) CallerCreateTime(8) TargetPid(4) ...
+    UINT32 targetPid = 0;
+    if (pEvent->UserDataLength >= 16) {
+        const BYTE* d = static_cast<const BYTE*>(pEvent->UserData);
+        memcpy(&targetPid, d + 12, sizeof(targetPid));
+    }
+
+    std::string taskName(taskNameW, taskNameW + wcslen(taskNameW));
+    std::string ts = BuildTimestamp();
+
+    std::string procName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(callerPid);
+        if (it != g_processCache.end()) procName = it->second.processName;
+    }
+    if (procName.empty()) procName = std::to_string(callerPid);
+
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [!] [Alert] | " + ts +
+        " | " + procName +
+        " | Method: ETW-TI" +
+        " | " + taskName +
+        (targetPid ? " -> PID " + std::to_string(targetPid) : "");
+
+    std::string det = "Date & Time: " + ts +
+        " | " + procName +
+        " | PID: " + std::to_string(callerPid) +
+        " | Method: ETW Threat-Intelligence" +
+        " | Operation: " + taskName +
+        (targetPid ? " | Target PID: " + std::to_string(targetPid) : "");
+
+    PushUiDetectionEvent(msg, det, "Method: ETW Threat-Intelligence",
+                         callerPid, DetectionSeverity::High);
+}
+
+static bool EnablePrivilege(LPCWSTR privName) {
+    HANDLE hToken;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return false;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    LookupPrivilegeValueW(nullptr, privName, &tp.Privileges[0].Luid);
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    AdjustTokenPrivileges(hToken, FALSE, &tp, 0, nullptr, nullptr);
+    DWORD err = GetLastError();
+    CloseHandle(hToken);
+    return err == ERROR_SUCCESS;
+}
+
+static void EtwTiSubscriberThread() {
+    // Attempt privilege escalation required for ETW-TI
+    EnablePrivilege(SE_SYSTEM_ENVIRONMENT_NAME);
+    EnablePrivilege(SE_DEBUG_NAME);
+
+    const wchar_t* kSessionName = L"NortonEDR-TI";
+
+    // Allocate EVENT_TRACE_PROPERTIES (name goes immediately after the struct)
+    const size_t nameBufBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize  = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize    = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags         = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode         = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset    = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_tiSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_tiSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-TI] StartTrace failed: " << status
+                  << " (access denied without PPL — skipping)\n";
+        return;
+    }
+
+    // Enable the TI provider on this session
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_tiSessionHandle, &kTiProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_VERBOSE,
+        0xFFFFFFFFFFFFFFFFULL, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-TI] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_tiSessionHandle, nullptr, &stopProps,
+                      EVENT_TRACE_CONTROL_STOP);
+        g_tiSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-TI] Session started — consuming threat-intelligence events\n";
+
+    // Open the real-time trace
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName       = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                               PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = TiEventCallback;
+
+    g_tiTraceHandle = OpenTraceW(&logFile);
+    if (g_tiTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-TI] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    // ProcessTrace blocks until CloseTrace is called from another thread
+    ProcessTrace(&g_tiTraceHandle, 1, nullptr, nullptr);
+    g_tiTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopEtwTiSession() {
+    if (g_tiTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_tiTraceHandle);
+        g_tiTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_tiSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_tiSessionHandle, nullptr, &stopProps,
+                      EVENT_TRACE_CONTROL_STOP);
+        g_tiSessionHandle = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PowerShell script-block logging (EID 4104)
+// Channel: Microsoft-Windows-PowerShell/Operational
+// ---------------------------------------------------------------------------
+
+static DWORD WINAPI PowerShellEventCallback(
+    EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID /*ctx*/, EVT_HANDLE hEvent)
+{
+    if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
+
+    std::string xml = RenderEventXml(hEvent);
+    if (xml.empty()) return ERROR_SUCCESS;
+
+    std::string scriptBlock = GetXmlField(xml, "ScriptBlockText");
+    if (scriptBlock.empty()) return ERROR_SUCCESS;
+
+    std::string ts    = BuildTimestamp();
+    UINT32      pid   = 0;
+
+    std::string pidStr = GetXmlField(xml, "ProcessID");
+    if (!pidStr.empty()) {
+        try { pid = static_cast<UINT32>(std::stoul(pidStr, nullptr, 0)); }
+        catch (...) {}
+    }
+
+    // Trim for display
+    std::string preview = scriptBlock.size() > 120
+        ? scriptBlock.substr(0, 120) + "..."
+        : scriptBlock;
+
+    // Run Sigma rules against the script block content (same pipeline as Sysmon)
+    std::string procName = "powershell";
+    NotifySigmaMatches(pid, procName, { scriptBlock }, "PowerShell/4104");
+
+    // Always surface script block loads as Info; Sigma can escalate
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [i] [Info] | " + ts +
+        " | powershell | Method: PS Script-Block Logging | " + preview;
+
+    std::string det = "Date & Time: " + ts +
+        " | powershell | PID: " + std::to_string(pid) +
+        " | Method: PowerShell Script-Block Logging (EID 4104)" +
+        " | Script: " + scriptBlock.substr(0, 512);
+
+    PushUiDetectionEvent(msg, det, "Method: PowerShell Script-Block Logging",
+                         pid, DetectionSeverity::Info);
+    return ERROR_SUCCESS;
+}
+
+static void PowerShellSubscriberThread() {
+    g_psSubscription = EvtSubscribe(
+        nullptr, nullptr,
+        L"Microsoft-Windows-PowerShell/Operational",
+        L"*[System[(EventID=4104)]]",
+        nullptr, nullptr,
+        reinterpret_cast<EVT_SUBSCRIBE_CALLBACK>(PowerShellEventCallback),
+        EvtSubscribeToFutureEvents
+    );
+
+    if (!g_psSubscription) {
+        std::cerr << "[PS] EvtSubscribe failed: " << GetLastError()
+                  << " (enable PS script-block logging via GPO)\n";
+        return;
+    }
+
+    std::cout << "[PS] Script-block logging subscriber active\n";
+    while (!g_psStop.load()) Sleep(500);
+    EvtClose(g_psSubscription);
+    g_psSubscription = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// DNS-Client query logging (EID 3006)
+// Channel: Microsoft-Windows-DNS-Client/Operational
+// ---------------------------------------------------------------------------
+
+static DWORD WINAPI DnsEventCallback(
+    EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID /*ctx*/, EVT_HANDLE hEvent)
+{
+    if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
+
+    std::string xml = RenderEventXml(hEvent);
+    if (xml.empty()) return ERROR_SUCCESS;
+
+    std::string queryName = GetXmlField(xml, "QueryName");
+    if (queryName.empty()) return ERROR_SUCCESS;
+
+    UINT32 pid = 0;
+    std::string pidStr = GetXmlField(xml, "ProcessID");
+    if (!pidStr.empty()) {
+        try { pid = static_cast<UINT32>(std::stoul(pidStr, nullptr, 0)); }
+        catch (...) {}
+    }
+
+    // Reuse the existing Sysmon EID-22 DGA heuristic (long label detection)
+    // by routing through Sigma matching on the query name
+    NotifySigmaMatches(pid, "dns-client", { queryName }, "DNS/3006");
+
+    return ERROR_SUCCESS;
+}
+
+static void DnsSubscriberThread() {
+    // Enable the DNS-Client operational channel (disabled by default)
+    EVT_HANDLE hCh = EvtOpenChannelConfigW(
+        nullptr, L"Microsoft-Windows-DNS-Client/Operational", 0);
+    if (hCh) {
+        EVT_VARIANT v{};
+        v.BooleanVal = TRUE;
+        v.Type       = EvtVarTypeBoolean;
+        EvtSetChannelConfigProperty(hCh, EvtChannelConfigEnabled, 0, &v);
+        EvtSaveChannelConfig(hCh, 0);
+        EvtClose(hCh);
+    }
+
+    g_dnsSubscription = EvtSubscribe(
+        nullptr, nullptr,
+        L"Microsoft-Windows-DNS-Client/Operational",
+        L"*[System[(EventID=3006)]]",
+        nullptr, nullptr,
+        reinterpret_cast<EVT_SUBSCRIBE_CALLBACK>(DnsEventCallback),
+        EvtSubscribeToFutureEvents
+    );
+
+    if (!g_dnsSubscription) {
+        std::cerr << "[DNS] EvtSubscribe failed: " << GetLastError()
+                  << " (DNS-Client operational channel may be unavailable)\n";
+        return;
+    }
+
+    std::cout << "[DNS] Client query subscriber active\n";
+    while (!g_dnsStop.load()) Sleep(500);
+    EvtClose(g_dnsSubscription);
+    g_dnsSubscription = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// WinRM lateral-movement detection (EIDs 6, 8, 91)
+// Channel: Microsoft-Windows-WinRM/Operational
+// ---------------------------------------------------------------------------
+
+static DWORD WINAPI WinRmEventCallback(
+    EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID /*ctx*/, EVT_HANDLE hEvent)
+{
+    if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
+
+    std::string xml = RenderEventXml(hEvent);
+    if (xml.empty()) return ERROR_SUCCESS;
+
+    std::string eidStr = GetXmlField(xml, "EventID");
+    int eid = 0;
+    try { eid = std::stoi(eidStr); } catch (...) { return ERROR_SUCCESS; }
+
+    std::string ts = BuildTimestamp();
+
+    const char* description = nullptr;
+    DetectionSeverity sev = DetectionSeverity::Medium;
+    switch (eid) {
+    case   6: description = "WSMan client session created";       break;
+    case   8: description = "WSMan client request sent";          break;
+    case  91: description = "WSMan session creation initiated";   break;
+    case 132: description = "WSMan HTTP request"; sev = DetectionSeverity::Low; break;
+    default: return ERROR_SUCCESS;
+    }
+
+    UINT32 pid = 0;
+    std::string pidStr = GetXmlField(xml, "ProcessID");
+    if (!pidStr.empty()) {
+        try { pid = static_cast<UINT32>(std::stoul(pidStr, nullptr, 0)); }
+        catch (...) {}
+    }
+
+    std::string procName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(pid);
+        if (it != g_processCache.end()) procName = it->second.processName;
+    }
+    if (procName.empty()) procName = "winrm-client";
+
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [*] [Warning] | " + ts +
+        " | " + procName +
+        " | Method: WinRM Lateral Movement Detection"
+        " | EID " + std::to_string(eid) + ": " + description;
+
+    std::string det = "Date & Time: " + ts +
+        " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: WinRM Lateral Movement Detection" +
+        " | EventID: " + std::to_string(eid) +
+        " | " + description;
+
+    PushUiDetectionEvent(msg, det, "Method: WinRM Lateral Movement Detection",
+                         pid, sev);
+    return ERROR_SUCCESS;
+}
+
+static void WinRmSubscriberThread() {
+    g_winrmSubscription = EvtSubscribe(
+        nullptr, nullptr,
+        L"Microsoft-Windows-WinRM/Operational",
+        L"*[System[(EventID=6 or EventID=8 or EventID=91 or EventID=132)]]",
+        nullptr, nullptr,
+        reinterpret_cast<EVT_SUBSCRIBE_CALLBACK>(WinRmEventCallback),
+        EvtSubscribeToFutureEvents
+    );
+
+    if (!g_winrmSubscription) {
+        std::cerr << "[WinRM] EvtSubscribe failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    std::cout << "[WinRM] Operational subscriber active\n";
+    while (!g_winrmStop.load()) Sleep(500);
+    EvtClose(g_winrmSubscription);
+    g_winrmSubscription = nullptr;
+}
+
 VOID ShowUI() {
 
     auto processesRenderer = Renderer([&] {
@@ -3311,12 +3745,20 @@ VOID ShowUI() {
         ConsumeIOCTLData(L"\\\\.\\NortonEDR", NORTONAV_RETRIEVE_DATA_FILE, 5);
         });
 
-    // Sysmon and SACL subscribers
+    // Sysmon, SACL, ETW-TI, PowerShell, DNS and WinRM subscribers
     SetupAuditSACLs();
     g_sysmonStop = false;
     g_saclStop   = false;
+    g_tiStop     = false;
+    g_psStop     = false;
+    g_dnsStop    = false;
+    g_winrmStop  = false;
     std::thread sysmonThread(SysmonSubscriberThread);
     std::thread saclThread(SecurityAuditSubscriberThread);
+    std::thread tiThread(EtwTiSubscriberThread);
+    std::thread psThread(PowerShellSubscriberThread);
+    std::thread dnsThread(DnsSubscriberThread);
+    std::thread winrmThread(WinRmSubscriberThread);
 
     try {
         screen.Loop(renderer);
@@ -3337,8 +3779,18 @@ VOID ShowUI() {
 
     g_sysmonStop = true;
     g_saclStop   = true;
+    g_psStop     = true;
+    g_dnsStop    = true;
+    g_winrmStop  = true;
     sysmonThread.join();
     saclThread.join();
+    psThread.join();
+    dnsThread.join();
+    winrmThread.join();
+
+    // ETW-TI: unblock ProcessTrace then join
+    StopEtwTiSession();
+    tiThread.join();
 }
 
 int main(int argc, char* argv[]) {

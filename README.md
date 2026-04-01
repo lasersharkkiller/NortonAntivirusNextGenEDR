@@ -1,6 +1,6 @@
 # NortonAntivirusNextGenEDR
 
-A Windows kernel-mode EDR built on top of [BestEdrOfTheMarket v3](https://xacone.github.io/BestEdrOfTheMarketV3.html), extended with Sysmon integration, SACL-based auditing, hook detection, and structured detection telemetry for defensive lab environments.
+A Windows kernel-mode EDR extended with Sysmon integration, SACL-based auditing, hook detection, and structured detection telemetry for defensive lab environments.
 
 ---
 
@@ -51,6 +51,24 @@ All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critic
 - LOLDrivers detection via cached JSON database
 - Deterministic severity scoring with live UI security score
 - PID-level short-window correlation alerts across detection methods
+
+### ETW Integration
+
+#### Kernel as ETW Provider
+- Driver registers as an ETW provider (GUID `D6E3E932-B0B9-4E8C-A2C3-F7A9B8C5D4E1`) via `EtwRegister` at load time
+- Every detection notification dequeued from the kernel ring is simultaneously written to ETW via `EtwWrite` — enables external consumers (xperf, WPA, SIEMs) without the TUI running
+- Six event IDs map to detection families: Hook(1), PE/VAD(2), Process(3), AMSI(4), Syscall(5), Generic(6)
+- Fields per event: process name, message, PID, scooped address
+
+#### ETW-TI Consumer (Microsoft-Windows-Threat-Intelligence)
+- Starts a real-time ETW session for `{F4E1897C-BB5D-5668-F1D8-040F4D8DD344}` via `StartTrace` + `EnableTraceEx2`
+- Surfaces remote injection operations: `AllocVM-Remote`, `ProtectVM-Remote`, `MapView-Remote`, `QueueUserAPC-Remote`, `SetThreadContext-Remote`, `WriteVM-Remote`, `ReadVM-Remote`
+- Falls back gracefully with an informational message if the process lacks PPL or `SeSystemEnvironmentPrivilege`
+
+#### Additional ETW Consumers
+- **PowerShell script-block logging** — `Microsoft-Windows-PowerShell/Operational` EID 4104; script content routed through Sigma-Lite rule engine
+- **DNS-Client queries** — `Microsoft-Windows-DNS-Client/Operational` EID 3006; query names routed through Sigma for DGA/C2 detection; enables the channel automatically if disabled
+- **WinRM lateral movement** — `Microsoft-Windows-WinRM/Operational` EIDs 6, 8, 91, 132; flags WSMan session creation and HTTP requests as Medium/Low severity
 
 ### Sysmon & SACL Integration
 - Sysmon event ingestion for host-based telemetry enrichment

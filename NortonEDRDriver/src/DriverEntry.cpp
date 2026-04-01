@@ -44,6 +44,7 @@ VOID UnloadDriver(PDRIVER_OBJECT DriverObject) {
 
 	g_callbackObjects->unsetNotificationsGlobal();
 
+	EtwProvider::Cleanup();
 	HookDetector::Cleanup();
 
 	g_syscallsUtils->DisableAltSyscallFromThreads3();
@@ -91,6 +92,9 @@ NTSTATUS DriverIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
 				PKERNEL_STRUCTURED_NOTIFICATION resp = CallbackObjects::GetNotifQueue()->Dequeue();
 				KeReleaseSpinLock(&g_spinLock, oldIrql);
+
+				// Emit ETW event at PASSIVE_LEVEL (spinlock already released)
+				EtwProvider::WriteDetectionEvent(resp);
 
 				if (!resp || !MmIsAddressValid(resp)) {
 					status = STATUS_NO_MORE_ENTRIES;
@@ -303,6 +307,8 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	g_callbackObjects->InitBufferQueue(g_bufferQueue);
 
 	g_callbackObjects->setupNotificationsGlobal();
+
+	EtwProvider::Init();
 
 	// Take SSDT baseline snapshot and run full hook scan
 	HookDetector::Init(g_hashQueue);

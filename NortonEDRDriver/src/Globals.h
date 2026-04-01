@@ -1083,6 +1083,21 @@ public:
     );
 };
 
+class EtwProvider {
+
+public:
+
+    // Register the driver as an ETW provider at load time.
+    static VOID Init();
+
+    // Unregister at unload time.
+    static VOID Cleanup();
+
+    // Emit one ETW event for a detection notification.
+    // Must be called at IRQL <= APC_LEVEL (call after releasing any spinlock).
+    static VOID WriteDetectionEvent(PKERNEL_STRUCTURED_NOTIFICATION notif);
+};
+
 class AmsiDetector {
 
 public:
