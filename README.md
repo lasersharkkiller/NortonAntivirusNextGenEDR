@@ -12,7 +12,7 @@ A Windows kernel-mode EDR featuring kernel-level telemetry, hook detection, proc
 - VAD tree exploitation for image integrity verification
 - Shadow Stack (CET) verification for thread call stack integrity
 - Code injection detection via thread call stack inspection
-- **WFP network callout** — `FwpsCalloutRegister` + `FwpmFilterAdd` on `FWPM_LAYER_OUTBOUND_TRANSPORT_V4`; logs connection tuples and blocks configurable ports
+- **WFP network callout** — `FwpsCalloutRegister` + `FwpmFilterAdd` on `FWPM_LAYER_OUTBOUND_TRANSPORT_V4`; PID-attributed connection tuples; configurable block list via `--block-ports <port,port,...>`; built-in suspicious-port heuristics (Metasploit 4444, Tor 9001/9002, IRC 6667, Back Orifice 31337, etc.) surface as Warning events in the detection queue, TUI, JSONL, and Elasticsearch
 
 ### Hook Detection
 - **SSDT integrity** — baseline snapshot of `nt!KiServiceTable` taken at driver load; subsequent scans compare live entries against the snapshot and alert on any modified syscall dispatch pointer
