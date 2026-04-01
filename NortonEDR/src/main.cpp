@@ -20,8 +20,10 @@
 #include <sddl.h>
 #include <evntrace.h>
 #include <evntcons.h>
+#include <wincrypt.h>
 
 #pragma comment(lib, "sechost.lib")
+#pragma comment(lib, "crypt32.lib")
 
 using namespace ftxui;
 using namespace std;
@@ -90,6 +92,7 @@ auto tab_1_menu = Menu(&tab_1_menu_items, &tab_1_selected, g_detectionMenuOption
 std::unordered_set<std::string> benignFSPaths;
 std::unordered_set<std::string> loadedYaraRulePaths;
 std::unordered_set<std::string> lolDriverNames;
+std::unordered_set<std::string> lolDriverHashes;   // lowercase hex SHA256
 std::unordered_set<std::string> detectedLolDriverPaths;
 
 const std::string kLoadedPotatoYaraRulesDir = R"(D:\Loaded-Potato\detections\yara)";
@@ -1957,6 +1960,170 @@ void NotifySigmaMatches(
     }
 }
 
+// ---------------------------------------------------------------------------
+// SHA256 file hash — returns lowercase hex string, empty on failure.
+// ---------------------------------------------------------------------------
+static std::string Sha256File(const std::string& path) {
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return {};
+
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    std::string result;
+
+    if (!CryptAcquireContextA(&hProv, nullptr, nullptr, PROV_RSA_AES,
+                               CRYPT_VERIFYCONTEXT)) goto cleanup;
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) goto cleanup;
+
+    {
+        BYTE buf[65536];
+        DWORD read;
+        while (ReadFile(hFile, buf, sizeof(buf), &read, nullptr) && read > 0)
+            if (!CryptHashData(hHash, buf, read, 0)) goto cleanup;
+    }
+
+    {
+        BYTE digest[32];
+        DWORD digestLen = sizeof(digest);
+        if (CryptGetHashParam(hHash, HP_HASHVAL, digest, &digestLen, 0)) {
+            char hex[65] = {};
+            for (int i = 0; i < 32; i++)
+                sprintf_s(hex + i * 2, 3, "%02x", digest[i]);
+            result = hex;
+        }
+    }
+
+cleanup:
+    if (hHash) CryptDestroyHash(hHash);
+    if (hProv) CryptReleaseContext(hProv, 0);
+    CloseHandle(hFile);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Import hash (imphash) — MD5 of sorted "module.funcname" pairs, matching
+// the convention used by pefile/VirusTotal for threat-intel correlation.
+// Returns lowercase hex string, empty if the PE has no import table.
+// ---------------------------------------------------------------------------
+static std::string ComputeImphash(const std::string& path) {
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return {};
+
+    HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(hFile);
+    if (!hMap) return {};
+
+    PVOID base = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hMap);
+    if (!base) return {};
+
+    std::string result;
+
+    __try {
+        auto* dos = (IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic != 0x5A4D) __leave;
+
+        auto* nth = (IMAGE_NT_HEADERS64*)((BYTE*)base + dos->e_lfanew);
+        if (nth->Signature != 0x00004550) __leave;
+
+        DWORD importRva = nth->OptionalHeader.DataDirectory[1].VirtualAddress;
+        DWORD importSz  = nth->OptionalHeader.DataDirectory[1].Size;
+        if (importRva == 0 || importSz == 0) __leave;
+
+        // RVA → file offset via section table
+        auto RvaToFileOff = [&](DWORD rva) -> DWORD {
+            WORD n = nth->FileHeader.NumberOfSections;
+            auto* sec = (IMAGE_SECTION_HEADER*)((BYTE*)&nth->OptionalHeader
+                        + nth->FileHeader.SizeOfOptionalHeader);
+            for (WORD i = 0; i < n; i++) {
+                if (rva >= sec[i].VirtualAddress &&
+                    rva <  sec[i].VirtualAddress + sec[i].SizeOfRawData)
+                    return rva - sec[i].VirtualAddress + sec[i].PointerToRawData;
+            }
+            return 0;
+        };
+
+        struct IMAGE_IMPORT_DESCRIPTOR {
+            DWORD OriginalFirstThunk;
+            DWORD TimeDateStamp;
+            DWORD ForwarderChain;
+            DWORD Name;
+            DWORD FirstThunk;
+        };
+
+        DWORD importOff = RvaToFileOff(importRva);
+        if (!importOff) __leave;
+
+        auto* desc = (IMAGE_IMPORT_DESCRIPTOR*)((BYTE*)base + importOff);
+        std::vector<std::string> entries;
+
+        for (; desc->Name != 0; desc++) {
+            DWORD nameOff = RvaToFileOff(desc->Name);
+            if (!nameOff) continue;
+            std::string modName = (char*)base + nameOff;
+            // Strip extension, lowercase
+            size_t dot = modName.rfind('.');
+            if (dot != std::string::npos) modName = modName.substr(0, dot);
+            for (auto& c : modName) c = (char)tolower((unsigned char)c);
+
+            DWORD thunkRva = desc->OriginalFirstThunk
+                           ? desc->OriginalFirstThunk : desc->FirstThunk;
+            DWORD thunkOff = RvaToFileOff(thunkRva);
+            if (!thunkOff) continue;
+
+            auto* thunk = (ULONGLONG*)((BYTE*)base + thunkOff);
+            for (; *thunk; thunk++) {
+                if (*thunk & (1ULL << 63)) {
+                    // Import by ordinal
+                    entries.push_back(modName + ".#" +
+                        std::to_string(*thunk & 0xFFFF));
+                } else {
+                    DWORD hintOff = RvaToFileOff((DWORD)(*thunk & 0xFFFFFFFF));
+                    if (!hintOff) continue;
+                    std::string fn = (char*)base + hintOff + 2; // skip Hint WORD
+                    for (auto& c : fn) c = (char)tolower((unsigned char)c);
+                    entries.push_back(modName + "." + fn);
+                }
+            }
+        }
+
+        if (entries.empty()) __leave;
+
+        std::string flat;
+        for (size_t i = 0; i < entries.size(); i++) {
+            if (i) flat += ',';
+            flat += entries[i];
+        }
+
+        // MD5 the concatenated string
+        HCRYPTPROV hProv = 0;
+        HCRYPTHASH hHash = 0;
+        if (CryptAcquireContextA(&hProv, nullptr, nullptr, PROV_RSA_FULL,
+                                  CRYPT_VERIFYCONTEXT)) {
+            if (CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
+                CryptHashData(hHash, (BYTE*)flat.data(), (DWORD)flat.size(), 0);
+                BYTE  dig[16]; DWORD dlen = 16;
+                if (CryptGetHashParam(hHash, HP_HASHVAL, dig, &dlen, 0)) {
+                    char hex[33] = {};
+                    for (int i = 0; i < 16; i++)
+                        sprintf_s(hex + i * 2, 3, "%02x", dig[i]);
+                    result = hex;
+                }
+                CryptDestroyHash(hHash);
+            }
+            CryptReleaseContext(hProv, 0);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    UnmapViewOfFile(base);
+    return result;
+}
+
 void NotifyLolDriverMatch(PKERNEL_STRUCTURED_NOTIFICATION notif, const std::string& fullPath) {
     if (lolDriverNames.empty() || fullPath.empty()) {
         return;
@@ -1970,9 +2137,16 @@ void NotifyLolDriverMatch(PKERNEL_STRUCTURED_NOTIFICATION notif, const std::stri
         return;
     }
 
-    if (lolDriverNames.find(fileName) == lolDriverNames.end()) {
-        return;
-    }
+    // Name-based match
+    bool nameMatch = lolDriverNames.find(fileName) != lolDriverNames.end();
+
+    // Hash-based match (always compute for .sys files — catches renames)
+    std::string fileHash = Sha256File(fullPath);
+    bool hashMatch = !fileHash.empty() &&
+                     !lolDriverHashes.empty() &&
+                     lolDriverHashes.find(fileHash) != lolDriverHashes.end();
+
+    if (!nameMatch && !hashMatch) return;
 
     const std::string normalizedPath = ToLowerCopy(fsPath.lexically_normal().string());
     if (detectedLolDriverPaths.find(normalizedPath) != detectedLolDriverPaths.end()) {
@@ -1985,18 +2159,23 @@ void NotifyLolDriverMatch(PKERNEL_STRUCTURED_NOTIFICATION notif, const std::stri
     const UINT32 pid = static_cast<UINT32>(notif->pid);
     const std::string procName = SafeFixedBufferString(notif->procName, sizeof(notif->procName));
 
+    std::string matchType = nameMatch && hashMatch ? "name+hash"
+                          : nameMatch              ? "name"
+                                                   : "hash";
+
     const std::string message = std::to_string(tab_1_menu_items.size()) +
         " - [!] [Warning] | " + date_time_str +
         " | " + procName +
-        " | Method: LOLDrivers Lookup" +
+        " | Method: LOLDrivers Lookup (" + matchType + ")" +
         " | Flagged driver file: " + fileName;
 
     const std::string details = "Date & Time: " + date_time_str +
         " | " + procName +
         " | PID: " + std::to_string(pid) +
-        " | Method: LOLDrivers Lookup" +
+        " | Method: LOLDrivers Lookup (" + matchType + ")" +
         " | Driver: " + fileName +
-        " | Path: " + fullPath;
+        " | Path: " + fullPath +
+        (fileHash.empty() ? "" : " | SHA256: " + fileHash);
 
     PushUiDetectionEvent(
         message,
@@ -2020,24 +2199,31 @@ bool LoadLolDriversCache(const std::string& cachePath) {
     );
 
     std::regex fileNameRegex(R"("n"\s*:\s*"([^"]+)")");
+    std::regex hashRegex(R"("sha256"\s*:\s*"([0-9a-fA-F]{64})")");
+
+    size_t beforeNames  = lolDriverNames.size();
+    size_t beforeHashes = lolDriverHashes.size();
+
     std::sregex_iterator it(rawJson.begin(), rawJson.end(), fileNameRegex);
     std::sregex_iterator end;
-
-    size_t beforeLoad = lolDriverNames.size();
-
-    for (; it != end; ++it) {
+    for (; it != end; ++it)
         if (it->size() > 1) {
-            std::string driverName = ToLowerCopy((*it)[1].str());
-            if (!driverName.empty()) {
-                lolDriverNames.insert(driverName);
-            }
+            std::string n = ToLowerCopy((*it)[1].str());
+            if (!n.empty()) lolDriverNames.insert(n);
         }
-    }
 
-    std::cout << "[*] " << (lolDriverNames.size() - beforeLoad)
-        << " LOLDrivers names loaded from " << cachePath << "\n";
+    std::sregex_iterator hit(rawJson.begin(), rawJson.end(), hashRegex);
+    for (; hit != end; ++hit)
+        if (hit->size() > 1) {
+            std::string h = ToLowerCopy((*hit)[1].str());
+            if (h.size() == 64) lolDriverHashes.insert(h);
+        }
 
-    return !lolDriverNames.empty();
+    std::cout << "[*] LOLDrivers: " << (lolDriverNames.size() - beforeNames)
+              << " names, " << (lolDriverHashes.size() - beforeHashes)
+              << " hashes loaded from " << cachePath << "\n";
+
+    return !lolDriverNames.empty() || !lolDriverHashes.empty();
 }
 
 
@@ -2708,7 +2894,11 @@ static void RunCapaScan(const std::string& path, UINT32 pid) {
     }
     CloseHandle(hRead);
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    // 60-second timeout — terminate capa if it stalls
+    if (WaitForSingleObject(pi.hProcess, 60000) == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 5000);
+    }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
@@ -2861,6 +3051,24 @@ void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) 
 
                             EnqueueYaraFileScan(notif, fullPath);
                             EnqueueCapaScan(fullPath, notifPid);
+
+                            // Compute and surface imphash for threat-intel correlation
+                            {
+                                std::string ih = ComputeImphash(fullPath);
+                                if (!ih.empty()) {
+                                    std::string sha = Sha256File(fullPath);
+                                    std::string details = "File: " + fullPath +
+                                        "\nImphash: " + ih +
+                                        (sha.empty() ? "" : "\nSHA256:  " + sha);
+                                    PushUiDetectionEvent(
+                                        "PE fingerprint: " + BaseNameLower(fullPath),
+                                        details,
+                                        "Static: Import Hash",
+                                        notifPid,
+                                        DetectionSeverity::Info
+                                    );
+                                }
+                            }
                         }
                         else {
                             std::vector<std::string> sigmaFields = { std::string(msg), notifProcName };

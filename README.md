@@ -31,6 +31,11 @@ All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critic
 - **Process ghosting** — `SeAuditProcessCreationInfo` null-check detects processes launched from deleted files
 - **PPID spoofing** — parent PID vs. creating thread process mismatch detected at process creation
 - **Process hollowing** — VAD/LDR cross-check verifies the main image VAD start address matches the PEB loader entry
+- **Section entropy analysis** — Shannon entropy computed per section; alerts at ≥ 7.2 bits/byte (packed/encrypted code)
+- **Section anomaly checks** — writable+executable sections (W+X), raw size < virtual size/2 flagged per section
+- **TLS callback detection** — `IMAGE_DIRECTORY_ENTRY_TLS` parsed; alerts if `AddressOfCallBacks` is non-zero (TLS injection vector)
+- **Import hash (imphash)** — MD5 of sorted `module.funcname` pairs computed for every flagged PE; surfaced as Info event for threat-intel correlation alongside SHA256
+- **LOLDrivers hash matching** — SHA256 of loaded `.sys` files checked against hash database in addition to filename lookup; catches renamed known-bad drivers
 
 ### AMSI Integration
 
