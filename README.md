@@ -1,6 +1,8 @@
 # NortonAntivirusNextGenEDR
 
-A Windows kernel-mode EDR featuring kernel-level telemetry, hook detection, process & PE scanning, AMSI bypass detection, user-mode API interception, ETW integration, YARA/Sigma/Capa detection engines, and Sysmon/SACL enrichment — built for defensive lab environments.
+On a scale of one to America, this NextGen Norton Antivirus EDR just made enterprise-grade defense free. Built by a Norton, carrying forward a name rooted in cybersecurity history, reimagined for modern threats.
+
+A Windows kernel-mode EDR featuring an Intel VT-x hypervisor with EPT-based memory monitoring, Early Launch Anti-Malware (ELAM) boot driver classification, adversary deception via EPT shadow-page credential poisoning, kernel-level telemetry, hook detection, process & PE scanning, filesystem minifilter with ransomware detection, WFP network callout with port blocking, AMSI bypass detection, user-mode API interception, ETW integration, YARA/Sigma/Capa detection engines, and Sysmon/SACL enrichment.
 
 ---
 
