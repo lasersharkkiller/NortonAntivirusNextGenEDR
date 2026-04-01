@@ -16,6 +16,7 @@ PDEVICE_OBJECT DeviceObject = NULL;
 
 SyscallsUtils* g_syscallsUtils;
 CallbackObjects* g_callbackObjects;
+WdfTcpipUtils* g_wfpUtils;
 
 BufferQueue* g_bufferQueue;
 NotifQueue* g_hashQueue;
@@ -50,6 +51,12 @@ VOID UnloadDriver(PDRIVER_OBJECT DriverObject) {
 	g_syscallsUtils->DisableAltSyscallFromThreads3();
 
 	g_syscallsUtils->UnInitAltSyscallHandler();
+
+	if (g_wfpUtils) {
+		g_wfpUtils->UnitializeWfp();
+		ExFreePool(g_wfpUtils);
+		g_wfpUtils = nullptr;
+	}
 
 	IoDeleteSymbolicLink(&symLink);
 	IoDeleteDevice(DriverObject->DeviceObject);
@@ -334,6 +341,18 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	{
 		IoDeleteDevice(DeviceObject);
 		return status;
+	}
+
+	g_wfpUtils = (WdfTcpipUtils*)ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_RAISE_ON_FAILURE, sizeof(WdfTcpipUtils), 'wfpu');
+	if (g_wfpUtils) {
+		NTSTATUS wfpStatus = g_wfpUtils->InitWfp();
+		if (!NT_SUCCESS(wfpStatus)) {
+			DbgPrint("[-] WFP initialization failed: 0x%x — network telemetry disabled\n", wfpStatus);
+			ExFreePool(g_wfpUtils);
+			g_wfpUtils = nullptr;
+		}
+	} else {
+		DbgPrint("[-] Failed to allocate WdfTcpipUtils\n");
 	}
 
 	DbgPrint("[+] Driver loaded\n");
