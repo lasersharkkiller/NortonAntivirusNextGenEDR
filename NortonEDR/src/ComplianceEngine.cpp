@@ -131,6 +131,59 @@ static ComplianceFinding Manual(const CheckDef& c, const std::string& note) {
 }
 
 // ---------------------------------------------------------------------------
+// Service start type helper (returns 4 = SERVICE_DISABLED; -1 = not found)
+// ---------------------------------------------------------------------------
+static DWORD SvcStartType(const char* name) {
+    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) return (DWORD)-1;
+    SC_HANDLE svc = OpenServiceA(scm, name, SERVICE_QUERY_CONFIG);
+    if (!svc) { CloseServiceHandle(scm); return (DWORD)-1; }
+    DWORD needed = 0;
+    QueryServiceConfigA(svc, nullptr, 0, &needed);
+    LPQUERY_SERVICE_CONFIGA cfg = (LPQUERY_SERVICE_CONFIGA)LocalAlloc(LMEM_FIXED, needed);
+    DWORD st = SERVICE_DISABLED;
+    if (cfg && QueryServiceConfigA(svc, cfg, needed, &needed)) st = cfg->dwStartType;
+    LocalFree(cfg);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return st;
+}
+
+// ---------------------------------------------------------------------------
+// Audit subcategory helper — checks success/failure bits via AuditQuerySystemPolicy
+// ---------------------------------------------------------------------------
+static ComplianceFinding CheckAuditSub(const CheckDef& c, const GUID& guid,
+                                        bool needSuccess, bool needFailure,
+                                        const char* subcatName) {
+    PAUDIT_POLICY_INFORMATION pInfo = nullptr;
+    if (!AuditQuerySystemPolicy(&guid, 1, &pInfo) || !pInfo) {
+        char note[320];
+        sprintf_s(note, sizeof(note),
+            "auditpol /get /subcategory:\"%s\"  (requires admin)", subcatName);
+        return Manual(c, note);
+    }
+    DWORD info = pInfo->AuditingInformation;
+    AuditFree(pInfo);
+    bool hasS = (info & POLICY_AUDIT_EVENT_SUCCESS) != 0;
+    bool hasF = (info & POLICY_AUDIT_EVENT_FAILURE) != 0;
+    auto statusStr = [&]() -> std::string {
+        if (!hasS && !hasF) return "None";
+        return std::string(hasS ? "Success" : "") + (hasF ? (hasS ? "+Failure" : "Failure") : "");
+    };
+    bool ok = (!needSuccess || hasS) && (!needFailure || hasF);
+    if (!ok) {
+        std::string req = std::string(needSuccess ? "Success" : "") +
+                          (needFailure ? (needSuccess ? "+Failure" : "Failure") : "");
+        char cmd[400];
+        sprintf_s(cmd, sizeof(cmd),
+            "auditpol /set /subcategory:\"%s\" /success:%s /failure:%s",
+            subcatName, needSuccess ? "enable" : "disable", needFailure ? "enable" : "disable");
+        return Fail(c, statusStr(), req, false, cmd);
+    }
+    return Pass(c, statusStr());
+}
+
+// ---------------------------------------------------------------------------
 // Build the complete check table
 // ---------------------------------------------------------------------------
 static std::vector<CheckDef> BuildChecks() {
@@ -623,6 +676,1268 @@ static std::vector<CheckDef> BuildChecks() {
                 "Disable via: Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root");
         },
         nullptr
+    });
+
+    // ==================================================================
+    // AC — Access Control additions
+    // ==================================================================
+
+    // ------------------------------------------------------------------
+    // ACLOCK-THR: Account lockout threshold <= 5
+    // ------------------------------------------------------------------
+    t.push_back({
+        "ACLOCK-THR",
+        "Account lockout threshold <= 5 invalid attempts",
+        STD_ALL,
+        { "AC-7", "3.1.8", "1.2.1", "1.2.1", "AC.1.001", "AC.2.009" },
+        []() -> ComplianceFinding {
+            USER_MODALS_INFO_3* m3 = nullptr;
+            NET_API_STATUS r = NetUserModalsGet(nullptr, 3, (LPBYTE*)&m3);
+            if (r != NERR_Success || !m3)
+                return Manual({"ACLOCK-THR","Account lockout threshold"},
+                    "NetUserModalsGet failed — requires admin or domain context");
+            DWORD thresh = m3->usrmod3_lockout_threshold;
+            NetApiBufferFree(m3);
+            if (thresh == 0)
+                return Fail({"ACLOCK-THR","Account lockout threshold"},
+                    "0 (never locks out)", "1-5", true, "");
+            if (thresh > 5)
+                return Fail({"ACLOCK-THR","Account lockout threshold"},
+                    std::to_string(thresh), "<= 5", true, "");
+            return Pass({"ACLOCK-THR","Account lockout threshold"}, std::to_string(thresh));
+        },
+        []() -> bool {
+            USER_MODALS_INFO_3* cur = nullptr;
+            if (NetUserModalsGet(nullptr, 3, (LPBYTE*)&cur) != NERR_Success || !cur) return false;
+            USER_MODALS_INFO_3 upd = *cur;
+            NetApiBufferFree(cur);
+            upd.usrmod3_lockout_threshold   = 5;
+            upd.usrmod3_lockout_duration    = 30;
+            upd.usrmod3_lockout_observation_window = 30;
+            DWORD parm_err = 0;
+            return NetUserSetModalInfo(nullptr, 3, (LPBYTE)&upd, &parm_err) == NERR_Success;
+        }
+    });
+
+    // ------------------------------------------------------------------
+    // ACLOCK-DUR: Account lockout duration >= 15 min (or TIMEQ_FOREVER)
+    // ------------------------------------------------------------------
+    t.push_back({
+        "ACLOCK-DUR",
+        "Account lockout duration >= 15 minutes (or never auto-unlock)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "AC-7", "3.1.8", "1.2.2", "1.2.2", nullptr, "AC.2.009" },
+        []() -> ComplianceFinding {
+            USER_MODALS_INFO_3* m3 = nullptr;
+            NET_API_STATUS r = NetUserModalsGet(nullptr, 3, (LPBYTE*)&m3);
+            if (r != NERR_Success || !m3)
+                return Manual({"ACLOCK-DUR","Account lockout duration"},
+                    "NetUserModalsGet failed — requires admin or domain context");
+            DWORD dur = m3->usrmod3_lockout_duration;
+            NetApiBufferFree(m3);
+            // TIMEQ_FOREVER = 0xFFFFFFFF => never auto-unlock => pass
+            if (dur == TIMEQ_FOREVER)
+                return Pass({"ACLOCK-DUR","Account lockout duration"}, "never (TIMEQ_FOREVER)");
+            // duration in 30-second units; 30 units = 15 min
+            if (dur < 30)
+                return Fail({"ACLOCK-DUR","Account lockout duration"},
+                    std::to_string(dur) + " units (" + std::to_string(dur / 2) + " min)",
+                    ">= 30 units (15 min)", true, "");
+            return Pass({"ACLOCK-DUR","Account lockout duration"},
+                std::to_string(dur) + " units");
+        },
+        []() -> bool {
+            USER_MODALS_INFO_3* cur = nullptr;
+            if (NetUserModalsGet(nullptr, 3, (LPBYTE*)&cur) != NERR_Success || !cur) return false;
+            USER_MODALS_INFO_3 upd = *cur;
+            NetApiBufferFree(cur);
+            upd.usrmod3_lockout_duration = 30;
+            DWORD parm_err = 0;
+            return NetUserSetModalInfo(nullptr, 3, (LPBYTE)&upd, &parm_err) == NERR_Success;
+        }
+    });
+
+    // ------------------------------------------------------------------
+    // ACLOCK-RST: Lockout observation window >= 15 min
+    // ------------------------------------------------------------------
+    t.push_back({
+        "ACLOCK-RST",
+        "Account lockout observation window >= 15 minutes",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "AC-7", "3.1.8", "1.2.3", "1.2.3", nullptr, "AC.2.009" },
+        []() -> ComplianceFinding {
+            USER_MODALS_INFO_3* m3 = nullptr;
+            NET_API_STATUS r = NetUserModalsGet(nullptr, 3, (LPBYTE*)&m3);
+            if (r != NERR_Success || !m3)
+                return Manual({"ACLOCK-RST","Lockout observation window"},
+                    "NetUserModalsGet failed — requires admin or domain context");
+            DWORD win = m3->usrmod3_lockout_observation_window;
+            NetApiBufferFree(m3);
+            if (win < 30)
+                return Fail({"ACLOCK-RST","Lockout observation window"},
+                    std::to_string(win) + " units (" + std::to_string(win / 2) + " min)",
+                    ">= 30 units (15 min)", true, "");
+            return Pass({"ACLOCK-RST","Lockout observation window"},
+                std::to_string(win) + " units");
+        },
+        []() -> bool {
+            USER_MODALS_INFO_3* cur = nullptr;
+            if (NetUserModalsGet(nullptr, 3, (LPBYTE*)&cur) != NERR_Success || !cur) return false;
+            USER_MODALS_INFO_3 upd = *cur;
+            NetApiBufferFree(cur);
+            upd.usrmod3_lockout_observation_window = 30;
+            DWORD parm_err = 0;
+            return NetUserSetModalInfo(nullptr, 3, (LPBYTE)&upd, &parm_err) == NERR_Success;
+        }
+    });
+
+    // ------------------------------------------------------------------
+    // SESS-LOCK: Machine inactivity lock timeout <= 900 s
+    // ------------------------------------------------------------------
+    t.push_back({
+        "SESS-LOCK",
+        "Machine inactivity lock timeout <= 900 seconds",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "AC-11", "3.1.10", "2.3.7.3", "2.3.7.3", nullptr, "AC.2.013" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                "InactivityTimeoutSecs", v);
+            if (!found || v == 0)
+                return Fail({"SESS-LOCK","Machine inactivity lock"},
+                    found ? "0 (disabled)" : "not set (disabled)", "<= 900", true, "");
+            if (v > 900)
+                return Fail({"SESS-LOCK","Machine inactivity lock"},
+                    std::to_string(v) + "s", "<= 900s", true, "");
+            return Pass({"SESS-LOCK","Machine inactivity lock"}, std::to_string(v) + "s");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                "InactivityTimeoutSecs", 900); }
+    });
+
+    // ------------------------------------------------------------------
+    // DISP-LAST: Don't display last username at logon
+    // ------------------------------------------------------------------
+    t.push_back({
+        "DISP-LAST",
+        "Last logged-on username not displayed at logon screen",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "AC-9", nullptr, "2.3.7.1", "2.3.7.1", nullptr, "AC.2.006" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                "DontDisplayLastUserName", v);
+            if (!found || v < 1)
+                return Fail({"DISP-LAST","Hide last username"},
+                    found ? std::to_string(v) : "not set", "1", true, "");
+            return Pass({"DISP-LAST","Hide last username"}, "1");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                "DontDisplayLastUserName", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // NULL-SESS: Null session / anonymous network access restricted
+    // ------------------------------------------------------------------
+    t.push_back({
+        "NULL-SESS",
+        "Null session access to named pipes and shares restricted",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "AC-3", "3.1.3", "2.3.10.2", "2.3.10.2", nullptr, "AC.2.006" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters",
+                "RestrictNullSessAccess", v);
+            if (!found || v < 1)
+                return Fail({"NULL-SESS","Null session restriction"},
+                    found ? std::to_string(v) : "not set", "1", true, "");
+            return Pass({"NULL-SESS","Null session restriction"}, "1");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters",
+                "RestrictNullSessAccess", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // ANON-RST: Anonymous access to network resources restricted
+    // ------------------------------------------------------------------
+    t.push_back({
+        "ANON-RST",
+        "Anonymous access to network resources restricted (RestrictAnonymous=1)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "AC-3", "3.1.3", "2.3.10.1", "2.3.10.1", nullptr, "AC.2.006" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Lsa",
+                "RestrictAnonymous", v);
+            if (!found || v < 1)
+                return Fail({"ANON-RST","Restrict anonymous access"},
+                    found ? std::to_string(v) : "not set", "1", true, "");
+            return Pass({"ANON-RST","Restrict anonymous access"}, "1");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Lsa",
+                "RestrictAnonymous", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // USB-DENY: Removable storage write access denied via policy
+    // ------------------------------------------------------------------
+    t.push_back({
+        "USB-DENY",
+        "Removable storage (USB) write access denied via policy",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L2 | STD_CMMC_L2,
+        { "MP-7", "3.8.7", nullptr, "18.9.97.2.1", nullptr, "MP.2.120" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\RemovableStorageDevices\\"
+                "{53f5630b-b6bf-11d0-94f2-00a0c91efb8b}",
+                "Deny_Write", v);
+            if (!found || v < 1)
+                return Fail({"USB-DENY","USB write denied"},
+                    found ? std::to_string(v) : "not set", "1", true, "");
+            return Pass({"USB-DENY","USB write denied"}, "1");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\RemovableStorageDevices\\"
+                "{53f5630b-b6bf-11d0-94f2-00a0c91efb8b}",
+                "Deny_Write", 1); }
+    });
+
+    // ==================================================================
+    // IA — Identification & Authentication additions
+    // ==================================================================
+
+    // ------------------------------------------------------------------
+    // PWD-LEN: Password minimum length >= 14 (warn if 8-13, fail if < 8)
+    // ------------------------------------------------------------------
+    t.push_back({
+        "PWD-LEN",
+        "Password minimum length >= 14 characters",
+        STD_ALL,
+        { "IA-5(1)", "3.5.7", "1.1.4", "1.1.4", "IA.1.076", nullptr },
+        []() -> ComplianceFinding {
+            USER_MODALS_INFO_0* m0 = nullptr;
+            NET_API_STATUS r = NetUserModalsGet(nullptr, 0, (LPBYTE*)&m0);
+            if (r != NERR_Success || !m0)
+                return Manual({"PWD-LEN","Password minimum length"},
+                    "NetUserModalsGet failed — requires admin or domain context");
+            DWORD len = m0->usrmod0_min_passwd_len;
+            NetApiBufferFree(m0);
+            if (len < 8)
+                return Fail({"PWD-LEN","Password minimum length"},
+                    std::to_string(len), ">= 14", true, "");
+            if (len < 14)
+                return Warn({"PWD-LEN","Password minimum length"},
+                    std::to_string(len), ">= 14 (CIS L1/L2, CMMC L2); >= 8 (CMMC L1)", true, "");
+            return Pass({"PWD-LEN","Password minimum length"}, std::to_string(len));
+        },
+        []() -> bool {
+            USER_MODALS_INFO_0* cur = nullptr;
+            if (NetUserModalsGet(nullptr, 0, (LPBYTE*)&cur) != NERR_Success || !cur) return false;
+            USER_MODALS_INFO_0 upd = *cur;
+            NetApiBufferFree(cur);
+            upd.usrmod0_min_passwd_len = 14;
+            DWORD parm_err = 0;
+            return NetUserSetModalInfo(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
+        }
+    });
+
+    // ------------------------------------------------------------------
+    // PWD-MAXAGE: Password maximum age <= 90 days
+    // ------------------------------------------------------------------
+    t.push_back({
+        "PWD-MAXAGE",
+        "Password maximum age <= 90 days (passwords must expire)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "IA-5(1)", "3.5.8", "1.1.2", "1.1.2", nullptr, "IA.3.083" },
+        []() -> ComplianceFinding {
+            USER_MODALS_INFO_0* m0 = nullptr;
+            NET_API_STATUS r = NetUserModalsGet(nullptr, 0, (LPBYTE*)&m0);
+            if (r != NERR_Success || !m0)
+                return Manual({"PWD-MAXAGE","Password maximum age"},
+                    "NetUserModalsGet failed — requires admin or domain context");
+            DWORD age = m0->usrmod0_max_passwd_age;
+            NetApiBufferFree(m0);
+            if (age == TIMEQ_FOREVER)
+                return Fail({"PWD-MAXAGE","Password maximum age"},
+                    "never expires (TIMEQ_FOREVER)", "<= 90 days", true, "");
+            // age in seconds; 90 days = 7776000
+            if (age > 7776000)
+                return Fail({"PWD-MAXAGE","Password maximum age"},
+                    std::to_string(age / 86400) + " days", "<= 90 days", true, "");
+            return Pass({"PWD-MAXAGE","Password maximum age"},
+                std::to_string(age / 86400) + " days");
+        },
+        []() -> bool {
+            USER_MODALS_INFO_0* cur = nullptr;
+            if (NetUserModalsGet(nullptr, 0, (LPBYTE*)&cur) != NERR_Success || !cur) return false;
+            USER_MODALS_INFO_0 upd = *cur;
+            NetApiBufferFree(cur);
+            upd.usrmod0_max_passwd_age = 7776000;
+            DWORD parm_err = 0;
+            return NetUserSetModalInfo(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
+        }
+    });
+
+    // ------------------------------------------------------------------
+    // PWD-MINAGE: Password minimum age >= 1 day
+    // ------------------------------------------------------------------
+    t.push_back({
+        "PWD-MINAGE",
+        "Password minimum age >= 1 day (prevents immediate re-use)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "IA-5(1)", nullptr, "1.1.3", "1.1.3", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            USER_MODALS_INFO_0* m0 = nullptr;
+            NET_API_STATUS r = NetUserModalsGet(nullptr, 0, (LPBYTE*)&m0);
+            if (r != NERR_Success || !m0)
+                return Manual({"PWD-MINAGE","Password minimum age"},
+                    "NetUserModalsGet failed — requires admin or domain context");
+            DWORD age = m0->usrmod0_min_passwd_age;
+            NetApiBufferFree(m0);
+            if (age < 86400)
+                return Fail({"PWD-MINAGE","Password minimum age"},
+                    age == 0 ? "0 (can change immediately)" : std::to_string(age) + "s",
+                    ">= 1 day (86400s)", true, "");
+            return Pass({"PWD-MINAGE","Password minimum age"},
+                std::to_string(age / 86400) + " day(s)");
+        },
+        []() -> bool {
+            USER_MODALS_INFO_0* cur = nullptr;
+            if (NetUserModalsGet(nullptr, 0, (LPBYTE*)&cur) != NERR_Success || !cur) return false;
+            USER_MODALS_INFO_0 upd = *cur;
+            NetApiBufferFree(cur);
+            upd.usrmod0_min_passwd_age = 86400;
+            DWORD parm_err = 0;
+            return NetUserSetModalInfo(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
+        }
+    });
+
+    // ------------------------------------------------------------------
+    // PWD-HIST: Password history >= 24
+    // ------------------------------------------------------------------
+    t.push_back({
+        "PWD-HIST",
+        "Password history >= 24 passwords remembered",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "IA-5(1)", "3.5.8", "1.1.1", "1.1.1", nullptr, "IA.3.083" },
+        []() -> ComplianceFinding {
+            USER_MODALS_INFO_0* m0 = nullptr;
+            NET_API_STATUS r = NetUserModalsGet(nullptr, 0, (LPBYTE*)&m0);
+            if (r != NERR_Success || !m0)
+                return Manual({"PWD-HIST","Password history"},
+                    "NetUserModalsGet failed — requires admin or domain context");
+            DWORD hist = m0->usrmod0_password_hist_len;
+            NetApiBufferFree(m0);
+            if (hist < 24)
+                return Fail({"PWD-HIST","Password history"},
+                    std::to_string(hist), ">= 24", true, "");
+            return Pass({"PWD-HIST","Password history"}, std::to_string(hist));
+        },
+        []() -> bool {
+            USER_MODALS_INFO_0* cur = nullptr;
+            if (NetUserModalsGet(nullptr, 0, (LPBYTE*)&cur) != NERR_Success || !cur) return false;
+            USER_MODALS_INFO_0 upd = *cur;
+            NetApiBufferFree(cur);
+            upd.usrmod0_password_hist_len = 24;
+            DWORD parm_err = 0;
+            return NetUserSetModalInfo(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
+        }
+    });
+
+    // ------------------------------------------------------------------
+    // PWD-CPX: Password complexity — manual check
+    // ------------------------------------------------------------------
+    t.push_back({
+        "PWD-CPX",
+        "Password complexity requirements enabled",
+        STD_ALL,
+        { "IA-5(1)", nullptr, "1.1.5", "1.1.5", "IA.1.076", nullptr },
+        []() -> ComplianceFinding {
+            return Manual({"PWD-CPX","Password complexity"},
+                "secedit /export /cfg \"%temp%\\sec.cfg\"  "
+                "then verify: PasswordComplexity = 1");
+        },
+        nullptr
+    });
+
+    // ------------------------------------------------------------------
+    // LM-HASH: LM hash storage disabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "LM-HASH",
+        "LM hash storage disabled (NoLMHash=1)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "IA-5(1)", "3.5.10", "2.3.11.6", "2.3.11.6", nullptr, "IA.3.083" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Lsa", "NoLMHash", v);
+            if (!found || v < 1)
+                return Fail({"LM-HASH","LM hash disabled"},
+                    found ? std::to_string(v) : "not set", "1", true, "");
+            return Pass({"LM-HASH","LM hash disabled"}, "1");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Lsa", "NoLMHash", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // LM-COMPAT: LAN Manager authentication level = 5 (NTLMv2 only)
+    // ------------------------------------------------------------------
+    t.push_back({
+        "LM-COMPAT",
+        "LAN Manager authentication level = 5 (NTLMv2 only, refuse LM/NTLM)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "IA-5(1)", "3.5.10", "2.3.11.7", "2.3.11.7", nullptr, "IA.3.083" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Lsa",
+                "LmCompatibilityLevel", v);
+            if (!found || v < 5)
+                return Fail({"LM-COMPAT","LM compatibility level"},
+                    found ? std::to_string(v) : "not set (default 0)", "5", true, "");
+            return Pass({"LM-COMPAT","LM compatibility level"}, std::to_string(v));
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Lsa",
+                "LmCompatibilityLevel", 5); }
+    });
+
+    // ==================================================================
+    // CM — Configuration Management additions
+    // ==================================================================
+
+    // ------------------------------------------------------------------
+    // DEF-RT: Windows Defender real-time protection enabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "DEF-RT",
+        "Windows Defender real-time protection enabled",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L1 | STD_CMMC_L2,
+        { "SI-3", "3.14.2", "5.1", "5.1", "SI.1.210", "SI.1.210" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            // Policy path overrides product path; value=1 means disabled
+            bool policyFound = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
+                "DisableRealtimeMonitoring", v);
+            if (!policyFound)
+                RegReadDword(HKEY_LOCAL_MACHINE,
+                    "SOFTWARE\\Microsoft\\Windows Defender\\Real-Time Protection",
+                    "DisableRealtimeMonitoring", v);
+            if (v == 1)
+                return Fail({"DEF-RT","Defender real-time protection"},
+                    "1 (disabled)", "0 (enabled)", true, "");
+            return Pass({"DEF-RT","Defender real-time protection"}, "0 (enabled)");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
+                "DisableRealtimeMonitoring", 0); }
+    });
+
+    // ------------------------------------------------------------------
+    // DEF-CLD: Windows Defender cloud-delivered protection
+    // ------------------------------------------------------------------
+    t.push_back({
+        "DEF-CLD",
+        "Windows Defender cloud-delivered protection enabled",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SI-3", nullptr, "5.1.2", "5.1.2", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Spynet",
+                "SpynetReporting", v);
+            if (!found)
+                found = RegReadDword(HKEY_LOCAL_MACHINE,
+                    "SOFTWARE\\Microsoft\\Windows Defender\\Spynet",
+                    "SpynetReporting", v);
+            if (!found || v == 0)
+                return Fail({"DEF-CLD","Defender cloud protection"},
+                    found ? "0 (disabled)" : "not set", ">= 1 (enabled)", true, "");
+            return Pass({"DEF-CLD","Defender cloud protection"}, std::to_string(v));
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Spynet",
+                "SpynetReporting", 2); }
+    });
+
+    // ------------------------------------------------------------------
+    // DEF-PUA: Windows Defender PUA protection enabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "DEF-PUA",
+        "Windows Defender PUA (Potentially Unwanted Application) protection enabled",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SI-3", nullptr, "5.1.4", "5.1.4", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+                "PUAProtection", v);
+            if (!found)
+                found = RegReadDword(HKEY_LOCAL_MACHINE,
+                    "SOFTWARE\\Microsoft\\Windows Defender",
+                    "PUAProtection", v);
+            if (!found || v == 0)
+                return Fail({"DEF-PUA","Defender PUA protection"},
+                    found ? "0 (disabled)" : "not set", ">= 1 (enabled)", true, "");
+            return Pass({"DEF-PUA","Defender PUA protection"}, std::to_string(v));
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+                "PUAProtection", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // DEF-TMP: Windows Defender Tamper Protection enabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "DEF-TMP",
+        "Windows Defender Tamper Protection enabled",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SI-7", nullptr, nullptr, "5.1.5", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows Defender\\Features",
+                "TamperProtection", v);
+            if (!found || v != 5)
+                return Fail({"DEF-TMP","Defender Tamper Protection"},
+                    found ? std::to_string(v) : "not set", "5 (enabled)", false,
+                    "Tamper Protection can only be enabled via Windows Security UI or Intune, "
+                    "not via registry when managed");
+            return Pass({"DEF-TMP","Defender Tamper Protection"}, "5");
+        },
+        nullptr
+    });
+
+    // ------------------------------------------------------------------
+    // DEF-CFA: Controlled Folder Access enabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "DEF-CFA",
+        "Controlled Folder Access (ransomware protection) enabled",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SI-3", "3.14.2", nullptr, nullptr, nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\"
+                "Windows Defender Exploit Guard\\Controlled Folder Access",
+                "EnableControlledFolderAccess", v);
+            if (!found)
+                found = RegReadDword(HKEY_LOCAL_MACHINE,
+                    "SOFTWARE\\Microsoft\\Windows Defender\\"
+                    "Windows Defender Exploit Guard\\Controlled Folder Access",
+                    "EnableControlledFolderAccess", v);
+            if (!found || v < 1)
+                return Fail({"DEF-CFA","Controlled Folder Access"},
+                    found ? std::to_string(v) : "not set", "1 (enabled)", true, "");
+            return Pass({"DEF-CFA","Controlled Folder Access"}, std::to_string(v));
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\"
+                "Windows Defender Exploit Guard\\Controlled Folder Access",
+                "EnableControlledFolderAccess", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // DEF-NP: Network Protection enabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "DEF-NP",
+        "Windows Defender Network Protection enabled (block malicious connections)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SC-7", "3.13.1", nullptr, nullptr, nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\"
+                "Windows Defender Exploit Guard\\Network Protection",
+                "EnableNetworkProtection", v);
+            if (!found)
+                found = RegReadDword(HKEY_LOCAL_MACHINE,
+                    "SOFTWARE\\Microsoft\\Windows Defender\\"
+                    "Windows Defender Exploit Guard\\Network Protection",
+                    "EnableNetworkProtection", v);
+            if (!found || v < 1)
+                return Fail({"DEF-NP","Network Protection"},
+                    found ? std::to_string(v) : "not set", "1 (block mode)", true, "");
+            return Pass({"DEF-NP","Network Protection"}, std::to_string(v));
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\"
+                "Windows Defender Exploit Guard\\Network Protection",
+                "EnableNetworkProtection", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // ASR-CFG: Attack Surface Reduction rules configured
+    // ------------------------------------------------------------------
+    t.push_back({
+        "ASR-CFG",
+        "Attack Surface Reduction (ASR) rules configured",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SI-3", nullptr, nullptr, "18.10.43.6.1", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            const char* keyPath =
+                "SOFTWARE\\Microsoft\\Windows Defender\\"
+                "Windows Defender Exploit Guard\\ASR\\Rules";
+            HKEY hk;
+            if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, keyPath, 0, KEY_READ, &hk) != ERROR_SUCCESS)
+                return Fail({"ASR-CFG","ASR rules configured"},
+                    "key not found", "at least one rule enabled", false,
+                    "Enable ASR rules via: Set-MpPreference -AttackSurfaceReductionRules_Ids "
+                    "<GUID> -AttackSurfaceReductionRules_Actions Enabled");
+            DWORD numValues = 0;
+            RegQueryInfoKeyA(hk, nullptr, nullptr, nullptr, nullptr, nullptr,
+                             nullptr, &numValues, nullptr, nullptr, nullptr, nullptr);
+            RegCloseKey(hk);
+            if (numValues == 0)
+                return Fail({"ASR-CFG","ASR rules configured"},
+                    "key exists but no rules set", "at least one rule enabled", false,
+                    "Enable ASR rules via: Set-MpPreference -AttackSurfaceReductionRules_Ids "
+                    "<GUID> -AttackSurfaceReductionRules_Actions Enabled");
+            return Pass({"ASR-CFG","ASR rules configured"},
+                std::to_string(numValues) + " rule(s) configured");
+        },
+        nullptr
+    });
+
+    // ------------------------------------------------------------------
+    // SVC-RREG: Remote Registry service disabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "SVC-RREG",
+        "Remote Registry service disabled",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "CM-7", nullptr, "5.26", "5.26", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD st = SvcStartType("RemoteRegistry");
+            if (st != SERVICE_DISABLED)
+                return Fail({"SVC-RREG","Remote Registry disabled"},
+                    st == (DWORD)-1 ? "not found" : "start type=" + std::to_string(st),
+                    "4 (disabled)", true, "");
+            return Pass({"SVC-RREG","Remote Registry disabled"}, "4 (disabled)");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\RemoteRegistry",
+                "Start", 4); }
+    });
+
+    // ------------------------------------------------------------------
+    // SVC-TELNET: Telnet service disabled (or not installed)
+    // ------------------------------------------------------------------
+    t.push_back({
+        "SVC-TELNET",
+        "Telnet service disabled or not installed",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L1 | STD_CMMC_L2,
+        { "CM-7", nullptr, "5.5", "5.5", "CM.1.074", "CM.2.061" },
+        []() -> ComplianceFinding {
+            DWORD st = SvcStartType("TlntSvr");
+            if (st == (DWORD)-1)
+                return Pass({"SVC-TELNET","Telnet service disabled"}, "not installed");
+            if (st != SERVICE_DISABLED)
+                return Fail({"SVC-TELNET","Telnet service disabled"},
+                    "start type=" + std::to_string(st), "4 (disabled)", true, "");
+            return Pass({"SVC-TELNET","Telnet service disabled"}, "4 (disabled)");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\TlntSvr",
+                "Start", 4); }
+    });
+
+    // ------------------------------------------------------------------
+    // SVC-SNMP: SNMP service disabled (or not installed)
+    // ------------------------------------------------------------------
+    t.push_back({
+        "SVC-SNMP",
+        "SNMP service disabled or not installed (community strings in cleartext)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L2 | STD_CMMC_L2,
+        { "CM-7", nullptr, nullptr, "5.26", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD st = SvcStartType("SNMP");
+            if (st == (DWORD)-1)
+                return Pass({"SVC-SNMP","SNMP service disabled"}, "not installed");
+            if (st != SERVICE_DISABLED)
+                return Fail({"SVC-SNMP","SNMP service disabled"},
+                    "start type=" + std::to_string(st), "4 (disabled)", true, "");
+            return Pass({"SVC-SNMP","SNMP service disabled"}, "4 (disabled)");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\SNMP",
+                "Start", 4); }
+    });
+
+    // ------------------------------------------------------------------
+    // WSH-DIS: Windows Script Host disabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "WSH-DIS",
+        "Windows Script Host disabled",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "CM-7", nullptr, "18.9.101", "18.9.101", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 1;  // default = enabled when key absent
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows Script Host\\Settings",
+                "Enabled", v);
+            if (!found || v != 0)
+                return Fail({"WSH-DIS","Windows Script Host disabled"},
+                    found ? std::to_string(v) : "not set (enabled)", "0 (disabled)", true, "");
+            return Pass({"WSH-DIS","Windows Script Host disabled"}, "0 (disabled)");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows Script Host\\Settings",
+                "Enabled", 0); }
+    });
+
+    // ------------------------------------------------------------------
+    // MSI-ELEV: AlwaysInstallElevated disabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "MSI-ELEV",
+        "Windows Installer AlwaysInstallElevated disabled (privilege escalation vector)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "CM-7", nullptr, "18.9.85.2", "18.9.85.2", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\Installer",
+                "AlwaysInstallElevated", v);
+            if (found && v == 1)
+                return Fail({"MSI-ELEV","AlwaysInstallElevated disabled"},
+                    "1 (enabled — privilege escalation risk)", "0 or not set", true, "");
+            return Pass({"MSI-ELEV","AlwaysInstallElevated disabled"},
+                found ? std::to_string(v) : "not set (safe)");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\Installer",
+                "AlwaysInstallElevated", 0); }
+    });
+
+    // ==================================================================
+    // AU — Audit and Accountability additions
+    // ==================================================================
+
+    // ------------------------------------------------------------------
+    // LOG-SEC: Security event log minimum size >= 196608 KB
+    // ------------------------------------------------------------------
+    t.push_back({
+        "LOG-SEC",
+        "Security event log minimum size >= 196608 KB (192 MB)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "AU-11", nullptr, "17.1.1", "17.1.1", nullptr, "AU.3.045" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            // Policy path stores value in KB
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\EventLog\\Security",
+                "MaxSize", v);
+            if (found) {
+                if (v < 196608)
+                    return Fail({"LOG-SEC","Security log size"},
+                        std::to_string(v) + " KB", ">= 196608 KB", true, "");
+                return Pass({"LOG-SEC","Security log size"}, std::to_string(v) + " KB");
+            }
+            // Fallback: service path stores value in bytes
+            bool foundB = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\EventLog\\Security",
+                "MaxSize", v);
+            if (foundB) {
+                if (v < 201326592)  // 196608 KB in bytes
+                    return Fail({"LOG-SEC","Security log size"},
+                        std::to_string(v / 1024) + " KB", ">= 196608 KB", true, "");
+                return Pass({"LOG-SEC","Security log size"}, std::to_string(v / 1024) + " KB");
+            }
+            return Fail({"LOG-SEC","Security log size"}, "not configured", ">= 196608 KB", true, "");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\EventLog\\Security",
+                "MaxSize", 196608); }
+    });
+
+    // ------------------------------------------------------------------
+    // LOG-APP: Application event log minimum size >= 32768 KB
+    // ------------------------------------------------------------------
+    t.push_back({
+        "LOG-APP",
+        "Application event log minimum size >= 32768 KB (32 MB)",
+        STD_NIST_80053 | STD_CIS_L1 | STD_CIS_L2,
+        { "AU-11", nullptr, "17.9.1", "17.9.1", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\EventLog\\Application",
+                "MaxSize", v);
+            if (found) {
+                if (v < 32768)
+                    return Fail({"LOG-APP","Application log size"},
+                        std::to_string(v) + " KB", ">= 32768 KB", true, "");
+                return Pass({"LOG-APP","Application log size"}, std::to_string(v) + " KB");
+            }
+            bool foundB = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application",
+                "MaxSize", v);
+            if (foundB) {
+                if (v < 33554432)  // 32768 KB in bytes
+                    return Fail({"LOG-APP","Application log size"},
+                        std::to_string(v / 1024) + " KB", ">= 32768 KB", true, "");
+                return Pass({"LOG-APP","Application log size"}, std::to_string(v / 1024) + " KB");
+            }
+            return Fail({"LOG-APP","Application log size"}, "not configured", ">= 32768 KB", true, "");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\EventLog\\Application",
+                "MaxSize", 32768); }
+    });
+
+    // ------------------------------------------------------------------
+    // LOG-SYS: System event log minimum size >= 32768 KB
+    // ------------------------------------------------------------------
+    t.push_back({
+        "LOG-SYS",
+        "System event log minimum size >= 32768 KB (32 MB)",
+        STD_NIST_80053 | STD_CIS_L1 | STD_CIS_L2,
+        { "AU-11", nullptr, "17.9.5", "17.9.5", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\EventLog\\System",
+                "MaxSize", v);
+            if (found) {
+                if (v < 32768)
+                    return Fail({"LOG-SYS","System log size"},
+                        std::to_string(v) + " KB", ">= 32768 KB", true, "");
+                return Pass({"LOG-SYS","System log size"}, std::to_string(v) + " KB");
+            }
+            bool foundB = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\EventLog\\System",
+                "MaxSize", v);
+            if (foundB) {
+                if (v < 33554432)
+                    return Fail({"LOG-SYS","System log size"},
+                        std::to_string(v / 1024) + " KB", ">= 32768 KB", true, "");
+                return Pass({"LOG-SYS","System log size"}, std::to_string(v / 1024) + " KB");
+            }
+            return Fail({"LOG-SYS","System log size"}, "not configured", ">= 32768 KB", true, "");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\EventLog\\System",
+                "MaxSize", 32768); }
+    });
+
+    // ------------------------------------------------------------------
+    // AUD-ACMGMT: Audit user account management (success + failure)
+    // GUID: {0CCE9236-69AE-11D9-BED3-505054503030}
+    // ------------------------------------------------------------------
+    t.push_back({
+        "AUD-ACMGMT",
+        "Audit User Account Management events enabled (Success + Failure)",
+        STD_ALL,
+        { "AU-2", nullptr, "17.2.1", "17.2.1", "AU.1.010", nullptr },
+        []() -> ComplianceFinding {
+            GUID g = { 0x0CCE9236, 0x69AE, 0x11D9,
+                       {0xBE, 0xD3, 0x50, 0x50, 0x54, 0x50, 0x30, 0x30} };
+            CheckDef cd{ "AUD-ACMGMT",
+                         "Audit User Account Management events enabled (Success + Failure)",
+                         0, {}, {}, {} };
+            return CheckAuditSub(cd, g, true, true, "User Account Management");
+        },
+        nullptr
+    });
+
+    // ------------------------------------------------------------------
+    // AUD-PROC: Audit process creation (success)
+    // GUID: {0CCE922B-69AE-11D9-BED3-505054503030}
+    // ------------------------------------------------------------------
+    t.push_back({
+        "AUD-PROC",
+        "Audit Process Creation events enabled (Success)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "AU-12", "3.3.1", "17.8.1", "17.8.1", nullptr, "AU.2.041" },
+        []() -> ComplianceFinding {
+            GUID g = { 0x0CCE922B, 0x69AE, 0x11D9,
+                       {0xBE, 0xD3, 0x50, 0x50, 0x54, 0x50, 0x30, 0x30} };
+            CheckDef cd{ "AUD-PROC", "Audit Process Creation events enabled (Success)",
+                         0, {}, {}, {} };
+            return CheckAuditSub(cd, g, true, false, "Process Creation");
+        },
+        nullptr
+    });
+
+    // ------------------------------------------------------------------
+    // AUD-PRIV: Audit sensitive privilege use (success + failure)
+    // GUID: {0CCE9228-69AE-11D9-BED3-505054503030}
+    // ------------------------------------------------------------------
+    t.push_back({
+        "AUD-PRIV",
+        "Audit Sensitive Privilege Use events enabled (Success + Failure)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L2 | STD_CMMC_L2,
+        { "AU-2", "3.3.1", nullptr, "17.7.1", nullptr, "AU.2.041" },
+        []() -> ComplianceFinding {
+            GUID g = { 0x0CCE9228, 0x69AE, 0x11D9,
+                       {0xBE, 0xD3, 0x50, 0x50, 0x54, 0x50, 0x30, 0x30} };
+            CheckDef cd{ "AUD-PRIV",
+                         "Audit Sensitive Privilege Use events enabled (Success + Failure)",
+                         0, {}, {}, {} };
+            return CheckAuditSub(cd, g, true, true, "Sensitive Privilege Use");
+        },
+        nullptr
+    });
+
+    // ------------------------------------------------------------------
+    // AUD-POLCHG: Audit policy change (success)
+    // GUID: {0CCE922F-69AE-11D9-BED3-505054503030}
+    // ------------------------------------------------------------------
+    t.push_back({
+        "AUD-POLCHG",
+        "Audit Policy Change events enabled (Success)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "AU-2", nullptr, "17.7.4", "17.7.4", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            GUID g = { 0x0CCE922F, 0x69AE, 0x11D9,
+                       {0xBE, 0xD3, 0x50, 0x50, 0x54, 0x50, 0x30, 0x30} };
+            CheckDef cd{ "AUD-POLCHG", "Audit Policy Change events enabled (Success)",
+                         0, {}, {}, {} };
+            return CheckAuditSub(cd, g, true, false, "Audit Policy Change");
+        },
+        nullptr
+    });
+
+    // ==================================================================
+    // SC — System & Communications additions
+    // ==================================================================
+
+    // ------------------------------------------------------------------
+    // DEP-POL: Data Execution Prevention policy
+    // ------------------------------------------------------------------
+    t.push_back({
+        "DEP-POL",
+        "Data Execution Prevention (DEP) policy enabled",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SI-16", nullptr, "18.8.3.1", "18.8.3.1", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DEP_SYSTEM_POLICY_TYPE pol = GetSystemDEPPolicy();
+            // 0=AlwaysOff, 1=AlwaysOn, 2=OptIn, 3=OptOut
+            if (pol == DEPPolicyAlwaysOff)
+                return Fail({"DEP-POL","DEP policy"},
+                    "AlwaysOff (0)", ">= OptIn (2)", false,
+                    "Enable via: bcdedit /set {current} nx AlwaysOn  (requires reboot)");
+            const char* names[] = { "AlwaysOff", "AlwaysOn", "OptIn", "OptOut" };
+            std::string cur = (pol >= 0 && pol <= 3) ? names[pol] : std::to_string((int)pol);
+            return Pass({"DEP-POL","DEP policy"}, cur);
+        },
+        nullptr
+    });
+
+    // ------------------------------------------------------------------
+    // ASLR-SYS: System-wide ASLR not disabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "ASLR-SYS",
+        "System-wide ASLR not disabled (MoveImages != 0)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SI-16", nullptr, nullptr, "18.8.3.2", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
+                "MoveImages", v);
+            if (!found)
+                return Pass({"ASLR-SYS","System ASLR"}, "not set (default ASLR enabled)");
+            if (v == 0)
+                return Fail({"ASLR-SYS","System ASLR"},
+                    "0 (ASLR disabled)", "0xFFFFFFFF (force ASLR) or not set", true,
+                    "Requires reboot to take effect");
+            return Pass({"ASLR-SYS","System ASLR"}, "0x" + [v]{
+                std::ostringstream ss; ss << std::hex << v; return ss.str(); }());
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
+                "MoveImages", 0xFFFFFFFF); }
+    });
+
+    // ------------------------------------------------------------------
+    // SEHOP: Structured Exception Handling Overwrite Protection enabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "SEHOP",
+        "SEHOP (Structured Exception Handling Overwrite Protection) enabled",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SI-16", nullptr, nullptr, "18.8.3.3", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel",
+                "DisableExceptionChainValidation", v);
+            // Not set or 0 = SEHOP enabled (pass); 1 = disabled (fail)
+            if (found && v == 1)
+                return Fail({"SEHOP","SEHOP enabled"},
+                    "1 (disabled)", "0 (enabled)", true, "");
+            return Pass({"SEHOP","SEHOP enabled"}, found ? "0 (enabled)" : "not set (enabled)");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel",
+                "DisableExceptionChainValidation", 0); }
+    });
+
+    // ------------------------------------------------------------------
+    // FW-BLK-DOM: Firewall Domain profile default inbound action = block
+    // ------------------------------------------------------------------
+    t.push_back({
+        "FW-BLK-DOM",
+        "Firewall Domain profile default inbound action = block",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L1 | STD_CMMC_L2,
+        { "SC-7", "3.13.1", "9.1.2", "9.1.2", "SC.1.175", "SC.3.177" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\"
+                "FirewallPolicy\\DomainProfile",
+                "DefaultInboundAction", v);
+            if (!found || v != 1)
+                return Fail({"FW-BLK-DOM","FW Domain inbound block"},
+                    found ? std::to_string(v) : "not set", "1 (block)", true, "");
+            return Pass({"FW-BLK-DOM","FW Domain inbound block"}, "1 (block)");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\"
+                "FirewallPolicy\\DomainProfile",
+                "DefaultInboundAction", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // FW-BLK-PRI: Firewall Private profile default inbound action = block
+    // ------------------------------------------------------------------
+    t.push_back({
+        "FW-BLK-PRI",
+        "Firewall Private profile default inbound action = block",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L1 | STD_CMMC_L2,
+        { "SC-7", "3.13.1", "9.2.2", "9.2.2", "SC.1.175", "SC.3.177" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\"
+                "FirewallPolicy\\StandardProfile",
+                "DefaultInboundAction", v);
+            if (!found || v != 1)
+                return Fail({"FW-BLK-PRI","FW Private inbound block"},
+                    found ? std::to_string(v) : "not set", "1 (block)", true, "");
+            return Pass({"FW-BLK-PRI","FW Private inbound block"}, "1 (block)");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\"
+                "FirewallPolicy\\StandardProfile",
+                "DefaultInboundAction", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // FW-BLK-PUB: Firewall Public profile default inbound action = block
+    // ------------------------------------------------------------------
+    t.push_back({
+        "FW-BLK-PUB",
+        "Firewall Public profile default inbound action = block",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L1 | STD_CMMC_L2,
+        { "SC-7", "3.13.1", "9.3.2", "9.3.2", "SC.1.175", "SC.3.177" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\"
+                "FirewallPolicy\\PublicProfile",
+                "DefaultInboundAction", v);
+            if (!found || v != 1)
+                return Fail({"FW-BLK-PUB","FW Public inbound block"},
+                    found ? std::to_string(v) : "not set", "1 (block)", true, "");
+            return Pass({"FW-BLK-PUB","FW Public inbound block"}, "1 (block)");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\"
+                "FirewallPolicy\\PublicProfile",
+                "DefaultInboundAction", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // SAFE-DLL: Safe DLL search mode enabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "SAFE-DLL",
+        "Safe DLL search mode enabled (SafeDllSearchMode=1)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "CM-6", nullptr, "18.4.1", "18.4.1", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 1;  // default when key absent = 1 (safe mode enabled)
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Session Manager",
+                "SafeDllSearchMode", v);
+            if (found && v == 0)
+                return Fail({"SAFE-DLL","Safe DLL search mode"},
+                    "0 (disabled)", "1 (enabled)", true, "");
+            return Pass({"SAFE-DLL","Safe DLL search mode"},
+                found ? std::to_string(v) : "not set (default 1, enabled)");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Session Manager",
+                "SafeDllSearchMode", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // NLOG-SIGN: Netlogon secure channel signing required
+    // ------------------------------------------------------------------
+    t.push_back({
+        "NLOG-SIGN",
+        "Netlogon secure channel data signing required",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SC-8", nullptr, "2.3.6.1", "2.3.6.1", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\Netlogon\\Parameters",
+                "RequireSignOrSeal", v);
+            if (!found || v < 1)
+                return Fail({"NLOG-SIGN","Netlogon signing required"},
+                    found ? std::to_string(v) : "not set", "1", true, "");
+            return Pass({"NLOG-SIGN","Netlogon signing required"}, "1");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\Netlogon\\Parameters",
+                "RequireSignOrSeal", 1); }
+    });
+
+    // ------------------------------------------------------------------
+    // NLOG-SEAL: Netlogon secure channel encryption required
+    // ------------------------------------------------------------------
+    t.push_back({
+        "NLOG-SEAL",
+        "Netlogon secure channel data encryption required",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SC-8", nullptr, "2.3.6.2", "2.3.6.2", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\Netlogon\\Parameters",
+                "SealSecureChannel", v);
+            if (!found || v < 1)
+                return Fail({"NLOG-SEAL","Netlogon encryption required"},
+                    found ? std::to_string(v) : "not set", "1", true, "");
+            return Pass({"NLOG-SEAL","Netlogon encryption required"}, "1");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Services\\Netlogon\\Parameters",
+                "SealSecureChannel", 1); }
+    });
+
+    // ==================================================================
+    // SI — System & Information Integrity additions
+    // ==================================================================
+
+    // ------------------------------------------------------------------
+    // WIN-UPD: Windows Update automatic download enabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "WIN-UPD",
+        "Windows Update automatic download enabled (NoAutoUpdate=0)",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L1 | STD_CMMC_L2,
+        { "SI-2", "3.14.1", "18.9.108", "18.9.108", "SI.1.210", "SI.1.210" },
+        []() -> ComplianceFinding {
+            DWORD noAuto = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU",
+                "NoAutoUpdate", noAuto);
+            if (found && noAuto == 1)
+                return Fail({"WIN-UPD","Windows Update auto-download"},
+                    "1 (automatic updates disabled)", "0 (enabled)", true, "");
+            return Pass({"WIN-UPD","Windows Update auto-download"},
+                found ? std::to_string(noAuto) : "not set (enabled by default)");
+        },
+        []() -> bool {
+            bool a = RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU",
+                "NoAutoUpdate", 0);
+            bool b = RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU",
+                "AUOptions", 4);
+            return a && b;
+        }
+    });
+
+    // ------------------------------------------------------------------
+    // DEF-DEFS: Windows Defender signature update interval
+    // ------------------------------------------------------------------
+    t.push_back({
+        "DEF-DEFS",
+        "Windows Defender signature updates automatic",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L1 | STD_CMMC_L2,
+        { "SI-3", "3.14.2", "5.1.3", "5.1.3", "SI.1.210", "SI.1.210" },
+        []() -> ComplianceFinding {
+            DWORD v = 0;
+            bool found = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Signature Updates",
+                "SignatureUpdateInterval", v);
+            if (!found)
+                found = RegReadDword(HKEY_LOCAL_MACHINE,
+                    "SOFTWARE\\Microsoft\\Windows Defender\\Signature Updates",
+                    "SignatureUpdateInterval", v);
+            // If not configured or 0, Windows manages updates automatically (pass via manual)
+            if (!found || v == 0)
+                return Manual({"DEF-DEFS","Defender signature updates"},
+                    "Windows Defender updates signatures automatically by default; "
+                    "verify via: Get-MpComputerStatus | Select AntivirusSignatureAge");
+            return Pass({"DEF-DEFS","Defender signature updates"},
+                "interval=" + std::to_string(v) + "h");
+        },
+        nullptr
+    });
+
+    // ------------------------------------------------------------------
+    // SMRT-SCR: Windows SmartScreen enabled
+    // ------------------------------------------------------------------
+    t.push_back({
+        "SMRT-SCR",
+        "Windows SmartScreen enabled for apps and files",
+        STD_NIST_80053 | STD_NIST_800171 | STD_CIS_L1 | STD_CIS_L2 | STD_CMMC_L2,
+        { "SI-3", nullptr, "18.9.85.1.1", "18.9.85.1.1", nullptr, nullptr },
+        []() -> ComplianceFinding {
+            // Check policy key first
+            DWORD v = 0;
+            bool policyFound = RegReadDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+                "EnableSmartScreen", v);
+            if (policyFound) {
+                if (v == 0)
+                    return Fail({"SMRT-SCR","SmartScreen enabled"},
+                        "0 (disabled by policy)", "1 (enabled)", true, "");
+                return Pass({"SMRT-SCR","SmartScreen enabled"}, std::to_string(v));
+            }
+            // Fallback: Explorer key uses string value
+            std::string sv;
+            bool explorerFound = RegReadString(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+                "SmartScreenEnabled", sv);
+            if (explorerFound) {
+                if (sv == "Off" || sv == "off")
+                    return Fail({"SMRT-SCR","SmartScreen enabled"},
+                        "Off", "On", true, "");
+                return Pass({"SMRT-SCR","SmartScreen enabled"}, sv);
+            }
+            return Warn({"SMRT-SCR","SmartScreen enabled"},
+                "not configured", "1 (enabled via policy)", true,
+                "SmartScreen may be managed by Windows Security Center");
+        },
+        []{ return RegWriteDword(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+                "EnableSmartScreen", 1); }
     });
 
     return t;
