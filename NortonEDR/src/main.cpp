@@ -191,6 +191,42 @@ static std::atomic<bool> g_dnsStop(false);
 static EVT_HANDLE        g_winrmSubscription = nullptr;
 static std::atomic<bool> g_winrmStop(false);
 
+// ---------------------------------------------------------------------------
+// Security event log — logon, privilege, process, service, task
+// ---------------------------------------------------------------------------
+static EVT_HANDLE        g_secExtSubscription = nullptr;
+static std::atomic<bool> g_secExtStop(false);
+
+// ---------------------------------------------------------------------------
+// Task Scheduler
+// ---------------------------------------------------------------------------
+static EVT_HANDLE        g_taskSubscription = nullptr;
+static std::atomic<bool> g_taskStop(false);
+
+// ---------------------------------------------------------------------------
+// Windows Defender
+// ---------------------------------------------------------------------------
+static EVT_HANDLE        g_defenderSubscription = nullptr;
+static std::atomic<bool> g_defenderStop(false);
+
+// ---------------------------------------------------------------------------
+// Print Spooler (PrintNightmare)
+// ---------------------------------------------------------------------------
+static EVT_HANDLE        g_spoolerSubscription = nullptr;
+static std::atomic<bool> g_spoolerStop(false);
+
+// ---------------------------------------------------------------------------
+// RDP — Terminal Services Remote Connection Manager
+// ---------------------------------------------------------------------------
+static EVT_HANDLE        g_rdpSubscription = nullptr;
+static std::atomic<bool> g_rdpStop(false);
+
+// ---------------------------------------------------------------------------
+// BITS Client
+// ---------------------------------------------------------------------------
+static EVT_HANDLE        g_bitsSubscription = nullptr;
+static std::atomic<bool> g_bitsStop(false);
+
 struct TraceRuntimeConfig {
     std::vector<std::string> targetProcessNamesLower;
     bool includeChildren = false;
@@ -4442,6 +4478,526 @@ static void WinRmSubscriberThread() {
     g_winrmSubscription = nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Security event log — extended (logon, explicit logon, process create,
+// service install, scheduled task, privilege assignment)
+// EIDs: 4624, 4625, 4648, 4672, 4688, 4697, 4698, 4702, 4720, 4726, 4732, 4733
+// ---------------------------------------------------------------------------
+static DWORD WINAPI SecExtEventCallback(
+    EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID /*ctx*/, EVT_HANDLE hEvent)
+{
+    if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
+
+    std::string xml = RenderEventXml(hEvent);
+    if (xml.empty()) return ERROR_SUCCESS;
+
+    std::string eidStr = GetXmlField(xml, "EventID");
+    int eid = 0;
+    try { eid = std::stoi(eidStr); } catch (...) { return ERROR_SUCCESS; }
+
+    std::string ts = BuildTimestamp();
+    UINT32 pid = 0;
+    std::string pidStr = GetXmlField(xml, "ProcessID");
+    if (!pidStr.empty()) try { pid = static_cast<UINT32>(std::stoul(pidStr, nullptr, 0)); } catch (...) {}
+
+    switch (eid) {
+
+    case 4624: {
+        // Successful logon — flag non-interactive remote types (3=network, 10=remoteinteractive)
+        std::string logonType = GetXmlField(xml, "LogonType");
+        std::string subjectUser = GetXmlField(xml, "SubjectUserName");
+        std::string targetUser  = GetXmlField(xml, "TargetUserName");
+        std::string workstation = GetXmlField(xml, "WorkstationName");
+        std::string ipAddr      = GetXmlField(xml, "IpAddress");
+        int lt = 0;
+        try { lt = std::stoi(logonType); } catch (...) {}
+        if (lt != 3 && lt != 10) return ERROR_SUCCESS;
+        std::string ltLabel = (lt == 3) ? "Network" : "RemoteInteractive";
+        std::string msg = "[Sec 4624] " + ts + " | Logon (" + ltLabel + ") " +
+            targetUser + " from " + (ipAddr.empty() ? workstation : ipAddr);
+        std::string det = "Date & Time: " + ts + " | EID 4624 Successful Logon" +
+            " | Type: " + ltLabel + " | User: " + targetUser +
+            " | Subject: " + subjectUser + " | Source: " + ipAddr;
+        PushUiDetectionEvent(msg, det, "Method: Security Log (Logon)", pid,
+            lt == 10 ? DetectionSeverity::Medium : DetectionSeverity::Low);
+        break;
+    }
+
+    case 4625: {
+        // Failed logon
+        std::string targetUser  = GetXmlField(xml, "TargetUserName");
+        std::string ipAddr      = GetXmlField(xml, "IpAddress");
+        std::string failureCode = GetXmlField(xml, "SubStatus");
+        std::string msg = "[Sec 4625] " + ts + " | Failed logon: " + targetUser +
+            " from " + (ipAddr.empty() ? "?" : ipAddr) + " (" + failureCode + ")";
+        std::string det = "Date & Time: " + ts + " | EID 4625 Failed Logon" +
+            " | User: " + targetUser + " | Source: " + ipAddr +
+            " | Code: " + failureCode;
+        PushUiDetectionEvent(msg, det, "Method: Security Log (Failed Logon)", pid,
+            DetectionSeverity::Low);
+        break;
+    }
+
+    case 4648: {
+        // Explicit credentials logon (runas / pass-the-hash)
+        std::string subjectUser = GetXmlField(xml, "SubjectUserName");
+        std::string targetUser  = GetXmlField(xml, "TargetUserName");
+        std::string targetServer= GetXmlField(xml, "TargetServerName");
+        std::string processName = GetXmlField(xml, "ProcessName");
+        std::string msg = "[Sec 4648] " + ts + " | Explicit cred logon: " +
+            subjectUser + " -> " + targetUser + "@" + targetServer;
+        std::string det = "Date & Time: " + ts + " | EID 4648 Explicit Credential Logon" +
+            " | Subject: " + subjectUser + " | Target: " + targetUser +
+            " | Server: " + targetServer + " | Process: " + processName;
+        PushUiDetectionEvent(msg, det, "Method: Security Log (Explicit Credential Logon)",
+            pid, DetectionSeverity::Medium);
+        break;
+    }
+
+    case 4672: {
+        // Special privileges assigned to new logon (admin/debug rights)
+        std::string user   = GetXmlField(xml, "SubjectUserName");
+        std::string privs  = GetXmlField(xml, "PrivilegeList");
+        // Only alert if SeDebugPrivilege or SeTcbPrivilege is assigned
+        if (privs.find("SeDebugPrivilege") == std::string::npos &&
+            privs.find("SeTcbPrivilege")   == std::string::npos) return ERROR_SUCCESS;
+        std::string msg = "[Sec 4672] " + ts + " | Sensitive privileges assigned: " +
+            user + " | " + privs.substr(0, 80);
+        std::string det = "Date & Time: " + ts + " | EID 4672 Special Privileges" +
+            " | User: " + user + " | Privs: " + privs.substr(0, 256);
+        PushUiDetectionEvent(msg, det, "Method: Security Log (Privilege Assignment)",
+            pid, DetectionSeverity::Medium);
+        break;
+    }
+
+    case 4688: {
+        // Process creation with command line (requires audit policy)
+        std::string newProcess  = GetXmlField(xml, "NewProcessName");
+        std::string cmdLine     = GetXmlField(xml, "CommandLine");
+        std::string creator     = GetXmlField(xml, "ParentProcessName");
+        std::string newPidStr   = GetXmlField(xml, "NewProcessId");
+        UINT32 newPid = 0;
+        try { newPid = static_cast<UINT32>(std::stoul(newPidStr, nullptr, 0)); } catch (...) {}
+        std::string cmdLow = ToLowerCopy(cmdLine);
+        std::string procLow = ToLowerCopy(newProcess);
+        // Only surface suspicious launches
+        bool suspicious =
+            cmdLow.find("mimikatz") != std::string::npos ||
+            cmdLow.find("-enc") != std::string::npos ||
+            cmdLow.find("invoke-") != std::string::npos ||
+            cmdLow.find("downloadstring") != std::string::npos ||
+            cmdLow.find("iex(") != std::string::npos ||
+            cmdLow.find("iex (") != std::string::npos ||
+            (procLow.find("cmd.exe") != std::string::npos && cmdLow.find("whoami") != std::string::npos) ||
+            procLow.find("certutil") != std::string::npos ||
+            procLow.find("mshta") != std::string::npos ||
+            procLow.find("regsvr32") != std::string::npos ||
+            procLow.find("rundll32") != std::string::npos;
+        if (!suspicious) return ERROR_SUCCESS;
+        std::string proc = newProcess.substr(newProcess.rfind('\\') + 1);
+        std::string msg = "[Sec 4688] " + ts + " | " + proc + " | " +
+            cmdLine.substr(0, 100);
+        std::string det = "Date & Time: " + ts + " | EID 4688 Process Create" +
+            " | Process: " + newProcess + " | PID: " + newPidStr +
+            " | Parent: " + creator + " | CmdLine: " + cmdLine.substr(0, 512);
+        PushUiDetectionEvent(msg, det, "Method: Security Log (Process Creation)",
+            newPid, DetectionSeverity::High);
+        break;
+    }
+
+    case 4697: {
+        // Service installed
+        std::string serviceName = GetXmlField(xml, "ServiceName");
+        std::string serviceFile = GetXmlField(xml, "ServiceFileName");
+        std::string user        = GetXmlField(xml, "SubjectUserName");
+        std::string msg = "[Sec 4697] " + ts + " | Service installed: " +
+            serviceName + " -> " + serviceFile.substr(serviceFile.rfind('\\') + 1);
+        std::string det = "Date & Time: " + ts + " | EID 4697 Service Installed" +
+            " | Name: " + serviceName + " | Binary: " + serviceFile +
+            " | By: " + user;
+        PushUiDetectionEvent(msg, det, "Method: Security Log (Service Installation)",
+            pid, DetectionSeverity::High);
+        break;
+    }
+
+    case 4698:
+    case 4702: {
+        // Scheduled task created or updated
+        std::string taskName    = GetXmlField(xml, "TaskName");
+        std::string subjectUser = GetXmlField(xml, "SubjectUserName");
+        std::string label = (eid == 4698) ? "created" : "updated";
+        std::string msg = "[Sec " + eidStr + "] " + ts + " | Scheduled task " +
+            label + ": " + taskName;
+        std::string det = "Date & Time: " + ts + " | EID " + eidStr +
+            " Scheduled Task " + label + " | Task: " + taskName +
+            " | By: " + subjectUser;
+        PushUiDetectionEvent(msg, det, "Method: Security Log (Scheduled Task)", pid,
+            DetectionSeverity::Medium);
+        break;
+    }
+
+    case 4720: {
+        std::string newUser = GetXmlField(xml, "TargetUserName");
+        std::string byUser  = GetXmlField(xml, "SubjectUserName");
+        std::string msg = "[Sec 4720] " + ts + " | Account created: " + newUser + " by " + byUser;
+        std::string det = "Date & Time: " + ts + " | EID 4720 Account Created" +
+            " | New: " + newUser + " | By: " + byUser;
+        PushUiDetectionEvent(msg, det, "Method: Security Log (Account Created)",
+            pid, DetectionSeverity::Medium);
+        break;
+    }
+
+    case 4726: {
+        std::string delUser = GetXmlField(xml, "TargetUserName");
+        std::string byUser  = GetXmlField(xml, "SubjectUserName");
+        std::string msg = "[Sec 4726] " + ts + " | Account deleted: " + delUser + " by " + byUser;
+        std::string det = "Date & Time: " + ts + " | EID 4726 Account Deleted" +
+            " | User: " + delUser + " | By: " + byUser;
+        PushUiDetectionEvent(msg, det, "Method: Security Log (Account Deleted)",
+            pid, DetectionSeverity::Medium);
+        break;
+    }
+
+    case 4732:
+    case 4733: {
+        std::string member = GetXmlField(xml, "MemberName");
+        std::string group  = GetXmlField(xml, "TargetUserName");
+        std::string byUser = GetXmlField(xml, "SubjectUserName");
+        // Only alert on admin-tier groups
+        std::string groupLow = ToLowerCopy(group);
+        if (groupLow.find("admin") == std::string::npos &&
+            groupLow.find("domain admins") == std::string::npos &&
+            groupLow.find("remote desktop") == std::string::npos) return ERROR_SUCCESS;
+        std::string action = (eid == 4732) ? "added to" : "removed from";
+        std::string msg = "[Sec " + eidStr + "] " + ts + " | " +
+            member + " " + action + " " + group;
+        std::string det = "Date & Time: " + ts + " | EID " + eidStr +
+            " Group Membership | Member: " + member +
+            " | Group: " + group + " | By: " + byUser;
+        PushUiDetectionEvent(msg, det, "Method: Security Log (Group Membership)",
+            pid, DetectionSeverity::High);
+        break;
+    }
+
+    default: break;
+    }
+
+    return ERROR_SUCCESS;
+}
+
+static void SecExtSubscriberThread() {
+    // EID filter covers all events we handle above
+    const wchar_t* query =
+        L"*[System[(EventID=4624 or EventID=4625 or EventID=4648 or EventID=4672"
+        L" or EventID=4688 or EventID=4697 or EventID=4698 or EventID=4702"
+        L" or EventID=4720 or EventID=4726 or EventID=4732 or EventID=4733)]]";
+
+    g_secExtSubscription = EvtSubscribe(
+        nullptr, nullptr, L"Security", query,
+        nullptr, nullptr,
+        reinterpret_cast<EVT_SUBSCRIBE_CALLBACK>(SecExtEventCallback),
+        EvtSubscribeToFutureEvents
+    );
+
+    if (!g_secExtSubscription) {
+        std::cerr << "[SecExt] EvtSubscribe failed: " << GetLastError()
+                  << " (run as administrator with audit policy enabled)\n";
+        return;
+    }
+
+    std::cout << "[SecExt] Security event log subscriber active\n";
+    while (!g_secExtStop.load()) Sleep(500);
+    EvtClose(g_secExtSubscription);
+    g_secExtSubscription = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Task Scheduler — persistence via scheduled tasks
+// EIDs: 106 (registered), 129 (launched), 140 (updated), 141 (deleted)
+// ---------------------------------------------------------------------------
+static DWORD WINAPI TaskEventCallback(
+    EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID /*ctx*/, EVT_HANDLE hEvent)
+{
+    if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
+
+    std::string xml = RenderEventXml(hEvent);
+    if (xml.empty()) return ERROR_SUCCESS;
+
+    std::string eidStr   = GetXmlField(xml, "EventID");
+    std::string taskName = GetXmlField(xml, "TaskName");
+    if (taskName.empty()) taskName = GetXmlField(xml, "Path");
+    std::string ts = BuildTimestamp();
+    int eid = 0;
+    try { eid = std::stoi(eidStr); } catch (...) { return ERROR_SUCCESS; }
+
+    const char* action_label = nullptr;
+    DetectionSeverity sev = DetectionSeverity::Medium;
+    switch (eid) {
+    case 106: action_label = "registered";         sev = DetectionSeverity::High;   break;
+    case 129: action_label = "launched";           sev = DetectionSeverity::Low;    break;
+    case 140: action_label = "updated";            sev = DetectionSeverity::Medium; break;
+    case 141: action_label = "deleted";            sev = DetectionSeverity::Low;    break;
+    default:  return ERROR_SUCCESS;
+    }
+
+    std::string msg = "[Task " + eidStr + "] " + ts + " | Task " +
+        action_label + ": " + taskName;
+    std::string det = "Date & Time: " + ts + " | EID " + eidStr +
+        " Task Scheduler | Task: " + taskName + " | Action: " + action_label;
+    PushUiDetectionEvent(msg, det, "Method: Task Scheduler Event", 0, sev);
+    return ERROR_SUCCESS;
+}
+
+static void TaskSubscriberThread() {
+    g_taskSubscription = EvtSubscribe(
+        nullptr, nullptr,
+        L"Microsoft-Windows-TaskScheduler/Operational",
+        L"*[System[(EventID=106 or EventID=129 or EventID=140 or EventID=141)]]",
+        nullptr, nullptr,
+        reinterpret_cast<EVT_SUBSCRIBE_CALLBACK>(TaskEventCallback),
+        EvtSubscribeToFutureEvents
+    );
+
+    if (!g_taskSubscription) {
+        std::cerr << "[Task] EvtSubscribe failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    std::cout << "[Task] Scheduler subscriber active\n";
+    while (!g_taskStop.load()) Sleep(500);
+    EvtClose(g_taskSubscription);
+    g_taskSubscription = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Windows Defender — detections and tamper events
+// EIDs: 1116 (detected), 1117 (action taken), 5001 (real-time protection disabled)
+// ---------------------------------------------------------------------------
+static DWORD WINAPI DefenderEventCallback(
+    EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID /*ctx*/, EVT_HANDLE hEvent)
+{
+    if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
+
+    std::string xml = RenderEventXml(hEvent);
+    if (xml.empty()) return ERROR_SUCCESS;
+
+    std::string eidStr = GetXmlField(xml, "EventID");
+    std::string ts = BuildTimestamp();
+    int eid = 0;
+    try { eid = std::stoi(eidStr); } catch (...) { return ERROR_SUCCESS; }
+
+    if (eid == 5001) {
+        std::string msg = "[Defender 5001] " + ts + " | Real-time protection DISABLED";
+        std::string det = "Date & Time: " + ts +
+            " | EID 5001 Defender Tamper: Real-time protection disabled";
+        PushUiDetectionEvent(msg, det, "Method: Windows Defender (Tamper)",
+            0, DetectionSeverity::Critical);
+        return ERROR_SUCCESS;
+    }
+
+    std::string threatName = GetXmlField(xml, "Threat Name");
+    if (threatName.empty()) threatName = GetXmlField(xml, "ThreatName");
+    std::string path       = GetXmlField(xml, "Path");
+    std::string actionTaken= GetXmlField(xml, "Action");
+
+    if (eid == 1116) {
+        std::string msg = "[Defender 1116] " + ts + " | Detection: " + threatName +
+            " | " + path.substr(path.rfind('\\') + 1);
+        std::string det = "Date & Time: " + ts + " | EID 1116 Defender Detection" +
+            " | Threat: " + threatName + " | Path: " + path;
+        PushUiDetectionEvent(msg, det, "Method: Windows Defender (Detection)",
+            0, DetectionSeverity::High);
+    } else if (eid == 1117) {
+        std::string msg = "[Defender 1117] " + ts + " | Action taken: " +
+            actionTaken + " on " + threatName;
+        std::string det = "Date & Time: " + ts + " | EID 1117 Defender Action" +
+            " | Threat: " + threatName + " | Action: " + actionTaken +
+            " | Path: " + path;
+        PushUiDetectionEvent(msg, det, "Method: Windows Defender (Action)",
+            0, DetectionSeverity::Medium);
+    }
+
+    return ERROR_SUCCESS;
+}
+
+static void DefenderSubscriberThread() {
+    g_defenderSubscription = EvtSubscribe(
+        nullptr, nullptr,
+        L"Microsoft-Windows-Windows Defender/Operational",
+        L"*[System[(EventID=1116 or EventID=1117 or EventID=5001)]]",
+        nullptr, nullptr,
+        reinterpret_cast<EVT_SUBSCRIBE_CALLBACK>(DefenderEventCallback),
+        EvtSubscribeToFutureEvents
+    );
+
+    if (!g_defenderSubscription) {
+        std::cerr << "[Defender] EvtSubscribe failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    std::cout << "[Defender] Operational subscriber active\n";
+    while (!g_defenderStop.load()) Sleep(500);
+    EvtClose(g_defenderSubscription);
+    g_defenderSubscription = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Print Spooler — driver installation (PrintNightmare / EID 316)
+// ---------------------------------------------------------------------------
+static DWORD WINAPI SpoolerEventCallback(
+    EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID /*ctx*/, EVT_HANDLE hEvent)
+{
+    if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
+
+    std::string xml = RenderEventXml(hEvent);
+    if (xml.empty()) return ERROR_SUCCESS;
+
+    std::string ts         = BuildTimestamp();
+    std::string driverName = GetXmlField(xml, "param3");   // driver name field in EID 316
+    std::string driverPath = GetXmlField(xml, "param4");
+    std::string user       = GetXmlField(xml, "param7");
+
+    std::string msg = "[Spooler 316] " + ts + " | Printer driver installed: " + driverName;
+    std::string det = "Date & Time: " + ts + " | EID 316 Printer Driver Install" +
+        " | Driver: " + driverName + " | Path: " + driverPath +
+        " | By: " + user;
+    PushUiDetectionEvent(msg, det, "Method: Print Spooler (Driver Install / PrintNightmare)",
+        0, DetectionSeverity::High);
+    return ERROR_SUCCESS;
+}
+
+static void SpoolerSubscriberThread() {
+    g_spoolerSubscription = EvtSubscribe(
+        nullptr, nullptr,
+        L"Microsoft-Windows-PrintSpooler/Operational",
+        L"*[System[(EventID=316)]]",
+        nullptr, nullptr,
+        reinterpret_cast<EVT_SUBSCRIBE_CALLBACK>(SpoolerEventCallback),
+        EvtSubscribeToFutureEvents
+    );
+
+    if (!g_spoolerSubscription) {
+        std::cerr << "[Spooler] EvtSubscribe failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    std::cout << "[Spooler] Print Spooler subscriber active\n";
+    while (!g_spoolerStop.load()) Sleep(500);
+    EvtClose(g_spoolerSubscription);
+    g_spoolerSubscription = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// RDP — Terminal Services Remote Connection Manager
+// EID 1149: Remote Desktop Services: User authentication succeeded
+// ---------------------------------------------------------------------------
+static DWORD WINAPI RdpEventCallback(
+    EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID /*ctx*/, EVT_HANDLE hEvent)
+{
+    if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
+
+    std::string xml = RenderEventXml(hEvent);
+    if (xml.empty()) return ERROR_SUCCESS;
+
+    std::string ts      = BuildTimestamp();
+    std::string user    = GetXmlField(xml, "Param1");
+    std::string domain  = GetXmlField(xml, "Param2");
+    std::string srcAddr = GetXmlField(xml, "Param3");
+
+    std::string msg = "[RDP 1149] " + ts + " | RDP logon: " +
+        (domain.empty() ? "" : domain + "\\") + user +
+        " from " + (srcAddr.empty() ? "?" : srcAddr);
+    std::string det = "Date & Time: " + ts +
+        " | EID 1149 RDP Authentication Success" +
+        " | User: " + domain + "\\" + user +
+        " | Source IP: " + srcAddr;
+    PushUiDetectionEvent(msg, det, "Method: RDP Logon (Lateral Movement)",
+        0, DetectionSeverity::Medium);
+    return ERROR_SUCCESS;
+}
+
+static void RdpSubscriberThread() {
+    g_rdpSubscription = EvtSubscribe(
+        nullptr, nullptr,
+        L"Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational",
+        L"*[System[(EventID=1149)]]",
+        nullptr, nullptr,
+        reinterpret_cast<EVT_SUBSCRIBE_CALLBACK>(RdpEventCallback),
+        EvtSubscribeToFutureEvents
+    );
+
+    if (!g_rdpSubscription) {
+        std::cerr << "[RDP] EvtSubscribe failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    std::cout << "[RDP] TerminalServices subscriber active\n";
+    while (!g_rdpStop.load()) Sleep(500);
+    EvtClose(g_rdpSubscription);
+    g_rdpSubscription = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// BITS Client — background transfer jobs (T1197 persistence / exfiltration)
+// EIDs: 3 (job created), 59 (transfer started), 60 (transfer completed)
+// ---------------------------------------------------------------------------
+static DWORD WINAPI BitsEventCallback(
+    EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID /*ctx*/, EVT_HANDLE hEvent)
+{
+    if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
+
+    std::string xml = RenderEventXml(hEvent);
+    if (xml.empty()) return ERROR_SUCCESS;
+
+    std::string eidStr  = GetXmlField(xml, "EventID");
+    std::string ts      = BuildTimestamp();
+    std::string jobName = GetXmlField(xml, "jobTitle");
+    if (jobName.empty()) jobName = GetXmlField(xml, "jobId");
+    std::string url     = GetXmlField(xml, "url");
+    std::string user    = GetXmlField(xml, "user");
+    std::string proc    = GetXmlField(xml, "processPath");
+    int eid = 0;
+    try { eid = std::stoi(eidStr); } catch (...) { return ERROR_SUCCESS; }
+
+    const char* action_label = nullptr;
+    DetectionSeverity sev = DetectionSeverity::Medium;
+    switch (eid) {
+    case  3: action_label = "created";   sev = DetectionSeverity::Medium; break;
+    case 59: action_label = "started";   sev = DetectionSeverity::Low;    break;
+    case 60: action_label = "completed"; sev = DetectionSeverity::Medium; break;
+    default: return ERROR_SUCCESS;
+    }
+
+    std::string msg = "[BITS " + eidStr + "] " + ts + " | BITS job " +
+        action_label + ": " + jobName + (url.empty() ? "" : " | " + url.substr(0, 80));
+    std::string det = "Date & Time: " + ts + " | EID " + eidStr + " BITS Job " + action_label +
+        " | Job: " + jobName + " | URL: " + url + " | User: " + user +
+        " | Process: " + proc;
+    PushUiDetectionEvent(msg, det, "Method: BITS Client (T1197)", 0, sev);
+    return ERROR_SUCCESS;
+}
+
+static void BitsSubscriberThread() {
+    g_bitsSubscription = EvtSubscribe(
+        nullptr, nullptr,
+        L"Microsoft-Windows-Bits-Client/Operational",
+        L"*[System[(EventID=3 or EventID=59 or EventID=60)]]",
+        nullptr, nullptr,
+        reinterpret_cast<EVT_SUBSCRIBE_CALLBACK>(BitsEventCallback),
+        EvtSubscribeToFutureEvents
+    );
+
+    if (!g_bitsSubscription) {
+        std::cerr << "[BITS] EvtSubscribe failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    std::cout << "[BITS] Client subscriber active\n";
+    while (!g_bitsStop.load()) Sleep(500);
+    EvtClose(g_bitsSubscription);
+    g_bitsSubscription = nullptr;
+}
+
 VOID ShowUI() {
 
     auto processesRenderer = Renderer([&] {
@@ -4541,20 +5097,32 @@ VOID ShowUI() {
         ConsumeIOCTLData(L"\\\\.\\NortonEDR", NORTONAV_RETRIEVE_DATA_FILE, 5);
         });
 
-    // Sysmon, SACL, ETW-TI, PowerShell, DNS and WinRM subscribers
+    // Sysmon, SACL, ETW-TI, PowerShell, DNS, WinRM and extended ETW subscribers
     SetupAuditSACLs();
-    g_sysmonStop = false;
-    g_saclStop   = false;
-    g_tiStop     = false;
-    g_psStop     = false;
-    g_dnsStop    = false;
-    g_winrmStop  = false;
+    g_sysmonStop    = false;
+    g_saclStop      = false;
+    g_tiStop        = false;
+    g_psStop        = false;
+    g_dnsStop       = false;
+    g_winrmStop     = false;
+    g_secExtStop    = false;
+    g_taskStop      = false;
+    g_defenderStop  = false;
+    g_spoolerStop   = false;
+    g_rdpStop       = false;
+    g_bitsStop      = false;
     std::thread sysmonThread(SysmonSubscriberThread);
     std::thread saclThread(SecurityAuditSubscriberThread);
     std::thread tiThread(EtwTiSubscriberThread);
     std::thread psThread(PowerShellSubscriberThread);
     std::thread dnsThread(DnsSubscriberThread);
     std::thread winrmThread(WinRmSubscriberThread);
+    std::thread secExtThread(SecExtSubscriberThread);
+    std::thread taskThread(TaskSubscriberThread);
+    std::thread defenderThread(DefenderSubscriberThread);
+    std::thread spoolerThread(SpoolerSubscriberThread);
+    std::thread rdpThread(RdpSubscriberThread);
+    std::thread bitsThread(BitsSubscriberThread);
 
     g_capaStop = false;
     std::thread capaWorker(CapaScanWorker);
@@ -4582,16 +5150,28 @@ VOID ShowUI() {
     threadByte.join();
     threadFile.join();
 
-    g_sysmonStop = true;
-    g_saclStop   = true;
-    g_psStop     = true;
-    g_dnsStop    = true;
-    g_winrmStop  = true;
+    g_sysmonStop   = true;
+    g_saclStop     = true;
+    g_psStop       = true;
+    g_dnsStop      = true;
+    g_winrmStop    = true;
+    g_secExtStop   = true;
+    g_taskStop     = true;
+    g_defenderStop = true;
+    g_spoolerStop  = true;
+    g_rdpStop      = true;
+    g_bitsStop     = true;
     sysmonThread.join();
     saclThread.join();
     psThread.join();
     dnsThread.join();
     winrmThread.join();
+    secExtThread.join();
+    taskThread.join();
+    defenderThread.join();
+    spoolerThread.join();
+    rdpThread.join();
+    bitsThread.join();
 
     // ETW-TI: unblock ProcessTrace then join
     StopEtwTiSession();
