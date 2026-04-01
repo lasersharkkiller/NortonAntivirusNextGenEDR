@@ -6,6 +6,19 @@ A Windows kernel-mode EDR featuring kernel-level telemetry, hook detection, proc
 
 ## Defensive Capabilities
 
+### Early Launch Anti-Malware (ELAM)
+- Standalone pure-WDM kernel driver (`NortonEDRElam.sys`) registered with `StartType=0` and `LoadOrderGroup=Early-Launch` — loaded by the Windows boot loader before every other boot-start driver
+- **Boot driver callback** — `IoRegisterBootDriverCallback` registers `NortonElamBootDriverCallback`; called once per boot-start driver before the loader initialises it
+- **Classification logic** (evaluated in priority order):
+  1. **Signature/integrity failure** — `BDCB_IMAGE_FLAG_FAILED_CODE_INTEGRITY` / `BDCB_IMAGE_FLAG_FAILED_IMAGE_HASH` → `KnownBadImage`; if `BDCB_IMAGE_FLAG_SYSTEM_CRITICAL` is also set → `KnownBadImageBootCritical` (triggers BSOD rather than silently skipping the driver)
+  2. **SHA-256 hash blocklist** — 32-byte hashes of known LOLDrivers (WinRing0x64, RTCore64, dbutil_2_3, AsrDrv103, gdrv) matched against `ImageHash`; match → `KnownBadImage`
+  3. **Known-good name prefix** — Microsoft boot-critical components (`ntoskrnl`, `hal`, `classpnp`, `disk`, `volmgr`, `fvevol`, `ndis`, `storport`, etc.) → `KnownGoodImage`
+  4. **Default** → `UnknownImage` (loader decides)
+- **Boot-phase statistics** — total/good/bad/unknown/verify-failed counters emitted to `DbgPrint` at `BdCbStatusOptionalDriversComplete`
+- **ETW provider** (`A1B2C3D4-E5F6-7890-ABCD-EF1234567890`) — `EtwRegister` at driver load; three event IDs: `BootDriverClassified(1)`, `KnownBadBlocked(2)`, `VerifyFailed(3)`; each carries the image name (UTF-16) and classification code — accessible to xperf, WPA, and SIEM collectors without the TUI running
+- **Secure ETW events (reception)** — ELAM-registered components gain access to protected ETW providers (e.g. `Microsoft-Windows-Threat-Intelligence`) via `EtwRegisterSecurityProvider`; the main `NortonEDRDriver` requests the ELAM handoff token post-boot to activate full ETW-TI reception in the running system
+- ELAM unload writes final boot-phase statistics to `DbgPrint` and calls `IoUnregisterBootDriverCallback` + `EtwUnregister`
+
 ### Filesystem Minifilter (FsFilter)
 - Kernel minifilter registered with the Windows Filter Manager at altitude **265000** (FSFilter Activity Monitor range) via `FltRegisterFilter` / `FltStartFiltering`
 - **`IRP_MJ_CREATE`** — credential file access detection: flags opens of `SAM`, `SYSTEM`, `SECURITY` hives, `NTDS.dit`, and LSASS dump files; executable drop detection: flags `.exe`/`.dll`/`.ps1`/`.vbs`/`.bat`/`.js`/`.hta` creation in `%Temp%`, `%AppData%`, `%ProgramData%`, `Public`
