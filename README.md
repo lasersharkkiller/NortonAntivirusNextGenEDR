@@ -22,6 +22,15 @@ A Windows kernel-mode EDR built on top of [BestEdrOfTheMarket v3](https://xacone
 
 All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critical, the hooked address, hook type, and resolved trampoline target into the driver's notification queue.
 
+### Process & PE Scanning
+- **Reflective DLL injection** — VAD tree walk on every new process; flags private executable regions containing an MZ/PE header that have no file backing
+- **Anonymous RWX regions** — same VAD walk flags private `EXECUTE_READWRITE` regions with no PE header as shellcode staging areas
+- **PE header in protect buffer** — `NtProtectVirtualMemory` hook checks the region content when memory is made executable; alerts if an MZ/PE header is present
+- **Cross-process PE write** — `NtWriteVirtualMemory` hook checks written data for an MZ/PE signature on remote writes (process injection in progress)
+- **Process ghosting** — `SeAuditProcessCreationInfo` null-check detects processes launched from deleted files
+- **PPID spoofing** — parent PID vs. creating thread process mismatch detected at process creation
+- **Process hollowing** — VAD/LDR cross-check verifies the main image VAD start address matches the PEB loader entry
+
 ### Detection Engine
 - YARA rule engine with recursive auto-loading from configurable paths
 - Sigma-Lite rule support with full boolean logic (`selection`, `filter`, `1 of`, `all of`, `and`, `or`, `not`) and string operators (`contains`, `contains|all`, `startswith`, `endswith`)

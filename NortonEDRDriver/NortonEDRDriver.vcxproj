@@ -122,6 +122,7 @@
   <ItemGroup>
     <ClCompile Include="src\Callbacks.cpp" />
     <ClCompile Include="src\HookDetection.cpp" />
+    <ClCompile Include="src\PeScan.cpp" />
     <ClCompile Include="src\Controller.cpp" />
     <ClCompile Include="src\DriverEntry.cpp" />
     <ClCompile Include="src\Objects.cpp" />
