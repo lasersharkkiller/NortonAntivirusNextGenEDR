@@ -1,6 +1,6 @@
 # NortonAntivirusNextGenEDR
 
-A Windows kernel-mode EDR built on top of [BestEdrOfTheMarket v3](https://xacone.github.io/BestEdrOfTheMarketV3.html), extended with Sysmon integration, SACL-based auditing, and structured detection telemetry for defensive lab environments.
+A Windows kernel-mode EDR built on top of [BestEdrOfTheMarket v3](https://xacone.github.io/BestEdrOfTheMarketV3.html), extended with Sysmon integration, SACL-based auditing, hook detection, and structured detection telemetry for defensive lab environments.
 
 ---
 
@@ -10,8 +10,16 @@ A Windows kernel-mode EDR built on top of [BestEdrOfTheMarket v3](https://xacone
 - Kernel callbacks for process/thread creation, image loading, registry operations, and object access
 - System call interception via alternative system call handlers with integrity checking
 - VAD tree exploitation for image integrity verification
-- Shadow Stack verification for thread call stack integrity
+- Shadow Stack (CET) verification for thread call stack integrity
 - Code injection detection via thread call stack inspection
+
+### Hook Detection
+- **SSDT integrity** — baseline snapshot of `nt!KiServiceTable` taken at driver load; subsequent scans compare live entries against the snapshot and alert on any modified syscall dispatch pointer
+- **Inline hooks** — prologue scan across all ntoskrnl exports detecting `JMP near` (E9), `JMP far` (FF 25), `MOV RAX + JMP RAX` (48 B8 … FF E0), and `PUSH + RET` (68 … C3) trampoline patterns
+- **EAT hooks** — export address table walk of the kernel module; flags any EAT entry whose resolved address falls outside the module's image bounds
+- **ETW hooks** — prologue scan of `EtwWrite`, `EtwWriteEx`, `EtwWriteTransfer`, and `EtwRegister`; detects inline patches used to silence kernel telemetry
+
+All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critical, the hooked address, hook type, and resolved trampoline target into the driver's notification queue.
 
 ### Detection Engine
 - YARA rule engine with recursive auto-loading from configurable paths
