@@ -356,6 +356,13 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		);
 
 	}
+	else if (NtSetContextThreadId != 0 && id == NtSetContextThreadId) {  // NtSetContextThread
+
+		NtSetContextThreadHandler(
+			(HANDLE)trapFrame->Rcx,
+			(PVOID)trapFrame->Rdx     // PCONTEXT
+		);
+	}
 	else if (id == NtAdjustPrivilegesTokenId) {  // NtAdjustPrivilegesToken
 
 		NtAdjustPrivilegesTokenHandler(
@@ -370,6 +377,14 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 	else if (id == 0x0054) {	        // NtReadVirtualMemory | Win 10 -> Win11 24H2
 
 		isSyscallDirect(trapFrame->Rip, "NtReadVirtualMemory");
+
+		NtReadVmHandler(
+			(HANDLE)trapFrame->Rcx,
+			(PVOID)trapFrame->Rdx,
+			(PVOID)trapFrame->R8,
+			(SIZE_T)trapFrame->R9,
+			(PSIZE_T)arg5
+		);
 	}
 	else if (id == 0x0008) {		// NtWriteFile
 
@@ -664,7 +679,48 @@ VOID SyscallsUtils::InitIds() {
 	NtFreeId = ntFreeSsn;
 }
 
-// Example Handler
+// ---------------------------------------------------------------------------
+// Private helper — allocates and enqueues a KERNEL_STRUCTURED_NOTIFICATION
+// for a syscall-level detection. Caller provides the scoped address, message,
+// calling process, optional target process, and severity flag.
+// ---------------------------------------------------------------------------
+static VOID EmitSyscallNotif(
+	ULONG64   scoopedAddr,
+	const char* msg,
+	PEPROCESS callerProcess,
+	PEPROCESS targetProcess,   // may be nullptr
+	BOOLEAN   critical
+) {
+	PKERNEL_STRUCTURED_NOTIFICATION n = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+		POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+	if (!n) return;
+
+	RtlZeroMemory(n, sizeof(KERNEL_STRUCTURED_NOTIFICATION));
+
+	if (critical) { SET_CRITICAL(*n); } else { SET_WARNING(*n); }
+	SET_SYSCALL_CHECK(*n);
+
+	n->isPath          = FALSE;
+	n->pid             = PsGetProcessId(callerProcess);
+	n->scoopedAddress  = scoopedAddr;
+	RtlCopyMemory(n->procName, PsGetProcessImageFileName(callerProcess), 14);
+	if (targetProcess)
+		RtlCopyMemory(n->targetProcName, PsGetProcessImageFileName(targetProcess), 14);
+
+	SIZE_T msgLen = strlen(msg) + 1;
+	n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+	if (n->msg) {
+		RtlCopyMemory(n->msg, msg, msgLen);
+		if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+			ExFreePool(n->msg);
+			ExFreePool(n);
+		}
+	} else {
+		ExFreePool(n);
+	}
+}
+
+// NtAllocateVirtualMemory — flag RWX allocations; cross-process is Critical.
 VOID SyscallsUtils::NtAllocVmHandler(
 	HANDLE ProcessHandle,
 	PVOID* BaseAddress,
@@ -673,19 +729,21 @@ VOID SyscallsUtils::NtAllocVmHandler(
 	ULONG AllocationType,
 	ULONG Protect
 ) {
+	// PAGE_EXECUTE_READWRITE = 0x40, PAGE_EXECUTE_WRITECOPY = 0x80
+	if (Protect != 0x40 && Protect != 0x80) return;
 
-	BOOLEAN Remote;
+	BOOLEAN remote = (ProcessHandle != (HANDLE)-1);
+	const char* msg = remote
+		? "NtAllocateVirtualMemory: remote RWX allocation (cross-process shellcode staging)"
+		: "NtAllocateVirtualMemory: local RWX allocation";
 
-	if (Protect == 0x40) {  // RWX
-
-		Remote = TRUE;
-
-		if (ProcessHandle == (HANDLE)-1) {
-			Remote = FALSE;
-		}
-
-		// For future use
-	}
+	EmitSyscallNotif(
+		BaseAddress && MmIsAddressValid(BaseAddress) ? (ULONG64)*BaseAddress : 0,
+		msg,
+		IoGetCurrentProcess(),
+		nullptr,
+		remote   // remote = Critical, local = Warning
+	);
 }
 
 VOID SyscallsUtils::NtProtectVmHandler(
@@ -798,6 +856,7 @@ VOID SyscallsUtils::NtWriteFileHandler(
 	}
 }
 
+// NtReadVirtualMemory — cross-process reads only; Critical if target is lsass.
 VOID SyscallsUtils::NtReadVmHandler(
 	HANDLE ProcessHandle,
 	PVOID BaseAddress,
@@ -805,11 +864,41 @@ VOID SyscallsUtils::NtReadVmHandler(
 	SIZE_T NumberOfBytesToRead,
 	PSIZE_T NumberOfBytesRead
 ) {
+	if (ProcessHandle == (HANDLE)-1) return; // self-read, not interesting
 
-	// For future use
+	PEPROCESS targetProcess = nullptr;
+	NTSTATUS status = ObReferenceObjectByHandle(
+		ProcessHandle, PROCESS_QUERY_INFORMATION, nullptr,
+		UserMode, (PVOID*)&targetProcess, nullptr);
+	if (!NT_SUCCESS(status)) return;
 
+	PEPROCESS callerProcess = IoGetCurrentProcess();
+
+	// Detect if the target is lsass for elevated severity
+	char targetName[15] = {};
+	RtlCopyMemory(targetName, PsGetProcessImageFileName(targetProcess), 14);
+
+	BOOLEAN isSensitive = FALSE;
+	char lower[15] = {};
+	for (int i = 0; i < 14 && targetName[i]; i++)
+		lower[i] = (targetName[i] >= 'A' && targetName[i] <= 'Z')
+		          ? (char)(targetName[i] + 32) : targetName[i];
+	if (RtlCompareMemory(lower, "lsass.exe", 9) == 9) isSensitive = TRUE;
+
+	EmitSyscallNotif(
+		(ULONG64)BaseAddress,
+		isSensitive
+			? "NtReadVirtualMemory: cross-process read from lsass (credential theft attempt)"
+			: "NtReadVirtualMemory: cross-process memory read",
+		callerProcess,
+		targetProcess,
+		isSensitive  // lsass read = Critical
+	);
+
+	ObDereferenceObject(targetProcess);
 }
 
+// NtQueueApcThread — flag cross-process APC injection.
 VOID SyscallsUtils::NtQueueApcThreadHandler(
 	HANDLE ThreadHandle,
 	PPS_APC_ROUTINE ApcRoutine,
@@ -817,11 +906,28 @@ VOID SyscallsUtils::NtQueueApcThreadHandler(
 	PVOID ApcArgument2,
 	PVOID ApcArgument3
 ) {
+	if (!ApcRoutine) return;
 
-	// For future use
+	PETHREAD targetThread = nullptr;
+	if (!NT_SUCCESS(ObReferenceObjectByHandle(
+		ThreadHandle, THREAD_QUERY_INFORMATION, nullptr,
+		UserMode, (PVOID*)&targetThread, nullptr))) return;
 
+	PEPROCESS targetProcess  = IoThreadToProcess(targetThread);
+	PEPROCESS callerProcess  = IoGetCurrentProcess();
+	BOOLEAN   crossProcess   = (targetProcess != callerProcess);
+
+	if (crossProcess) {
+		EmitSyscallNotif(
+			(ULONG64)ApcRoutine,
+			"NtQueueApcThread: cross-process APC injection",
+			callerProcess, targetProcess, TRUE);
+	}
+
+	ObDereferenceObject(targetThread);
 }
 
+// NtQueueApcThreadEx — same as above but with UserApcReserveHandle (Win8+).
 VOID SyscallsUtils::NtQueueApcThreadExHandler(
 	HANDLE ThreadHandle,
 	HANDLE UserApcReserveHandle,
@@ -829,31 +935,121 @@ VOID SyscallsUtils::NtQueueApcThreadExHandler(
 	PVOID ApcArgument1,
 	PVOID ApcArgument2,
 	PVOID ApcArgument3
-)
-{
+) {
+	if (!ApcRoutine) return;
 
-	// For future use
+	PETHREAD targetThread = nullptr;
+	if (!NT_SUCCESS(ObReferenceObjectByHandle(
+		ThreadHandle, THREAD_QUERY_INFORMATION, nullptr,
+		UserMode, (PVOID*)&targetThread, nullptr))) return;
 
+	PEPROCESS targetProcess = IoThreadToProcess(targetThread);
+	PEPROCESS callerProcess = IoGetCurrentProcess();
+
+	if (targetProcess != callerProcess) {
+		EmitSyscallNotif(
+			(ULONG64)ApcRoutine,
+			"NtQueueApcThreadEx: cross-process APC injection (extended)",
+			callerProcess, targetProcess, TRUE);
+	}
+
+	ObDereferenceObject(targetThread);
 }
 
+// NtContinue — flag execution redirected into private executable memory.
+// Typical attack: process hollowing / shellcode loader sets context then
+// calls NtContinue to jump into injected code.
 VOID SyscallsUtils::NtContinueHandler(
 	PCONTEXT Context,
 	BOOLEAN TestAlert
 ) {
+	if (!Context || !MmIsAddressValid(Context)) return;
 
-	// For future use
+	ULONG64 rip = Context->Rip;
+	// Only inspect user-mode addresses
+	if (!rip || rip >= 0x00007FFFFFFFFFFF) return;
 
+	// Skip protected processes — their pages aren't queryable this way
+	PPS_PROTECTION prot = PsGetProcessProtection(IoGetCurrentProcess());
+	if (prot->Level != 0x0) return;
+
+	MEMORY_BASIC_INFORMATION mbi = {};
+	SIZE_T retLen = 0;
+	NTSTATUS status = ZwQueryVirtualMemory(
+		NtCurrentProcess(),
+		(PVOID)rip,
+		MemoryBasicInformation,
+		&mbi, sizeof(mbi), &retLen);
+	if (!NT_SUCCESS(status)) return;
+
+	// Private memory with an execute bit set = suspicious
+	BOOLEAN isExec    = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+	                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+	BOOLEAN isPrivate = (mbi.Type == 0x20000); // MEM_PRIVATE
+
+	if (!isExec || !isPrivate) return;
+
+	EmitSyscallNotif(
+		rip,
+		"NtContinue: execution redirected to private executable region (possible shellcode)",
+		IoGetCurrentProcess(), nullptr, FALSE);
 }
 
+// NtResumeThread — flag cross-process thread resumption (process hollowing).
 VOID SyscallsUtils::NtResumeThreadHandler(
 	HANDLE ThreadHandle,
 	PULONG SuspendCount
 ) {
+	PETHREAD targetThread = nullptr;
+	if (!NT_SUCCESS(ObReferenceObjectByHandle(
+		ThreadHandle, THREAD_QUERY_INFORMATION, nullptr,
+		UserMode, (PVOID*)&targetThread, nullptr))) return;
 
+	PEPROCESS targetProcess = IoThreadToProcess(targetThread);
+	PEPROCESS callerProcess = IoGetCurrentProcess();
+	BOOLEAN   crossProcess  = (targetProcess != callerProcess);
 
+	ObDereferenceObject(targetThread);
 
-	// For future use
+	if (!crossProcess) return;
 
+	EmitSyscallNotif(
+		0,
+		"NtResumeThread: cross-process thread resumption (possible process hollowing)",
+		callerProcess, targetProcess, FALSE);
+}
+
+// NtSetContextThread — flag cross-process thread context hijacking.
+// scoopedAddress is the new RIP from the supplied CONTEXT.
+VOID SyscallsUtils::NtSetContextThreadHandler(
+	HANDLE ThreadHandle,
+	PVOID  Context
+) {
+	if (!Context || !MmIsAddressValid(Context)) return;
+
+	PETHREAD targetThread = nullptr;
+	if (!NT_SUCCESS(ObReferenceObjectByHandle(
+		ThreadHandle, THREAD_QUERY_INFORMATION, nullptr,
+		UserMode, (PVOID*)&targetThread, nullptr))) return;
+
+	PEPROCESS targetProcess = IoThreadToProcess(targetThread);
+	PEPROCESS callerProcess = IoGetCurrentProcess();
+	BOOLEAN   crossProcess  = (targetProcess != callerProcess);
+
+	ULONG64 newRip = 0;
+	if (crossProcess) {
+		__try {
+			newRip = ((PCONTEXT)Context)->Rip;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+
+		EmitSyscallNotif(
+			newRip,
+			"NtSetContextThread: cross-process thread context hijack",
+			callerProcess, targetProcess, TRUE);
+	}
+
+	ObDereferenceObject(targetThread);
 }
 
 VOID SyscallsUtils::DisableAltSyscallFromThreads2() {
