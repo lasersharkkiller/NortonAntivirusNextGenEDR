@@ -33,7 +33,21 @@
 
 #define NORTONAV_RETRIEVE_DATA_BYTE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// Input: HOOKDLL_INJECT_CONFIG — configures kernel APC injection of HookDll.dll
+#define NORTONAV_SET_INJECT_CONFIG CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 #define END_THAT_PROCESS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x216, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Payload sent from user mode to configure DllInjector.
+// LoadLibraryWAddress is the VA of LoadLibraryW in the NortonEDR process;
+// it is valid in all processes because system DLLs are mapped at the same VA
+// per boot (shared image section, boot-time ASLR only).
+struct HOOKDLL_INJECT_CONFIG {
+    PVOID  LoadLibraryWAddress; // user-mode VA of LoadLibraryW
+    ULONG  PathByteLen;         // byte length of HookDllPath including null
+    ULONG  OwnerPid;            // NortonEDR PID — excluded from injection
+    WCHAR  HookDllPath[260];    // full path to HookDll.dll
+};
 
 #define ProcessAltSystemCallInformation 0x64
 
@@ -958,6 +972,14 @@ public:
 		HANDLE,
 		PPS_CREATE_NOTIFY_INFO
 	);
+};
+
+class DllInjector {
+public:
+    static VOID Initialize();
+    static VOID SetConfig(PVOID loadLibraryW, ULONG ownerPid, PCWSTR path, ULONG byteLen);
+    // Must be called at PASSIVE_LEVEL while attached to `process` via KeStackAttachProcess.
+    static VOID TryInject(PEPROCESS process, PUNICODE_STRING fullImageName);
 };
 
 class ImageUtils {

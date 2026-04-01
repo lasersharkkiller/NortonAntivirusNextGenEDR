@@ -119,6 +119,9 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
             DbgPrint("[-] Exception in ImageLoadNotifyRoutine\n");
         }
 
+        // Queue HookDll APC while still attached — allocates path buffer in target process.
+        DllInjector::TryInject(targetProcess, FullImageName);
+
         KeUnstackDetachProcess(&apcState);
         attached = FALSE;
     }

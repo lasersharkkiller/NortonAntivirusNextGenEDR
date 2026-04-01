@@ -35,6 +35,14 @@ using namespace std;
 #define NORTONAV_RETRIEVE_DATA_BYTE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define END_THAT_PROCESS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x216, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define NORTONAV_SET_INJECT_CONFIG CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+struct HOOKDLL_INJECT_CONFIG {
+    void*   LoadLibraryWAddress;
+    ULONG   PathByteLen;
+    ULONG   OwnerPid;
+    wchar_t HookDllPath[260];
+};
 
 UINT32 curPid;
 
@@ -4479,6 +4487,36 @@ int main(int argc, char* argv[]) {
 
     printf("[*] %d Yara Rules Loaded & Compiled\n", yara_rules_count);
     system("pause");
+
+    // Send HookDll injection config to the kernel driver.
+    // LoadLibraryW is at the same VA in all processes (shared section, boot ASLR only).
+    {
+        HANDLE hDev = CreateFileW(L"\\\\.\\NortonEDR",
+            GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hDev != INVALID_HANDLE_VALUE) {
+            HOOKDLL_INJECT_CONFIG cfg = {};
+            cfg.LoadLibraryWAddress =
+                (void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
+            cfg.OwnerPid = GetCurrentProcessId();
+
+            // Build HookDll.dll path from NortonEDR.exe directory
+            wchar_t exePath[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+            if (lastSlash)
+                wcscpy_s(lastSlash + 1,
+                         MAX_PATH - (DWORD)(lastSlash + 1 - exePath),
+                         L"HookDll.dll");
+            wcscpy_s(cfg.HookDllPath, exePath);
+            cfg.PathByteLen = (ULONG)((wcslen(cfg.HookDllPath) + 1) * sizeof(wchar_t));
+
+            DWORD returned = 0;
+            DeviceIoControl(hDev, NORTONAV_SET_INJECT_CONFIG,
+                            &cfg, sizeof(cfg), nullptr, 0, &returned, nullptr);
+            CloseHandle(hDev);
+        }
+    }
 
     ShowUI();
 

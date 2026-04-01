@@ -212,6 +212,20 @@ NTSTATUS DriverIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 			// queue and no other code path will release it.
 			ExFreePool(resp);
 		}
+		else if (stack->Parameters.DeviceIoControl.IoControlCode == NORTONAV_SET_INJECT_CONFIG) {
+
+			if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(HOOKDLL_INJECT_CONFIG)) {
+				status = STATUS_INVALID_PARAMETER;
+				__leave;
+			}
+
+			HOOKDLL_INJECT_CONFIG* cfg = (HOOKDLL_INJECT_CONFIG*)Irp->AssociatedIrp.SystemBuffer;
+			DllInjector::SetConfig(
+				cfg->LoadLibraryWAddress,
+				cfg->OwnerPid,
+				cfg->HookDllPath,
+				cfg->PathByteLen);
+		}
 		else if (stack->Parameters.DeviceIoControl.IoControlCode == END_THAT_PROCESS) {
 
 			if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(UINT32)) {
@@ -261,6 +275,8 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	}
 
 	g_bufferQueue->Init(MAX_BUFFER_COUNT);
+
+	DllInjector::Initialize();
 
 	g_hashQueue = (NotifQueue*)ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_RAISE_ON_FAILURE, sizeof(NotifQueue), 'hshq');
 
