@@ -1059,6 +1059,30 @@ public:
 
 };
 
+class PeScanner {
+
+public:
+
+    // Walk the VAD tree of a target process and flag private executable
+    // regions that contain an MZ/PE header (reflective injection) or are
+    // anonymous RWX (shellcode staging). Must be called at PASSIVE_LEVEL.
+    static VOID ScanProcessVad(
+        PEPROCESS    process,
+        BufferQueue* bufQueue
+    );
+
+    // Check a kernel-memory buffer (already copied from user space) for an
+    // MZ/PE signature. Called from NtProtectVmHandler / NtWriteVmHandler.
+    static VOID CheckBufferForPeHeader(
+        PVOID        buffer,
+        SIZE_T       size,
+        PVOID        targetAddress,
+        HANDLE       targetPid,
+        char*        procName,
+        BufferQueue* bufQueue
+    );
+};
+
 class HookDetector {
 
     static PSSDT_BASELINE_ENTRY ssdtBaseline;

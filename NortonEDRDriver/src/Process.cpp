@@ -67,7 +67,10 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 	ProcessUtils procUtils = ProcessUtils(Process);
 	
 	if (CreateInfo) {
-	
+
+		// PE scan: walk the new process VAD for suspicious executable regions
+		PeScanner::ScanProcessVad(Process, CallbackObjects::GetNotifQueue());
+
 		if (procUtils.isProcessParentPidSpoofed(CreateInfo)) {
 
 			PKERNEL_STRUCTURED_NOTIFICATION kernelNotif = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');

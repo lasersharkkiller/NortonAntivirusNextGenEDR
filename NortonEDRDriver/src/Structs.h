@@ -54,6 +54,7 @@
 #define SET_EAT_HOOK_CHECK(notification)     ((notification).EatHookCheck     = 1)
 #define SET_ETW_HOOK_CHECK(notification)           ((notification).EtwHookCheck           = 1)
 #define SET_ALT_SYSCALL_HANDLER_CHECK(notification) ((notification).AltSyscallHandlerCheck = 1)
+#define SET_PESCAN_CHECK(notification)              ((notification).PeScanCheck            = 1)
 
 typedef unsigned short WORD;
 typedef unsigned char BYTE;
@@ -687,7 +688,8 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
             unsigned char EatHookCheck            : 1;
             unsigned char EtwHookCheck            : 1;
             unsigned char AltSyscallHandlerCheck  : 1;
-            unsigned char Reserved                : 2;
+            unsigned char PeScanCheck             : 1;
+            unsigned char Reserved                : 1;
         };
         unsigned char method2;
     };

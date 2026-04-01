@@ -704,6 +704,16 @@ VOID SyscallsUtils::NtProtectVmHandler(
 
 			RtlCopyMemory(buffer, BaseAddress, *NumberOfBytesToProtect);
 
+			// PE scan: check if the region being made executable contains a PE header
+			PeScanner::CheckBufferForPeHeader(
+				buffer,
+				*NumberOfBytesToProtect,
+				BaseAddress,
+				PsGetProcessId(PsGetCurrentProcess()),
+				PsGetProcessImageFileName(PsGetCurrentProcess()),
+				CallbackObjects::GetNotifQueue()
+			);
+
 			RAW_BUFFER rawBuf;
 
 			rawBuf.buffer = (BYTE*)buffer;
@@ -731,6 +741,18 @@ VOID SyscallsUtils::NtWriteVmHandler(
 	if (buffer) {
 
 		RtlCopyMemory(buffer, Buffer, NumberOfBytesToWrite);
+
+		// PE scan: flag cross-process writes that carry a PE header
+		if (ProcessHandle != (HANDLE)-1) {
+			PeScanner::CheckBufferForPeHeader(
+				buffer,
+				NumberOfBytesToWrite,
+				BaseAddress,
+				PsGetProcessId(PsGetCurrentProcess()),
+				PsGetProcessImageFileName(PsGetCurrentProcess()),
+				CallbackObjects::GetNotifQueue()
+			);
+		}
 
 		RAW_BUFFER rawBuf;
 
