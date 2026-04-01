@@ -1,0 +1,51 @@
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+
+# Build outputs
+x64/
+x86/
+**/x64/
+**/x86/
+[Bb]in/
+[Oo]bj/
+**/[Dd]ebug/
+**/[Rr]elease/
+*.obj
+*.pch
+*.pdb
+*.idb
+*.ilk
+*.tlog
+*.lastbuildstate
+*.log
+
+# CMake / Ninja
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+build/
+out/
+
+# vcpkg and local dependency cache
+vcpkg/
+
+# Local tooling artifacts
+tools/pwsh-portable/
+tools/*.zip
+tools/*.msi
+
+# Runtime output
+beotm_events.jsonl
+*.part
+*.tmp
+
+# Windows OS noise
+Thumbs.db
+Desktop.ini
