@@ -126,6 +126,7 @@
     <ClCompile Include="src\HookDetection.cpp" />
     <ClCompile Include="src\PeScan.cpp" />
     <ClCompile Include="src\Controller.cpp" />
+    <ClCompile Include="src\DllInjector.cpp" />
     <ClCompile Include="src\DriverEntry.cpp" />
     <ClCompile Include="src\Objects.cpp" />
     <ClCompile Include="src\Images.cpp" />

@@ -1,6 +1,6 @@
 # NortonAntivirusNextGenEDR
 
-A Windows kernel-mode EDR extended with Sysmon integration, SACL-based auditing, hook detection, and structured detection telemetry for defensive lab environments.
+A Windows kernel-mode EDR featuring kernel-level telemetry, hook detection, process & PE scanning, AMSI bypass detection, user-mode API interception, ETW integration, YARA/Sigma/Capa detection engines, and Sysmon/SACL enrichment — built for defensive lab environments.
 
 ---
 
@@ -90,7 +90,8 @@ All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critic
 - Telemetry reported via named pipe `\\.\pipe\NortonEDR_HookDll` using a tab-delimited line protocol (`SEVERITY\tCALLER_PID\tAPI_NAME\tTARGET_PID\tDETAIL\n`)
 - NortonEDR hosts a multi-client pipe server thread; each client connection is dispatched to a detached thread for concurrent handling
 - `DllMain` calls `InstallHooks`/`RemoveHooks` automatically; exports allow explicit control
-- Inject via any standard technique (manual map, `CreateRemoteThread`+`LoadLibrary`, `AppInit_DLLs`, etc.)
+- **Kernel APC injection** — `DllInjector.cpp` hooks `ImageLoadNotifyRoutine`; on every `ntdll.dll` map the loading thread is used as the APC target (`PsGetCurrentThread()`); path buffer allocated in the target process via `ZwAllocateVirtualMemory(NtCurrentProcess())` while attached; `KeInitializeApc`/`KeInsertQueueApc` queues `LoadLibraryW(hookDllPath)` for user-mode delivery; system processes (`smss`, `csrss`, `wininit`, `lsass`) and NortonEDR itself are excluded
+- **IOCTL `NORTONAV_SET_INJECT_CONFIG`** — at startup NortonEDR sends `LoadLibraryW` VA (valid in all processes — shared DLL section, boot-time ASLR only), HookDll full path, and own PID to the driver; injection activates automatically for all subsequent process creations
 
 ### Sysmon & SACL Integration
 - Sysmon event ingestion for host-based telemetry enrichment
