@@ -96,6 +96,7 @@ const std::string kLoadedPotatoYaraRulesDir = R"(D:\Loaded-Potato\detections\yar
 const std::string kLoadedPotatoLolDriversCachePath = R"(D:\Loaded-Potato\detections\loldrivers\loldrivers_cache.json)";
 const std::string kLoadedPotatoSigmaRulesDir = R"(D:\Loaded-Potato\detections\sigma)";
 const std::string kDefaultEventsLogPath = R"(nortonav_events.jsonl)";
+const std::string kCapaExePath          = "capa.exe"; // must be on PATH or same dir as the binary
 
 enum class DetectionSeverity : int {
     Info = 0,
@@ -233,6 +234,13 @@ static std::mutex                  g_yaraScanMutex;
 static std::condition_variable     g_yaraScanCv;
 static std::atomic<bool>           g_yaraScanStop(false);
 static const size_t                kYaraScanQueueMax = 512;
+
+static std::queue<std::pair<std::string, UINT32>> g_capaQueue;
+static std::mutex                                  g_capaMutex;
+static std::condition_variable                     g_capaCv;
+static std::atomic<bool>                           g_capaStop(false);
+static std::unordered_set<std::string>             g_capaScanned;
+static constexpr size_t                            kCapaQueueMax = 32;
 
 std::string startupAsciiTitle = R"(
 
@@ -2603,6 +2611,152 @@ void YaraScanWorker() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Capa capabilities scanning
+// ---------------------------------------------------------------------------
+
+// Parse the top-level rule names from capa's --json output.
+// Tracks brace depth so only direct children of the "rules" object are returned.
+static std::vector<std::string> ParseCapaRuleNames(const std::string& json) {
+    std::vector<std::string> names;
+
+    size_t rulesPos = json.find("\"rules\":");
+    if (rulesPos == std::string::npos) return names;
+    size_t braceStart = json.find('{', rulesPos + 8);
+    if (braceStart == std::string::npos) return names;
+
+    int    depth    = 0;
+    bool   inString = false;
+    size_t pos      = braceStart;
+
+    while (pos < json.size()) {
+        char c = json[pos];
+
+        if (inString) {
+            if (c == '\\') { pos += 2; continue; }
+            if (c == '"')  inString = false;
+            ++pos; continue;
+        }
+
+        if      (c == '{') { ++depth; ++pos; continue; }
+        else if (c == '}') {
+            if (--depth == 0) break;
+            ++pos; continue;
+        }
+        else if (c == '"') {
+            if (depth == 1) {
+                // Candidate rule-name key at the top level of the rules object
+                size_t nameStart = pos + 1;
+                size_t nameEnd   = json.find('"', nameStart);
+                if (nameEnd == std::string::npos) break;
+                std::string key = json.substr(nameStart, nameEnd - nameStart);
+
+                // Verify it is followed by ': {' (possibly with whitespace)
+                size_t chk = nameEnd + 1;
+                while (chk < json.size() && std::isspace((unsigned char)json[chk])) ++chk;
+                if (chk < json.size() && json[chk] == ':') {
+                    ++chk;
+                    while (chk < json.size() && std::isspace((unsigned char)json[chk])) ++chk;
+                    if (chk < json.size() && json[chk] == '{')
+                        names.push_back(std::move(key));
+                }
+                pos = nameEnd + 1; continue;
+            }
+            inString = true;
+        }
+        ++pos;
+    }
+    return names;
+}
+
+// Run capa on a PE file, parse the JSON output, and surface every matched
+// capability as a High-severity detection event.
+static void RunCapaScan(const std::string& path, UINT32 pid) {
+    std::string cmd = "\"" + kCapaExePath + "\" --json \"" + path + "\"";
+
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength        = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE hRead = INVALID_HANDLE_VALUE, hWrite = INVALID_HANDLE_VALUE;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return;
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si = {};
+    si.cb          = sizeof(si);
+    si.dwFlags     = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.hStdOutput  = hWrite;
+    si.hStdError   = hWrite;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = {};
+    std::vector<char> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back('\0');
+
+    if (!CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr, TRUE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(hRead); CloseHandle(hWrite); return;
+    }
+    CloseHandle(hWrite);
+
+    std::string output;
+    char   buf[4096];
+    DWORD  bytesRead;
+    while (ReadFile(hRead, buf, sizeof(buf) - 1, &bytesRead, nullptr) && bytesRead > 0) {
+        buf[bytesRead] = '\0';
+        output += buf;
+    }
+    CloseHandle(hRead);
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (output.empty()) return;
+
+    std::vector<std::string> caps = ParseCapaRuleNames(output);
+    if (caps.empty()) return;
+
+    std::string baseName = BaseNameLower(path);
+    std::string details  = "File: " + path + "\nCapabilities (" + std::to_string(caps.size()) + "):\n";
+    for (const auto& cap : caps)
+        details += "  - " + cap + "\n";
+
+    PushUiDetectionEvent(
+        "capa: " + std::to_string(caps.size()) + " capabilities in " + baseName,
+        details,
+        "Capa: Capabilities Scan",
+        pid,
+        DetectionSeverity::High
+    );
+}
+
+static void EnqueueCapaScan(const std::string& path, UINT32 pid) {
+    if (path.empty()) return;
+    std::lock_guard<std::mutex> lock(g_capaMutex);
+    if (g_capaScanned.count(path)) return;          // deduplicate
+    if (g_capaQueue.size() >= kCapaQueueMax) return; // drop rather than block
+    g_capaScanned.insert(path);
+    g_capaQueue.push({ path, pid });
+    g_capaCv.notify_one();
+}
+
+void CapaScanWorker() {
+    while (true) {
+        std::pair<std::string, UINT32> work;
+        {
+            std::unique_lock<std::mutex> lock(g_capaMutex);
+            g_capaCv.wait(lock, [] {
+                return !g_capaQueue.empty() || g_capaStop.load();
+            });
+            if (g_capaStop.load() && g_capaQueue.empty()) break;
+            work = std::move(g_capaQueue.front());
+            g_capaQueue.pop();
+        }
+        RunCapaScan(work.first, work.second);
+    }
+}
+
 void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) {
 
     hNortonDevice = CreateFileW(
@@ -2706,6 +2860,7 @@ void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) 
                             }
 
                             EnqueueYaraFileScan(notif, fullPath);
+                            EnqueueCapaScan(fullPath, notifPid);
                         }
                         else {
                             std::vector<std::string> sigmaFields = { std::string(msg), notifProcName };
@@ -2713,6 +2868,18 @@ void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) 
                             NotifySigmaMatches(notifPid, notifProcName, sigmaFields, "generic_notification");
 
                             Notify(notif, msg);
+
+                            // Resolve the process image path and queue a capa scan
+                            if (notifPid > 0) {
+                                HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, notifPid);
+                                if (hProc) {
+                                    char imagePath[MAX_PATH * 4] = {};
+                                    DWORD imgSize = sizeof(imagePath);
+                                    if (QueryFullProcessImageNameA(hProc, 0, imagePath, &imgSize))
+                                        EnqueueCapaScan(std::string(imagePath, imgSize), notifPid);
+                                    CloseHandle(hProc);
+                                }
+                            }
                         }
                     }
                 }
@@ -3760,6 +3927,9 @@ VOID ShowUI() {
     std::thread dnsThread(DnsSubscriberThread);
     std::thread winrmThread(WinRmSubscriberThread);
 
+    g_capaStop = false;
+    std::thread capaWorker(CapaScanWorker);
+
     try {
         screen.Loop(renderer);
     }
@@ -3791,6 +3961,10 @@ VOID ShowUI() {
     // ETW-TI: unblock ProcessTrace then join
     StopEtwTiSession();
     tiThread.join();
+
+    g_capaStop = true;
+    g_capaCv.notify_all();
+    capaWorker.join();
 }
 
 int main(int argc, char* argv[]) {
