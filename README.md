@@ -8,10 +8,11 @@ A Windows kernel-mode EDR extended with Sysmon integration, SACL-based auditing,
 
 ### Kernel-Level Telemetry
 - Kernel callbacks for process/thread creation, image loading, registry operations, and object access
-- System call interception via alternative system call handlers with integrity checking
+- System call interception via alternative system call handlers — active handlers: `NtAllocateVirtualMemory` (RWX), `NtWriteVirtualMemory`, `NtProtectVirtualMemory`, `NtReadVirtualMemory` (cross-process/lsass), `NtWriteFile`, `NtQueueApcThread`, `NtQueueApcThreadEx`, `NtSetContextThread`, `NtResumeThread`, `NtContinue` (private exec region)
 - VAD tree exploitation for image integrity verification
 - Shadow Stack (CET) verification for thread call stack integrity
 - Code injection detection via thread call stack inspection
+- **WFP network callout** — `FwpsCalloutRegister` + `FwpmFilterAdd` on `FWPM_LAYER_OUTBOUND_TRANSPORT_V4`; logs connection tuples and blocks configurable ports
 
 ### Hook Detection
 - **SSDT integrity** — baseline snapshot of `nt!KiServiceTable` taken at driver load; subsequent scans compare live entries against the snapshot and alert on any modified syscall dispatch pointer
@@ -49,6 +50,7 @@ All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critic
 - YARA rule engine with recursive auto-loading from configurable paths
 - Sigma-Lite rule support with full boolean logic (`selection`, `filter`, `1 of`, `all of`, `and`, `or`, `not`) and string operators (`contains`, `contains|all`, `startswith`, `endswith`)
 - LOLDrivers detection via cached JSON database
+- **Capa capabilities scanning** — on every kernel detection event, the flagged PE is submitted to a `capa.exe` worker (deduped by path); matched capabilities surface as High-severity events in the TUI and JSONL telemetry
 - Deterministic severity scoring with live UI security score
 - PID-level short-window correlation alerts across detection methods
 
