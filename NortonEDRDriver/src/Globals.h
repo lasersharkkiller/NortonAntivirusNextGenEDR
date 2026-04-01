@@ -1059,10 +1059,38 @@ public:
 
 };
 
+class HookDetector {
+
+    static PSSDT_BASELINE_ENTRY ssdtBaseline;
+    static ULONG                ssdtBaselineCount;
+    static PVOID                cachedKiServiceTable;
+
+    static UCHAR DetectInlineHookType(PVOID functionAddress);
+    static PVOID ResolveHookTarget(PVOID functionAddress, UCHAR hookType);
+
+public:
+
+    static VOID  Init(BufferQueue* bufQueue);
+    static VOID  Cleanup();
+
+    static VOID  TakeSsdtBaseline(PVOID kiServiceTable, ULONG count);
+    static ULONG CheckSsdtIntegrity(BufferQueue* bufQueue);
+
+    static ULONG    ScanKernelInlineHooks(PFUNCTION_MAP exportsMap, BufferQueue* bufQueue);
+    static ULONG    ScanKernelEatHooks(PVOID moduleBase, BufferQueue* bufQueue);
+    static BOOLEAN  CheckEtwHooks(BufferQueue* bufQueue);
+
+    static VOID RunAllHookChecks(
+        PFUNCTION_MAP exportsMap,
+        PVOID         moduleBase,
+        BufferQueue*  bufQueue
+    );
+};
+
 class CallbackObjects :
 
 	public ThreadUtils,
-	public RegistryUtils, 
+	public RegistryUtils,
 	public ImageUtils,
 	public ObjectUtils
 

@@ -25,6 +25,12 @@
 #define MSR_IA32_PL3_SSP			0x000006A7U
 #define MSR_IA32_LSTAR				0xC0000082U
 
+#define HOOK_TYPE_NONE     0x00
+#define HOOK_TYPE_JMP_NEAR 0x01
+#define HOOK_TYPE_JMP_FAR  0x02
+#define HOOK_TYPE_MOV_JMP  0x03
+#define HOOK_TYPE_PUSH_RET 0x04
+
 #define MAX_SSDT_ENTRIES 4096
 
 #define GDI_HANDLE_BUFFER_SIZE 34
@@ -43,6 +49,10 @@
 #define SET_REG_CHECK(notification) ((notification).RegCheck = 1)
 #define SET_SYSCALL_CHECK(notification) ((notification).SyscallCheck = 1)
 #define SET_SHADOW_STACK_CHECK(notification) ((notification).ShadowStackCheck = 1)
+#define SET_SSDT_HOOK_CHECK(notification)    ((notification).SsdtHookCheck    = 1)
+#define SET_INLINE_HOOK_CHECK(notification)  ((notification).InlineHookCheck  = 1)
+#define SET_EAT_HOOK_CHECK(notification)     ((notification).EatHookCheck     = 1)
+#define SET_ETW_HOOK_CHECK(notification)     ((notification).EtwHookCheck     = 1)
 
 typedef unsigned short WORD;
 typedef unsigned char BYTE;
@@ -671,7 +681,11 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
     union {
         struct {
             unsigned char ShadowStackCheck : 1;
-            unsigned char Reserved : 7; // Align
+            unsigned char SsdtHookCheck    : 1;
+            unsigned char InlineHookCheck  : 1;
+            unsigned char EatHookCheck     : 1;
+            unsigned char EtwHookCheck     : 1;
+            unsigned char Reserved         : 3;
         };
         unsigned char method2;
     };
@@ -713,3 +727,7 @@ struct VAD_RANGE {
     ULONG64 start;
     ULONG64 end;
 };
+
+typedef struct _SSDT_BASELINE_ENTRY {
+    PVOID OriginalAddress;
+} SSDT_BASELINE_ENTRY, *PSSDT_BASELINE_ENTRY;

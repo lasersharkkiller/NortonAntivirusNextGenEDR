@@ -44,6 +44,8 @@ VOID UnloadDriver(PDRIVER_OBJECT DriverObject) {
 
 	g_callbackObjects->unsetNotificationsGlobal();
 
+	HookDetector::Cleanup();
+
 	g_syscallsUtils->DisableAltSyscallFromThreads3();
 
 	g_syscallsUtils->UnInitAltSyscallHandler();
@@ -301,6 +303,16 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	g_callbackObjects->InitBufferQueue(g_bufferQueue);
 
 	g_callbackObjects->setupNotificationsGlobal();
+
+	// Take SSDT baseline snapshot and run full hook scan
+	HookDetector::Init(g_hashQueue);
+
+	SsdtUtils ssdtUtils;
+	PVOID moduleBase = ssdtUtils.GetKernelBaseAddress();
+	if (moduleBase) {
+		FUNCTION_MAP kExports = ssdtUtils.GetAndStoreKernelExports(moduleBase);
+		HookDetector::RunAllHookChecks(&kExports, moduleBase, g_hashQueue);
+	}
 
 	UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\NortonEDR");
 	UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\NortonEDR");
