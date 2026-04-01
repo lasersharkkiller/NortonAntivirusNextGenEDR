@@ -43,8 +43,19 @@ tools/*.msi
 
 # Runtime output
 beotm_events.jsonl
+nortonav_events.jsonl
 *.part
 *.tmp
+*.dmp
+*.mdmp
+
+# Code signing certificates — never commit private keys
+*.pfx
+*.pvk
+*.cer
+
+# Inf2Cat generated catalog files
+*.cat
 
 # Windows OS noise
 Thumbs.db
