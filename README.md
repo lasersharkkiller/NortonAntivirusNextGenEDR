@@ -84,6 +84,12 @@ All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critic
 - **PowerShell script-block logging** — `Microsoft-Windows-PowerShell/Operational` EID 4104; script content routed through Sigma-Lite rule engine
 - **DNS-Client queries** — `Microsoft-Windows-DNS-Client/Operational` EID 3006; query names routed through Sigma for DGA/C2 detection; enables the channel automatically if disabled
 - **WinRM lateral movement** — `Microsoft-Windows-WinRM/Operational` EIDs 6, 8, 91, 132; flags WSMan session creation and HTTP requests as Medium/Low severity
+- **Security log (extended)** — EIDs 4624/4625 (logon/failure with type filter), 4648 (explicit credential logon / pass-the-hash), 4672 (SeDebug/SeTcb privilege assignment), 4688 (process creation with suspicious command-line heuristics), 4697 (service install), 4698/4702 (scheduled task create/update), 4720/4726 (account create/delete), 4732/4733 (admin group membership changes)
+- **Task Scheduler** — `Microsoft-Windows-TaskScheduler/Operational` EIDs 106/129/140/141; surfaces scheduled task registration and execution as persistence indicators
+- **Windows Defender** — `Microsoft-Windows-Windows Defender/Operational` EIDs 1116/1117 (threat detection and action), 5001 (real-time protection disabled — tamper detection, Critical severity)
+- **Print Spooler** — `Microsoft-Windows-PrintSpooler/Operational` EID 316; printer driver installation flagged as High severity (PrintNightmare vector)
+- **RDP logon** — `Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational` EID 1149; successful RDP authentication with source IP surfaced as Medium severity lateral movement indicator
+- **BITS Client** — `Microsoft-Windows-Bits-Client/Operational` EIDs 3/59/60; background transfer job creation and completion flagged for T1197 persistence and exfiltration detection
 
 ### User-Mode API Hook DLL (`HookDll.dll`)
 
