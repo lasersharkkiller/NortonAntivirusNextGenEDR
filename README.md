@@ -18,6 +18,7 @@ A Windows kernel-mode EDR built on top of [BestEdrOfTheMarket v3](https://xacone
 - **Inline hooks** — prologue scan across all ntoskrnl exports detecting `JMP near` (E9), `JMP far` (FF 25), `MOV RAX + JMP RAX` (48 B8 … FF E0), and `PUSH + RET` (68 … C3) trampoline patterns
 - **EAT hooks** — export address table walk of the kernel module; flags any EAT entry whose resolved address falls outside the module's image bounds
 - **ETW hooks** — prologue scan of `EtwWrite`, `EtwWriteEx`, `EtwWriteTransfer`, and `EtwRegister`; detects inline patches used to silence kernel telemetry
+- **Alt syscall handler integrity** — resolves `PspAltSystemCallHandlers` via the same `LEA R14,[RIP+]` scan used at registration; verifies slot 1 still points to the driver's `SyscallHandler` and alerts if it has been nulled out or replaced
 
 All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critical, the hooked address, hook type, and resolved trampoline target into the driver's notification queue.
 

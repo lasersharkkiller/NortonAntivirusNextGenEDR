@@ -1079,6 +1079,7 @@ public:
     static ULONG    ScanKernelInlineHooks(PFUNCTION_MAP exportsMap, BufferQueue* bufQueue);
     static ULONG    ScanKernelEatHooks(PVOID moduleBase, BufferQueue* bufQueue);
     static BOOLEAN  CheckEtwHooks(BufferQueue* bufQueue);
+    static VOID     CheckAltSyscallHandlerIntegrity(BufferQueue* bufQueue);
 
     static VOID RunAllHookChecks(
         PFUNCTION_MAP exportsMap,

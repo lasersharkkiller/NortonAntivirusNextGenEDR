@@ -360,6 +360,88 @@ BOOLEAN HookDetector::CheckEtwHooks(BufferQueue* bufQueue) {
 }
 
 // ---------------------------------------------------------------------------
+// CheckAltSyscallHandlerIntegrity — verify that PspAltSystemCallHandlers[1]
+// still points to SyscallsUtils::SyscallHandler and has not been nulled out
+// or replaced by a third-party routine.
+//
+// Uses the same LeakPspAltSystemCallHandlers scan as InitAltSyscallHandler:
+//   resolve PsRegisterAltSystemCallHandler -> scan for LEA R14,[RIP+] ->
+//   read handlers[1].
+// ---------------------------------------------------------------------------
+
+static ULONGLONG FindPspAltSyscallHandlers(ULONGLONG rOffset) {
+
+    for (int i = 0; i < 0x100; i++) {
+        __try {
+            UINT8 sig[] = { 0x4C, 0x8D, 0x35 };
+            ULONGLONG opcodes = *(PULONGLONG)rOffset;
+
+            if (starts_with_signature((ULONGLONG)&opcodes, sig, sizeof(sig))) {
+                ULONGLONG correctOffset = ((*(PLONGLONG)(rOffset)) >> 24 & 0x0000FFFFFF);
+                return rOffset + 7 + correctOffset;
+            }
+            rOffset += 2;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+VOID HookDetector::CheckAltSyscallHandlerIntegrity(BufferQueue* bufQueue) {
+
+    UNICODE_STRING name;
+    RtlInitUnicodeString(&name, L"PsRegisterAltSystemCallHandler");
+    PVOID psRegAlt = MmGetSystemRoutineAddress(&name);
+
+    if (!psRegAlt || !MmIsAddressValid(psRegAlt)) {
+        DbgPrint("[-] HookDetector: PsRegisterAltSystemCallHandler not found\n");
+        return;
+    }
+
+    LONGLONG* handlers = (LONGLONG*)FindPspAltSyscallHandlers((ULONGLONG)psRegAlt);
+
+    if (!handlers || !MmIsAddressValid(handlers)) {
+        DbgPrint("[-] HookDetector: PspAltSystemCallHandlers not found\n");
+        return;
+    }
+
+    LONGLONG current  = handlers[1];
+    LONGLONG expected = (LONGLONG)SyscallsUtils::SyscallHandler;
+
+    if (current == 0) {
+
+        DbgPrint("[!] AltSyscallHandler: slot 1 is NULL — handler was removed\n");
+
+        char msg[64];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "AltSyscallHandler[1] NULL (removed)");
+
+        KERNEL_STRUCTURED_NOTIFICATION tmp = {};
+        SET_ALT_SYSCALL_HANDLER_CHECK(tmp);
+        EnqueueHookNotif(bufQueue, (ULONG64)handlers, tmp.method2, msg);
+
+    } else if (current != expected) {
+
+        DbgPrint("[!] AltSyscallHandler: slot 1 tampered — expected=%p got=%p\n",
+            (PVOID)expected, (PVOID)current);
+
+        char msg[64];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "AltSyscallHandler[1] tampered %p->%p",
+            (PVOID)expected, (PVOID)current);
+
+        KERNEL_STRUCTURED_NOTIFICATION tmp = {};
+        SET_ALT_SYSCALL_HANDLER_CHECK(tmp);
+        EnqueueHookNotif(bufQueue, (ULONG64)current, tmp.method2, msg);
+
+    } else {
+        DbgPrint("[+] AltSyscallHandler: integrity OK (%p)\n", (PVOID)current);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RunAllHookChecks — run all four detection routines in sequence.
 // Call after driver init is complete.
 // ---------------------------------------------------------------------------
@@ -375,6 +457,7 @@ VOID HookDetector::RunAllHookChecks(
     ULONG inl    = ScanKernelInlineHooks(exportsMap, bufQueue);
     ULONG eat    = ScanKernelEatHooks(moduleBase, bufQueue);
     BOOLEAN etw  = CheckEtwHooks(bufQueue);
+    CheckAltSyscallHandlerIntegrity(bufQueue);
 
     DbgPrint("[*] HookDetector results — SSDT=%lu Inline=%lu EAT=%lu ETW=%d\n",
         ssdt, inl, eat, (int)etw);

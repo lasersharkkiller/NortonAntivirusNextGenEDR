@@ -52,7 +52,8 @@
 #define SET_SSDT_HOOK_CHECK(notification)    ((notification).SsdtHookCheck    = 1)
 #define SET_INLINE_HOOK_CHECK(notification)  ((notification).InlineHookCheck  = 1)
 #define SET_EAT_HOOK_CHECK(notification)     ((notification).EatHookCheck     = 1)
-#define SET_ETW_HOOK_CHECK(notification)     ((notification).EtwHookCheck     = 1)
+#define SET_ETW_HOOK_CHECK(notification)           ((notification).EtwHookCheck           = 1)
+#define SET_ALT_SYSCALL_HANDLER_CHECK(notification) ((notification).AltSyscallHandlerCheck = 1)
 
 typedef unsigned short WORD;
 typedef unsigned char BYTE;
@@ -680,12 +681,13 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
 
     union {
         struct {
-            unsigned char ShadowStackCheck : 1;
-            unsigned char SsdtHookCheck    : 1;
-            unsigned char InlineHookCheck  : 1;
-            unsigned char EatHookCheck     : 1;
-            unsigned char EtwHookCheck     : 1;
-            unsigned char Reserved         : 3;
+            unsigned char ShadowStackCheck        : 1;
+            unsigned char SsdtHookCheck           : 1;
+            unsigned char InlineHookCheck         : 1;
+            unsigned char EatHookCheck            : 1;
+            unsigned char EtwHookCheck            : 1;
+            unsigned char AltSyscallHandlerCheck  : 1;
+            unsigned char Reserved                : 2;
         };
         unsigned char method2;
     };
