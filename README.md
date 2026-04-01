@@ -103,6 +103,14 @@ All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critic
 - Trace targeting (`--trace`) with optional child-process inheritance (`--trace-children`)
 - Local REST API on `127.0.0.1` — endpoints: `/api/stats`, `/api/events`, `/api/processes`, `/api/reset`
 
+### Elasticsearch Forwarding
+- Background shipper thread batches detection events and POSTs to an Elasticsearch `/_bulk` endpoint via WinHTTP
+- Events emitted as **ECS (Elastic Common Schema)** documents — `@timestamp`, `agent.name`, `host.name`, `event.kind/category/severity/action`, `process.pid`, `rule.name`, `message`, `nortonav.method`, `nortonav.details`
+- Severity mapped to ECS numeric scale: Critical=100, High=75, Medium=50, Low=25, Info=10
+- Configurable batch size (50 events) and flush interval (5 s); queue capped at 1 000 events
+- Supports **API key** auth (`--elastic-api-key`) or **HTTP Basic** auth (`--elastic-user` / `--elastic-pass`); optional TLS verification skip (`--elastic-no-verify`) for self-signed certs
+- Default index: `nortonav-edr`; enabled via `--elastic-host https://host:9200`
+
 ---
 
 ## Requirements

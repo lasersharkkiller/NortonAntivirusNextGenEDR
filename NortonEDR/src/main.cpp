@@ -21,9 +21,11 @@
 #include <evntrace.h>
 #include <evntcons.h>
 #include <wincrypt.h>
+#include <winhttp.h>
 
 #pragma comment(lib, "sechost.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "winhttp.lib")
 
 using namespace ftxui;
 using namespace std;
@@ -260,6 +262,30 @@ static constexpr size_t                            kCapaQueueMax = 32;
 // ---------------------------------------------------------------------------
 static std::atomic<bool> g_hookPipeStop(false);
 static constexpr const char* kHookPipeName = "\\\\.\\pipe\\NortonEDR_HookDll";
+
+// ---------------------------------------------------------------------------
+// Elasticsearch shipper
+// Events are enqueued from PushUiDetectionEvent and flushed in batches by
+// ElasticShipperThread via WinHTTP POST to /<index>/_bulk.
+// ---------------------------------------------------------------------------
+struct ElasticConfig {
+    std::string host;       // e.g. "https://localhost:9200"
+    std::string index;      // e.g. "nortonav-events"
+    std::string apiKey;     // base64 API key (Authorization: ApiKey <key>)
+    std::string username;   // for Basic auth (alternative to apiKey)
+    std::string password;
+    bool        enabled   = false;
+    bool        tlsVerify = true;   // set false with --elastic-no-verify
+};
+static ElasticConfig           g_elasticConfig;
+static std::queue<std::string> g_elasticQueue;   // ECS JSON documents (one per event)
+static std::mutex              g_elasticMutex;
+static std::condition_variable g_elasticCv;
+static std::atomic<bool>       g_elasticStop(false);
+static constexpr size_t        kElasticQueueMax  = 1000;
+static constexpr size_t        kElasticBatchSize = 50;
+static constexpr int           kElasticFlushMs   = 5000;
+static std::string             g_hostname;        // cached at startup
 
 std::string startupAsciiTitle = R"(
 
@@ -1895,6 +1921,16 @@ void PushUiDetectionEvent(
     }
 
     PersistDetectionEvent(timestamp, severity, pid, method, message, enrichedDetails, securityScore);
+
+    if (g_elasticConfig.enabled) {
+        std::string doc = BuildEcsDocument(SeverityToLabel(severity), pid, method, message, enrichedDetails);
+        {
+            std::lock_guard<std::mutex> eLock(g_elasticMutex);
+            if (g_elasticQueue.size() < kElasticQueueMax)
+                g_elasticQueue.push(std::move(doc));
+        }
+        g_elasticCv.notify_one();
+    }
 
     if (emitCorrelationAlert) {
         PushUiDetectionEvent(
@@ -4016,6 +4052,239 @@ static DWORD WINAPI WinRmEventCallback(
     return ERROR_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------
+// Elasticsearch helpers
+// ---------------------------------------------------------------------------
+
+static std::string GetIso8601Timestamp() {
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    char buf[32];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+        "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    return buf;
+}
+
+static std::string JsonEscapeStr(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:
+            if (c >= 0x20) out += (char)c;
+        }
+    }
+    return out;
+}
+
+static std::string Base64Encode(const std::string& input) {
+    DWORD outLen = 0;
+    CryptBinaryToStringA(
+        (const BYTE*)input.data(), (DWORD)input.size(),
+        CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &outLen);
+    std::string out(outLen, '\0');
+    CryptBinaryToStringA(
+        (const BYTE*)input.data(), (DWORD)input.size(),
+        CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &out[0], &outLen);
+    while (!out.empty() && out.back() == '\0') out.pop_back();
+    return out;
+}
+
+// Map severity label to ECS numeric severity (higher = more severe)
+static int SeverityToEcsInt(const std::string& label) {
+    if (label == "critical") return 100;
+    if (label == "high")     return 75;
+    if (label == "medium")   return 50;
+    if (label == "low")      return 25;
+    return 10; // info
+}
+
+// Build a single ECS-aligned JSON document for the bulk body (no newline appended).
+static std::string BuildEcsDocument(
+    const std::string& severity,
+    UINT32 pid,
+    const std::string& method,
+    const std::string& summary,
+    const std::string& details)
+{
+    std::string det = details.size() > 512 ? details.substr(0, 512) + "..." : details;
+
+    std::string doc = "{";
+    doc += "\"@timestamp\":\"" + GetIso8601Timestamp() + "\",";
+    doc += "\"agent\":{\"name\":\"NortonEDR\",\"type\":\"endpoint\"},";
+    doc += "\"host\":{\"name\":\"" + JsonEscapeStr(g_hostname) + "\"},";
+    doc += "\"event\":{";
+    doc +=   "\"kind\":\"alert\",";
+    doc +=   "\"category\":[\"intrusion_detection\"],";
+    doc +=   "\"type\":[\"info\"],";
+    doc +=   "\"severity\":" + std::to_string(SeverityToEcsInt(severity)) + ",";
+    doc +=   "\"action\":\"" + JsonEscapeStr(method) + "\"";
+    doc += "},";
+    doc += "\"process\":{\"pid\":" + std::to_string(pid) + "},";
+    doc += "\"rule\":{\"name\":\"" + JsonEscapeStr(summary) + "\"},";
+    doc += "\"message\":\"" + JsonEscapeStr(summary) + "\",";
+    doc += "\"nortonav\":{";
+    doc +=   "\"details\":\"" + JsonEscapeStr(det) + "\",";
+    doc +=   "\"severity_label\":\"" + severity + "\"";
+    doc += "}";
+    doc += "}";
+    return doc;
+}
+
+static bool ParseElasticUrl(
+    const std::string& url,
+    bool& outHttps,
+    std::wstring& outHost,
+    INTERNET_PORT& outPort,
+    std::wstring& outPathPrefix)
+{
+    std::string rest;
+    if (url.rfind("https://", 0) == 0) { outHttps = true;  rest = url.substr(8); }
+    else if (url.rfind("http://", 0) == 0) { outHttps = false; rest = url.substr(7); }
+    else return false;
+
+    size_t pathPos = rest.find('/');
+    std::string hostPort = (pathPos != std::string::npos) ? rest.substr(0, pathPos) : rest;
+    outPathPrefix = (pathPos != std::string::npos)
+        ? std::wstring(rest.begin() + (int)pathPos, rest.end())
+        : L"";
+
+    size_t colon = hostPort.rfind(':');
+    if (colon != std::string::npos) {
+        outHost = std::wstring(hostPort.begin(), hostPort.begin() + (int)colon);
+        outPort = (INTERNET_PORT)std::stoi(hostPort.substr(colon + 1));
+    } else {
+        outHost = std::wstring(hostPort.begin(), hostPort.end());
+        outPort = outHttps ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT;
+    }
+    return !outHost.empty();
+}
+
+static void ShipBatch(const std::vector<std::string>& docs) {
+    if (!g_elasticConfig.enabled || docs.empty()) return;
+
+    // Build NDJSON body: action + document per event
+    std::string body;
+    body.reserve(docs.size() * 512);
+    for (const auto& doc : docs) {
+        body += "{\"index\":{}}\n";
+        body += doc;
+        body += "\n";
+    }
+
+    bool isHttps = true;
+    std::wstring host, pathPrefix;
+    INTERNET_PORT port = 9200;
+    if (!ParseElasticUrl(g_elasticConfig.host, isHttps, host, port, pathPrefix)) {
+        std::cerr << "[Elastic] Invalid host URL: " << g_elasticConfig.host << "\n";
+        return;
+    }
+
+    std::wstring indexW(g_elasticConfig.index.begin(), g_elasticConfig.index.end());
+    std::wstring bulkPath = pathPrefix + L"/" + indexW + L"/_bulk";
+
+    HINTERNET hSession = WinHttpOpen(L"NortonEDR/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return;
+
+    DWORD timeout = 5000;
+    WinHttpSetOption(hSession, WINHTTP_OPTION_CONNECT_TIMEOUT,  &timeout, sizeof(timeout));
+    WinHttpSetOption(hSession, WINHTTP_OPTION_SEND_TIMEOUT,     &timeout, sizeof(timeout));
+    WinHttpSetOption(hSession, WINHTTP_OPTION_RECEIVE_TIMEOUT,  &timeout, sizeof(timeout));
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", bulkPath.c_str(),
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        isHttps ? WINHTTP_FLAG_SECURE : 0);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    if (isHttps && !g_elasticConfig.tlsVerify) {
+        DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA       |
+                         SECURITY_FLAG_IGNORE_CERT_CN_INVALID  |
+                         SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+    }
+
+    // Authorization header
+    std::wstring headers = L"Content-Type: application/x-ndjson\r\n";
+    if (!g_elasticConfig.apiKey.empty()) {
+        std::wstring keyW(g_elasticConfig.apiKey.begin(), g_elasticConfig.apiKey.end());
+        headers += L"Authorization: ApiKey " + keyW + L"\r\n";
+    } else if (!g_elasticConfig.username.empty()) {
+        std::string b64 = Base64Encode(g_elasticConfig.username + ":" + g_elasticConfig.password);
+        headers += L"Authorization: Basic " +
+                   std::wstring(b64.begin(), b64.end()) + L"\r\n";
+    }
+    WinHttpAddRequestHeaders(hRequest, headers.c_str(), (DWORD)headers.size(),
+                             WINHTTP_ADDREQ_FLAG_ADD);
+
+    BOOL ok = WinHttpSendRequest(hRequest,
+        WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        (LPVOID)body.c_str(), (DWORD)body.size(), (DWORD)body.size(), 0);
+    if (ok) ok = WinHttpReceiveResponse(hRequest, nullptr);
+
+    if (ok) {
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+        if (status < 200 || status >= 300)
+            std::cerr << "[Elastic] Bulk POST HTTP " << status
+                      << " — " << docs.size() << " event(s) dropped\n";
+    } else {
+        std::cerr << "[Elastic] WinHTTP failed (err=" << GetLastError()
+                  << ") — " << docs.size() << " event(s) dropped\n";
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+}
+
+static void ElasticShipperThread() {
+    while (!g_elasticStop.load()) {
+        std::vector<std::string> batch;
+        {
+            std::unique_lock<std::mutex> lock(g_elasticMutex);
+            g_elasticCv.wait_for(lock,
+                std::chrono::milliseconds(kElasticFlushMs),
+                [&] {
+                    return g_elasticStop.load() ||
+                           g_elasticQueue.size() >= kElasticBatchSize;
+                });
+            while (!g_elasticQueue.empty() && batch.size() < kElasticBatchSize) {
+                batch.push_back(std::move(g_elasticQueue.front()));
+                g_elasticQueue.pop();
+            }
+        }
+        if (!batch.empty()) ShipBatch(batch);
+    }
+    // Flush remaining events on shutdown
+    std::vector<std::string> tail;
+    {
+        std::lock_guard<std::mutex> lock(g_elasticMutex);
+        while (!g_elasticQueue.empty()) {
+            tail.push_back(std::move(g_elasticQueue.front()));
+            g_elasticQueue.pop();
+        }
+    }
+    if (!tail.empty()) ShipBatch(tail);
+}
+
 static DetectionSeverity SeverityFromLabel(const char* s) {
     if (!s) return DetectionSeverity::Info;
     if (_stricmp(s, "critical") == 0) return DetectionSeverity::Critical;
@@ -4257,6 +4526,9 @@ VOID ShowUI() {
     g_hookPipeStop = false;
     std::thread hookPipeThread(HookPipeServerThread);
 
+    g_elasticStop = false;
+    std::thread elasticThread(ElasticShipperThread);
+
     try {
         screen.Loop(renderer);
     }
@@ -4299,6 +4571,10 @@ VOID ShowUI() {
                                OPEN_EXISTING, 0, nullptr);
     if (dummy != INVALID_HANDLE_VALUE) CloseHandle(dummy);
     hookPipeThread.join();
+
+    g_elasticStop = true;
+    g_elasticCv.notify_all();
+    elasticThread.join();
 }
 
 int main(int argc, char* argv[]) {
@@ -4385,6 +4661,63 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (arg == "--elastic-host") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --elastic-host\n"; return 1; }
+            g_elasticConfig.host    = argv[++i];
+            g_elasticConfig.enabled = true;
+            continue;
+        }
+        if (arg.rfind("--elastic-host=", 0) == 0) {
+            g_elasticConfig.host    = arg.substr(15);
+            g_elasticConfig.enabled = true;
+            continue;
+        }
+
+        if (arg == "--elastic-index") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --elastic-index\n"; return 1; }
+            g_elasticConfig.index = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--elastic-index=", 0) == 0) {
+            g_elasticConfig.index = arg.substr(16);
+            continue;
+        }
+
+        if (arg == "--elastic-api-key") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --elastic-api-key\n"; return 1; }
+            g_elasticConfig.apiKey = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--elastic-api-key=", 0) == 0) {
+            g_elasticConfig.apiKey = arg.substr(18);
+            continue;
+        }
+
+        if (arg == "--elastic-user") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --elastic-user\n"; return 1; }
+            g_elasticConfig.username = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--elastic-user=", 0) == 0) {
+            g_elasticConfig.username = arg.substr(15);
+            continue;
+        }
+
+        if (arg == "--elastic-pass") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --elastic-pass\n"; return 1; }
+            g_elasticConfig.password = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--elastic-pass=", 0) == 0) {
+            g_elasticConfig.password = arg.substr(15);
+            continue;
+        }
+
+        if (arg == "--elastic-no-verify") {
+            g_elasticConfig.tlsVerify = false;
+            continue;
+        }
+
         positionalArgs.push_back(arg);
     }
 
@@ -4397,10 +4730,30 @@ int main(int argc, char* argv[]) {
         g_apiEventLimit = 1;
     }
 
+    if (g_elasticConfig.enabled && g_elasticConfig.index.empty()) {
+        g_elasticConfig.index = "nortonav-edr";
+    }
+
+    {
+        WCHAR buf[MAX_COMPUTERNAME_LENGTH + 1] = {};
+        DWORD sz = MAX_COMPUTERNAME_LENGTH + 1;
+        if (GetComputerNameW(buf, &sz)) {
+            int needed = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
+            if (needed > 0) {
+                g_hostname.resize(needed - 1);
+                WideCharToMultiByte(CP_UTF8, 0, buf, -1, &g_hostname[0], needed, nullptr, nullptr);
+            }
+        }
+        if (g_hostname.empty()) g_hostname = "unknown";
+    }
+
     if (positionalArgs.empty()) {
         std::cerr << "Usage: " << argv[0]
             << " <path to driver> [path to YARA rules directory] [path to LOLDrivers cache] [path to Sigma rules directory]"
-            << " [--trace <proc1,proc2>] [--trace-children] [--api-port <port>] [--api-events-limit <n>]\n";
+            << " [--trace <proc1,proc2>] [--trace-children] [--api-port <port>] [--api-events-limit <n>]"
+            << " [--elastic-host <https://host:port>] [--elastic-index <index>]"
+            << " [--elastic-api-key <key> | --elastic-user <u> --elastic-pass <p>]"
+            << " [--elastic-no-verify]\n";
         return 1;
     }
 
