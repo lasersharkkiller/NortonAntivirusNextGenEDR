@@ -4,6 +4,7 @@
 #include <tlhelp32.h>
 
 #include "Utils.h"
+#include "ComplianceEngine.h"
 
 #pragma comment(lib, "ftxui-component.lib")
 #pragma comment(lib, "ftxui-dom.lib")
@@ -5201,6 +5202,8 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> traceTargetRawValues;
     std::string              blockPortsRaw;
     bool includeTraceChildren = false;
+    std::string              complianceArg;   // --compliance <standard>
+    bool                     hardenMode = false; // --harden (skip interactive prompt)
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -5345,6 +5348,21 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (arg == "--compliance") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --compliance\n"; return 1; }
+            complianceArg = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--compliance=", 0) == 0) {
+            complianceArg = arg.substr(13);
+            continue;
+        }
+
+        if (arg == "--harden") {
+            hardenMode = true;
+            continue;
+        }
+
         positionalArgs.push_back(arg);
     }
 
@@ -5374,6 +5392,21 @@ int main(int argc, char* argv[]) {
         if (g_hostname.empty()) g_hostname = "unknown";
     }
 
+    // ------------------------------------------------------------------
+    // Compliance evaluation mode — runs standalone, no driver required.
+    // Usage: NortonEDR.exe --compliance <standard> [--harden]
+    //   standards: nist800-53  nist800-171  cis-l1  cis-l2  cmmc-l1  cmmc-l2
+    // ------------------------------------------------------------------
+    if (!complianceArg.empty()) {
+        ComplianceStandard std;
+        if (!ComplianceEngine::ParseStandard(complianceArg, std)) {
+            std::cerr << "Unknown compliance standard: \"" << complianceArg << "\"\n"
+                      << "Valid values: nist800-53  nist800-171  cis-l1  cis-l2  cmmc-l1  cmmc-l2\n";
+            return 1;
+        }
+        return ComplianceEngine::RunEvaluation(std, hardenMode);
+    }
+
     if (positionalArgs.empty()) {
         std::cerr << "Usage: " << argv[0]
             << " <path to driver> [path to YARA rules directory] [path to LOLDrivers cache] [path to Sigma rules directory]"
@@ -5381,7 +5414,8 @@ int main(int argc, char* argv[]) {
             << " [--elastic-host <https://host:port>] [--elastic-index <index>]"
             << " [--elastic-api-key <key> | --elastic-user <u> --elastic-pass <p>]"
             << " [--elastic-no-verify]"
-            << " [--block-ports <port1,port2,...>]\n";
+            << " [--block-ports <port1,port2,...>]"
+            << " [--compliance <standard>] [--harden]\n";
         return 1;
     }
 
