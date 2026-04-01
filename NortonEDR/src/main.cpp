@@ -1,4 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <tlhelp32.h>
@@ -23,6 +24,7 @@
 #include <evntcons.h>
 #include <wincrypt.h>
 #include <winhttp.h>
+#include <winioctl.h>
 
 #pragma comment(lib, "sechost.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -88,7 +90,7 @@ int tab_1_selected = 0;
 
 MenuOption g_detectionMenuOption = [] {
     MenuOption opt;
-    opt.transform = [](const EntryState& state) -> Element {
+    opt.entries_option.transform = [](const EntryState& state) -> Element {
         Color itemColor = Color::Default;
         if (state.index < static_cast<int>(g_eventSeverityLabels.size())) {
             const std::string& sev = g_eventSeverityLabels[state.index];
@@ -151,8 +153,21 @@ std::unordered_map<UINT32, time_t> g_lastCorrelationAlertByPid;
 std::array<int, 5> g_severityCounters = { 0, 0, 0, 0, 0 };
 std::vector<SigmaLiteRule> g_sigmaRules;
 std::unordered_set<std::string> g_sigmaMatchDedup;
+struct DetectionEvent {
+    std::string timestamp;
+    std::string severity;
+    UINT32 pid;
+    std::string method;
+    std::string summary;
+    std::string details;
+};
+
 std::vector<DetectionEvent> g_detectionEvents; // structured store for API consumers
 std::mutex events_log_mutex;
+
+// Forward declarations
+static std::string BuildEcsDocument(const std::string& severity, UINT32 pid,
+    const std::string& method, const std::string& summary, const std::string& details);
 
 // ---------------------------------------------------------------------------
 // Sysmon event subscription
@@ -250,15 +265,6 @@ struct ProcessSnapshotData {
     std::string processName;
     std::string imagePath;
     std::string commandLine;
-};
-
-struct DetectionEvent {
-    std::string timestamp;
-    std::string severity;
-    UINT32 pid;
-    std::string method;
-    std::string summary;
-    std::string details;
 };
 
 TraceRuntimeConfig g_traceConfig;
@@ -448,6 +454,38 @@ static std::string XmlElementValue(const std::wstring& xml, const std::wstring& 
     if (end == std::wstring::npos) return "";
     std::wstring wval = xml.substr(pos, end - pos);
     return std::string(wval.begin(), wval.end());
+}
+
+// Render event XML and return as narrow string (lossy for non-ASCII, acceptable for field parsing).
+static std::string RenderEventXmlStr(EVT_HANDLE hEvent) {
+    LPWSTR buf = RenderEventXml(hEvent);
+    if (!buf) return {};
+    std::wstring ws(buf);
+    free(buf);
+    return std::string(ws.begin(), ws.end());
+}
+
+// Extract a named field from narrow event XML — tries Data Name='X' and <X> element formats.
+static std::string GetXmlField(const std::string& xml, const std::string& fieldName) {
+    std::string prefix = "Name='" + fieldName + "'>";
+    auto pos = xml.find(prefix);
+    if (pos == std::string::npos) {
+        prefix = "Name=\"" + fieldName + "\">";
+        pos = xml.find(prefix);
+    }
+    if (pos != std::string::npos) {
+        pos += prefix.size();
+        auto end = xml.find('<', pos);
+        if (end != std::string::npos) return xml.substr(pos, end - pos);
+    }
+    std::string open = "<" + fieldName + ">";
+    pos = xml.find(open);
+    if (pos != std::string::npos) {
+        pos += open.size();
+        auto end = xml.find("</" + fieldName + ">", pos);
+        if (end != std::string::npos) return xml.substr(pos, end - pos);
+    }
+    return {};
 }
 
 // Enable a named privilege in the current process token.
@@ -1204,7 +1242,7 @@ void RunLocalApiServer() {
     serviceAddr.sin_port = htons(static_cast<u_short>(g_apiPort));
     inet_pton(AF_INET, "127.0.0.1", &serviceAddr.sin_addr);
 
-    if (bind(listenSocket, reinterpret_cast<SOCKADDR*>(&serviceAddr), sizeof(serviceAddr)) == SOCKET_ERROR) {
+    if (::bind(listenSocket, reinterpret_cast<SOCKADDR*>(&serviceAddr), sizeof(serviceAddr)) == SOCKET_ERROR) {
         std::cerr << "[*] API: bind failed on 127.0.0.1:" << g_apiPort << "\n";
         closesocket(listenSocket);
         WSACleanup();
@@ -2251,7 +2289,7 @@ void NotifyLolDriverMatch(PKERNEL_STRUCTURED_NOTIFICATION notif, const std::stri
     detectedLolDriverPaths.insert(normalizedPath);
 
     const std::string date_time_str = BuildTimestamp();
-    const UINT32 pid = static_cast<UINT32>(notif->pid);
+    const UINT32 pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(notif->pid));
     const std::string procName = SafeFixedBufferString(notif->procName, sizeof(notif->procName));
 
     std::string matchType = nameMatch && hashMatch ? "name+hash"
@@ -2293,8 +2331,8 @@ bool LoadLolDriversCache(const std::string& cachePath) {
         std::istreambuf_iterator<char>()
     );
 
-    std::regex fileNameRegex(R"("n"\s*:\s*"([^"]+)")");
-    std::regex hashRegex(R"("sha256"\s*:\s*"([0-9a-fA-F]{64})")");
+    std::regex fileNameRegex(R"re("n"\s*:\s*"([^"]+)")re");
+    std::regex hashRegex(R"re("sha256"\s*:\s*"([0-9a-fA-F]{64})")re");
 
     size_t beforeNames  = lolDriverNames.size();
     size_t beforeHashes = lolDriverHashes.size();
@@ -2330,7 +2368,7 @@ int yr_callback_function_file(
 {
     if (message == CALLBACK_MSG_RULE_MATCHING) {
         KERNEL_STRUCTURED_NOTIFICATION* notif = (PKERNEL_STRUCTURED_NOTIFICATION)user_data;
-        UINT32 pid = (UINT32)notif->pid;
+        UINT32 pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(notif->pid));
         std::string procName = SafeFixedBufferString(notif->procName, sizeof(notif->procName));
 
         if (!ShouldHandlePidEvent(pid, procName)) {
@@ -2504,7 +2542,7 @@ int Notify(PKERNEL_STRUCTURED_NOTIFICATION notif, char* msg) {
     char date_time[80];
     strftime(date_time, sizeof(date_time), "%Y-%m-%d %H:%M:%S", &timeinfo);
 
-    UINT32 pid = (UINT32)notif->pid;
+    UINT32 pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(notif->pid));
     std::string procName = SafeFixedBufferString(notif->procName, sizeof(notif->procName));
     std::string targetProcName = SafeFixedBufferString(notif->targetProcName, sizeof(notif->targetProcName));
 
@@ -3124,7 +3162,7 @@ void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) 
                     char* msg = (char*)(buffer + sizeof(KERNEL_STRUCTURED_NOTIFICATION));
 
                     if (msg != NULL) {
-                        UINT32 notifPid = static_cast<UINT32>(notif->pid);
+                        UINT32 notifPid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(notif->pid));
                         std::string notifProcName = SafeFixedBufferString(notif->procName, sizeof(notif->procName));
                         if (!ShouldHandlePidEvent(notifPid, notifProcName)) {
                             continue;
@@ -3456,7 +3494,7 @@ static DWORD WINAPI SysmonEventCallback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
         DetectionSeverity sev = (isUnsigned && fromTemp) ?
             DetectionSeverity::High : DetectionSeverity::Medium;
         std::string reason = isUnsigned ? "unsigned" : "";
-        if (fromTemp) reason += (reason.empty() ? "" : " + ") + "loaded from user-writable path";
+        if (fromTemp) reason += std::string(reason.empty() ? "" : " + ") + "loaded from user-writable path";
 
         std::string ts  = BuildTimestamp();
         std::string dll = loaded.substr(loaded.rfind('\\') + 1);
@@ -3526,14 +3564,6 @@ static DWORD WINAPI SysmonEventCallback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
 }
 
 static void SysmonSubscriberThread() {
-    EVT_HANDLE hCh = EvtOpenChannelConfigW(nullptr,
-        L"Microsoft-Windows-Sysmon/Operational", 0);
-    if (!hCh) {
-        std::cerr << "[Sysmon] Channel not available (is Sysmon installed?)\n";
-        return;
-    }
-    EvtClose(hCh);
-
     g_sysmonSubscription = EvtSubscribe(
         nullptr, nullptr,
         L"Microsoft-Windows-Sysmon/Operational",
@@ -3938,7 +3968,7 @@ static DWORD WINAPI PowerShellEventCallback(
 {
     if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
 
-    std::string xml = RenderEventXml(hEvent);
+    std::string xml = RenderEventXmlStr(hEvent);
     if (xml.empty()) return ERROR_SUCCESS;
 
     std::string scriptBlock = GetXmlField(xml, "ScriptBlockText");
@@ -4009,7 +4039,7 @@ static DWORD WINAPI DnsEventCallback(
 {
     if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
 
-    std::string xml = RenderEventXml(hEvent);
+    std::string xml = RenderEventXmlStr(hEvent);
     if (xml.empty()) return ERROR_SUCCESS;
 
     std::string queryName = GetXmlField(xml, "QueryName");
@@ -4030,18 +4060,6 @@ static DWORD WINAPI DnsEventCallback(
 }
 
 static void DnsSubscriberThread() {
-    // Enable the DNS-Client operational channel (disabled by default)
-    EVT_HANDLE hCh = EvtOpenChannelConfigW(
-        nullptr, L"Microsoft-Windows-DNS-Client/Operational", 0);
-    if (hCh) {
-        EVT_VARIANT v{};
-        v.BooleanVal = TRUE;
-        v.Type       = EvtVarTypeBoolean;
-        EvtSetChannelConfigProperty(hCh, EvtChannelConfigEnabled, 0, &v);
-        EvtSaveChannelConfig(hCh, 0);
-        EvtClose(hCh);
-    }
-
     g_dnsSubscription = EvtSubscribe(
         nullptr, nullptr,
         L"Microsoft-Windows-DNS-Client/Operational",
@@ -4073,7 +4091,7 @@ static DWORD WINAPI WinRmEventCallback(
 {
     if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
 
-    std::string xml = RenderEventXml(hEvent);
+    std::string xml = RenderEventXmlStr(hEvent);
     if (xml.empty()) return ERROR_SUCCESS;
 
     std::string eidStr = GetXmlField(xml, "EventID");
@@ -4489,7 +4507,7 @@ static DWORD WINAPI SecExtEventCallback(
 {
     if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
 
-    std::string xml = RenderEventXml(hEvent);
+    std::string xml = RenderEventXmlStr(hEvent);
     if (xml.empty()) return ERROR_SUCCESS;
 
     std::string eidStr = GetXmlField(xml, "EventID");
@@ -4721,7 +4739,7 @@ static DWORD WINAPI TaskEventCallback(
 {
     if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
 
-    std::string xml = RenderEventXml(hEvent);
+    std::string xml = RenderEventXmlStr(hEvent);
     if (xml.empty()) return ERROR_SUCCESS;
 
     std::string eidStr   = GetXmlField(xml, "EventID");
@@ -4779,7 +4797,7 @@ static DWORD WINAPI DefenderEventCallback(
 {
     if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
 
-    std::string xml = RenderEventXml(hEvent);
+    std::string xml = RenderEventXmlStr(hEvent);
     if (xml.empty()) return ERROR_SUCCESS;
 
     std::string eidStr = GetXmlField(xml, "EventID");
@@ -4850,7 +4868,7 @@ static DWORD WINAPI SpoolerEventCallback(
 {
     if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
 
-    std::string xml = RenderEventXml(hEvent);
+    std::string xml = RenderEventXmlStr(hEvent);
     if (xml.empty()) return ERROR_SUCCESS;
 
     std::string ts         = BuildTimestamp();
@@ -4897,7 +4915,7 @@ static DWORD WINAPI RdpEventCallback(
 {
     if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
 
-    std::string xml = RenderEventXml(hEvent);
+    std::string xml = RenderEventXmlStr(hEvent);
     if (xml.empty()) return ERROR_SUCCESS;
 
     std::string ts      = BuildTimestamp();
@@ -4947,7 +4965,7 @@ static DWORD WINAPI BitsEventCallback(
 {
     if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
 
-    std::string xml = RenderEventXml(hEvent);
+    std::string xml = RenderEventXmlStr(hEvent);
     if (xml.empty()) return ERROR_SUCCESS;
 
     std::string eidStr  = GetXmlField(xml, "EventID");
@@ -5030,7 +5048,7 @@ VOID ShowUI() {
             std::string cmdLine = ctx.commandLine.size() > 60
                 ? ctx.commandLine.substr(0, 57) + "..."
                 : ctx.commandLine;
-            Color rowColor = ctx.observed ? Color::Default : Color::GrayDark;
+            Color rowColor = ctx.observed ? Color(Color::Palette1::Default) : Color(Color::Palette16::GrayDark);
             rows.push_back(hbox({
                 text(std::to_string(ctx.pid)) | size(WIDTH, EQUAL, 7) | color(rowColor),
                 text(std::to_string(ctx.parentPid)) | size(WIDTH, EQUAL, 7) | color(rowColor),

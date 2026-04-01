@@ -202,7 +202,7 @@ static std::vector<CheckDef> BuildChecks() {
             DWORD v = 0;
             bool found = RegReadDword(HKEY_LOCAL_MACHINE,
                 "SYSTEM\\CurrentControlSet\\Control\\Lsa", "RunAsPPL", v);
-            if (!found || v < 1) return Fail({"LSA-RPL","LSA Protection (RunAsPPL)"}, {},
+            if (!found || v < 1) return Fail({"LSA-RPL","LSA Protection (RunAsPPL)"},
                 found ? std::to_string(v) : "not set", "1", true);
             return Pass({"LSA-RPL","LSA Protection (RunAsPPL)"}, std::to_string(v));
         },
@@ -223,7 +223,7 @@ static std::vector<CheckDef> BuildChecks() {
             RegReadDword(HKEY_LOCAL_MACHINE,
                 "SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\WDigest",
                 "UseLogonCredential", v);
-            if (v != 0) return Fail({"WDIG-000","WDigest disabled"}, {},
+            if (v != 0) return Fail({"WDIG-000","WDigest disabled"},
                 std::to_string(v), "0", true);
             return Pass({"WDIG-000","WDigest disabled"}, "0");
         },
@@ -245,7 +245,7 @@ static std::vector<CheckDef> BuildChecks() {
             RegReadDword(HKEY_LOCAL_MACHINE,
                 "SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters",
                 "SMB1", v);
-            if (v != 0) return Fail({"SMB-V1","SMBv1 disabled"}, {},
+            if (v != 0) return Fail({"SMB-V1","SMBv1 disabled"},
                 std::to_string(v), "0", true);
             return Pass({"SMB-V1","SMBv1 disabled"}, "0");
         },
@@ -267,7 +267,7 @@ static std::vector<CheckDef> BuildChecks() {
             RegReadDword(HKEY_LOCAL_MACHINE,
                 "SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters",
                 "RequireSecuritySignature", v);
-            if (v < 1) return Fail({"SMB-SGS","SMB signing (server)"}, {},
+            if (v < 1) return Fail({"SMB-SGS","SMB signing (server)"},
                 std::to_string(v), "1", true);
             return Pass({"SMB-SGS","SMB signing (server)"}, "1");
         },
@@ -289,7 +289,7 @@ static std::vector<CheckDef> BuildChecks() {
             RegReadDword(HKEY_LOCAL_MACHINE,
                 "SYSTEM\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters",
                 "RequireSecuritySignature", v);
-            if (v < 1) return Fail({"SMB-SGC","SMB signing (client)"}, {},
+            if (v < 1) return Fail({"SMB-SGC","SMB signing (client)"},
                 std::to_string(v), "1", true);
             return Pass({"SMB-SGC","SMB signing (client)"}, "1");
         },
@@ -311,7 +311,7 @@ static std::vector<CheckDef> BuildChecks() {
             RegReadDword(HKEY_LOCAL_MACHINE,
                 "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
                 "EnableLUA", v);
-            if (v < 1) return Fail({"UAC-ENA","UAC enabled"}, {},
+            if (v < 1) return Fail({"UAC-ENA","UAC enabled"},
                 std::to_string(v), "1", true);
             return Pass({"UAC-ENA","UAC enabled"}, "1");
         },
@@ -334,10 +334,10 @@ static std::vector<CheckDef> BuildChecks() {
                 "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
                 "ConsentPromptBehaviorAdmin", v);
             // 0 = elevate without prompt (insecure); any other value is acceptable
-            if (v == 0) return Fail({"UAC-ADM","UAC admin prompt"}, {},
+            if (v == 0) return Fail({"UAC-ADM","UAC admin prompt"},
                 "0 (no prompt)", ">= 1", true,
                 "Setting to 2 (prompt for credentials on secure desktop)");
-            if (v < 2) return Warn({"UAC-ADM","UAC admin prompt"}, {},
+            if (v < 2) return Warn({"UAC-ADM","UAC admin prompt"},
                 std::to_string(v), "2 (secure desktop)", true);
             return Pass({"UAC-ADM","UAC admin prompt"}, std::to_string(v));
         },
@@ -359,7 +359,7 @@ static std::vector<CheckDef> BuildChecks() {
             bool found = RegReadDword(HKEY_LOCAL_MACHINE,
                 "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer",
                 "NoDriveTypeAutoRun", v);
-            if (!found || v != 255) return Fail({"AUTO-RUN","AutoPlay disabled"}, {},
+            if (!found || v != 255) return Fail({"AUTO-RUN","AutoPlay disabled"},
                 found ? std::to_string(v) : "not set", "255", true);
             return Pass({"AUTO-RUN","AutoPlay disabled"}, "255");
         },
@@ -381,7 +381,7 @@ static std::vector<CheckDef> BuildChecks() {
             RegReadDword(HKEY_LOCAL_MACHINE,
                 "SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging",
                 "EnableScriptBlockLogging", v);
-            if (v < 1) return Fail({"PS-SBL","PS ScriptBlock Logging"}, {},
+            if (v < 1) return Fail({"PS-SBL","PS ScriptBlock Logging"},
                 std::to_string(v), "1", true);
             return Pass({"PS-SBL","PS ScriptBlock Logging"}, "1");
         },
@@ -403,7 +403,7 @@ static std::vector<CheckDef> BuildChecks() {
             RegReadDword(HKEY_LOCAL_MACHINE,
                 "SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\Transcription",
                 "EnableTranscripting", v);
-            if (v < 1) return Fail({"PS-TRN","PS Transcription"}, {},
+            if (v < 1) return Fail({"PS-TRN","PS Transcription"},
                 std::to_string(v), "1", true);
             return Pass({"PS-TRN","PS Transcription"}, "1");
         },
@@ -430,7 +430,7 @@ static std::vector<CheckDef> BuildChecks() {
             [id, title, key]() -> ComplianceFinding {
                 DWORD v = 0;
                 RegReadDword(HKEY_LOCAL_MACHINE, key.c_str(), "EnableFirewall", v);
-                if (v < 1) return Fail({id, title}, {}, std::to_string(v), "1", true);
+                if (v < 1) return Fail({id, title}, std::to_string(v), "1", true);
                 return Pass({id, title}, "1");
             },
             [key]{ return RegWriteDword(HKEY_LOCAL_MACHINE, key.c_str(), "EnableFirewall", 1); }
@@ -450,7 +450,7 @@ static std::vector<CheckDef> BuildChecks() {
             RegReadDword(HKEY_LOCAL_MACHINE,
                 "SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp",
                 "UserAuthentication", v);
-            if (v < 1) return Fail({"RDP-NLA","NLA for RDP"}, {},
+            if (v < 1) return Fail({"RDP-NLA","NLA for RDP"},
                 std::to_string(v), "1", true);
             return Pass({"RDP-NLA","NLA for RDP"}, "1");
         },
@@ -479,7 +479,7 @@ static std::vector<CheckDef> BuildChecks() {
                     "SYSTEM\\CurrentControlSet\\Control\\Lsa\\MSV1_0", regVal.c_str(), v);
                 const DWORD required = 0x20080000;
                 if ((v & required) != required)
-                    return Fail({id, title}, {}, "0x" + [v]{ std::ostringstream ss; ss << std::hex << v; return ss.str(); }(),
+                    return Fail({id, title}, "0x" + [v]{ std::ostringstream ss; ss << std::hex << v; return ss.str(); }(),
                         "0x20080000", true);
                 return Pass({id, title}, "0x20080000");
             },
@@ -505,7 +505,7 @@ static std::vector<CheckDef> BuildChecks() {
                 "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard",
                 "LsaCfgFlags", lsa);
             if (vbs < 1 || lsa < 1)
-                return Fail({"CRED-GRD","Credential Guard"}, {},
+                return Fail({"CRED-GRD","Credential Guard"},
                     "VBS=" + std::to_string(vbs) + " LsaCfg=" + std::to_string(lsa),
                     "VBS=1 LsaCfg=1", true,
                     "Requires Secure Boot, TPM 2.0, UEFI firmware, and a reboot to activate");
@@ -541,7 +541,7 @@ static std::vector<CheckDef> BuildChecks() {
                     "Run: net user Guest /active:no");
             bool disabled = (info->usri1_flags & UF_ACCOUNTDISABLE) != 0;
             NetApiBufferFree(info);
-            if (!disabled) return Fail({"ACCT-GST","Guest account disabled"}, {},
+            if (!disabled) return Fail({"ACCT-GST","Guest account disabled"},
                 "active", "disabled", true);
             return Pass({"ACCT-GST","Guest account disabled"}, "disabled");
         },
@@ -569,7 +569,7 @@ static std::vector<CheckDef> BuildChecks() {
             RegReadDword(HKEY_LOCAL_MACHINE,
                 "SYSTEM\\CurrentControlSet\\Control\\Lsa",
                 "RestrictAnonymousSAM", v);
-            if (v < 1) return Fail({"LSA-ANO","Anonymous SAM restriction"}, {},
+            if (v < 1) return Fail({"LSA-ANO","Anonymous SAM restriction"},
                 std::to_string(v), "1", true);
             return Pass({"LSA-ANO","Anonymous SAM restriction"}, "1");
         },
@@ -592,7 +592,7 @@ static std::vector<CheckDef> BuildChecks() {
                 "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
                 "CachedLogonsCount", v);
             int count = v.empty() ? 10 : std::stoi(v);  // Windows default = 10
-            if (count > 4) return Fail({"AUTH-CAC","Cached logon count"}, {},
+            if (count > 4) return Fail({"AUTH-CAC","Cached logon count"},
                 v.empty() ? "10 (default)" : v, "<= 4", true);
             return Pass({"AUTH-CAC","Cached logon count"}, v.empty() ? "10" : v);
         },
@@ -615,7 +615,7 @@ static std::vector<CheckDef> BuildChecks() {
             GUID logonGuid = { 0x0CCE9216, 0x69AE, 0x11D9,
                                {0xBE, 0xD3, 0x50, 0x50, 0x54, 0x50, 0x30, 0x30} };
             PAUDIT_POLICY_INFORMATION pInfo = nullptr;
-            if (!AuditQuerySubcategoryPolicy(&logonGuid, &pInfo) || !pInfo)
+            if (!AuditQuerySystemPolicy(&logonGuid, 1, &pInfo) || !pInfo)
                 return Manual({"AUD-LOG","Audit Logon events"},
                     "Run: auditpol /get /subcategory:Logon   (requires admin)");
             DWORD info = pInfo->AuditingInformation;
@@ -623,7 +623,7 @@ static std::vector<CheckDef> BuildChecks() {
             bool hasSuccess = (info & POLICY_AUDIT_EVENT_SUCCESS) != 0;
             bool hasFailure = (info & POLICY_AUDIT_EVENT_FAILURE) != 0;
             if (!hasSuccess || !hasFailure)
-                return Fail({"AUD-LOG","Audit Logon events"}, {},
+                return Fail({"AUD-LOG","Audit Logon events"},
                     std::string(hasSuccess ? "Success" : "") + (hasFailure ? "+Failure" : ""),
                     "Success+Failure", false,
                     "Run: auditpol /set /subcategory:Logon /success:enable /failure:enable");
