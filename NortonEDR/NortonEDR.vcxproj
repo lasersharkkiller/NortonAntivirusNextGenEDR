@@ -24,9 +24,11 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\ComplianceEngine.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\Utils.h" />
+    <ClInclude Include="src\ComplianceEngine.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
