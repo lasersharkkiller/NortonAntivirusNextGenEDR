@@ -71,6 +71,14 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
         unsigned char method2;
     };
 
+    union {
+        struct {
+            unsigned char NetworkCheck : 1;
+            unsigned char Reserved3   : 7;
+        };
+        unsigned char method3;
+    };
+
     ULONG64 scoopedAddress;
     BOOLEAN isPath;
     HANDLE pid;

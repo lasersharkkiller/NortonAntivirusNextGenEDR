@@ -36,6 +36,9 @@
 // Input: HOOKDLL_INJECT_CONFIG — configures kernel APC injection of HookDll.dll
 #define NORTONAV_SET_INJECT_CONFIG CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// Input: NETWORK_FILTER_CONFIG — sets the WFP blocked-port list from user-mode
+#define NORTONAV_SET_NETWORK_CONFIG CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 #define END_THAT_PROCESS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x216, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // Payload sent from user mode to configure DllInjector.
@@ -47,6 +50,12 @@ struct HOOKDLL_INJECT_CONFIG {
     ULONG  PathByteLen;         // byte length of HookDllPath including null
     ULONG  OwnerPid;            // NortonEDR PID — excluded from injection
     WCHAR  HookDllPath[260];    // full path to HookDll.dll
+};
+
+// Payload sent from user mode to configure the WFP blocked-port list.
+struct NETWORK_FILTER_CONFIG {
+    UINT16 BlockedPorts[32];    // destination ports to block
+    UINT32 NumBlockedPorts;     // number of valid entries in BlockedPorts
 };
 
 #define ProcessAltSystemCallInformation 0x64
@@ -322,6 +331,9 @@ public:
 	NTSTATUS WfpRegisterCallout();
 	VOID UnitializeWfp();
 	NTSTATUS AddSubLayer();
+
+	// Update the blocked-port list from user-mode (NORTONAV_SET_NETWORK_CONFIG).
+	static VOID WfpSetBlocklist(const UINT16* ports, UINT32 count);
 	
 	static VOID TcpipFilteringCallback(
 		const FWPS_INCOMING_VALUES*,

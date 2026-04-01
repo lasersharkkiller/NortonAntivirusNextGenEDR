@@ -226,6 +226,16 @@ NTSTATUS DriverIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 				cfg->HookDllPath,
 				cfg->PathByteLen);
 		}
+		else if (stack->Parameters.DeviceIoControl.IoControlCode == NORTONAV_SET_NETWORK_CONFIG) {
+
+			if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(NETWORK_FILTER_CONFIG)) {
+				status = STATUS_INVALID_PARAMETER;
+				__leave;
+			}
+
+			NETWORK_FILTER_CONFIG* cfg = (NETWORK_FILTER_CONFIG*)Irp->AssociatedIrp.SystemBuffer;
+			WdfTcpipUtils::WfpSetBlocklist(cfg->BlockedPorts, cfg->NumBlockedPorts);
+		}
 		else if (stack->Parameters.DeviceIoControl.IoControlCode == END_THAT_PROCESS) {
 
 			if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(UINT32)) {

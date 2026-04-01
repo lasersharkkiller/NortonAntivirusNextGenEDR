@@ -37,13 +37,19 @@ using namespace std;
 #define NORTONAV_RETRIEVE_DATA_BYTE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define END_THAT_PROCESS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x216, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define NORTONAV_SET_INJECT_CONFIG CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define NORTONAV_SET_INJECT_CONFIG  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define NORTONAV_SET_NETWORK_CONFIG CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 struct HOOKDLL_INJECT_CONFIG {
     void*   LoadLibraryWAddress;
     ULONG   PathByteLen;
     ULONG   OwnerPid;
     wchar_t HookDllPath[260];
+};
+
+struct NETWORK_FILTER_CONFIG {
+    UINT16 BlockedPorts[32];
+    UINT32 NumBlockedPorts;
 };
 
 UINT32 curPid;
@@ -2530,6 +2536,9 @@ int Notify(PKERNEL_STRUCTURED_NOTIFICATION notif, char* msg) {
     else if (notif->AmsiBypassCheck) {
         method = "Method: AMSI Bypass Detection";
     }
+    else if (notif->NetworkCheck) {
+        method = "Method: Network Traffic Inspection";
+    }
 
     if (notif->Critical) {
 
@@ -4583,6 +4592,7 @@ int main(int argc, char* argv[]) {
 
     std::vector<std::string> positionalArgs;
     std::vector<std::string> traceTargetRawValues;
+    std::string              blockPortsRaw;
     bool includeTraceChildren = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -4718,6 +4728,16 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (arg == "--block-ports") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --block-ports\n"; return 1; }
+            blockPortsRaw = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--block-ports=", 0) == 0) {
+            blockPortsRaw = arg.substr(14);
+            continue;
+        }
+
         positionalArgs.push_back(arg);
     }
 
@@ -4753,7 +4773,8 @@ int main(int argc, char* argv[]) {
             << " [--trace <proc1,proc2>] [--trace-children] [--api-port <port>] [--api-events-limit <n>]"
             << " [--elastic-host <https://host:port>] [--elastic-index <index>]"
             << " [--elastic-api-key <key> | --elastic-user <u> --elastic-pass <p>]"
-            << " [--elastic-no-verify]\n";
+            << " [--elastic-no-verify]"
+            << " [--block-ports <port1,port2,...>]\n";
         return 1;
     }
 
@@ -4868,6 +4889,32 @@ int main(int argc, char* argv[]) {
             DeviceIoControl(hDev, NORTONAV_SET_INJECT_CONFIG,
                             &cfg, sizeof(cfg), nullptr, 0, &returned, nullptr);
             CloseHandle(hDev);
+        }
+    }
+
+    // Send WFP blocked-port list to the kernel driver.
+    if (!blockPortsRaw.empty()) {
+        NETWORK_FILTER_CONFIG netCfg = {};
+        std::istringstream ss(blockPortsRaw);
+        std::string token;
+        while (std::getline(ss, token, ',') && netCfg.NumBlockedPorts < 32) {
+            try {
+                int p = std::stoi(token);
+                if (p > 0 && p <= 65535)
+                    netCfg.BlockedPorts[netCfg.NumBlockedPorts++] = static_cast<UINT16>(p);
+            } catch (...) {}
+        }
+        if (netCfg.NumBlockedPorts > 0) {
+            HANDLE hDev = CreateFileW(L"\\\\.\\NortonEDR",
+                GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hDev != INVALID_HANDLE_VALUE) {
+                DWORD returned = 0;
+                DeviceIoControl(hDev, NORTONAV_SET_NETWORK_CONFIG,
+                                &netCfg, sizeof(netCfg), nullptr, 0, &returned, nullptr);
+                CloseHandle(hDev);
+                std::cout << "[*] WFP blocking " << netCfg.NumBlockedPorts << " port(s)\n";
+            }
         }
     }
 
