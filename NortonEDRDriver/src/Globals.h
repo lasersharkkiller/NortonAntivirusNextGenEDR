@@ -1001,6 +1001,12 @@ public:
     static FLT_PREOP_CALLBACK_STATUS FLTAPI PreSetInformation(
         PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
 
+    static FLT_PREOP_CALLBACK_STATUS FLTAPI PreDirControl(
+        PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
+
+    static FLT_PREOP_CALLBACK_STATUS FLTAPI PreNetworkQueryOpen(
+        PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
+
     static NTSTATUS FLTAPI FilterUnloadCallback(FLT_FILTER_UNLOAD_FLAGS Flags);
 };
 
