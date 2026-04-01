@@ -77,13 +77,28 @@ All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critic
 - **DNS-Client queries** — `Microsoft-Windows-DNS-Client/Operational` EID 3006; query names routed through Sigma for DGA/C2 detection; enables the channel automatically if disabled
 - **WinRM lateral movement** — `Microsoft-Windows-WinRM/Operational` EIDs 6, 8, 91, 132; flags WSMan session creation and HTTP requests as Medium/Low severity
 
+### User-Mode API Hook DLL (`HookDll.dll`)
+
+- Standalone injectable DLL with dual-layer hook engine (IAT patching + inline prologue hooks) targeting 13 Win32/Native APIs
+- **Monitored APIs**: `VirtualAlloc` (RWX), `VirtualAllocEx` (remote), `WriteProcessMemory`, `CreateRemoteThread`, `CreateRemoteThreadEx`, `LoadLibraryA/W/ExA/ExW`, `ResumeThread` (cross-process), `SetThreadContext` (cross-process), `RegSetValueExA/W`
+- `WriteProcessMemory` hook checks written data for an MZ/PE signature and tags the event
+- `SetThreadContext` hook extracts the new RIP from the `CONTEXT` struct and surfaces it
+- `RegSetValueExA/W` hook flags known persistence value names (`Run`, `AppInit_DLLs`, etc.) at High severity; all other writes at Info
+- **Inline hooks** patch each function's prologue with a 14-byte absolute `JMP [RIP+0]` + 8-byte address, catching callers who resolve APIs via `GetProcAddress` at runtime (IAT patching alone misses these); `IsSafeToCopy` rejects prologues containing relative branches or RIP-relative memory operands before patching
+- **Trampolines** per hook: displaced prologue bytes (14) + `JMP` back to `target+14`; allocated in a single `PAGE_EXECUTE_READWRITE` pool; `GetCallThrough()` returns the trampoline when inline hooks are active so IAT stubs don't re-enter the patched prologue
+- **SetWindowsHookEx** intentionally excluded — it reaches only GUI message-loop threads and is irrelevant for the targeted injection/persistence APIs
+- Telemetry reported via named pipe `\\.\pipe\NortonEDR_HookDll` using a tab-delimited line protocol (`SEVERITY\tCALLER_PID\tAPI_NAME\tTARGET_PID\tDETAIL\n`)
+- NortonEDR hosts a multi-client pipe server thread; each client connection is dispatched to a detached thread for concurrent handling
+- `DllMain` calls `InstallHooks`/`RemoveHooks` automatically; exports allow explicit control
+- Inject via any standard technique (manual map, `CreateRemoteThread`+`LoadLibrary`, `AppInit_DLLs`, etc.)
+
 ### Sysmon & SACL Integration
 - Sysmon event ingestion for host-based telemetry enrichment
 - SACL (System Access Control List) auditing for object-level access visibility
 - Process context cache enrichment: parent PID and image path appended to detection details
 
 ### Logging & API
-- Persistent JSONL telemetry logging to `beotm_events.jsonl`
+- Persistent JSONL telemetry logging to `nortonav_events.jsonl`
 - Trace targeting (`--trace`) with optional child-process inheritance (`--trace-children`)
 - Local REST API on `127.0.0.1` — endpoints: `/api/stats`, `/api/events`, `/api/processes`, `/api/reset`
 
@@ -94,6 +109,7 @@ All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critic
 - Windows 10 20H1–22H2 test VM in `TESTSIGNING` mode
 - Visual Studio 2022, C++20, WDK
 - vcpkg with `yara` package installed
+- `capa.exe` (FLARE) on `PATH` or alongside the NortonEDR binary for capabilities scanning
 
 ---
 

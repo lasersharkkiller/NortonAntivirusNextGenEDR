@@ -245,6 +245,14 @@ static std::atomic<bool>                           g_capaStop(false);
 static std::unordered_set<std::string>             g_capaScanned;
 static constexpr size_t                            kCapaQueueMax = 32;
 
+// ---------------------------------------------------------------------------
+// HookDll named-pipe server
+// Receives telemetry lines from injected HookDll instances.
+// Line format: SEVERITY\tCALLER_PID\tAPI_NAME\tTARGET_PID\tDETAIL\n
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_hookPipeStop(false);
+static constexpr const char* kHookPipeName = "\\\\.\\pipe\\NortonEDR_HookDll";
+
 std::string startupAsciiTitle = R"(
 
    _   _            _              _____ ____  ____
@@ -4000,6 +4008,106 @@ static DWORD WINAPI WinRmEventCallback(
     return ERROR_SUCCESS;
 }
 
+static DetectionSeverity SeverityFromLabel(const char* s) {
+    if (!s) return DetectionSeverity::Info;
+    if (_stricmp(s, "critical") == 0) return DetectionSeverity::Critical;
+    if (_stricmp(s, "high")     == 0) return DetectionSeverity::High;
+    if (_stricmp(s, "warning")  == 0) return DetectionSeverity::Medium;
+    if (_stricmp(s, "medium")   == 0) return DetectionSeverity::Medium;
+    if (_stricmp(s, "low")      == 0) return DetectionSeverity::Low;
+    return DetectionSeverity::Info;
+}
+
+// Called on a per-client thread; reads lines until the pipe client disconnects.
+static void HandleHookPipeClient(HANDLE hPipe) {
+    char buf[4096];
+    DWORD total = 0;
+
+    while (true) {
+        DWORD read = 0;
+        BOOL  ok   = ReadFile(hPipe, buf + total,
+                              (DWORD)(sizeof(buf) - total - 1), &read, nullptr);
+        if (!ok || read == 0) break;
+        total += read;
+
+        // Process all complete lines in the buffer
+        char* lineStart = buf;
+        buf[total] = '\0';
+
+        char* newline;
+        while ((newline = strchr(lineStart, '\n')) != nullptr) {
+            *newline = '\0';
+
+            // Parse: SEVERITY\tCALLER_PID\tAPI_NAME\tTARGET_PID\tDETAIL
+            char   severityBuf[16]  = {};
+            DWORD  callerPid        = 0;
+            char   apiName[64]      = {};
+            DWORD  targetPid        = 0;
+            char   detail[512]      = {};
+
+            // sscanf with tab delimiters
+            int fields = sscanf_s(lineStart,
+                "%15[^\t]\t%lu\t%63[^\t]\t%lu\t%511[^\r]",
+                severityBuf, (unsigned)sizeof(severityBuf),
+                &callerPid,
+                apiName,     (unsigned)sizeof(apiName),
+                &targetPid,
+                detail,      (unsigned)sizeof(detail));
+
+            if (fields >= 3) {
+                std::string msg = std::string("HookDll: ") + apiName;
+                std::string det = std::string(detail);
+                if (targetPid)
+                    det += "\nTarget PID: " + std::to_string(targetPid);
+                det += "\nCaller PID: " + std::to_string(callerPid);
+
+                PushUiDetectionEvent(msg, det,
+                    "Method: User-Mode API Hook",
+                    callerPid,
+                    SeverityFromLabel(severityBuf));
+            }
+
+            lineStart = newline + 1;
+        }
+
+        // Shift remaining partial line to the front
+        DWORD remaining = (DWORD)(buf + total - lineStart);
+        if (remaining > 0 && lineStart != buf)
+            memmove(buf, lineStart, remaining);
+        total = remaining;
+    }
+}
+
+static void HookPipeServerThread() {
+    while (!g_hookPipeStop.load()) {
+        HANDLE hPipe = CreateNamedPipeA(
+            kHookPipeName,
+            PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            0, 4096, 0, nullptr
+        );
+        if (hPipe == INVALID_HANDLE_VALUE) {
+            Sleep(1000);
+            continue;
+        }
+
+        // Block until a client connects (or we're stopping)
+        BOOL connected = ConnectNamedPipe(hPipe, nullptr);
+        if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
+            CloseHandle(hPipe);
+            continue;
+        }
+
+        // Service this client on a detached thread so we can accept the next
+        std::thread([hPipe]() {
+            HandleHookPipeClient(hPipe);
+            DisconnectNamedPipe(hPipe);
+            CloseHandle(hPipe);
+        }).detach();
+    }
+}
+
 static void WinRmSubscriberThread() {
     g_winrmSubscription = EvtSubscribe(
         nullptr, nullptr,
@@ -4138,6 +4246,9 @@ VOID ShowUI() {
     g_capaStop = false;
     std::thread capaWorker(CapaScanWorker);
 
+    g_hookPipeStop = false;
+    std::thread hookPipeThread(HookPipeServerThread);
+
     try {
         screen.Loop(renderer);
     }
@@ -4173,6 +4284,13 @@ VOID ShowUI() {
     g_capaStop = true;
     g_capaCv.notify_all();
     capaWorker.join();
+
+    g_hookPipeStop = true;
+    // Unblock ConnectNamedPipe by opening a dummy client connection
+    HANDLE dummy = CreateFileA(kHookPipeName, GENERIC_WRITE, 0, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+    if (dummy != INVALID_HANDLE_VALUE) CloseHandle(dummy);
+    hookPipeThread.join();
 }
 
 int main(int argc, char* argv[]) {
