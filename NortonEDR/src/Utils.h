@@ -59,8 +59,14 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
 
     union {
         struct {
-            unsigned char ShadowStackCheck : 1;
-            unsigned char Reserved : 7; // Align
+            unsigned char ShadowStackCheck       : 1;
+            unsigned char SsdtHookCheck          : 1;
+            unsigned char InlineHookCheck        : 1;
+            unsigned char EatHookCheck           : 1;
+            unsigned char EtwHookCheck           : 1;
+            unsigned char AltSyscallHandlerCheck : 1;
+            unsigned char PeScanCheck            : 1;
+            unsigned char AmsiBypassCheck        : 1;
         };
         unsigned char method2;
     };

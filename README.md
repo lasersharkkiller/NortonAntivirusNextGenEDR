@@ -31,6 +31,20 @@ All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critic
 - **PPID spoofing** — parent PID vs. creating thread process mismatch detected at process creation
 - **Process hollowing** — VAD/LDR cross-check verifies the main image VAD start address matches the PEB loader entry
 
+### AMSI Integration
+
+#### Kernel — Bypass Detection
+- **AMSI export scan** — `ImageLoadNotifyRoutine` intercepts `amsi.dll` load events; immediately scans `AmsiScanBuffer`, `AmsiOpenSession`, `AmsiInitialize`, and `AmsiScanString` prologues for known bypass patches
+- Detected patch patterns: `XOR EAX,EAX; RET` (33 C0 C3 / 31 C0 C3), `XOR RAX,RAX; RET` (48 31 C0 C3), `MOV EAX,0x80070057; RET` (E_INVALIDARG patch), `JMP near` trampoline, `JMP far` indirect redirect
+- Detections emitted as `KERNEL_STRUCTURED_NOTIFICATION` with severity Critical and `AmsiBypassCheck` method flag
+
+#### User-Mode — AMSI Provider (`AmsiProvider.dll`)
+- COM in-process server implementing `IAntimalwareProvider` (CLSID `{C18BED31-4E42-4E0F-B00D-A7E3FE09E18D}`)
+- Registered under `HKLM\SOFTWARE\Microsoft\AMSI\Providers\` — receives every `AmsiScanBuffer` call from PowerShell, VBScript, .NET, and other AMSI-aware hosts
+- Keyword detection engine covers: Mimikatz invocations, credential-theft commands, PowerSploit/PowerView/BloodHound, AMSI bypass reflection patterns, shellcode stager strings, Meterpreter/Cobalt Strike indicators
+- Self-registers via `regsvr32 AmsiProvider.dll`; self-unregisters via `regsvr32 /u AmsiProvider.dll`
+- Logs detections to `norton_amsi_detections.log` alongside the binary
+
 ### Detection Engine
 - YARA rule engine with recursive auto-loading from configurable paths
 - Sigma-Lite rule support with full boolean logic (`selection`, `filter`, `1 of`, `all of`, `and`, `or`, `not`) and string operators (`contains`, `contains|all`, `startswith`, `endswith`)

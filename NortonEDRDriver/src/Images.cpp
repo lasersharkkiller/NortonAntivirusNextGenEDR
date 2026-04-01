@@ -73,6 +73,37 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                             }
                            
                             RtlFreeAnsiString(&ansiString);
+
+                            // Detect amsi.dll load and scan exports for bypass patches.
+                            // We are still attached to the target process here.
+                            if (ImageInfo->ImageBase != NULL && ImageInfo->ImageSize > 0) {
+                                SIZE_T cbLen = SafeStringLength(charBuffer, charBufferSize - 1);
+                                BOOLEAN isAmsiDll = FALSE;
+                                for (SIZE_T k = 0; k + 8 <= cbLen; k++) {
+                                    if (((charBuffer[k]   | 0x20) == 'a') &&
+                                        ((charBuffer[k+1] | 0x20) == 'm') &&
+                                        ((charBuffer[k+2] | 0x20) == 's') &&
+                                        ((charBuffer[k+3] | 0x20) == 'i') &&
+                                         (charBuffer[k+4]         == '.') &&
+                                        ((charBuffer[k+5] | 0x20) == 'd') &&
+                                        ((charBuffer[k+6] | 0x20) == 'l') &&
+                                        ((charBuffer[k+7] | 0x20) == 'l')) {
+                                        isAmsiDll = TRUE;
+                                        break;
+                                    }
+                                }
+                                if (isAmsiDll) {
+                                    AmsiDetector::ScanAmsiBypassPatterns(
+                                        ImageInfo->ImageBase,
+                                        ImageInfo->ImageSize,
+                                        ProcessId,
+                                        PsGetProcessImageFileName(targetProcess),
+                                        CallbackObjects::GetNotifQueue()
+                                    );
+                                }
+                            }
+
+                            ExFreePool(charBuffer);
                         }
                         else {
                             ExFreePool(charBuffer);

@@ -2234,6 +2234,27 @@ int Notify(PKERNEL_STRUCTURED_NOTIFICATION notif, char* msg) {
         lastNotifiedStackSpoofPid = pid;
         method = "Method: Shadow Stack Inspection";
     }
+    else if (notif->SsdtHookCheck) {
+        method = "Method: SSDT Integrity Check";
+    }
+    else if (notif->InlineHookCheck) {
+        method = "Method: Inline Hook Detection";
+    }
+    else if (notif->EatHookCheck) {
+        method = "Method: EAT Hook Detection";
+    }
+    else if (notif->EtwHookCheck) {
+        method = "Method: ETW Hook Detection";
+    }
+    else if (notif->AltSyscallHandlerCheck) {
+        method = "Method: Alt Syscall Handler Integrity";
+    }
+    else if (notif->PeScanCheck) {
+        method = "Method: PE / VAD Scan";
+    }
+    else if (notif->AmsiBypassCheck) {
+        method = "Method: AMSI Bypass Detection";
+    }
 
     if (notif->Critical) {
 

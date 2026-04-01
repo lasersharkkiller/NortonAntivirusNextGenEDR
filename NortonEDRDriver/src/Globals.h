@@ -1083,6 +1083,21 @@ public:
     );
 };
 
+class AmsiDetector {
+
+public:
+
+    // Scan amsi.dll exports for known bypass patch patterns.
+    // Must be called while attached to the target process (KeStackAttachProcess).
+    static VOID ScanAmsiBypassPatterns(
+        PVOID        imageBase,
+        SIZE_T       imageSize,
+        HANDLE       pid,
+        char*        procName,
+        BufferQueue* bufQueue
+    );
+};
+
 class HookDetector {
 
     static PSSDT_BASELINE_ENTRY ssdtBaseline;
