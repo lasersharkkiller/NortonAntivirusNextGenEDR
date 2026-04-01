@@ -1,0 +1,60 @@
+; NortonEDRElam.inf
+; Early Launch Anti-Malware driver INF
+; Loads before all boot-start drivers (StartType = 0, LoadOrderGroup = Early-Launch)
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = AntiVirus
+ClassGuid   = {b1d1a169-c54f-4379-81db-bee7d88d7454}
+Provider    = %ManufacturerName%
+CatalogFile = NortonEDRElam.cat
+DriverVer   = 04/01/2026, 1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12   ; %windir%\System32\drivers
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+NortonEDRElam.sys = 1,,
+
+; --------------------------------------------------------------------------
+; Default install
+; --------------------------------------------------------------------------
+[DefaultInstall.NTamd64]
+CopyFiles = NortonEDRElam.CopyFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService = NortonEDRElam, 0x00000002, NortonEDRElam.Service
+
+[DefaultUninstall.NTamd64]
+DelFiles   = NortonEDRElam.CopyFiles
+DelService = NortonEDRElam, 0x00000200
+
+[NortonEDRElam.CopyFiles]
+NortonEDRElam.sys
+
+; --------------------------------------------------------------------------
+; Service configuration — ELAM requires:
+;   StartType      = 0 (SERVICE_BOOT_START)
+;   LoadOrderGroup = Early-Launch
+; --------------------------------------------------------------------------
+[NortonEDRElam.Service]
+DisplayName    = %ServiceName%
+Description    = %ServiceDescription%
+ServiceBinary  = %12%\NortonEDRElam.sys
+ServiceType    = 1                   ; SERVICE_KERNEL_DRIVER
+StartType      = 0                   ; SERVICE_BOOT_START  ← ELAM requirement
+ErrorControl   = 1                   ; SERVICE_ERROR_NORMAL
+LoadOrderGroup = Early-Launch        ; ← ELAM requirement — loader recognises this
+
+; --------------------------------------------------------------------------
+; Strings
+; --------------------------------------------------------------------------
+[Strings]
+ManufacturerName   = "NortonNextGenEDR"
+DiskName           = "Norton NextGen EDR ELAM Driver Disk"
+ServiceName        = "NortonEDRElam"
+ServiceDescription = "Norton NextGen EDR Early Launch Anti-Malware"
