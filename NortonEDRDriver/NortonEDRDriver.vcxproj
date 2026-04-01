@@ -121,6 +121,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\Callbacks.cpp" />
+    <ClCompile Include="src\Deception.cpp" />
     <ClCompile Include="src\AmsiDetection.cpp" />
     <ClCompile Include="src\EtwProvider.cpp" />
     <ClCompile Include="src\HookDetection.cpp" />

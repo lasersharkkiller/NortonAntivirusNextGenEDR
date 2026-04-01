@@ -128,6 +128,7 @@
     <ClCompile Include="src\HvEntry.cpp" />
     <ClCompile Include="src\HvVmcs.cpp" />
     <ClCompile Include="src\HvEpt.cpp" />
+    <ClCompile Include="src\HvDeception.cpp" />
   </ItemGroup>
 
   <!-- Header files -->
