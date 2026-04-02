@@ -102,15 +102,16 @@ VOID DeceptionEngine::EmitDeceptionAlert(
 
     PKERNEL_STRUCTURED_NOTIFICATION notif =
         (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
-            POOL_FLAG_NON_PAGED | POOL_FLAG_ZERO_ALLOCATION,
+            POOL_FLAG_NON_PAGED,
             totalSize, 'dcpt');
     if (!notif) return;
+    RtlZeroMemory(notif, totalSize);
 
-    notif->pid = (UINT64)pid;
-    notif->method1 = 0;
+    notif->pid = (HANDLE)(ULONG_PTR)pid;
+    notif->method = 0;
     notif->method2 = 0;
     notif->method3 = 0;
-    SET_CRITICAL(notif);   // deception events are always Critical severity
+    SET_CRITICAL(*notif);  // deception events are always Critical severity
 
     // Tag as a deception event (using NetworkCheck bit as generic "detection" bit
     // for deception category — maps cleanly to existing TUI rendering)

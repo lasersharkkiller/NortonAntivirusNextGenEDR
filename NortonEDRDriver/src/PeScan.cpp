@@ -1,5 +1,8 @@
 #include "Globals.h"
 
+static VOID SendPeScanAlert(BufferQueue* bufQueue, ULONG64 address, HANDLE pid,
+    char* procName, BOOLEAN isCritical, const char* message);
+
 // ---------------------------------------------------------------------------
 // Static PE analysis helpers — entropy, section anomalies, TLS callbacks.
 // All operate on kernel-memory buffers already validated to contain MZ+NT.

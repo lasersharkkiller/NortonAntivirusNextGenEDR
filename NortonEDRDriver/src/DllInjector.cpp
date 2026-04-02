@@ -1,5 +1,24 @@
 #include "Globals.h"
 
+// Undocumented APC types and functions not always exposed by ntifs.h
+typedef VOID (NTAPI* PKNORMAL_ROUTINE)(PVOID NormalContext, PVOID SystemArgument1, PVOID SystemArgument2);
+typedef VOID (NTAPI* PKKERNEL_ROUTINE_)(PRKAPC Apc, PKNORMAL_ROUTINE* NormalRoutine,
+    PVOID* NormalContext, PVOID* SystemArgument1, PVOID* SystemArgument2);
+typedef VOID (NTAPI* PKRUNDOWN_ROUTINE_)(PRKAPC Apc);
+typedef enum _KAPC_ENVIRONMENT_ {
+    OriginalApcEnvironment = 0,
+    AttachedApcEnvironment,
+    CurrentApcEnvironment,
+    InsertApcEnvironment
+} KAPC_ENVIRONMENT_, *PKAPC_ENVIRONMENT_;
+
+NTKERNELAPI VOID KeInitializeApc(PRKAPC Apc, PKTHREAD Thread,
+    KAPC_ENVIRONMENT_ Environment, PKKERNEL_ROUTINE_ KernelRoutine,
+    PKRUNDOWN_ROUTINE_ RundownRoutine, PKNORMAL_ROUTINE NormalRoutine,
+    KPROCESSOR_MODE ApcMode, PVOID NormalContext);
+NTKERNELAPI BOOLEAN KeInsertQueueApc(PRKAPC Apc, PVOID SystemArgument1,
+    PVOID SystemArgument2, KPRIORITY Increment);
+
 // ---------------------------------------------------------------------------
 // DllInjector — kernel-mode APC injection of HookDll.dll into user processes.
 //

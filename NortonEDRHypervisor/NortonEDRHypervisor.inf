@@ -11,6 +11,7 @@ DriverVer   = 04/01/2026, 1.0.0.0
 PnpLockdown = 1
 
 [DestinationDirs]
+HV.CopyFiles   = 12
 DefaultDestDir = 12
 
 [SourceDisksNames]
@@ -26,6 +27,7 @@ CopyFiles = HV.CopyFiles
 AddService = NortonEDRHypervisor, 0x00000002, HV.Service
 
 [DefaultUninstall.NTamd64]
+LegacyUninstall = 1
 DelFiles   = HV.CopyFiles
 DelService = NortonEDRHypervisor, 0x00000200
 

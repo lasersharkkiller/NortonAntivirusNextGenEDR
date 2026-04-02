@@ -1,6 +1,11 @@
+#pragma once
 #include <ntifs.h>
 
 #pragma warning(disable:4201)
+
+#ifndef IMAGE_DIRECTORY_ENTRY_EXPORT
+#define IMAGE_DIRECTORY_ENTRY_EXPORT 0
+#endif
 
 typedef unsigned short WORD;
 typedef unsigned long DWORD;

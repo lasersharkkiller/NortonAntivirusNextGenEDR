@@ -1,3 +1,4 @@
+#pragma once
 #include <ntifs.h>
 
 #include <ndis.h>
@@ -24,6 +25,13 @@
 #pragma warning(disable:4309)
 #pragma warning(disable:4245)
 #pragma warning(disable: 4244)
+#pragma warning(disable:4100)  // unreferenced formal parameter
+#pragma warning(disable:4101)  // unreferenced local variable
+#pragma warning(disable:4189)  // local variable initialized but not referenced
+#pragma warning(disable:4267)  // conversion from size_t to smaller type
+#pragma warning(disable:4456)  // declaration hides previous local declaration
+#pragma warning(disable:4458)  // declaration hides class member
+#pragma warning(disable:4459)  // declaration hides global declaration
 
 #define ALTITUDE L"300021"
 
@@ -476,7 +484,6 @@ public:
 	}
 
 	ULONG GetSize() {
-		KIRQL oldIrql;
 		KeAcquireSpinLockAtDpcLevel(&spinLock);
 		ULONG currentSize = size;
 		KeReleaseSpinLockFromDpcLevel(&spinLock);
@@ -495,7 +502,6 @@ public:
 	}
 
 	VOID PrintSizes() {
-		KIRQL oldIrql;
 		KeAcquireSpinLockAtDpcLevel(&spinLock);
 		for (ULONG i = 0; i < size; i++) {
 			RAW_BUFFER rb = bufferArray[(head + i) % capacity];
@@ -584,7 +590,6 @@ public:
 	}
 
 	ULONG GetSize() {
-		KIRQL oldIrql;
 		KeAcquireSpinLockAtDpcLevel(&spinLock);
 		ULONG currentSize = size;
 		KeReleaseSpinLockFromDpcLevel(&spinLock);

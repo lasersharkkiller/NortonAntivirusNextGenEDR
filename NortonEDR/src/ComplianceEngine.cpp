@@ -715,7 +715,7 @@ static std::vector<CheckDef> BuildChecks() {
             upd.usrmod3_lockout_duration    = 30;
             upd.usrmod3_lockout_observation_window = 30;
             DWORD parm_err = 0;
-            return NetUserSetModalInfo(nullptr, 3, (LPBYTE)&upd, &parm_err) == NERR_Success;
+            return NetUserModalsSet(nullptr, 3, (LPBYTE)&upd, &parm_err) == NERR_Success;
         }
     });
 
@@ -753,7 +753,7 @@ static std::vector<CheckDef> BuildChecks() {
             NetApiBufferFree(cur);
             upd.usrmod3_lockout_duration = 30;
             DWORD parm_err = 0;
-            return NetUserSetModalInfo(nullptr, 3, (LPBYTE)&upd, &parm_err) == NERR_Success;
+            return NetUserModalsSet(nullptr, 3, (LPBYTE)&upd, &parm_err) == NERR_Success;
         }
     });
 
@@ -787,7 +787,7 @@ static std::vector<CheckDef> BuildChecks() {
             NetApiBufferFree(cur);
             upd.usrmod3_lockout_observation_window = 30;
             DWORD parm_err = 0;
-            return NetUserSetModalInfo(nullptr, 3, (LPBYTE)&upd, &parm_err) == NERR_Success;
+            return NetUserModalsSet(nullptr, 3, (LPBYTE)&upd, &parm_err) == NERR_Success;
         }
     });
 
@@ -946,7 +946,7 @@ static std::vector<CheckDef> BuildChecks() {
             NetApiBufferFree(cur);
             upd.usrmod0_min_passwd_len = 14;
             DWORD parm_err = 0;
-            return NetUserSetModalInfo(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
+            return NetUserModalsSet(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
         }
     });
 
@@ -983,7 +983,7 @@ static std::vector<CheckDef> BuildChecks() {
             NetApiBufferFree(cur);
             upd.usrmod0_max_passwd_age = 7776000;
             DWORD parm_err = 0;
-            return NetUserSetModalInfo(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
+            return NetUserModalsSet(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
         }
     });
 
@@ -1017,7 +1017,7 @@ static std::vector<CheckDef> BuildChecks() {
             NetApiBufferFree(cur);
             upd.usrmod0_min_passwd_age = 86400;
             DWORD parm_err = 0;
-            return NetUserSetModalInfo(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
+            return NetUserModalsSet(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
         }
     });
 
@@ -1049,7 +1049,7 @@ static std::vector<CheckDef> BuildChecks() {
             NetApiBufferFree(cur);
             upd.usrmod0_password_hist_len = 24;
             DWORD parm_err = 0;
-            return NetUserSetModalInfo(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
+            return NetUserModalsSet(nullptr, 0, (LPBYTE)&upd, &parm_err) == NERR_Success;
         }
     });
 

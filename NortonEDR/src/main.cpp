@@ -26,7 +26,6 @@
 #include <winhttp.h>
 #include <winioctl.h>
 
-#pragma comment(lib, "sechost.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "winhttp.lib")
 
@@ -2135,8 +2134,87 @@ cleanup:
     return result;
 }
 
+// RVA → file offset (free function — no C++ objects, safe for SEH callers).
+static DWORD ImphashRvaToOff(const IMAGE_NT_HEADERS64* nth, DWORD rva) {
+    WORD n = nth->FileHeader.NumberOfSections;
+    const IMAGE_SECTION_HEADER* sec =
+        (const IMAGE_SECTION_HEADER*)((const BYTE*)&nth->OptionalHeader
+        + nth->FileHeader.SizeOfOptionalHeader);
+    for (WORD i = 0; i < n; i++)
+        if (rva >= sec[i].VirtualAddress &&
+            rva <  sec[i].VirtualAddress + sec[i].SizeOfRawData)
+            return rva - sec[i].VirtualAddress + sec[i].PointerToRawData;
+    return 0;
+}
+
+// SEH-safe import walker. Writes "mod.fn,mod.fn,..." (null-terminated) into buf.
+// No C++ objects in this frame. Returns bytes written, 0 on AV or empty table.
+static DWORD CollectImportFlat(PVOID base, char* buf, DWORD cap) {
+    struct ImpDesc { DWORD OFT, TS, FC, Name, FT; };
+    DWORD w = 0;
+    __try {
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic != 0x5A4D) __leave;
+        const IMAGE_NT_HEADERS64* nth =
+            (const IMAGE_NT_HEADERS64*)((const BYTE*)base + dos->e_lfanew);
+        if (nth->Signature != 0x00004550) __leave;
+        DWORD impRva = nth->OptionalHeader.DataDirectory[1].VirtualAddress;
+        if (!impRva) __leave;
+        DWORD impOff = ImphashRvaToOff(nth, impRva);
+        if (!impOff) __leave;
+
+        const ImpDesc* desc = (const ImpDesc*)((const BYTE*)base + impOff);
+        for (; desc->Name; desc++) {
+            DWORD nameOff = ImphashRvaToOff(nth, desc->Name);
+            if (!nameOff) continue;
+
+            char mod[256]; int modLen = 0;
+            const char* p = (const char*)base + nameOff;
+            while (*p && modLen < 255) {
+                char c = *p++;
+                mod[modLen++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+            }
+            for (int i = modLen - 1; i >= 0; i--)
+                if (mod[i] == '.') { modLen = i; break; }
+            mod[modLen] = '\0';
+
+            DWORD thunkRva = desc->OFT ? desc->OFT : desc->FT;
+            DWORD thunkOff = ImphashRvaToOff(nth, thunkRva);
+            if (!thunkOff) continue;
+
+            const ULONGLONG* thunk = (const ULONGLONG*)((const BYTE*)base + thunkOff);
+            for (; *thunk; thunk++) {
+                char fn[256]; int fnLen = 0;
+                if (*thunk & (1ULL << 63)) {
+                    char tmp[8]; _itoa_s((int)(*thunk & 0xFFFF), tmp, 10);
+                    fn[fnLen++] = '#';
+                    for (const char* q = tmp; *q; q++) fn[fnLen++] = *q;
+                } else {
+                    DWORD hOff = ImphashRvaToOff(nth, (DWORD)(*thunk & 0xFFFFFFFF));
+                    if (!hOff) continue;
+                    const char* r = (const char*)base + hOff + 2;
+                    while (*r && fnLen < 255) {
+                        char c = *r++;
+                        fn[fnLen++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+                    }
+                }
+                fn[fnLen] = '\0';
+                DWORD need = (DWORD)(modLen + 1 + fnLen);
+                if (w + need + 2 > cap) __leave;
+                if (w) buf[w++] = ',';
+                memcpy(buf + w, mod, modLen); w += modLen;
+                buf[w++] = '.';
+                memcpy(buf + w, fn, fnLen);   w += fnLen;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { w = 0; }
+    buf[w] = '\0';
+    return w;
+}
+
 // ---------------------------------------------------------------------------
-// Import hash (imphash) — MD5 of sorted "module.funcname" pairs, matching
+// Import hash (imphash) — MD5 of "module.funcname,..." pairs, matching
 // the convention used by pefile/VirusTotal for threat-intel correlation.
 // Returns lowercase hex string, empty if the PE has no import table.
 // ---------------------------------------------------------------------------
@@ -2154,106 +2232,30 @@ static std::string ComputeImphash(const std::string& path) {
     CloseHandle(hMap);
     if (!base) return {};
 
-    std::string result;
-
-    __try {
-        auto* dos = (IMAGE_DOS_HEADER*)base;
-        if (dos->e_magic != 0x5A4D) __leave;
-
-        auto* nth = (IMAGE_NT_HEADERS64*)((BYTE*)base + dos->e_lfanew);
-        if (nth->Signature != 0x00004550) __leave;
-
-        DWORD importRva = nth->OptionalHeader.DataDirectory[1].VirtualAddress;
-        DWORD importSz  = nth->OptionalHeader.DataDirectory[1].Size;
-        if (importRva == 0 || importSz == 0) __leave;
-
-        // RVA → file offset via section table
-        auto RvaToFileOff = [&](DWORD rva) -> DWORD {
-            WORD n = nth->FileHeader.NumberOfSections;
-            auto* sec = (IMAGE_SECTION_HEADER*)((BYTE*)&nth->OptionalHeader
-                        + nth->FileHeader.SizeOfOptionalHeader);
-            for (WORD i = 0; i < n; i++) {
-                if (rva >= sec[i].VirtualAddress &&
-                    rva <  sec[i].VirtualAddress + sec[i].SizeOfRawData)
-                    return rva - sec[i].VirtualAddress + sec[i].PointerToRawData;
-            }
-            return 0;
-        };
-
-        struct IMAGE_IMPORT_DESCRIPTOR {
-            DWORD OriginalFirstThunk;
-            DWORD TimeDateStamp;
-            DWORD ForwarderChain;
-            DWORD Name;
-            DWORD FirstThunk;
-        };
-
-        DWORD importOff = RvaToFileOff(importRva);
-        if (!importOff) __leave;
-
-        auto* desc = (IMAGE_IMPORT_DESCRIPTOR*)((BYTE*)base + importOff);
-        std::vector<std::string> entries;
-
-        for (; desc->Name != 0; desc++) {
-            DWORD nameOff = RvaToFileOff(desc->Name);
-            if (!nameOff) continue;
-            std::string modName = (char*)base + nameOff;
-            // Strip extension, lowercase
-            size_t dot = modName.rfind('.');
-            if (dot != std::string::npos) modName = modName.substr(0, dot);
-            for (auto& c : modName) c = (char)tolower((unsigned char)c);
-
-            DWORD thunkRva = desc->OriginalFirstThunk
-                           ? desc->OriginalFirstThunk : desc->FirstThunk;
-            DWORD thunkOff = RvaToFileOff(thunkRva);
-            if (!thunkOff) continue;
-
-            auto* thunk = (ULONGLONG*)((BYTE*)base + thunkOff);
-            for (; *thunk; thunk++) {
-                if (*thunk & (1ULL << 63)) {
-                    // Import by ordinal
-                    entries.push_back(modName + ".#" +
-                        std::to_string(*thunk & 0xFFFF));
-                } else {
-                    DWORD hintOff = RvaToFileOff((DWORD)(*thunk & 0xFFFFFFFF));
-                    if (!hintOff) continue;
-                    std::string fn = (char*)base + hintOff + 2; // skip Hint WORD
-                    for (auto& c : fn) c = (char)tolower((unsigned char)c);
-                    entries.push_back(modName + "." + fn);
-                }
-            }
-        }
-
-        if (entries.empty()) __leave;
-
-        std::string flat;
-        for (size_t i = 0; i < entries.size(); i++) {
-            if (i) flat += ',';
-            flat += entries[i];
-        }
-
-        // MD5 the concatenated string
-        HCRYPTPROV hProv = 0;
-        HCRYPTHASH hHash = 0;
-        if (CryptAcquireContextA(&hProv, nullptr, nullptr, PROV_RSA_FULL,
-                                  CRYPT_VERIFYCONTEXT)) {
-            if (CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
-                CryptHashData(hHash, (BYTE*)flat.data(), (DWORD)flat.size(), 0);
-                BYTE  dig[16]; DWORD dlen = 16;
-                if (CryptGetHashParam(hHash, HP_HASHVAL, dig, &dlen, 0)) {
-                    char hex[33] = {};
-                    for (int i = 0; i < 16; i++)
-                        sprintf_s(hex + i * 2, 3, "%02x", dig[i]);
-                    result = hex;
-                }
-                CryptDestroyHash(hHash);
-            }
-            CryptReleaseContext(hProv, 0);
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-
+    // Heap-allocate the flat buffer so __try is in a separate frame (no C++ objects there)
+    std::vector<char> flatBuf(131072, 0);
+    DWORD flatLen = CollectImportFlat(base, flatBuf.data(), (DWORD)flatBuf.size() - 1);
     UnmapViewOfFile(base);
+    if (!flatLen) return {};
+
+    // MD5 the concatenated string (all C++ objects outside any __try)
+    std::string result;
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    if (CryptAcquireContextA(&hProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        if (CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
+            CryptHashData(hHash, (BYTE*)flatBuf.data(), flatLen, 0);
+            BYTE dig[16]; DWORD dlen = 16;
+            if (CryptGetHashParam(hHash, HP_HASHVAL, dig, &dlen, 0)) {
+                char hex[33] = {};
+                for (int i = 0; i < 16; i++)
+                    sprintf_s(hex + i * 2, 3, "%02x", dig[i]);
+                result = hex;
+            }
+            CryptDestroyHash(hHash);
+        }
+        CryptReleaseContext(hProv, 0);
+    }
     return result;
 }
 
@@ -3851,20 +3853,6 @@ static void WINAPI TiEventCallback(PEVENT_RECORD pEvent) {
                          callerPid, DetectionSeverity::High);
 }
 
-static bool EnablePrivilege(LPCWSTR privName) {
-    HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(),
-                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
-        return false;
-    TOKEN_PRIVILEGES tp{};
-    tp.PrivilegeCount = 1;
-    LookupPrivilegeValueW(nullptr, privName, &tp.Privileges[0].Luid);
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    AdjustTokenPrivileges(hToken, FALSE, &tp, 0, nullptr, nullptr);
-    DWORD err = GetLastError();
-    CloseHandle(hToken);
-    return err == ERROR_SUCCESS;
-}
 
 static void EtwTiSubscriberThread() {
     // Attempt privilege escalation required for ETW-TI

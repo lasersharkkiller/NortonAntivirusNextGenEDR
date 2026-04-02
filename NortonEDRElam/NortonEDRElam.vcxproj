@@ -79,6 +79,7 @@
       <PreprocessorDefinitions>
         _AMD64_;NTDDI_VERSION=NTDDI_WIN10_RS5;WINVER=0x0A00;%(PreprocessorDefinitions)
       </PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\10.0.26100.0\km;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <!-- Pure WDM: link ntoskrnl + hal only.  No wdfstubl / wdfdriverentry. -->
@@ -97,6 +98,7 @@
         _AMD64_;NTDDI_VERSION=NTDDI_WIN10_RS5;WINVER=0x0A00;%(PreprocessorDefinitions)
       </PreprocessorDefinitions>
       <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\10.0.26100.0\km;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <AdditionalDependencies>$(DDK_LIB_PATH)\ntoskrnl.lib;$(DDK_LIB_PATH)\hal.lib;%(AdditionalDependencies)</AdditionalDependencies>

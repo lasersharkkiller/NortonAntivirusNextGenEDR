@@ -1,6 +1,14 @@
 #include "Globals.h"
 #include "Deception.h"
 
+// User-mode access masks not defined in kernel headers
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION 0x0400
+#endif
+#ifndef THREAD_QUERY_INFORMATION
+#define THREAD_QUERY_INFORMATION  0x0040
+#endif
+
 PSSDT_TABLE SyscallsUtils::ssdtTable = nullptr;
 PFUNCTION_MAP SyscallsUtils::exportsMap = nullptr;
 ZwSetInformationProcess SyscallsUtils::pZwSetInformationProcess = nullptr;

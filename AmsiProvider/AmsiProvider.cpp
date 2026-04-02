@@ -1,3 +1,4 @@
+#define INITGUID
 #include "AmsiProvider.h"
 #include <cstdio>
 #include <cctype>
