@@ -30,6 +30,7 @@ CopyFiles = NortonEDRElam.CopyFiles
 AddService = NortonEDRElam, 0x00000002, NortonEDRElam.Service
 
 [DefaultUninstall.NTamd64]
+LegacyUninstall = 1
 DelFiles   = NortonEDRElam.CopyFiles
 DelService = NortonEDRElam, 0x00000200
 
