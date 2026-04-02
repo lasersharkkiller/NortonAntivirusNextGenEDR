@@ -8,41 +8,6 @@ A Windows kernel-mode EDR featuring an Intel VT-x hypervisor with EPT-based memo
 
 ## Defensive Capabilities
 
-### Adversary Deception
-
-A four-layer deception stack that serves false data to attackers instead of blocking them — causing credential theft tools to ingest canary credentials, fail authentication, and trigger SIEM alerts, while the adversary believes their tooling is broken rather than detected.
-
-**Canary credential design** — all injected credentials use the MD4(empty string) NTLM hash (`31d6cfe0d16ae931b73c59d7e0c089c0`) and the empty-string LM hash (`aad3b435b51404ee`). These are universally blocked by domain controllers (authentication fails) and flagged by SIEMs (pass-the-hash attempt with a known-bad hash), so any use of captured credentials produces an auditable failure event without the attacker receiving an error.
-
-**Layer 1 — Honeypot registry keys** (`NortonEDRDriver/src/Deception.cpp`)
-- Three volatile registry keys created at driver load under `HKLM\SECURITY\Policy\Secrets`, `HKLM\SYSTEM\...\Services\FakeSvcPassword\Parameters`, and `HKLM\SAM\...\Users\HoneypotUser`
-- Keys contain: an LSA secret blob with canary NTLM hash at offset 8; a fake service account password (`BackupAdmin2024!`) as `REG_SZ`; a synthetic SAM F-value with canary hash at offset `0x18` (where `samparse` / `impacket` expect the NT hash)
-- The `RegOpNotifyCallback` in `Registry.cpp` calls `DeceptionEngine::IsHoneypotRegistryAccess()` on every `RegNtPreCreateKeyEx` event; matches emit a Critical `DeceptionCheck` alert and **allow the open to proceed** so the attacker receives the fake data
-- Account name: `svc_backup_admin`, domain: `CORP` — plausible service account names that pass basic sanity checks in credential-theft tools
-
-**Layer 2 — Honeypot file traps** (`NortonEDRDriver/src/Deception.cpp`)
-- Five file name patterns monitored: `sam_backup.bak`, `.env.credentials`, `credentials.xml`, `ntds_backup.dit`, `lsass_dump.dmp`
-- `FsFilter` pre-create callback checks the file name via `DeceptionEngine::IsHoneypotFilePath()`; match → Critical alert; file open **allowed** so the attacker can read the decoy content
-- Alert includes the accessing process name and PID for immediate attribution
-
-**Layer 3 — Kernel LSASS read buffer patching** (`NortonEDRDriver/src/SyscallsTracing.cpp`, `HookDll/HookDll.cpp`)
-- *Kernel path*: `NtReadVmHandler` (the alt-syscall pre-call hook for `NtReadVirtualMemory`) detects cross-process reads targeting LSASS; when the output buffer is already kernel-mapped, `DeceptionEngine::PatchLsassReadBuffer()` walks it in 8-byte aligned 16-byte windows and replaces values that match the NTLM-hash heuristic (≥8 non-zero bytes, high-byte ≥5, max run ≤4) with the canary hash in place
-- *User-mode path*: `HookDll`'s `Hook_ReadProcessMemory` fires post-read (after the real syscall completes); `IsLsassHandle()` confirms the target is lsass.exe; `PatchNtlmHashesInBuffer()` applies the same heuristic walk on the user-mode output buffer; patch count is reported via the named pipe
-- The attacker's process receives a buffer with canary hashes in place of real credentials; Mimikatz and similar tools parse and display the fake data without error
-
-**Layer 4 — Hypervisor EPT shadow-page deception** (`NortonEDRHypervisor/src/HvDeception.cpp`)
-- Uses EPT Monitor Trap Flag (MTF) split-page hooking to serve a decoy 4 KB page to any reader of LSASS credential cache pages, while LSASS itself continues to use the real data
-- **Decoy page content**: fake `MSV1_0_PRIMARY_CREDENTIAL` header at offset 0 (fake UNICODE_STRING fields for `svc_backup_admin`/`CORP`); canary NTLM hash at `+0x40`; canary LM hash at `+0x50`; repeated at every `0x230`-byte boundary (size of the struct in Windows 10 22H2); WDigest fake plaintext `BackupAdmin2024!` at `+0x800`
-- **Mechanism** (per read from a non-LSASS process): EPT marks the protected page execute-only → EPT read violation fires → handler maps the decoy page and enables MTF (bit 27 of Primary Proc Controls) → guest executes one instruction reading the decoy → MTF VM exit (reason 37) → real mapping restored, MTF cleared → guest continues normally with real data
-- `HvDeceptionProtectPage()` registers GPAs; `g_MtfRestoreGpa[64]` tracks per-CPU pending restores (nesting is impossible since MTF fires after exactly one instruction)
-- `HvDeceptionInit()` / `HvDeceptionCleanup()` called from `HvEntry.cpp` `DriverEntry` / `HvUnload`; EPT read violation dispatch wired into `HvHandleVmExit` before the general `HvEptHandleViolation` path
-
-**NtQuerySystemInformation process list falsification** (`HookDll/HookDll.cpp`)
-- `Hook_NtQuerySystemInformation` intercepts class 5 (`SystemProcessInformation`) calls; walks the `SYSTEM_PROCESS_INFORMATION` linked list and unlinks entries whose image names match known EDR process names (`NortonEDR.exe`, `nortonav.exe`, `MsMpEng.exe`, `SentinelAgent.exe`, `CSFalconService.exe`) by patching `NextEntryOffset`; first-entry removal uses `MoveMemory` to slide the buffer
-- A decoy `svchost_config.exe` entry is injected as a honeypot — any tool that specifically enumerates for and interacts with this process is immediately flagged
-
----
-
 ### Hypervisor (Intel VT-x)
 - Standalone pure-WDM kernel driver (`NortonEDRHypervisor.sys`) implementing a thin Type-1 style VMM using Intel VT-x; the existing Windows kernel becomes the guest and runs unmodified in VMX non-root operation
 - **Initialization** — `KeIpiGenericCall` broadcasts per-CPU VMX setup atomically: CPUID vendor check → `IA32_FEATURE_CONTROL` lock verification → CR0/CR4 fixed-bit adjustment → VMXON region + VMCS + MSR bitmap + EPT allocation → `VMXON` → VMCS configuration → `VMLAUNCH`; guest resumes at the captured `GUEST_RIP` continuation label in the MASM stub
@@ -176,6 +141,39 @@ All hook detections emit a `KERNEL_STRUCTURED_NOTIFICATION` with severity Critic
 - `DllMain` calls `InstallHooks`/`RemoveHooks` automatically; exports allow explicit control
 - **Kernel APC injection** — `DllInjector.cpp` hooks `ImageLoadNotifyRoutine`; on every `ntdll.dll` map the loading thread is used as the APC target (`PsGetCurrentThread()`); path buffer allocated in the target process via `ZwAllocateVirtualMemory(NtCurrentProcess())` while attached; `KeInitializeApc`/`KeInsertQueueApc` queues `LoadLibraryW(hookDllPath)` for user-mode delivery; system processes (`smss`, `csrss`, `wininit`, `lsass`) and NortonEDR itself are excluded
 - **IOCTL `NORTONAV_SET_INJECT_CONFIG`** — at startup NortonEDR sends `LoadLibraryW` VA (valid in all processes — shared DLL section, boot-time ASLR only), HookDll full path, and own PID to the driver; injection activates automatically for all subsequent process creations
+
+### Adversary Deception
+
+A four-layer deception stack that serves false data to attackers instead of blocking them — causing credential theft tools to ingest canary credentials, fail authentication, and trigger SIEM alerts, while the adversary believes their tooling is broken rather than detected.
+
+**Canary credential design** — all injected credentials use the MD4(empty string) NTLM hash (`31d6cfe0d16ae931b73c59d7e0c089c0`) and the empty-string LM hash (`aad3b435b51404ee`). These are universally blocked by domain controllers (authentication fails) and flagged by SIEMs (pass-the-hash attempt with a known-bad hash), so any use of captured credentials produces an auditable failure event without the attacker receiving an error.
+
+**Layer 1 — Honeypot registry keys** (`NortonEDRDriver/src/Deception.cpp`)
+- Three volatile registry keys created at driver load under `HKLM\SECURITY\Policy\Secrets`, `HKLM\SYSTEM\...\Services\FakeSvcPassword\Parameters`, and `HKLM\SAM\...\Users\HoneypotUser`
+- Keys contain: an LSA secret blob with canary NTLM hash at offset 8; a fake service account password (`BackupAdmin2024!`) as `REG_SZ`; a synthetic SAM F-value with canary hash at offset `0x18` (where `samparse` / `impacket` expect the NT hash)
+- The `RegOpNotifyCallback` in `Registry.cpp` calls `DeceptionEngine::IsHoneypotRegistryAccess()` on every `RegNtPreCreateKeyEx` event; matches emit a Critical `DeceptionCheck` alert and **allow the open to proceed** so the attacker receives the fake data
+- Account name: `svc_backup_admin`, domain: `CORP` — plausible service account names that pass basic sanity checks in credential-theft tools
+
+**Layer 2 — Honeypot file traps** (`NortonEDRDriver/src/Deception.cpp`)
+- Five file name patterns monitored: `sam_backup.bak`, `.env.credentials`, `credentials.xml`, `ntds_backup.dit`, `lsass_dump.dmp`
+- `FsFilter` pre-create callback checks the file name via `DeceptionEngine::IsHoneypotFilePath()`; match → Critical alert; file open **allowed** so the attacker can read the decoy content
+- Alert includes the accessing process name and PID for immediate attribution
+
+**Layer 3 — Kernel LSASS read buffer patching** (`NortonEDRDriver/src/SyscallsTracing.cpp`, `HookDll/HookDll.cpp`)
+- *Kernel path*: `NtReadVmHandler` (the alt-syscall pre-call hook for `NtReadVirtualMemory`) detects cross-process reads targeting LSASS; when the output buffer is already kernel-mapped, `DeceptionEngine::PatchLsassReadBuffer()` walks it in 8-byte aligned 16-byte windows and replaces values that match the NTLM-hash heuristic (≥8 non-zero bytes, high-byte ≥5, max run ≤4) with the canary hash in place
+- *User-mode path*: `HookDll`'s `Hook_ReadProcessMemory` fires post-read (after the real syscall completes); `IsLsassHandle()` confirms the target is lsass.exe; `PatchNtlmHashesInBuffer()` applies the same heuristic walk on the user-mode output buffer; patch count is reported via the named pipe
+- The attacker's process receives a buffer with canary hashes in place of real credentials; Mimikatz and similar tools parse and display the fake data without error
+
+**Layer 4 — Hypervisor EPT shadow-page deception** (`NortonEDRHypervisor/src/HvDeception.cpp`)
+- Uses EPT Monitor Trap Flag (MTF) split-page hooking to serve a decoy 4 KB page to any reader of LSASS credential cache pages, while LSASS itself continues to use the real data
+- **Decoy page content**: fake `MSV1_0_PRIMARY_CREDENTIAL` header at offset 0 (fake UNICODE_STRING fields for `svc_backup_admin`/`CORP`); canary NTLM hash at `+0x40`; canary LM hash at `+0x50`; repeated at every `0x230`-byte boundary (size of the struct in Windows 10 22H2); WDigest fake plaintext `BackupAdmin2024!` at `+0x800`
+- **Mechanism** (per read from a non-LSASS process): EPT marks the protected page execute-only → EPT read violation fires → handler maps the decoy page and enables MTF (bit 27 of Primary Proc Controls) → guest executes one instruction reading the decoy → MTF VM exit (reason 37) → real mapping restored, MTF cleared → guest continues normally with real data
+- `HvDeceptionProtectPage()` registers GPAs; `g_MtfRestoreGpa[64]` tracks per-CPU pending restores (nesting is impossible since MTF fires after exactly one instruction)
+- `HvDeceptionInit()` / `HvDeceptionCleanup()` called from `HvEntry.cpp` `DriverEntry` / `HvUnload`; EPT read violation dispatch wired into `HvHandleVmExit` before the general `HvEptHandleViolation` path
+
+**NtQuerySystemInformation process list falsification** (`HookDll/HookDll.cpp`)
+- `Hook_NtQuerySystemInformation` intercepts class 5 (`SystemProcessInformation`) calls; walks the `SYSTEM_PROCESS_INFORMATION` linked list and unlinks entries whose image names match known EDR process names (`NortonEDR.exe`, `nortonav.exe`, `MsMpEng.exe`, `SentinelAgent.exe`, `CSFalconService.exe`) by patching `NextEntryOffset`; first-entry removal uses `MoveMemory` to slide the buffer
+- A decoy `svchost_config.exe` entry is injected as a honeypot — any tool that specifically enumerates for and interacts with this process is immediately flagged
 
 ### Sysmon & SACL Integration
 - Sysmon event ingestion for host-based telemetry enrichment
