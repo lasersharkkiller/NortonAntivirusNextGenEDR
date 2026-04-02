@@ -25,11 +25,16 @@
 #include "HvDefs.h"
 
 // Forward declarations from HvEpt.cpp
-extern VOID HvEptHandleViolation(_In_ PVCPU vcpu);
+extern VOID     HvEptHandleViolation(_In_ PVCPU vcpu);
+extern NTSTATUS HvEptSetPagePermissions(_In_ PVCPU vcpu, _In_ ULONG64 gpa, _In_ ULONG64 permissions);
 
 // Forward declarations from HvDeception.cpp
 extern BOOLEAN HvDeceptionHandleEptReadViolation(_In_ PVCPU vcpu, _In_ ULONG64 gpa);
 extern VOID    HvDeceptionHandleMtfExit(_In_ PVCPU vcpu);
+
+// g_VcpuArray is defined in HvEntry.cpp — declare at file scope to avoid
+// inheriting C linkage when referenced inside an extern "C" function body.
+extern PVCPU g_VcpuArray;
 
 // ---------------------------------------------------------------------------
 // MSR bitmap helpers
@@ -102,19 +107,19 @@ NTSTATUS HvSetupVmcs(_In_ PVCPU vcpu)
 
     // Read GDT / IDT
     PSEUDO_DESCRIPTOR gdtr = {}, idtr = {};
-    __sgdt(&gdtr);
-    __sidt(&idtr);
+    HvSgdt(&gdtr);
+    HvSidt(&idtr);
     ULONG_PTR gdtBase = gdtr.Base;
 
     // Segment selectors
-    USHORT cs = (USHORT)__readcs();
-    USHORT ss = (USHORT)__readss();
-    USHORT ds = (USHORT)__readds();
-    USHORT es = (USHORT)__reades();
-    USHORT fs = (USHORT)__readfs();
-    USHORT gs = (USHORT)__readgs();
-    USHORT tr = (USHORT)__readtr();
-    USHORT ldtr = (USHORT)__readldtr();
+    USHORT cs   = HvReadCs();
+    USHORT ss   = HvReadSs();
+    USHORT ds   = HvReadDs();
+    USHORT es   = HvReadEs();
+    USHORT fs   = HvReadFs();
+    USHORT gs   = HvReadGs();
+    USHORT tr   = HvReadTr();
+    USHORT ldtr = HvReadLdtr();
 
     W(VMCS_GUEST_CS_SEL,   cs);
     W(VMCS_GUEST_SS_SEL,   ss);
@@ -520,8 +525,6 @@ extern "C" VOID HvHandleVmExit(_In_ PGUEST_REGISTERS regs)
     // Identify the vCPU for the current logical processor
     ULONG cpu = KeGetCurrentProcessorNumberEx(nullptr);
 
-    // g_VcpuArray is declared in HvEntry.cpp
-    extern PVCPU g_VcpuArray;
     PVCPU vcpu = &g_VcpuArray[cpu];
     vcpu->ExitCount++;
 

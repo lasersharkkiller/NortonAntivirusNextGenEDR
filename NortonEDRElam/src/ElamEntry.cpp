@@ -39,73 +39,62 @@
 
 #include "ElamDefs.h"
 
-// ---------------------------------------------------------------------------
-// ELAM must declare the BDCB structures and IoRegisterBootDriverCallback
-// when building against older SDK headers that don't expose them.
-// With WDK 10.0.26100 these are present in ntddk.h / wdm.h automatically.
-// ---------------------------------------------------------------------------
-#ifndef _BDCB_IMAGE_INFORMATION_DEFINED
-#define _BDCB_IMAGE_INFORMATION_DEFINED
+// Manual BDCB declarations — wdm.h does not expose these; ntddk.h's version
+// has a different IoRegisterBootDriverCallback signature (2-arg vs 3-arg).
+// Using the 3-argument form documented in WDK samples / KB4493539.
 
 typedef enum _BDCB_CALLBACK_TYPE {
-    BdCbStatusUpdate,
-    BdCbInitializeImage
-} BDCB_CALLBACK_TYPE;
+    BdCbStatusUpdate        = 0,
+    BdCbInitializeImage     = 1,
+} BDCB_CALLBACK_TYPE, *PBDCB_CALLBACK_TYPE;
 
 typedef enum _BDCB_CLASSIFICATION {
-    BdCbClassificationUnknownImage,
-    BdCbClassificationKnownGoodImage,
-    BdCbClassificationKnownBadImage,
-    BdCbClassificationKnownBadImageBootCritical,
-    BdCbClassificationEnd
-} BDCB_CLASSIFICATION;
+    BdCbClassificationUnknownImage              = 0,
+    BdCbClassificationKnownGoodImage            = 1,
+    BdCbClassificationKnownBadImage             = 2,
+    BdCbClassificationKnownBadImageBootCritical = 3,
+} BDCB_CLASSIFICATION, *PBDCB_CLASSIFICATION;
 
 typedef enum _BDCB_STATUS_UPDATE_TYPE {
-    BdCbStatusPrepareForDriverLoad,
-    BdCbStatusPrepareForUnload,
-    BdCbStatusOptionalDriversComplete
-} BDCB_STATUS_UPDATE_TYPE;
-
-#define BDCB_IMAGE_FLAG_FAILED_CODE_INTEGRITY   0x00000001
-#define BDCB_IMAGE_FLAG_FAILED_IMAGE_HASH       0x00000002
-#define BDCB_IMAGE_FLAG_SYSTEM_CRITICAL         0x00000004
+    BdCbStatusPrepareForDriverLoad      = 0,
+    BdCbStatusOptionalDriversComplete   = 1,
+    BdCbStatusPrepareForUnload          = 2,
+} BDCB_STATUS_UPDATE_TYPE, *PBDCB_STATUS_UPDATE_TYPE;
 
 typedef struct _BDCB_STATUS_UPDATE_INFORMATION {
     BDCB_STATUS_UPDATE_TYPE StatusType;
 } BDCB_STATUS_UPDATE_INFORMATION, *PBDCB_STATUS_UPDATE_INFORMATION;
 
+#define BDCB_IMAGE_FLAG_FAILED_CODE_INTEGRITY   0x00000001
+#define BDCB_IMAGE_FLAG_FAILED_IMAGE_HASH       0x00000002
+#define BDCB_IMAGE_FLAG_SYSTEM_CRITICAL         0x00000004
+
 typedef struct _BDCB_IMAGE_INFORMATION {
     BDCB_CLASSIFICATION Classification;
     ULONG               ImageFlags;
-    UNICODE_STRING      ImageName;
-    UNICODE_STRING      RegistryPath;
-    UNICODE_STRING      CertificatePublisher;
-    UNICODE_STRING      CertificateIssuer;
     PVOID               ImageHash;
-    PVOID               CertificateThumbprint;
-    ULONG               ImageHashAlgorithm;
-    ULONG               ThumbprintHashAlgorithm;
-    ULONG               ImageHashLength;
-    ULONG               CertificateThumbprintLength;
+    USHORT              ImageHashLength;
+    USHORT              ImageHashAlgorithm;
+    UNICODE_STRING      ImageName;
+    PUNICODE_STRING     RegistryPath;
+    USHORT              ImageInformationVersion;
+    BOOLEAN             SystemCritical;
 } BDCB_IMAGE_INFORMATION, *PBDCB_IMAGE_INFORMATION;
 
-typedef VOID (NTAPI *PBOOT_DRIVER_CALLBACK_FUNCTION)(
-    PVOID                   CallbackContext,
-    BDCB_CALLBACK_TYPE      CallbackType,
-    PBDCB_IMAGE_INFORMATION ImageInformation
-);
+typedef VOID (NTAPI* BOOT_DRIVER_CALLBACK_FUNCTION)(
+    _In_opt_ PVOID               CallbackContext,
+    _In_     BDCB_CALLBACK_TYPE  CallbackType,
+    _In_opt_ PBDCB_IMAGE_INFORMATION ImageInformation);
 
-NTKERNELAPI NTSTATUS NTAPI
-IoRegisterBootDriverCallback(
-    _In_  PBOOT_DRIVER_CALLBACK_FUNCTION CallbackFunction,
-    _In_opt_ PVOID                       CallbackContext,
-    _Out_ PVOID                         *CallbackHandle
-);
+extern "C" {
+NTKERNELAPI NTSTATUS IoRegisterBootDriverCallback(
+    _In_  BOOT_DRIVER_CALLBACK_FUNCTION CallbackFunction,
+    _In_opt_ PVOID                      CallbackContext,
+    _Out_ PVOID*                        CallbackHandle);
 
-NTKERNELAPI VOID NTAPI
-IoUnregisterBootDriverCallback(_In_ PVOID CallbackHandle);
-
-#endif // _BDCB_IMAGE_INFORMATION_DEFINED
+NTKERNELAPI VOID IoUnregisterBootDriverCallback(
+    _In_ PVOID CallbackHandle);
+}
 
 // ---------------------------------------------------------------------------
 // Module-level state

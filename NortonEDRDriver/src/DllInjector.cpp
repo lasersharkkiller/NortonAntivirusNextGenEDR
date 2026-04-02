@@ -12,12 +12,16 @@ typedef enum _KAPC_ENVIRONMENT_ {
     InsertApcEnvironment
 } KAPC_ENVIRONMENT_, *PKAPC_ENVIRONMENT_;
 
+// Must be extern "C" — these are undocumented exports in ntoskrnl.lib;
+// C++ mangling would produce a decorated name the linker cannot find.
+extern "C" {
 NTKERNELAPI VOID KeInitializeApc(PRKAPC Apc, PKTHREAD Thread,
     KAPC_ENVIRONMENT_ Environment, PKKERNEL_ROUTINE_ KernelRoutine,
     PKRUNDOWN_ROUTINE_ RundownRoutine, PKNORMAL_ROUTINE NormalRoutine,
     KPROCESSOR_MODE ApcMode, PVOID NormalContext);
 NTKERNELAPI BOOLEAN KeInsertQueueApc(PRKAPC Apc, PVOID SystemArgument1,
     PVOID SystemArgument2, KPRIORITY Increment);
+}
 
 // ---------------------------------------------------------------------------
 // DllInjector — kernel-mode APC injection of HookDll.dll into user processes.

@@ -4,11 +4,11 @@
 #include <ndis.h>
 #include <ndis/nbl.h>
 
+#define INITGUID
+#include <guiddef.h>
 #include <fwpmk.h>
 #include <fwpsk.h>
 #include <fltKernel.h>
-#define INITGUID
-#include <guiddef.h>
 
 #include <windef.h>
 #include <intrin.h>
@@ -21,6 +21,7 @@
 
 #pragma comment(lib, "fwpkclnt.lib")
 #pragma comment(lib, "ndis.lib")
+#pragma comment(lib, "fltMgr.lib")
 
 #pragma warning(disable:4309)
 #pragma warning(disable:4245)

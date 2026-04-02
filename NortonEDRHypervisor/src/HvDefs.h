@@ -2,6 +2,21 @@
 #include <ntddk.h>
 #include <intrin.h>
 
+// BYTE is a Win32 type not defined in kernel headers
+#ifndef BYTE
+typedef UCHAR BYTE;
+#endif
+
+// POOL_FLAG_ZERO_ALLOCATION missing from EWDK 26100 kernel headers
+#ifndef POOL_FLAG_ZERO_ALLOCATION
+#define POOL_FLAG_ZERO_ALLOCATION 0x0000000000000100UI64
+#endif
+
+// STATUS_NOT_INITIALIZED missing from EWDK 26100 ntddk.h in some configs
+#ifndef STATUS_NOT_INITIALIZED
+#define STATUS_NOT_INITIALIZED ((NTSTATUS)0xC0000019L)
+#endif
+
 // ---------------------------------------------------------------------------
 // Sizes and limits
 // ---------------------------------------------------------------------------
@@ -393,6 +408,20 @@ typedef struct _VCPU {
 // Assembly stubs (defined in HvAsm.asm, called from C)
 // ---------------------------------------------------------------------------
 extern "C" {
+    // Descriptor table register reads (SGDT/SIDT — not MSVC x64 intrinsics)
+    VOID     HvSgdt(_Out_ PVOID desc);    // stores 10-byte PSEUDO_DESCRIPTOR
+    VOID     HvSidt(_Out_ PVOID desc);
+
+    // Segment register reads (not available as MSVC x64 intrinsics in kernel)
+    USHORT   HvReadCs();
+    USHORT   HvReadSs();
+    USHORT   HvReadDs();
+    USHORT   HvReadEs();
+    USHORT   HvReadFs();
+    USHORT   HvReadGs();
+    USHORT   HvReadTr();
+    USHORT   HvReadLdtr();
+
     NTSTATUS HvVmxOn(_In_ PHYSICAL_ADDRESS* physAddr);
     VOID     HvVmxOff();
     NTSTATUS HvVmClear(_In_ PHYSICAL_ADDRESS* physAddr);

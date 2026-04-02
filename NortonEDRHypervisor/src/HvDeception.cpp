@@ -37,6 +37,10 @@
 
 #include "HvDefs.h"
 
+// Forward declarations from HvEpt.cpp
+extern NTSTATUS HvEptSplitPage(_In_ PVCPU vcpu, _In_ ULONG64 gpa);
+extern NTSTATUS HvEptSetPagePermissions(_In_ PVCPU vcpu, _In_ ULONG64 gpa, _In_ ULONG64 permissions);
+
 // ---------------------------------------------------------------------------
 // Canary NTLM hash (MD4 of empty string) — same as in Deception.cpp
 // ---------------------------------------------------------------------------

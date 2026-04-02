@@ -258,4 +258,68 @@ HvVmExitStub PROC
     hlt
 HvVmExitStub ENDP
 
+
+; ---------------------------------------------------------------------------
+; VOID HvSgdt(PVOID desc)
+; Stores the current GDTR into the 10-byte PSEUDO_DESCRIPTOR at [RCX].
+; ---------------------------------------------------------------------------
+HvSgdt PROC
+    sgdt [rcx]
+    ret
+HvSgdt ENDP
+
+
+; ---------------------------------------------------------------------------
+; VOID HvSidt(PVOID desc)
+; Stores the current IDTR into the 10-byte PSEUDO_DESCRIPTOR at [RCX].
+; ---------------------------------------------------------------------------
+HvSidt PROC
+    sidt [rcx]
+    ret
+HvSidt ENDP
+
+
+; ---------------------------------------------------------------------------
+; Segment selector reads — return value in AX (zero-extended to RAX).
+; ---------------------------------------------------------------------------
+HvReadCs PROC
+    mov ax, cs
+    ret
+HvReadCs ENDP
+
+HvReadSs PROC
+    mov ax, ss
+    ret
+HvReadSs ENDP
+
+HvReadDs PROC
+    mov ax, ds
+    ret
+HvReadDs ENDP
+
+HvReadEs PROC
+    mov ax, es
+    ret
+HvReadEs ENDP
+
+HvReadFs PROC
+    mov ax, fs
+    ret
+HvReadFs ENDP
+
+HvReadGs PROC
+    mov ax, gs
+    ret
+HvReadGs ENDP
+
+HvReadTr PROC
+    str ax
+    ret
+HvReadTr ENDP
+
+HvReadLdtr PROC
+    sldt ax
+    ret
+HvReadLdtr ENDP
+
 END
