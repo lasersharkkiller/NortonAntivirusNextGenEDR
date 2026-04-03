@@ -116,7 +116,7 @@ std::unordered_set<std::string> detectedLolDriverPaths;
 const std::string kLoadedPotatoYaraRulesDir = R"(D:\Loaded-Potato\detections\yara)";
 const std::string kLoadedPotatoLolDriversCachePath = R"(D:\Loaded-Potato\detections\loldrivers\loldrivers_cache.json)";
 const std::string kLoadedPotatoSigmaRulesDir = R"(D:\Loaded-Potato\detections\sigma)";
-const std::string kDefaultEventsLogPath = R"(nortonav_events.jsonl)";
+const std::string kDefaultEventsLogPath = R"(C:\ProgramData\NortonEDR\events.jsonl)";
 const std::string kCapaExePath          = "capa.exe"; // must be on PATH or same dir as the binary
 
 enum class DetectionSeverity : int {
@@ -5397,6 +5397,9 @@ int main(int argc, char* argv[]) {
         }
         if (g_hostname.empty()) g_hostname = "unknown";
     }
+
+    // Ensure log directory exists before the first PersistDetectionEvent write.
+    std::filesystem::create_directories(R"(C:\ProgramData\NortonEDR)");
 
     // ------------------------------------------------------------------
     // Compliance evaluation mode — runs standalone, no driver required.

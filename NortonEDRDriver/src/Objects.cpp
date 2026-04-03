@@ -75,68 +75,85 @@ OB_PREOP_CALLBACK_STATUS ObjectUtils::PreOperationCallback(
 	return OB_PREOP_SUCCESS;
 }
 
-//
-//BOOLEAN ObjectUtils::isRemoteContextMapipulation(
-//	POB_POST_OPERATION_INFORMATION OpInfo
-//) {
-//	NTSTATUS status;
-//
-//	PETHREAD curThread = PsGetCurrentThread();
-//	PETHREAD concernedThread = (PETHREAD)OpInfo->Object;
-//
-//	PEPROCESS curProc = PsGetCurrentProcess();
-//	PEPROCESS concernedProcess = IoThreadToProcess(concernedThread);
-//
-//	char* curprocname = (char*)PsGetProcessImageFileName(curProc);
-//	char* targprocname = (char*)PsGetProcessImageFileName(concernedProcess);
-//
-//	PPS_PROTECTION curProcProtection = PsGetProcessProtection(curProc);
-//	HANDLE curProcId = PsGetProcessId(curProc);
-//
-//	HANDLE parentProc = PsGetProcessInheritedFromUniqueProcessId(curProc);
-//
-//	PEPROCESS parentProcEproc;
-//	status = PsLookupProcessByProcessId(parentProc, &parentProcEproc);
-//
-//	if (!NT_SUCCESS(status)) {
-//		return FALSE;
-//	}
-//
-//	if (parentProcEproc) {
-//
-//		PPS_PROTECTION parentProcProtection = PsGetProcessProtection(parentProcEproc);
-//
-//		if (parentProcProtection) {
-//			if (curProc != concernedProcess
-//				&& curProcProtection->Level == 0x0
-//				&& curProcId != (HANDLE)0x4
-//			) {
-//
-//				if (OpInfo->Operation == OB_OPERATION_HANDLE_CREATE) {
-//
-//					if (OpInfo->Parameters->CreateHandleInformation.GrantedAccess & THREAD_SET_CONTEXT) {
-//
-//						return TRUE;
-//					}
-//				}
-//			}
-//		}
-//	}
-//
-//	return FALSE;
-//}
+BOOLEAN ObjectUtils::isRemoteContextMapipulation(
+	POB_POST_OPERATION_INFORMATION OpInfo
+) {
+	if (OpInfo->Operation != OB_OPERATION_HANDLE_CREATE) {
+		return FALSE;
+	}
 
-//POB_POST_OPERATION_CALLBACK ObjectUtils::PostOperationCallback(
-//	PVOID RegContext,
-//	POB_POST_OPERATION_INFORMATION OpInfo
-//) {
-//
-//	if (ObjectUtils::isRemoteContextMapipulation(OpInfo)) {
-//
-//	}
-//
-//	return 0;
-//}
+	PETHREAD concernedThread = (PETHREAD)OpInfo->Object;
+	PEPROCESS concernedProcess = IoThreadToProcess(concernedThread);
+	PEPROCESS curProc = PsGetCurrentProcess();
+
+	// Skip self-targeting
+	if (curProc == concernedProcess) {
+		return FALSE;
+	}
+
+	// Only flag access to threads inside lsass
+	PUNICODE_STRING targetImageName = NULL;
+	SeLocateProcessImageName(concernedProcess, &targetImageName);
+	if (targetImageName == NULL) {
+		return FALSE;
+	}
+	if (!UnicodeStringContains(targetImageName, L"lsass.exe") &&
+		!UnicodeStringContains(targetImageName, L"LSASS.exe")) {
+		return FALSE;
+	}
+
+	// Only flag unprotected callers (not PPL/antimalware processes)
+	PPS_PROTECTION callerProt = PsGetProcessProtection(curProc);
+	if (callerProt->Level != 0x0) {
+		return FALSE;
+	}
+
+	// Alert when THREAD_SET_CONTEXT was granted — used for thread hijacking / pass-the-hash
+	if (OpInfo->Parameters->CreateHandleInformation.GrantedAccess & THREAD_SET_CONTEXT) {
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+POB_POST_OPERATION_CALLBACK ObjectUtils::PostOperationCallback(
+	PVOID RegContext,
+	POB_POST_OPERATION_INFORMATION OpInfo
+) {
+	if (ObjectUtils::isRemoteContextMapipulation(OpInfo)) {
+
+		PKERNEL_STRUCTURED_NOTIFICATION kernelNotif = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+			POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+
+		if (kernelNotif) {
+			char* msg = "Lateral Movement: Cross-process THREAD_SET_CONTEXT on lsass thread";
+
+			SET_CRITICAL(*kernelNotif);
+			SET_OBJECT_CHECK(*kernelNotif);
+
+			kernelNotif->bufSize = (ULONG)(strlen(msg) + 1);
+			kernelNotif->isPath = FALSE;
+			kernelNotif->pid = PsGetProcessId(PsGetCurrentProcess());
+			kernelNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, strlen(msg) + 1, 'msg');
+
+			RtlCopyMemory(kernelNotif->procName, PsGetProcessImageFileName(PsGetCurrentProcess()), 15);
+			RtlCopyMemory(kernelNotif->targetProcName, "lsass.exe", 10);
+
+			if (kernelNotif->msg) {
+				RtlCopyMemory(kernelNotif->msg, msg, strlen(msg) + 1);
+				if (!CallbackObjects::GetNotifQueue()->Enqueue(kernelNotif)) {
+					ExFreePool(kernelNotif->msg);
+					ExFreePool(kernelNotif);
+				}
+			}
+			else {
+				ExFreePool(kernelNotif);
+			}
+		}
+	}
+
+	return 0;
+}
 
 VOID ObjectUtils::setObjectNotificationCallback() {
 
@@ -163,24 +180,28 @@ VOID ObjectUtils::setObjectNotificationCallback() {
 
 	DbgPrint("[+] ObRegisterCallbacks 1 success\n");
 
-	//setThreadContextPostOpOperation.ObjectType = PsThreadType;
-	//setThreadContextPostOpOperation.Operations = OB_OPERATION_HANDLE_CREATE;
-	//setThreadContextPostOpOperation.PreOperation = NULL;
-	//setThreadContextPostOpOperation.PostOperation = (POB_POST_OPERATION_CALLBACK)PostOperationCallback;
+	UNICODE_STRING altitude2;
+	RtlInitUnicodeString(&altitude2, L"300022");
 
-	//objOpCallbackRegistration2.Version = OB_FLT_REGISTRATION_VERSION;
-	//objOpCallbackRegistration2.OperationRegistrationCount = 1;
-	//objOpCallbackRegistration2.Altitude = altitude;
-	//objOpCallbackRegistration2.RegistrationContext = NULL;
-	//objOpCallbackRegistration2.OperationRegistration = &setThreadContextPostOpOperation;
+	setThreadContextPostOpOperation.ObjectType = PsThreadType;
+	setThreadContextPostOpOperation.Operations = OB_OPERATION_HANDLE_CREATE;
+	setThreadContextPostOpOperation.PreOperation = NULL;
+	setThreadContextPostOpOperation.PostOperation = (POB_POST_OPERATION_CALLBACK)PostOperationCallback;
 
-	//status = ObRegisterCallbacks(&objOpCallbackRegistration2, &regHandle2);
+	objOpCallbackRegistration2.Version = OB_FLT_REGISTRATION_VERSION;
+	objOpCallbackRegistration2.OperationRegistrationCount = 1;
+	objOpCallbackRegistration2.Altitude = altitude2;
+	objOpCallbackRegistration2.RegistrationContext = NULL;
+	objOpCallbackRegistration2.OperationRegistration = &setThreadContextPostOpOperation;
 
-	//if (!NT_SUCCESS(status)) {
-	//	DbgPrint("[-] ObRegisterCallbacks 2 failed\n");
-	//}
+	status = ObRegisterCallbacks(&objOpCallbackRegistration2, &regHandle2);
 
-	//DbgPrint("[+] ObRegisterCallbacks 2 success\n");
+	if (!NT_SUCCESS(status)) {
+		DbgPrint("[-] ObRegisterCallbacks 2 failed: 0x%x\n", status);
+	}
+	else {
+		DbgPrint("[+] ObRegisterCallbacks 2 success\n");
+	}
 
 }
 
@@ -189,7 +210,9 @@ VOID ObjectUtils::unsetObjectNotificationCallback() {
 	ObUnRegisterCallbacks(regHandle1);
 	DbgPrint("[+] ObUnRegisterCallbacks 1 success\n");
 
-	//ObUnRegisterCallbacks(regHandle2);
-	//DbgPrint("[+] ObUnRegisterCallbacks 2 success\n");
+	if (regHandle2) {
+		ObUnRegisterCallbacks(regHandle2);
+		DbgPrint("[+] ObUnRegisterCallbacks 2 success\n");
+	}
 }
 

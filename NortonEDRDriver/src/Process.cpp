@@ -112,14 +112,14 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 
 			if (kernelNotif) {
 
-				char* msg = "Process is Ghosted !";
+				char* msg = "Process is Ghosted ! [BLOCKED]";
 
 				SET_CRITICAL(*kernelNotif);
 				SET_SE_AUDIT_INFO_CHECK(*kernelNotif);
 
-				kernelNotif->bufSize = sizeof(msg);
+				kernelNotif->bufSize = (ULONG)(strlen(msg) + 1);
 				kernelNotif->isPath = FALSE;
-				kernelNotif->pid = PsGetProcessId(IoGetCurrentProcess());
+				kernelNotif->pid = PsGetProcessId(Process);  // ghosted child, not parent
 				kernelNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, strlen(msg) + 1, 'msg');
 
 				char procName[15];
@@ -138,8 +138,65 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				}
 
 			}
+
+			// Block execution before it starts
+			CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
 		}
-	
+
+		// Lateral movement: remote execution host (WMI, WinRM) spawning interactive shell
+		{
+			PEPROCESS parentProcess = NULL;
+			if (NT_SUCCESS(PsLookupProcessByProcessId(CreateInfo->ParentProcessId, &parentProcess))) {
+
+				char* parentName = PsGetProcessImageFileName(parentProcess);
+
+				if (parentName != NULL &&
+					(strcmp(parentName, "wmiprvse.exe") == 0 ||
+					 strcmp(parentName, "wsmprovhost.exe") == 0 ||
+					 strcmp(parentName, "winrshost.exe") == 0)) {
+
+					if (CreateInfo->ImageFileName != NULL &&
+						(UnicodeStringContains(CreateInfo->ImageFileName, L"cmd.exe") ||
+						 UnicodeStringContains(CreateInfo->ImageFileName, L"powershell.exe") ||
+						 UnicodeStringContains(CreateInfo->ImageFileName, L"pwsh.exe") ||
+						 UnicodeStringContains(CreateInfo->ImageFileName, L"wscript.exe") ||
+						 UnicodeStringContains(CreateInfo->ImageFileName, L"cscript.exe") ||
+						 UnicodeStringContains(CreateInfo->ImageFileName, L"mshta.exe"))) {
+
+						PKERNEL_STRUCTURED_NOTIFICATION kernelNotif =
+							(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+								POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+
+						if (kernelNotif) {
+							char* msg = "Lateral Movement: Remote exec host spawned shell process";
+
+							SET_CRITICAL(*kernelNotif);
+							SET_CALLING_PROC_PID_CHECK(*kernelNotif);
+
+							kernelNotif->bufSize = (ULONG)(strlen(msg) + 1);
+							kernelNotif->isPath = FALSE;
+							kernelNotif->pid = PsGetProcessId(Process);  // the spawned shell
+							RtlCopyMemory(kernelNotif->procName, parentName, 15);
+							kernelNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, strlen(msg) + 1, 'msg');
+
+							if (kernelNotif->msg) {
+								RtlCopyMemory(kernelNotif->msg, msg, strlen(msg) + 1);
+								if (!CallbackObjects::GetNotifQueue()->Enqueue(kernelNotif)) {
+									ExFreePool(kernelNotif->msg);
+									ExFreePool(kernelNotif);
+								}
+							}
+							else {
+								ExFreePool(kernelNotif);
+							}
+						}
+					}
+				}
+
+				ObDereferenceObject(parentProcess);
+			}
+		}
+
 	}
 }
 

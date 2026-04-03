@@ -19,6 +19,10 @@ static const UINT16 kSuspiciousPorts[] = {
     9002,   // Tor bridge
     1337,   // leet port
     31337,  // Back Orifice / leet
+    // Lateral movement channels — alert when non-System processes use these
+    135,    // DCOM/RPC — WMI remote execution, DCOM lateral movement
+    445,    // SMB — PsExec, remote service creation, pass-the-hash
+    3389,   // RDP — RDP hijacking, pivoting
 };
 
 static BOOLEAN IsPortBlocked(UINT16 port) {
@@ -102,6 +106,12 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
 
     BOOLEAN blocked    = IsPortBlocked(remotePort);
     BOOLEAN suspicious = !blocked && IsPortSuspicious(remotePort);
+
+    // Suppress lateral-movement-port alerts for System (PID 4) and Idle (PID 0)
+    // — they legitimately use SMB/DCOM/RDP at the OS level.
+    if (suspicious && (pid == 0 || pid == 4)) {
+        suspicious = FALSE;
+    }
 
     classifyOut->actionType = blocked ? FWP_ACTION_BLOCK : FWP_ACTION_PERMIT;
 
