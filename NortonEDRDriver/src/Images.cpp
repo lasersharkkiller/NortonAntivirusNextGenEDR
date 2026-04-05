@@ -101,6 +101,93 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                         CallbackObjects::GetNotifQueue()
                                     );
                                 }
+
+                                // Detect unmanaged PowerShell hosting:
+                                // System.Management.Automation.dll loading into any process
+                                // that is not a known legitimate PowerShell host is a strong
+                                // indicator of the "spawn email client + host PS runtime" evasion
+                                // technique (and reflective PS injection in general).
+                                BOOLEAN isSMADll = FALSE;
+                                for (SIZE_T k = 0; k + 28 <= cbLen; k++) {
+                                    if (((charBuffer[k]    | 0x20) == 's') &&
+                                        ((charBuffer[k+1]  | 0x20) == 'y') &&
+                                        ((charBuffer[k+2]  | 0x20) == 's') &&
+                                        ((charBuffer[k+3]  | 0x20) == 't') &&
+                                        ((charBuffer[k+4]  | 0x20) == 'e') &&
+                                        ((charBuffer[k+5]  | 0x20) == 'm') &&
+                                         (charBuffer[k+6]           == '.') &&
+                                        ((charBuffer[k+7]  | 0x20) == 'm') &&
+                                        ((charBuffer[k+8]  | 0x20) == 'a') &&
+                                        ((charBuffer[k+9]  | 0x20) == 'n') &&
+                                        ((charBuffer[k+10] | 0x20) == 'a') &&
+                                        ((charBuffer[k+11] | 0x20) == 'g') &&
+                                        ((charBuffer[k+12] | 0x20) == 'e') &&
+                                        ((charBuffer[k+13] | 0x20) == 'm') &&
+                                        ((charBuffer[k+14] | 0x20) == 'e') &&
+                                        ((charBuffer[k+15] | 0x20) == 'n') &&
+                                        ((charBuffer[k+16] | 0x20) == 't') &&
+                                         (charBuffer[k+17]          == '.') &&
+                                        ((charBuffer[k+18] | 0x20) == 'a') &&
+                                        ((charBuffer[k+19] | 0x20) == 'u') &&
+                                        ((charBuffer[k+20] | 0x20) == 't') &&
+                                        ((charBuffer[k+21] | 0x20) == 'o') &&
+                                        ((charBuffer[k+22] | 0x20) == 'm') &&
+                                        ((charBuffer[k+23] | 0x20) == 'a') &&
+                                        ((charBuffer[k+24] | 0x20) == 't') &&
+                                        ((charBuffer[k+25] | 0x20) == 'i') &&
+                                        ((charBuffer[k+26] | 0x20) == 'o') &&
+                                        ((charBuffer[k+27] | 0x20) == 'n')) {
+                                        isSMADll = TRUE;
+                                        break;
+                                    }
+                                }
+
+                                if (isSMADll) {
+                                    char* hostName = PsGetProcessImageFileName(targetProcess);
+                                    if (hostName != NULL &&
+                                        strcmp(hostName, "powershell.exe")   != 0 &&
+                                        strcmp(hostName, "pwsh.exe")         != 0 &&
+                                        strcmp(hostName, "wsmprovhost.exe")  != 0 &&
+                                        strcmp(hostName, "powershell_ise")   != 0) {
+
+                                        const char* smaMsg = "Unmanaged PowerShell hosting: System.Management.Automation.dll in unexpected process";
+                                        SIZE_T smaMsgLen = 84;
+
+                                        PKERNEL_STRUCTURED_NOTIFICATION smaNotif =
+                                            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                                                POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+
+                                        if (smaNotif) {
+                                            SET_CRITICAL(*smaNotif);
+                                            SET_IMAGE_LOAD_PATH_CHECK(*smaNotif);
+                                            SET_CALLING_PROC_PID_CHECK(*smaNotif);
+
+                                            smaNotif->pid    = PsGetProcessId(targetProcess);
+                                            smaNotif->isPath = FALSE;
+
+                                            RtlStringCbCopyA(smaNotif->procName,
+                                                             sizeof(smaNotif->procName),
+                                                             hostName);
+
+                                            char* msgBuf = (char*)ExAllocatePool2(
+                                                POOL_FLAG_NON_PAGED, smaMsgLen + 1, 'msg');
+
+                                            if (msgBuf) {
+                                                RtlCopyMemory(msgBuf, smaMsg, smaMsgLen);
+                                                msgBuf[smaMsgLen] = '\0';
+                                                smaNotif->msg     = msgBuf;
+                                                smaNotif->bufSize = (ULONG)(smaMsgLen + 1);
+
+                                                if (!CallbackObjects::GetNotifQueue()->Enqueue(smaNotif)) {
+                                                    ExFreePool(smaNotif->msg);
+                                                    ExFreePool(smaNotif);
+                                                }
+                                            } else {
+                                                ExFreePool(smaNotif);
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             ExFreePool(charBuffer);
