@@ -188,6 +188,133 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                         }
                                     }
                                 }
+
+                                // -------------------------------------------------------
+                                // Category 2: Mimikatz-family DLL import fingerprinting
+                                //
+                                // These DLLs have rarity score 100 (zero clean samples)
+                                // and cluster in the differential as Mimikatz/credential-
+                                // dumping tool signatures. Loading any of them into a
+                                // non-system, non-lsass process is a Critical indicator.
+                                //
+                                // Covered DLLs and their attack role:
+                                //   samlib.dll    — SAM database enumeration
+                                //   cryptdll.dll  — Mimikatz crypto primitives (MD5Init etc.)
+                                //   msasn1.dll    — Mimikatz certificate/ASN.1 parsing
+                                //   winscard.dll  — Smart card credential theft
+                                //   rstrtmgr.dll  — Ransomware: unlock files before encryption
+                                //   fltlib.dll    — Enumerate minifilter drivers (EDR hunting)
+                                //   winsta.dll    — RDP session hijacking / enumeration
+                                //   mpr.dll       — Lateral movement via network share mapping
+                                //   netapi32.dll  — Domain replication / Mimikatz DC attacks
+                                //   dbghelp.dll   — MiniDumpWriteDump (LSASS dump)
+                                //   secur32.dll   — LsaCallAuthenticationPackage (SSP abuse)
+                                // -------------------------------------------------------
+
+                                struct {
+                                    const char* dll;        // substring to match in charBuffer
+                                    SIZE_T      dllLen;
+                                    const char* threat;     // description for the alert message
+                                    BOOLEAN     alwaysCritical; // TRUE = Critical regardless of host
+                                } kMimikatzDlls[] = {
+                                    { "samlib.dll",   11, "SAM database enumeration (Mimikatz/secretsdump)",         TRUE  },
+                                    { "cryptdll.dll", 12, "Mimikatz crypto primitives (MD5Init/CDLocateCSystem)",    TRUE  },
+                                    { "msasn1.dll",   10, "Mimikatz ASN.1/certificate parsing",                     TRUE  },
+                                    { "winscard.dll", 12, "Smart card credential theft",                            TRUE  },
+                                    { "rstrtmgr.dll", 12, "Ransomware file-unlock (RmGetList/RmShutdown)",          TRUE  },
+                                    { "fltlib.dll",   10, "Minifilter driver enumeration (EDR hunting)",            TRUE  },
+                                    { "winsta.dll",   10, "RDP session hijacking/enumeration",                      TRUE  },
+                                    { "mpr.dll",       7, "Network share lateral movement (WNetAddConnection2)",    FALSE },
+                                    { "dbghelp.dll",  11, "MiniDumpWriteDump — LSASS/process memory dump",          TRUE  },
+                                    { "secur32.dll",  11, "LsaCallAuthenticationPackage / SSP credential abuse",    TRUE  },
+                                    { "netapi32.dll", 12, "Domain replication attack (I_NetServerAuthenticate2)",   TRUE  },
+                                    { nullptr, 0, nullptr, FALSE }
+                                };
+
+                                // Processes that legitimately load these DLLs
+                                static const char* kAllowedHosts[] = {
+                                    "lsass.exe", "svchost.exe", "services.exe",
+                                    "winlogon.exe", "csrss.exe", "smss.exe",
+                                    "wininit.exe", "spoolsv.exe", nullptr
+                                };
+
+                                char* loadingProcess = PsGetProcessImageFileName(targetProcess);
+                                BOOLEAN isAllowedHost = FALSE;
+                                if (loadingProcess) {
+                                    for (int ah = 0; kAllowedHosts[ah] != nullptr; ah++) {
+                                        if (strcmp(loadingProcess, kAllowedHosts[ah]) == 0) {
+                                            isAllowedHost = TRUE;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if (!isAllowedHost) {
+                                    for (int di = 0; kMimikatzDlls[di].dll != nullptr; di++) {
+                                        const char* dll    = kMimikatzDlls[di].dll;
+                                        SIZE_T      dllLen = kMimikatzDlls[di].dllLen;
+
+                                        // Case-insensitive substring search for the DLL name
+                                        BOOLEAN found = FALSE;
+                                        if (cbLen >= dllLen) {
+                                            for (SIZE_T k = 0; k <= cbLen - dllLen; k++) {
+                                                BOOLEAN match = TRUE;
+                                                for (SIZE_T m = 0; m < dllLen; m++) {
+                                                    if ((charBuffer[k+m] | 0x20) != dll[m]) {
+                                                        match = FALSE;
+                                                        break;
+                                                    }
+                                                }
+                                                if (match) { found = TRUE; break; }
+                                            }
+                                        }
+
+                                        if (!found) continue;
+
+                                        const char* threat = kMimikatzDlls[di].threat;
+                                        SIZE_T      tLen   = strlen(threat);
+
+                                        PKERNEL_STRUCTURED_NOTIFICATION mzNotif =
+                                            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                                                POOL_FLAG_NON_PAGED,
+                                                sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+                                        if (!mzNotif) break;
+
+                                        if (kMimikatzDlls[di].alwaysCritical) {
+                                            SET_CRITICAL(*mzNotif);
+                                        } else {
+                                            SET_WARNING(*mzNotif);
+                                        }
+                                        SET_IMAGE_LOAD_PATH_CHECK(*mzNotif);
+                                        SET_CALLING_PROC_PID_CHECK(*mzNotif);
+
+                                        mzNotif->pid    = PsGetProcessId(targetProcess);
+                                        mzNotif->isPath = FALSE;
+                                        if (loadingProcess) {
+                                            RtlStringCbCopyA(mzNotif->procName,
+                                                             sizeof(mzNotif->procName),
+                                                             loadingProcess);
+                                        }
+
+                                        char* msgBuf = (char*)ExAllocatePool2(
+                                            POOL_FLAG_NON_PAGED, tLen + 1, 'msg');
+                                        if (msgBuf) {
+                                            RtlCopyMemory(msgBuf, threat, tLen);
+                                            msgBuf[tLen]    = '\0';
+                                            mzNotif->msg    = msgBuf;
+                                            mzNotif->bufSize = (ULONG)(tLen + 1);
+
+                                            if (!CallbackObjects::GetNotifQueue()->Enqueue(mzNotif)) {
+                                                ExFreePool(mzNotif->msg);
+                                                ExFreePool(mzNotif);
+                                            }
+                                        } else {
+                                            ExFreePool(mzNotif);
+                                        }
+                                        // Only fire one alert per image load event
+                                        break;
+                                    }
+                                }
                             }
 
                             ExFreePool(charBuffer);

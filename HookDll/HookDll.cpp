@@ -3,6 +3,10 @@
 #include <winternl.h>
 #include <psapi.h>
 #include <winreg.h>
+// wincrypt.h types used in CRYPT32 hooks — defined as opaque pointers to avoid
+// WIN32_LEAN_AND_MEAN / include-order conflicts with the full wincrypt.h header.
+typedef void*       HCERTSTORE_OPAQUE;
+typedef const void* PCCERT_CONTEXT_OPAQUE;
 #include <cstdio>
 #include <cstring>
 
@@ -49,22 +53,53 @@ static void SendHookEvent(
 // ---------------------------------------------------------------------------
 
 enum HookIdx : int {
-    IDX_VIRTUALALLOC         = 0,
-    IDX_VIRTUALALLOCEX       = 1,
-    IDX_WRITEPROCESSMEMORY   = 2,
-    IDX_CREATEREMOTETHREAD   = 3,
-    IDX_CREATEREMOTETHREADEX = 4,
-    IDX_LOADLIBRARYA         = 5,
-    IDX_LOADLIBRARYW         = 6,
-    IDX_LOADLIBRARYEXA       = 7,
-    IDX_LOADLIBRARYEXW       = 8,
-    IDX_RESUMETHREAD         = 9,
-    IDX_SETTHREADCONTEXT     = 10,
-    IDX_REGSETVALUEEX_A      = 11,
-    IDX_REGSETVALUEEX_W      = 12,
-    IDX_READPROCESSMEMORY    = 13,   // deception: post-read LSASS buffer patching
-    IDX_NTQUERYSYSTEMINFO    = 14,   // deception: hide EDR, inject decoy process
-    HOOK_COUNT               = 15
+    IDX_VIRTUALALLOC          = 0,
+    IDX_VIRTUALALLOCEX        = 1,
+    IDX_WRITEPROCESSMEMORY    = 2,
+    IDX_CREATEREMOTETHREAD    = 3,
+    IDX_CREATEREMOTETHREADEX  = 4,
+    IDX_LOADLIBRARYA          = 5,
+    IDX_LOADLIBRARYW          = 6,
+    IDX_LOADLIBRARYEXA        = 7,
+    IDX_LOADLIBRARYEXW        = 8,
+    IDX_RESUMETHREAD          = 9,
+    IDX_SETTHREADCONTEXT      = 10,
+    IDX_REGSETVALUEEX_A       = 11,
+    IDX_REGSETVALUEEX_W       = 12,
+    IDX_READPROCESSMEMORY     = 13,  // deception: post-read LSASS buffer patching
+    IDX_NTQUERYSYSTEMINFO     = 14,  // deception: hide EDR, inject decoy process
+    // --- Evasion-path execution triggers ---
+    IDX_CREATETHREAD          = 15,  // local thread with non-module start address
+    IDX_MAPVIEWOFFILE         = 16,  // file-backed section mapped executable
+    IDX_REGISTERCLASSEXA      = 17,  // WndProc shellcode dispatch (window message)
+    IDX_REGISTERCLASSEXW      = 18,
+    IDX_ENUMSYSTEMLOCALESA    = 19,  // callback abuse
+    IDX_ENUMSYSLANGGRPA       = 20,  // callback abuse — rarity score 100 in malware set
+    IDX_ENUMWINDOWS           = 21,  // callback abuse
+    IDX_ENUMCHILDWINDOWS      = 22,  // callback abuse
+    IDX_SETTIMER              = 23,  // timer callback execution
+    IDX_SETWAITABLETIMER      = 24,  // timer callback execution
+    IDX_CREATETIMERQUEUETIMER  = 25,  // timer callback execution
+    // --- Category 1 additions from differential analysis ---
+    IDX_OPENPROCESS            = 26,  // injection precursor — log target PID
+    IDX_VIRTUALPROTECT         = 27,  // RWX page marking (shellcode staging)
+    IDX_CREATEFILEMAPPINGW     = 28,  // section creation for module stomping
+    IDX_CREATEFILEMAPPINGA     = 29,
+    IDX_ENUMSYSTEMLOCALESW     = 30,  // W variant callback abuse
+    IDX_CALLWINDOWPROCA        = 31,  // WndProc dispatch callback abuse
+    IDX_CALLWINDOWPROCW        = 32,
+    IDX_ENUMTHREADWINDOWS      = 33,  // callback abuse
+    IDX_CONVERTTHREADTOFIBER   = 34,  // fiber-based shellcode execution
+    IDX_CREATEFIBER            = 35,
+    IDX_SWITCHTOFIBER          = 36,
+    IDX_RTLCREATEUSERTHREAD    = 37,  // direct user-mode thread (ntdll, bypasses CreateThread)
+    IDX_CREATEWAITABLETIMEREXW  = 38,  // timer variant missed in first pass
+    // --- Gap closure: window WndProc hijack + CRYPT32 callback abuse ---
+    IDX_SETWINDOWLONGPTRA       = 39,  // post-creation WndProc replacement (Path B window msgs)
+    IDX_SETWINDOWLONGPTRW       = 40,
+    IDX_CERTENUMCERTIFICATES    = 41,  // CRYPT32 callback abuse (score 94, mal 27)
+    IDX_CERTFINDCERTIFICATE     = 42,  // CRYPT32 callback abuse (score 94, mal 24)
+    HOOK_COUNT                  = 43
 };
 
 struct ApiHook {
@@ -101,6 +136,35 @@ static LONG    WINAPI Hook_RegSetValueExA(HKEY, LPCSTR, DWORD, DWORD, const BYTE
 static LONG    WINAPI Hook_RegSetValueExW(HKEY, LPCWSTR, DWORD, DWORD, const BYTE*, DWORD);
 static BOOL    WINAPI Hook_ReadProcessMemory(HANDLE, LPCVOID, LPVOID, SIZE_T, SIZE_T*);
 static BOOL    WINAPI Hook_NtQuerySystemInformation(ULONG, PVOID, ULONG, PULONG);
+static HANDLE  WINAPI Hook_CreateThread(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+static LPVOID  WINAPI Hook_MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
+static ATOM    WINAPI Hook_RegisterClassExA(const WNDCLASSEXA*);
+static ATOM    WINAPI Hook_RegisterClassExW(const WNDCLASSEXW*);
+static BOOL    WINAPI Hook_EnumSystemLocalesA(LOCALE_ENUMPROCA, DWORD);
+static BOOL    WINAPI Hook_EnumSystemLanguageGroupsA(LANGUAGEGROUP_ENUMPROCA, DWORD, LONG_PTR);
+static BOOL    WINAPI Hook_EnumWindows(WNDENUMPROC, LPARAM);
+static BOOL    WINAPI Hook_EnumChildWindows(HWND, WNDENUMPROC, LPARAM);
+static UINT_PTR WINAPI Hook_SetTimer(HWND, UINT_PTR, UINT, TIMERPROC);
+static BOOL    WINAPI Hook_SetWaitableTimer(HANDLE, const LARGE_INTEGER*, LONG, PTIMERAPCROUTINE, PVOID, BOOL);
+static BOOL    WINAPI Hook_CreateTimerQueueTimer(PHANDLE, HANDLE, WAITORTIMERCALLBACK, PVOID, DWORD, DWORD, ULONG);
+static HANDLE  WINAPI Hook_OpenProcess(DWORD, BOOL, DWORD);
+static BOOL    WINAPI Hook_VirtualProtect(LPVOID, SIZE_T, DWORD, PDWORD);
+static HANDLE  WINAPI Hook_CreateFileMappingW(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCWSTR);
+static HANDLE  WINAPI Hook_CreateFileMappingA(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCSTR);
+static BOOL    WINAPI Hook_EnumSystemLocalesW(LOCALE_ENUMPROCW, DWORD);
+static LRESULT WINAPI Hook_CallWindowProcA(WNDPROC, HWND, UINT, WPARAM, LPARAM);
+static LRESULT WINAPI Hook_CallWindowProcW(WNDPROC, HWND, UINT, WPARAM, LPARAM);
+static BOOL    WINAPI Hook_EnumThreadWindows(DWORD, WNDENUMPROC, LPARAM);
+static LPVOID  WINAPI Hook_ConvertThreadToFiber(LPVOID);
+static LPVOID  WINAPI Hook_CreateFiber(SIZE_T, LPFIBER_START_ROUTINE, LPVOID);
+static VOID    WINAPI Hook_SwitchToFiber(LPVOID);
+static NTSTATUS NTAPI Hook_RtlCreateUserThread(HANDLE, PSECURITY_DESCRIPTOR, BOOLEAN, ULONG,
+                                               SIZE_T, SIZE_T, PVOID, PVOID, PHANDLE, PVOID);
+static HANDLE  WINAPI Hook_CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+static LONG_PTR WINAPI Hook_SetWindowLongPtrA(HWND, int, LONG_PTR);
+static LONG_PTR WINAPI Hook_SetWindowLongPtrW(HWND, int, LONG_PTR);
+static PCCERT_CONTEXT_OPAQUE WINAPI Hook_CertFindCertificateInStore(HCERTSTORE_OPAQUE, DWORD, DWORD, DWORD, const void*, PCCERT_CONTEXT_OPAQUE);
+static PCCERT_CONTEXT_OPAQUE WINAPI Hook_CertEnumCertificatesInStore(HCERTSTORE_OPAQUE, PCCERT_CONTEXT_OPAQUE);
 
 static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "VirtualAlloc",         (FARPROC)Hook_VirtualAlloc,        nullptr, nullptr, {}, nullptr, false },
@@ -117,7 +181,35 @@ static ApiHook g_hooks[HOOK_COUNT] = {
     { "advapi32.dll", "RegSetValueExA",       (FARPROC)Hook_RegSetValueExA,       nullptr, nullptr, {}, nullptr, false },
     { "advapi32.dll", "RegSetValueExW",       (FARPROC)Hook_RegSetValueExW,       nullptr, nullptr, {}, nullptr, false },
     { "kernel32.dll", "ReadProcessMemory",    (FARPROC)Hook_ReadProcessMemory,    nullptr, nullptr, {}, nullptr, false },
-    { "ntdll.dll",    "NtQuerySystemInformation", (FARPROC)Hook_NtQuerySystemInformation, nullptr, nullptr, {}, nullptr, false },
+    { "ntdll.dll",    "NtQuerySystemInformation",    (FARPROC)Hook_NtQuerySystemInformation,    nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "CreateThread",               (FARPROC)Hook_CreateThread,                nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "MapViewOfFile",              (FARPROC)Hook_MapViewOfFile,               nullptr, nullptr, {}, nullptr, false },
+    { "user32.dll",   "RegisterClassExA",           (FARPROC)Hook_RegisterClassExA,            nullptr, nullptr, {}, nullptr, false },
+    { "user32.dll",   "RegisterClassExW",           (FARPROC)Hook_RegisterClassExW,            nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "EnumSystemLocalesA",         (FARPROC)Hook_EnumSystemLocalesA,          nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "EnumSystemLanguageGroupsA",  (FARPROC)Hook_EnumSystemLanguageGroupsA,   nullptr, nullptr, {}, nullptr, false },
+    { "user32.dll",   "EnumWindows",                (FARPROC)Hook_EnumWindows,                 nullptr, nullptr, {}, nullptr, false },
+    { "user32.dll",   "EnumChildWindows",           (FARPROC)Hook_EnumChildWindows,            nullptr, nullptr, {}, nullptr, false },
+    { "user32.dll",   "SetTimer",                   (FARPROC)Hook_SetTimer,                    nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "SetWaitableTimer",           (FARPROC)Hook_SetWaitableTimer,            nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "CreateTimerQueueTimer",      (FARPROC)Hook_CreateTimerQueueTimer,       nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "OpenProcess",               (FARPROC)Hook_OpenProcess,                 nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "VirtualProtect",            (FARPROC)Hook_VirtualProtect,              nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "CreateFileMappingW",        (FARPROC)Hook_CreateFileMappingW,          nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "CreateFileMappingA",        (FARPROC)Hook_CreateFileMappingA,          nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "EnumSystemLocalesW",        (FARPROC)Hook_EnumSystemLocalesW,          nullptr, nullptr, {}, nullptr, false },
+    { "user32.dll",   "CallWindowProcA",           (FARPROC)Hook_CallWindowProcA,             nullptr, nullptr, {}, nullptr, false },
+    { "user32.dll",   "CallWindowProcW",           (FARPROC)Hook_CallWindowProcW,             nullptr, nullptr, {}, nullptr, false },
+    { "user32.dll",   "EnumThreadWindows",         (FARPROC)Hook_EnumThreadWindows,           nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "ConvertThreadToFiber",      (FARPROC)Hook_ConvertThreadToFiber,        nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "CreateFiber",               (FARPROC)Hook_CreateFiber,                 nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "SwitchToFiber",             (FARPROC)Hook_SwitchToFiber,               nullptr, nullptr, {}, nullptr, false },
+    { "ntdll.dll",    "RtlCreateUserThread",       (FARPROC)Hook_RtlCreateUserThread,         nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "CreateWaitableTimerExW",    (FARPROC)Hook_CreateWaitableTimerExW,      nullptr, nullptr, {}, nullptr, false },
+    { "user32.dll",   "SetWindowLongPtrA",         (FARPROC)Hook_SetWindowLongPtrA,           nullptr, nullptr, {}, nullptr, false },
+    { "user32.dll",   "SetWindowLongPtrW",         (FARPROC)Hook_SetWindowLongPtrW,           nullptr, nullptr, {}, nullptr, false },
+    { "crypt32.dll",  "CertFindCertificateInStore",(FARPROC)Hook_CertFindCertificateInStore,   nullptr, nullptr, {}, nullptr, false },
+    { "crypt32.dll",  "CertEnumCertificatesInStore",(FARPROC)Hook_CertEnumCertificatesInStore, nullptr, nullptr, {}, nullptr, false },
 };
 
 // Returns the correct call-through address.
@@ -759,6 +851,464 @@ static BOOL WINAPI Hook_NtQuerySystemInformation(
     }
 
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Category 1 stubs — injection precursors and missing execution paths
+// ---------------------------------------------------------------------------
+
+// OpenProcess: log every cross-process handle acquisition with its desired access.
+// This is the universal precursor to every injection technique and credential dump.
+static HANDLE WINAPI Hook_OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId) {
+    typedef HANDLE(WINAPI* Fn)(DWORD, BOOL, DWORD);
+    if (dwProcessId != g_selfPid) {
+        const char* sev = (dwDesiredAccess & (PROCESS_VM_WRITE | PROCESS_VM_READ |
+                           PROCESS_CREATE_THREAD | PROCESS_DUP_HANDLE)) ? "High" : "Info";
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "targetPid=%lu access=0x%lX", dwProcessId, dwDesiredAccess);
+        SendHookEvent(sev, "OpenProcess", dwProcessId, det);
+    }
+    return ((Fn)GetCallThrough(IDX_OPENPROCESS))(dwDesiredAccess, bInheritHandle, dwProcessId);
+}
+
+// VirtualProtect: alert when marking a region PAGE_EXECUTE_READWRITE or PAGE_EXECUTE_WRITECOPY.
+// Catches in-process shellcode staging that doesn't go through VirtualAlloc.
+static BOOL WINAPI Hook_VirtualProtect(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect) {
+    typedef BOOL(WINAPI* Fn)(LPVOID, SIZE_T, DWORD, PDWORD);
+    if (flNewProtect == PAGE_EXECUTE_READWRITE || flNewProtect == PAGE_EXECUTE_WRITECOPY) {
+        BOOL inModule = IsAddressInKnownModule(lpAddress);
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "addr=%p size=0x%llX prot=0x%lX inModule=%d",
+            lpAddress, (ULONG64)dwSize, flNewProtect, (int)inModule);
+        // Only Critical if the address is outside all known modules (shellcode staging)
+        SendHookEvent(inModule ? "Info" : "Critical", "VirtualProtect", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_VIRTUALPROTECT))(lpAddress, dwSize, flNewProtect, lpflOldProtect);
+}
+
+// CreateFileMapping: flag executable sections (SEC_IMAGE or PAGE_EXECUTE_*)
+static HANDLE WINAPI Hook_CreateFileMappingW(
+    HANDLE hFile, LPSECURITY_ATTRIBUTES lpAttr, DWORD flProtect,
+    DWORD dwMaxSizeHigh, DWORD dwMaxSizeLow, LPCWSTR lpName)
+{
+    typedef HANDLE(WINAPI* Fn)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCWSTR);
+    DWORD prot = flProtect & 0xFF; // low byte is page protection
+    if (prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
+        prot == PAGE_EXECUTE_WRITECOPY || (flProtect & SEC_IMAGE)) {
+        char name[64] = {};
+        if (lpName) WideCharToMultiByte(CP_UTF8, 0, lpName, -1, name, sizeof(name)-1, nullptr, nullptr);
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "executable section: prot=0x%lX name=%s", flProtect, name[0] ? name : "(anon)");
+        SendHookEvent("High", "CreateFileMappingW", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_CREATEFILEMAPPINGW))(
+        hFile, lpAttr, flProtect, dwMaxSizeHigh, dwMaxSizeLow, lpName);
+}
+
+static HANDLE WINAPI Hook_CreateFileMappingA(
+    HANDLE hFile, LPSECURITY_ATTRIBUTES lpAttr, DWORD flProtect,
+    DWORD dwMaxSizeHigh, DWORD dwMaxSizeLow, LPCSTR lpName)
+{
+    typedef HANDLE(WINAPI* Fn)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCSTR);
+    DWORD prot = flProtect & 0xFF;
+    if (prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
+        prot == PAGE_EXECUTE_WRITECOPY || (flProtect & SEC_IMAGE)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "executable section: prot=0x%lX name=%s", flProtect, lpName ? lpName : "(anon)");
+        SendHookEvent("High", "CreateFileMappingA", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_CREATEFILEMAPPINGA))(
+        hFile, lpAttr, flProtect, dwMaxSizeHigh, dwMaxSizeLow, lpName);
+}
+
+// EnumSystemLocalesW — W variant of the callback-abuse technique
+static BOOL WINAPI Hook_EnumSystemLocalesW(LOCALE_ENUMPROCW lpLocaleEnumProc, DWORD dwFlags) {
+    typedef BOOL(WINAPI* Fn)(LOCALE_ENUMPROCW, DWORD);
+    if (lpLocaleEnumProc && !IsAddressInKnownModule((const void*)lpLocaleEnumProc)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "callback=%p NOT in any loaded module", (void*)lpLocaleEnumProc);
+        SendHookEvent("Critical", "EnumSystemLocalesW", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_ENUMSYSTEMLOCALESW))(lpLocaleEnumProc, dwFlags);
+}
+
+// CallWindowProc: used to dispatch shellcode through an existing window procedure slot
+static LRESULT WINAPI Hook_CallWindowProcA(WNDPROC lpPrevWndFunc, HWND hWnd, UINT Msg, WPARAM wP, LPARAM lP) {
+    typedef LRESULT(WINAPI* Fn)(WNDPROC, HWND, UINT, WPARAM, LPARAM);
+    if (lpPrevWndFunc && !IsAddressInKnownModule((const void*)lpPrevWndFunc)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WndProc=%p NOT in any loaded module", (void*)lpPrevWndFunc);
+        SendHookEvent("Critical", "CallWindowProcA", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_CALLWINDOWPROCA))(lpPrevWndFunc, hWnd, Msg, wP, lP);
+}
+
+static LRESULT WINAPI Hook_CallWindowProcW(WNDPROC lpPrevWndFunc, HWND hWnd, UINT Msg, WPARAM wP, LPARAM lP) {
+    typedef LRESULT(WINAPI* Fn)(WNDPROC, HWND, UINT, WPARAM, LPARAM);
+    if (lpPrevWndFunc && !IsAddressInKnownModule((const void*)lpPrevWndFunc)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WndProc=%p NOT in any loaded module", (void*)lpPrevWndFunc);
+        SendHookEvent("Critical", "CallWindowProcW", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_CALLWINDOWPROCW))(lpPrevWndFunc, hWnd, Msg, wP, lP);
+}
+
+static BOOL WINAPI Hook_EnumThreadWindows(DWORD dwThreadId, WNDENUMPROC lpfn, LPARAM lParam) {
+    typedef BOOL(WINAPI* Fn)(DWORD, WNDENUMPROC, LPARAM);
+    if (lpfn && !IsAddressInKnownModule((const void*)lpfn)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "callback=%p NOT in any loaded module", (void*)lpfn);
+        SendHookEvent("Critical", "EnumThreadWindows", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_ENUMTHREADWINDOWS))(dwThreadId, lpfn, lParam);
+}
+
+// Fiber-based shellcode: ConvertThreadToFiber + CreateFiber + SwitchToFiber
+// The detection point is SwitchToFiber with a non-module address — that's when
+// execution is transferred. ConvertThreadToFiber and CreateFiber are logged for
+// context but not blocked (they're legitimately used by runtimes like .NET).
+static LPVOID WINAPI Hook_ConvertThreadToFiber(LPVOID lpParameter) {
+    typedef LPVOID(WINAPI* Fn)(LPVOID);
+    SendHookEvent("Info", "ConvertThreadToFiber", 0, "thread converted to fiber");
+    return ((Fn)GetCallThrough(IDX_CONVERTTHREADTOFIBER))(lpParameter);
+}
+
+static LPVOID WINAPI Hook_CreateFiber(
+    SIZE_T dwStackSize, LPFIBER_START_ROUTINE lpStartAddress, LPVOID lpParameter)
+{
+    typedef LPVOID(WINAPI* Fn)(SIZE_T, LPFIBER_START_ROUTINE, LPVOID);
+    if (lpStartAddress && !IsAddressInKnownModule((const void*)lpStartAddress)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "fiberStart=%p NOT in any loaded module", (void*)lpStartAddress);
+        SendHookEvent("Critical", "CreateFiber", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_CREATEFIBER))(dwStackSize, lpStartAddress, lpParameter);
+}
+
+static VOID WINAPI Hook_SwitchToFiber(LPVOID lpFiber) {
+    typedef VOID(WINAPI* Fn)(LPVOID);
+    if (lpFiber && !IsAddressInKnownModule(lpFiber)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "fiberAddr=%p NOT in any loaded module — shellcode fiber execution", lpFiber);
+        SendHookEvent("Critical", "SwitchToFiber", 0, det);
+    }
+    ((Fn)GetCallThrough(IDX_SWITCHTOFIBER))(lpFiber);
+}
+
+// RtlCreateUserThread: direct ntdll thread creation, bypasses CreateThread hook.
+// Used by Metasploit, Cobalt Strike, and Mimikatz for remote thread injection.
+typedef NTSTATUS (NTAPI* RtlCreateUserThread_t)(
+    HANDLE, PSECURITY_DESCRIPTOR, BOOLEAN, ULONG,
+    SIZE_T, SIZE_T, PVOID, PVOID, PHANDLE, PVOID);
+
+static NTSTATUS NTAPI Hook_RtlCreateUserThread(
+    HANDLE ProcessHandle, PSECURITY_DESCRIPTOR SecurityDescriptor,
+    BOOLEAN CreateSuspended, ULONG StackZeroBits,
+    SIZE_T StackReserve, SIZE_T StackCommit,
+    PVOID StartAddress, PVOID Parameter,
+    PHANDLE ThreadHandle, PVOID ClientId)
+{
+    DWORD targetPid = GetProcessId(ProcessHandle);
+    const char* sev = (targetPid && targetPid != g_selfPid) ? "Critical" : "High";
+    char det[128];
+    _snprintf_s(det, sizeof(det), _TRUNCATE,
+        "targetPid=%lu startAddr=%p inModule=%d",
+        targetPid, StartAddress, (int)IsAddressInKnownModule(StartAddress));
+    SendHookEvent(sev, "RtlCreateUserThread", targetPid, det);
+    return ((RtlCreateUserThread_t)GetCallThrough(IDX_RTLCREATEUSERTHREAD))(
+        ProcessHandle, SecurityDescriptor, CreateSuspended, StackZeroBits,
+        StackReserve, StackCommit, StartAddress, Parameter, ThreadHandle, ClientId);
+}
+
+// CreateWaitableTimerExW — timer variant with APC callback (missed in first pass)
+static HANDLE WINAPI Hook_CreateWaitableTimerExW(
+    LPSECURITY_ATTRIBUTES lpAttr, LPCWSTR lpName, DWORD dwFlags, DWORD dwDesiredAccess)
+{
+    typedef HANDLE(WINAPI* Fn)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+    // Log creation; execution trigger is caught by SetWaitableTimer hook
+    SendHookEvent("Info", "CreateWaitableTimerExW", 0, "waitable timer created");
+    return ((Fn)GetCallThrough(IDX_CREATEWAITABLETIMEREXW))(lpAttr, lpName, dwFlags, dwDesiredAccess);
+}
+
+// SetWindowLongPtr(GWLP_WNDPROC): post-creation WndProc replacement.
+// This is Path B of the window-message shellcode technique — the attacker
+// creates a legitimate window then replaces its WndProc with a shellcode
+// address, bypassing our RegisterClassEx hook entirely.
+#ifndef GWLP_WNDPROC
+#define GWLP_WNDPROC (-4)
+#endif
+
+static LONG_PTR WINAPI Hook_SetWindowLongPtrA(HWND hWnd, int nIndex, LONG_PTR dwNewLong) {
+    typedef LONG_PTR(WINAPI* Fn)(HWND, int, LONG_PTR);
+    if (nIndex == GWLP_WNDPROC && dwNewLong &&
+        !IsAddressInKnownModule((const void*)dwNewLong)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "GWLP_WNDPROC replaced with addr=%p NOT in any loaded module "
+            "(window-message shellcode dispatch, Path B)",
+            (void*)dwNewLong);
+        SendHookEvent("Critical", "SetWindowLongPtrA", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_SETWINDOWLONGPTRA))(hWnd, nIndex, dwNewLong);
+}
+
+static LONG_PTR WINAPI Hook_SetWindowLongPtrW(HWND hWnd, int nIndex, LONG_PTR dwNewLong) {
+    typedef LONG_PTR(WINAPI* Fn)(HWND, int, LONG_PTR);
+    if (nIndex == GWLP_WNDPROC && dwNewLong &&
+        !IsAddressInKnownModule((const void*)dwNewLong)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "GWLP_WNDPROC replaced with addr=%p NOT in any loaded module "
+            "(window-message shellcode dispatch, Path B)",
+            (void*)dwNewLong);
+        SendHookEvent("Critical", "SetWindowLongPtrW", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_SETWINDOWLONGPTRW))(hWnd, nIndex, dwNewLong);
+}
+
+// CertFindCertificateInStore / CertEnumCertificatesInStore:
+// Both accept a pfnFindCallback function pointer (optional, may be NULL).
+// When non-NULL and pointing outside loaded modules, this is the CRYPT32
+// callback abuse technique — shellcode passed as a certificate enumeration
+// callback (score 94, mal 24-27 in differential, zero clean use).
+// Note: CertEnumCertificatesInStore has no explicit callback argument —
+// we hook it purely as a telemetry signal since it appears in the Mimikatz
+// certificate-store enumeration path alongside cryptdll.dll.
+static PCCERT_CONTEXT_OPAQUE WINAPI Hook_CertFindCertificateInStore(
+    HCERTSTORE_OPAQUE hCertStore, DWORD dwCertEncodingType, DWORD dwFindFlags,
+    DWORD dwFindType, const void* pvFindPara, PCCERT_CONTEXT_OPAQUE pPrevCertContext)
+{
+    typedef PCCERT_CONTEXT_OPAQUE(WINAPI* Fn)(HCERTSTORE_OPAQUE, DWORD, DWORD, DWORD, const void*, PCCERT_CONTEXT_OPAQUE);
+    // dwFindType == 6 (CERT_FIND_SUBJECT_FUNC) or 8 (CERT_FIND_ISSUER_FUNC)
+    // means pvFindPara is a function pointer — the callback abuse path.
+    if (pvFindPara &&
+        (dwFindType == 6 || dwFindType == 8) &&
+        !IsAddressInKnownModule(pvFindPara)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "callback=%p NOT in any loaded module findType=%lu (CRYPT32 callback abuse)",
+            pvFindPara, dwFindType);
+        SendHookEvent("Critical", "CertFindCertificateInStore", 0, det);
+    } else {
+        SendHookEvent("Info", "CertFindCertificateInStore", 0, "certificate store access");
+    }
+    return ((Fn)GetCallThrough(IDX_CERTFINDCERTIFICATE))(
+        hCertStore, dwCertEncodingType, dwFindFlags, dwFindType, pvFindPara, pPrevCertContext);
+}
+
+static PCCERT_CONTEXT_OPAQUE WINAPI Hook_CertEnumCertificatesInStore(
+    HCERTSTORE_OPAQUE hCertStore, PCCERT_CONTEXT_OPAQUE pPrevCertContext)
+{
+    typedef PCCERT_CONTEXT_OPAQUE(WINAPI* Fn)(HCERTSTORE_OPAQUE, PCCERT_CONTEXT_OPAQUE);
+    if (pPrevCertContext == nullptr)
+        SendHookEvent("Info", "CertEnumCertificatesInStore", 0, "certificate store enumeration start");
+    return ((Fn)GetCallThrough(IDX_CERTENUMCERTIFICATES))(hCertStore, pPrevCertContext);
+}
+
+// ---------------------------------------------------------------------------
+// IsAddressInKnownModule
+//
+// Returns true if `addr` falls within the virtual address range of any module
+// loaded in the current process. Used by all execution-trigger hooks to detect
+// shellcode function pointers that live in heap or anonymous mapped memory.
+// ---------------------------------------------------------------------------
+
+static bool IsAddressInKnownModule(const void* addr) {
+    if (!addr) return true; // NULL is not shellcode
+    HMODULE mods[1024] = {};
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+        return true; // can't tell — don't false-positive
+    DWORD n = needed / sizeof(HMODULE);
+    for (DWORD i = 0; i < n; i++) {
+        if (!mods[i]) continue;
+        MODULEINFO mi = {};
+        if (!GetModuleInformation(GetCurrentProcess(), mods[i], &mi, sizeof(mi))) continue;
+        const BYTE* base = (const BYTE*)mi.lpBaseOfDll;
+        if ((const BYTE*)addr >= base && (const BYTE*)addr < base + mi.SizeOfImage)
+            return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Evasion-path execution trigger stubs
+// ---------------------------------------------------------------------------
+
+// Technique 3: local CreateThread with shellcode start address (heap staging)
+static HANDLE WINAPI Hook_CreateThread(
+    LPSECURITY_ATTRIBUTES lpSA, SIZE_T dwStackSize,
+    LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParam,
+    DWORD dwCreationFlags, LPDWORD lpThreadId)
+{
+    typedef HANDLE(WINAPI* Fn)(LPSECURITY_ATTRIBUTES, SIZE_T,
+                                LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+    if (lpStartAddress && !IsAddressInKnownModule((const void*)lpStartAddress)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "local thread: startAddr=%p NOT in any loaded module (heap/anon shellcode)",
+            (void*)lpStartAddress);
+        SendHookEvent("Critical", "CreateThread", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_CREATETHREAD))(
+        lpSA, dwStackSize, lpStartAddress, lpParam, dwCreationFlags, lpThreadId);
+}
+
+// Technique 6: MapViewOfFile with FILE_MAP_EXECUTE — file-backed section / module stomping
+static LPVOID WINAPI Hook_MapViewOfFile(
+    HANDLE hFileMappingObject, DWORD dwDesiredAccess,
+    DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow, SIZE_T dwNumberOfBytesToMap)
+{
+    typedef LPVOID(WINAPI* Fn)(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
+    if (dwDesiredAccess & FILE_MAP_EXECUTE) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "executable file mapping: access=0x%lX size=0x%llX",
+            dwDesiredAccess, (ULONG64)dwNumberOfBytesToMap);
+        SendHookEvent("High", "MapViewOfFile", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_MAPVIEWOFFILE))(
+        hFileMappingObject, dwDesiredAccess,
+        dwFileOffsetHigh, dwFileOffsetLow, dwNumberOfBytesToMap);
+}
+
+// Technique 2: RegisterClassEx with WndProc shellcode address (window message dispatch)
+static ATOM WINAPI Hook_RegisterClassExA(const WNDCLASSEXA* lpwcx) {
+    typedef ATOM(WINAPI* Fn)(const WNDCLASSEXA*);
+    if (lpwcx && lpwcx->lpfnWndProc &&
+        !IsAddressInKnownModule((const void*)lpwcx->lpfnWndProc)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WndProc=%p NOT in any loaded module — window message shellcode dispatch",
+            (void*)lpwcx->lpfnWndProc);
+        SendHookEvent("Critical", "RegisterClassExA", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_REGISTERCLASSEXA))(lpwcx);
+}
+
+static ATOM WINAPI Hook_RegisterClassExW(const WNDCLASSEXW* lpwcx) {
+    typedef ATOM(WINAPI* Fn)(const WNDCLASSEXW*);
+    if (lpwcx && lpwcx->lpfnWndProc &&
+        !IsAddressInKnownModule((const void*)lpwcx->lpfnWndProc)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WndProc=%p NOT in any loaded module — window message shellcode dispatch",
+            (void*)lpwcx->lpfnWndProc);
+        SendHookEvent("Critical", "RegisterClassExW", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_REGISTERCLASSEXW))(lpwcx);
+}
+
+// Technique 4: Callback abuse — Enum* functions used to dispatch shellcode
+static BOOL WINAPI Hook_EnumSystemLocalesA(LOCALE_ENUMPROCA lpLocaleEnumProc, DWORD dwFlags) {
+    typedef BOOL(WINAPI* Fn)(LOCALE_ENUMPROCA, DWORD);
+    if (lpLocaleEnumProc && !IsAddressInKnownModule((const void*)lpLocaleEnumProc)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "callback=%p NOT in any loaded module", (void*)lpLocaleEnumProc);
+        SendHookEvent("Critical", "EnumSystemLocalesA", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_ENUMSYSTEMLOCALESA))(lpLocaleEnumProc, dwFlags);
+}
+
+// EnumSystemLanguageGroupsA — rarity score 100 in malware differential: never in clean,
+// seen in 16 malicious samples. Treat as Critical unconditionally when callback is
+// outside module space.
+static BOOL WINAPI Hook_EnumSystemLanguageGroupsA(
+    LANGUAGEGROUP_ENUMPROCA lpLanguageGroupEnumProc, DWORD dwFlags, LONG_PTR lParam)
+{
+    typedef BOOL(WINAPI* Fn)(LANGUAGEGROUP_ENUMPROCA, DWORD, LONG_PTR);
+    if (lpLanguageGroupEnumProc &&
+        !IsAddressInKnownModule((const void*)lpLanguageGroupEnumProc)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "callback=%p NOT in any loaded module [rarity-100 malware indicator]",
+            (void*)lpLanguageGroupEnumProc);
+        SendHookEvent("Critical", "EnumSystemLanguageGroupsA", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_ENUMSYSLANGGRPA))(
+        lpLanguageGroupEnumProc, dwFlags, lParam);
+}
+
+static BOOL WINAPI Hook_EnumWindows(WNDENUMPROC lpEnumFunc, LPARAM lParam) {
+    typedef BOOL(WINAPI* Fn)(WNDENUMPROC, LPARAM);
+    if (lpEnumFunc && !IsAddressInKnownModule((const void*)lpEnumFunc)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "callback=%p NOT in any loaded module", (void*)lpEnumFunc);
+        SendHookEvent("Critical", "EnumWindows", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_ENUMWINDOWS))(lpEnumFunc, lParam);
+}
+
+static BOOL WINAPI Hook_EnumChildWindows(HWND hWndParent, WNDENUMPROC lpEnumFunc, LPARAM lParam) {
+    typedef BOOL(WINAPI* Fn)(HWND, WNDENUMPROC, LPARAM);
+    if (lpEnumFunc && !IsAddressInKnownModule((const void*)lpEnumFunc)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "callback=%p NOT in any loaded module", (void*)lpEnumFunc);
+        SendHookEvent("Critical", "EnumChildWindows", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_ENUMCHILDWINDOWS))(hWndParent, lpEnumFunc, lParam);
+}
+
+// Technique 5: Timer callbacks — shellcode registered as timer handler
+static UINT_PTR WINAPI Hook_SetTimer(
+    HWND hWnd, UINT_PTR nIDEvent, UINT uElapse, TIMERPROC lpTimerFunc)
+{
+    typedef UINT_PTR(WINAPI* Fn)(HWND, UINT_PTR, UINT, TIMERPROC);
+    if (lpTimerFunc && !IsAddressInKnownModule((const void*)lpTimerFunc)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "TimerProc=%p NOT in any loaded module", (void*)lpTimerFunc);
+        SendHookEvent("Critical", "SetTimer", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_SETTIMER))(hWnd, nIDEvent, uElapse, lpTimerFunc);
+}
+
+static BOOL WINAPI Hook_SetWaitableTimer(
+    HANDLE hTimer, const LARGE_INTEGER* lpDueTime, LONG lPeriod,
+    PTIMERAPCROUTINE pfnCompletionRoutine, PVOID lpArgToCompletionRoutine, BOOL fResume)
+{
+    typedef BOOL(WINAPI* Fn)(HANDLE, const LARGE_INTEGER*, LONG,
+                              PTIMERAPCROUTINE, PVOID, BOOL);
+    if (pfnCompletionRoutine &&
+        !IsAddressInKnownModule((const void*)pfnCompletionRoutine)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "APC routine=%p NOT in any loaded module", (void*)pfnCompletionRoutine);
+        SendHookEvent("Critical", "SetWaitableTimer", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_SETWAITABLETIMER))(
+        hTimer, lpDueTime, lPeriod, pfnCompletionRoutine,
+        lpArgToCompletionRoutine, fResume);
+}
+
+static BOOL WINAPI Hook_CreateTimerQueueTimer(
+    PHANDLE phNewTimer, HANDLE TimerQueue,
+    WAITORTIMERCALLBACK Callback, PVOID Parameter,
+    DWORD DueTime, DWORD Period, ULONG Flags)
+{
+    typedef BOOL(WINAPI* Fn)(PHANDLE, HANDLE, WAITORTIMERCALLBACK, PVOID,
+                              DWORD, DWORD, ULONG);
+    if (Callback && !IsAddressInKnownModule((const void*)Callback)) {
+        char det[128];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "callback=%p NOT in any loaded module", (void*)Callback);
+        SendHookEvent("Critical", "CreateTimerQueueTimer", 0, det);
+    }
+    return ((Fn)GetCallThrough(IDX_CREATETIMERQUEUETIMER))(
+        phNewTimer, TimerQueue, Callback, Parameter, DueTime, Period, Flags);
 }
 
 // ---------------------------------------------------------------------------
