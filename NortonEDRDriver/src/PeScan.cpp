@@ -284,23 +284,44 @@ static VOID WalkVadForPeScan(
                             PsGetProcessImageFileName(process),
                             bufQueue);
                 }
+                else {
+                    // Not an MZ image — check for a raw COFF object (BOF).
+                    // CS beacons allocate RW private memory, write the .o file,
+                    // then flip to RX before reflectively executing it.  After
+                    // execution the region may remain committed and show up here.
+                    if (size >= 20) {
+                        __try {
+                            ProbeForRead(startPtr, 20, sizeof(BYTE));
+                            // We are already attached to the target process so
+                            // startPtr is directly readable — pass it as buffer.
+                            PeScanner::CheckBufferForCoffHeader(
+                                startPtr,
+                                size,
+                                startPtr,
+                                PsGetProcessId(process),
+                                PsGetProcessImageFileName(process),
+                                bufQueue);
+                        }
+                        __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    }
 
-                // Separately flag anonymous RWX even without an MZ header
-                else if (prot == MM_EXECUTE_READWRITE) {
+                    // Separately flag anonymous RWX even without an MZ/COFF header
+                    if (prot == MM_EXECUTE_READWRITE) {
 
-                    DbgPrint("[!] PeScan: anonymous RWX region %p size=0x%llX (pid=%llu)\n",
-                        startPtr, (ULONG64)size,
-                        (ULONG64)PsGetProcessId(process));
+                        DbgPrint("[!] PeScan: anonymous RWX region %p size=0x%llX (pid=%llu)\n",
+                            startPtr, (ULONG64)size,
+                            (ULONG64)PsGetProcessId(process));
 
-                    char msg[64];
-                    RtlStringCbPrintfA(msg, sizeof(msg),
-                        "AnonRWX %p sz=0x%llX", startPtr, (ULONG64)size);
+                        char msg[64];
+                        RtlStringCbPrintfA(msg, sizeof(msg),
+                            "AnonRWX %p sz=0x%llX", startPtr, (ULONG64)size);
 
-                    (*alertCount)++;
-                    SendPeScanAlert(bufQueue,
-                        startVa, PsGetProcessId(process),
-                        PsGetProcessImageFileName(process),
-                        FALSE, msg);
+                        (*alertCount)++;
+                        SendPeScanAlert(bufQueue,
+                            startVa, PsGetProcessId(process),
+                            PsGetProcessImageFileName(process),
+                            FALSE, msg);
+                    }
                 }
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -390,6 +411,86 @@ VOID PeScanner::CheckBufferForPeHeader(
 
         if (validPe)
             AnalysePeSections(buffer, size, targetPid, procName, bufQueue);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// ---------------------------------------------------------------------------
+// CheckBufferForCoffHeader — detect raw COFF object files (BOF / Beacon Object
+// Files) loaded in-process by a CS beacon or compatible loader.
+//
+// A COFF .o file starts with IMAGE_FILE_HEADER (no DOS stub, no MZ):
+//   +0x00  WORD  Machine          (0x8664 = AMD64, 0x014C = I386)
+//   +0x02  WORD  NumberOfSections (1..96 for a sane object)
+//   +0x04  DWORD TimeDateStamp
+//   +0x08  DWORD PointerToSymbolTable
+//   +0x0C  DWORD NumberOfSymbols
+//   +0x10  WORD  SizeOfOptionalHeader (0 for .o files — non-zero means it's
+//                                      a PE image header, not a raw object)
+//   +0x12  WORD  Characteristics
+//
+// A BOF loader typically:
+//   1. VirtualAlloc(RW)  or  VirtualAlloc(RWX)
+//   2. memcpy(COFF bytes)
+//   3. Apply relocations manually
+//   4. VirtualProtect → RX  (or leave RWX)
+//   5. call entry_point()
+//
+// We check for a valid COFF machine type + sane section count +
+// SizeOfOptionalHeader == 0 at both the write step (buffer) and the
+// protect step (region about to become executable).
+// ---------------------------------------------------------------------------
+
+// COFF machine types we care about
+#define COFF_MACHINE_AMD64  0x8664
+#define COFF_MACHINE_I386   0x014C
+#define COFF_MACHINE_ARM64  0xAA64
+
+VOID PeScanner::CheckBufferForCoffHeader(
+    PVOID        buffer,
+    SIZE_T       size,
+    PVOID        targetAddress,
+    HANDLE       targetPid,
+    char*        procName,
+    BufferQueue* bufQueue
+) {
+    // Need at least the 20-byte IMAGE_FILE_HEADER
+    if (!buffer || size < 20 || !bufQueue) return;
+
+    __try {
+        PWORD pw = (PWORD)buffer;
+        WORD  machine          = pw[0];
+        WORD  numberOfSections = pw[1];
+        WORD  sizeOfOptHdr     = pw[8];  // at offset 0x10 = index 8 in WORD array
+
+        // Machine must be a known type
+        if (machine != COFF_MACHINE_AMD64 &&
+            machine != COFF_MACHINE_I386  &&
+            machine != COFF_MACHINE_ARM64) return;
+
+        // Sanity: at least 1 section, no more than 96, no optional header
+        if (numberOfSections == 0 || numberOfSections > 96) return;
+        if (sizeOfOptHdr != 0) return;  // non-zero = PE image header, not .o
+
+        // Confirm at least one section header fits in the buffer.
+        // Each section header is 40 bytes; they follow immediately after
+        // the 20-byte file header.
+        SIZE_T minSize = 20 + (SIZE_T)numberOfSections * 40;
+        if (size < minSize) return;
+
+        const char* archStr =
+            (machine == COFF_MACHINE_AMD64) ? "x64" :
+            (machine == COFF_MACHINE_ARM64) ? "arm64" : "x86";
+
+        char msg[128];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "COFF object (BOF) at %p sz=0x%llX arch=%s sections=%u"
+            " -- Beacon Object File / in-process COFF loader",
+            targetAddress, (ULONG64)size, archStr, (UINT)numberOfSections);
+
+        DbgPrint("[!] PeScan COFF/BOF: %s pid=%llu\n", msg, (ULONG64)targetPid);
+        SendPeScanAlert(bufQueue, (ULONG64)targetAddress, targetPid,
+                        procName, TRUE, msg);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }

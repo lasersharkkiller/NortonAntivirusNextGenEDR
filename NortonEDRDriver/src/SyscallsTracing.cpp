@@ -1074,6 +1074,11 @@ VOID SyscallsUtils::NtWriteVmHandler(
 					}
 				}
 			}
+			// Fork-and-run correlation: mark this PID as written-to so that
+			// a subsequent NtCreateThreadEx into it triggers a combined alert.
+			if (!isSelf)
+				ForkRunTracker::MarkWritten(PsGetProcessId(targetProcess));
+
 			if (!isSelf) ObDereferenceObject(targetProcess);
 		}
 	}
@@ -1084,7 +1089,7 @@ VOID SyscallsUtils::NtWriteVmHandler(
 
 		RtlCopyMemory(buffer, Buffer, NumberOfBytesToWrite);
 
-		// PE scan: flag cross-process writes that carry a PE header
+		// PE scan: flag writes that carry a PE header (cross-process only)
 		if (!isSelf) {
 			PeScanner::CheckBufferForPeHeader(
 				buffer,
@@ -1095,6 +1100,17 @@ VOID SyscallsUtils::NtWriteVmHandler(
 				CallbackObjects::GetNotifQueue()
 			);
 		}
+
+		// COFF/BOF scan: check all writes (self and cross-process) for raw COFF objects.
+		// CS beacons write the BOF into their own process memory before executing it.
+		PeScanner::CheckBufferForCoffHeader(
+			buffer,
+			NumberOfBytesToWrite,
+			BaseAddress,
+			PsGetProcessId(PsGetCurrentProcess()),
+			PsGetProcessImageFileName(PsGetCurrentProcess()),
+			CallbackObjects::GetNotifQueue()
+		);
 
 		RAW_BUFFER rawBuf;
 
@@ -1424,8 +1440,16 @@ VOID SyscallsUtils::NtOpenProcessHandler(
 	if (targetProcess) ObDereferenceObject(targetProcess);
 }
 
-// NtCreateThreadEx — flag remote thread creation (classic injection) and
-// local thread creation via direct syscall (bypasses CreateThread telemetry).
+// NtCreateThreadEx — flag remote thread creation (classic injection), local
+// direct-syscall thread creation (hook bypass), suspended-thread staging, and
+// the final step of a fork-and-run sequence.
+//
+// THREAD_CREATE_FLAGS_CREATE_SUSPENDED (bit 0): attacker creates the thread
+// suspended so they can set its context before it runs — two-phase injection.
+//
+// Fork-and-run: if the target PID was previously recorded as a known spawnto
+// host that already received a cross-process write, this NtCreateThreadEx
+// completes the three-step sequence and fires a combined Critical alert.
 VOID SyscallsUtils::NtCreateThreadExHandler(
 	PHANDLE     ThreadHandle,
 	ACCESS_MASK DesiredAccess,
@@ -1441,15 +1465,93 @@ VOID SyscallsUtils::NtCreateThreadExHandler(
 ) {
 	BOOLEAN crossProcess = (ProcessHandle != (HANDLE)-1);
 
+	// THREAD_CREATE_FLAGS_CREATE_SUSPENDED = 0x1
+	BOOLEAN createSuspended = (CreateFlags & 0x1) != 0;
+
+	// Build the primary per-event alert message.
+	char primaryMsg[200];
+	if (crossProcess && createSuspended) {
+		RtlStringCbPrintfA(primaryMsg, sizeof(primaryMsg),
+			"NtCreateThreadEx: remote SUSPENDED thread in foreign process"
+			" startAddr=0x%llX -- two-phase injection staging",
+			(ULONG64)StartRoutine);
+	} else if (crossProcess) {
+		RtlStringCbPrintfA(primaryMsg, sizeof(primaryMsg),
+			"NtCreateThreadEx: remote thread creation (classic injection primitive)"
+			" startAddr=0x%llX",
+			(ULONG64)StartRoutine);
+	} else if (createSuspended) {
+		RtlStringCbPrintfA(primaryMsg, sizeof(primaryMsg),
+			"NtCreateThreadEx: local suspended thread via direct syscall"
+			" startAddr=0x%llX -- staged self-injection",
+			(ULONG64)StartRoutine);
+	} else {
+		RtlStringCbPrintfA(primaryMsg, sizeof(primaryMsg),
+			"NtCreateThreadEx: local thread via direct syscall (hook bypass)"
+			" startAddr=0x%llX",
+			(ULONG64)StartRoutine);
+	}
+
 	EmitSyscallNotif(
 		(ULONG64)StartRoutine,
-		crossProcess
-			? "NtCreateThreadEx: remote thread creation (classic injection primitive)"
-			: "NtCreateThreadEx: local thread via direct syscall (hook bypass)",
+		primaryMsg,
 		IoGetCurrentProcess(),
 		nullptr,
 		crossProcess  // cross-process = Critical; local = Warning
 	);
+
+	// Fork-and-run correlation: resolve the target process PID and check
+	// whether it has already been written to by this caller (step 2 of 3).
+	if (crossProcess) {
+		PEPROCESS targetProc = nullptr;
+		if (NT_SUCCESS(ObReferenceObjectByHandle(
+			ProcessHandle, 0, *PsProcessType, UserMode,
+			(PVOID*)&targetProc, nullptr)) && targetProc) {
+
+			HANDLE targetPid = PsGetProcessId(targetProc);
+			char*  targetName = PsGetProcessImageFileName(targetProc);
+			char*  callerName = PsGetProcessImageFileName(IoGetCurrentProcess());
+
+			if (ForkRunTracker::CheckForkRun(targetPid)) {
+				// Sequence complete: spawn → write → thread.  Emit the combined alert.
+				char forkMsg[280];
+				RtlStringCbPrintfA(forkMsg, sizeof(forkMsg),
+					"FORK-AND-RUN: '%s' (pid=%llu) spawned '%s' as sacrificial process,"
+					" wrote shellcode, then created remote thread at 0x%llX"
+					" -- Cobalt Strike fork-and-run / process injection pattern",
+					callerName  ? callerName  : "?",
+					(ULONG64)PsGetProcessId(IoGetCurrentProcess()),
+					targetName  ? targetName  : "?",
+					(ULONG64)StartRoutine);
+
+				PKERNEL_STRUCTURED_NOTIFICATION n =
+					(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+						POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'frkr');
+				if (n) {
+					RtlZeroMemory(n, sizeof(*n));
+					SET_CRITICAL(*n);
+					SET_SYSCALL_CHECK(*n);
+					n->scoopedAddress = (ULONG64)StartRoutine;
+					n->pid            = PsGetProcessId(IoGetCurrentProcess());
+					n->isPath         = FALSE;
+					if (callerName) RtlCopyMemory(n->procName,       callerName, 14);
+					if (targetName) RtlCopyMemory(n->targetProcName, targetName, 14);
+					SIZE_T msgLen = strlen(forkMsg) + 1;
+					n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'fmsg');
+					if (n->msg) {
+						RtlCopyMemory(n->msg, forkMsg, msgLen);
+						n->bufSize = (ULONG)msgLen;
+						if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+							ExFreePool(n->msg);
+							ExFreePool(n);
+						}
+					} else { ExFreePool(n); }
+				}
+			}
+
+			ObDereferenceObject(targetProc);
+		}
+	}
 }
 
 // NtSuspendThread — flag cross-process suspension (APC injection / hollowing step).
@@ -1727,10 +1829,12 @@ VOID SyscallsUtils::NtProtectVirtualMemoryHandler(
 	PSIZE_T RegionSize,
 	ULONG   NewProtect
 ) {
-	// Only care when write permission is being granted
+	// Pass through when write OR execute bits are being set — both are interesting.
 	const ULONG kWriteMask = PAGE_READWRITE | PAGE_WRITECOPY |
 	                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-	if (!(NewProtect & kWriteMask)) return;
+	const ULONG kExecMask  = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+	                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+	if (!(NewProtect & kWriteMask) && !(NewProtect & kExecMask)) return;
 
 	// Resolve target process
 	PEPROCESS targetProcess = nullptr;
@@ -1758,29 +1862,47 @@ VOID SyscallsUtils::NtProtectVirtualMemoryHandler(
 
 	if (crossProcess) {
 		// Any write grant on a foreign process is suspicious (process hollowing / injection staging)
-		char msg[220];
-		RtlStringCbPrintfA(msg, sizeof(msg),
-			"NtProtectVirtualMemory: cross-process write permission granted "
-			"addr=0x%llX size=0x%llX prot=0x%lX",
-			(ULONG64)base, (ULONG64)size, NewProtect);
-		EmitSyscallNotif((ULONG64)base, msg, callerProcess, targetProcess, TRUE);
+		if (NewProtect & kWriteMask) {
+			char msg[220];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtProtectVirtualMemory: cross-process write permission granted "
+				"addr=0x%llX size=0x%llX prot=0x%lX",
+				(ULONG64)base, (ULONG64)size, NewProtect);
+			EmitSyscallNotif((ULONG64)base, msg, callerProcess, targetProcess, TRUE);
+		}
 	} else if (base) {
-		// Same-process: flag only if the target is image-backed memory (ntdll / loaded DLL).
-		// MEM_IMAGE (0x1000000) means the region is mapped from an image section — granting
-		// write on such a region is the ntdll-stomp signature.
 		MEMORY_BASIC_INFORMATION mbi = {};
 		SIZE_T retLen = 0;
 		NTSTATUS s = ZwQueryVirtualMemory(
 			NtCurrentProcess(), base,
 			(MEMORY_INFORMATION_CLASS)0,  // MemoryBasicInformation
 			&mbi, sizeof(mbi), &retLen);
-		if (NT_SUCCESS(s) && mbi.Type == 0x1000000 /* MEM_IMAGE */) {
-			char msg[240];
-			RtlStringCbPrintfA(msg, sizeof(msg),
-				"NtProtectVirtualMemory: write permission on image-mapped region "
-				"addr=0x%llX size=0x%llX prot=0x%lX — ntdll/DLL stomp attempt",
-				(ULONG64)base, (ULONG64)size, NewProtect);
-			EmitSyscallNotif((ULONG64)base, msg, callerProcess, nullptr, TRUE);
+
+		if (NT_SUCCESS(s)) {
+			// ntdll/DLL stomp: write grant on image-backed memory
+			if ((NewProtect & kWriteMask) && mbi.Type == 0x1000000 /* MEM_IMAGE */) {
+				char msg[240];
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"NtProtectVirtualMemory: write permission on image-mapped region "
+					"addr=0x%llX size=0x%llX prot=0x%lX — ntdll/DLL stomp attempt",
+					(ULONG64)base, (ULONG64)size, NewProtect);
+				EmitSyscallNotif((ULONG64)base, msg, callerProcess, nullptr, TRUE);
+			}
+
+			// W->X flip on private memory: shellcode/BOF staging pattern.
+			// RW private alloc is written (BOF loaded), then flipped to RX for execution.
+			// Only flag pure execute grants (not RWX — those are caught by the write check above).
+			BOOLEAN newIsExecOnly = (NewProtect & kExecMask) && !(NewProtect & kWriteMask);
+			BOOLEAN oldWasWritable = (mbi.Protect & kWriteMask) != 0;
+			if (newIsExecOnly && oldWasWritable && mbi.Type == 0x20000 /* MEM_PRIVATE */) {
+				char msg[280];
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"NtProtectVirtualMemory: W->X flip on private memory "
+					"addr=0x%llX size=0x%llX oldProt=0x%lX newProt=0x%lX "
+					"— shellcode/BOF execution staging",
+					(ULONG64)base, (ULONG64)size, mbi.Protect, NewProtect);
+				EmitSyscallNotif((ULONG64)base, msg, callerProcess, nullptr, TRUE);
+			}
 		}
 	}
 

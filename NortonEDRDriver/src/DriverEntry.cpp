@@ -321,6 +321,8 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 
+	ForkRunTracker::Init();
+
 	g_syscallsUtils->NtVersionPreCheck();
 	g_syscallsUtils->InitIds();
 	g_syscallsUtils->InitAltSyscallHandler();

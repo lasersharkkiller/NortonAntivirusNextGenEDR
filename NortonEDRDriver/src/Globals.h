@@ -1110,6 +1110,56 @@ public:
     static VOID UntrackImageSectionFile(PFILE_OBJECT FileObject);
 };
 
+// ---------------------------------------------------------------------------
+// Fork-and-run injection tracker.
+//
+// Cobalt Strike "fork and run" pattern:
+//   1. CreateProcess(spawnto_host, CREATE_SUSPENDED)  — sacrificial process
+//   2. NtWriteVirtualMemory → inject shellcode into child
+//   3. NtCreateThreadEx / NtResumeThread → execute in child
+//   4. Parent waits; child runs payload and exits
+//
+// Detection strategy: when a known spawnto host (rundll32, dllhost, WerFault,
+// etc.) or a process with a suspiciously empty command line is spawned, add it
+// to the tracker.  When a cross-process write into that PID is later seen, mark
+// it.  When a remote thread is subsequently created in it, fire a combined
+// Critical "fork-and-run" alert that links all three events.
+//
+// This is orthogonal to the individual NtWriteVm / NtCreateThreadEx alerts —
+// those still fire for each event separately.  The combined alert is the
+// high-confidence fork-and-run signal.
+// ---------------------------------------------------------------------------
+#define FORK_TRACK_MAX 64
+
+struct FORK_TRACK_ENTRY {
+    HANDLE  Pid;               // 0 = free slot
+    BOOLEAN KnownHost;         // image is a classic spawnto binary
+    BOOLEAN SuspiciousCmdLine; // cmdline missing or just the exe name
+    BOOLEAN WrittenTo;         // cross-process NtWriteVm seen into this PID
+    BOOLEAN Alerted;           // prevent duplicate combined alerts
+};
+
+class ForkRunTracker {
+public:
+    static VOID Init();
+
+    // Called from CreateProcessNotifyEx (process creation path only).
+    // Adds a slot if the process is a known spawnto host or has no/minimal args.
+    static VOID TrackProcess(HANDLE pid, BOOLEAN knownHost, BOOLEAN suspiciousCmdLine);
+
+    // Called from NtWriteVmHandler on any cross-process write.
+    // Updates an existing slot — does NOT create one (avoids tracking all processes).
+    static VOID MarkWritten(HANDLE targetPid);
+
+    // Called from NtCreateThreadExHandler on cross-process thread creation.
+    // Returns TRUE (and marks alerted) if WrittenTo is set for this PID,
+    // completing the fork-and-run three-step.
+    static BOOLEAN CheckForkRun(HANDLE targetPid);
+
+    // Called from CreateProcessNotifyEx (process exit path) to free the slot.
+    static VOID Remove(HANDLE pid);
+};
+
 class DllInjector {
 public:
     static VOID Initialize();
@@ -1242,6 +1292,20 @@ public:
     // Check a kernel-memory buffer (already copied from user space) for an
     // MZ/PE signature. Called from NtProtectVmHandler / NtWriteVmHandler.
     static VOID CheckBufferForPeHeader(
+        PVOID        buffer,
+        SIZE_T       size,
+        PVOID        targetAddress,
+        HANDLE       targetPid,
+        char*        procName,
+        BufferQueue* bufQueue
+    );
+
+    // Check a kernel-memory buffer for a raw COFF object file header.
+    // BOFs (Beacon Object Files) are COFF .o files loaded and executed
+    // in-process — they never have an MZ header so CheckBufferForPeHeader
+    // misses them entirely.  A valid COFF object starts with a 2-byte machine
+    // type (0x8664 or 0x014C), has NumberOfSections > 0, and SizeOfOptionalHeader == 0.
+    static VOID CheckBufferForCoffHeader(
         PVOID        buffer,
         SIZE_T       size,
         PVOID        targetAddress,

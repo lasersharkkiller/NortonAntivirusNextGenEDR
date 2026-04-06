@@ -27,6 +27,156 @@ static VOID EnsureMitigationResolver() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ForkRunTracker implementation
+// ---------------------------------------------------------------------------
+
+static FORK_TRACK_ENTRY g_ForkSlots[FORK_TRACK_MAX];
+static KSPIN_LOCK        g_ForkLock;
+static LONG              g_ForkInitDone = 0;
+
+VOID ForkRunTracker::Init() {
+    if (InterlockedCompareExchange(&g_ForkInitDone, 1, 0) == 0) {
+        RtlZeroMemory(g_ForkSlots, sizeof(g_ForkSlots));
+        KeInitializeSpinLock(&g_ForkLock);
+    }
+}
+
+VOID ForkRunTracker::TrackProcess(HANDLE pid, BOOLEAN knownHost, BOOLEAN suspiciousCmdLine) {
+    if (!pid) return;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ForkLock, &irql);
+    // Check for duplicate (re-use if process restarted with same PID — rare but safe)
+    for (int i = 0; i < FORK_TRACK_MAX; i++) {
+        if (g_ForkSlots[i].Pid == pid) {
+            // Update flags on duplicate
+            g_ForkSlots[i].KnownHost         |= knownHost;
+            g_ForkSlots[i].SuspiciousCmdLine  |= suspiciousCmdLine;
+            KeReleaseSpinLock(&g_ForkLock, irql);
+            return;
+        }
+    }
+    for (int i = 0; i < FORK_TRACK_MAX; i++) {
+        if (g_ForkSlots[i].Pid == nullptr) {
+            g_ForkSlots[i].Pid               = pid;
+            g_ForkSlots[i].KnownHost         = knownHost;
+            g_ForkSlots[i].SuspiciousCmdLine = suspiciousCmdLine;
+            g_ForkSlots[i].WrittenTo         = FALSE;
+            g_ForkSlots[i].Alerted           = FALSE;
+            break;
+        }
+    }
+    // Table full: silently drop (64 concurrent injections is an unrealistic load)
+    KeReleaseSpinLock(&g_ForkLock, irql);
+}
+
+VOID ForkRunTracker::MarkWritten(HANDLE targetPid) {
+    if (!targetPid) return;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ForkLock, &irql);
+    for (int i = 0; i < FORK_TRACK_MAX; i++) {
+        if (g_ForkSlots[i].Pid == targetPid) {
+            g_ForkSlots[i].WrittenTo = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_ForkLock, irql);
+}
+
+BOOLEAN ForkRunTracker::CheckForkRun(HANDLE targetPid) {
+    if (!targetPid) return FALSE;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ForkLock, &irql);
+    BOOLEAN fire = FALSE;
+    for (int i = 0; i < FORK_TRACK_MAX; i++) {
+        if (g_ForkSlots[i].Pid == targetPid &&
+            g_ForkSlots[i].WrittenTo        &&
+            !g_ForkSlots[i].Alerted) {
+            g_ForkSlots[i].Alerted = TRUE;
+            fire = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_ForkLock, irql);
+    return fire;
+}
+
+VOID ForkRunTracker::Remove(HANDLE pid) {
+    if (!pid) return;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ForkLock, &irql);
+    for (int i = 0; i < FORK_TRACK_MAX; i++) {
+        if (g_ForkSlots[i].Pid == pid) {
+            RtlZeroMemory(&g_ForkSlots[i], sizeof(FORK_TRACK_ENTRY));
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_ForkLock, irql);
+}
+
+// Known Cobalt Strike spawnto / process-injection host binaries (lowercase).
+// This list covers CS defaults and the most common attacker-configured targets.
+static const char* kSpawntoHosts[] = {
+    "rundll32.exe",
+    "dllhost.exe",
+    "werfault.exe",   // WerFault.exe — CS default on x64
+    "regsvr32.exe",
+    "mshta.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "gpupdate.exe",
+    "explorer.exe",
+    nullptr
+};
+
+// Returns TRUE if procName (already lowercase-normalised) is a known spawnto host.
+static BOOLEAN IsKnownSpawntoHost(const char* procName) {
+    if (!procName) return FALSE;
+    for (int i = 0; kSpawntoHosts[i]; i++) {
+        if (strcmp(procName, kSpawntoHosts[i]) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+// Returns TRUE if the command line looks like a process spawned with no real
+// arguments — just the binary name (or empty), which is the fork-and-run default.
+// needle: lowercase 15-char ANSI image filename from PsGetProcessImageFileName.
+static BOOLEAN IsSuspiciousCmdLine(PCUNICODE_STRING cmdLine, const char* imgName) {
+    if (!cmdLine || !cmdLine->Buffer || cmdLine->Length == 0) return TRUE; // empty = suspicious
+
+    USHORT chars = cmdLine->Length / sizeof(WCHAR);
+
+    // Strip leading quote and path, find actual argument portion.
+    // Format is typically: "C:\Windows\System32\rundll32.exe" [args]
+    // or: C:\Windows\System32\rundll32.exe [args]
+    USHORT argStart = 0;
+    BOOLEAN inQuote = (cmdLine->Buffer[0] == L'"');
+    if (inQuote) {
+        // Find closing quote
+        for (USHORT i = 1; i < chars; i++) {
+            if (cmdLine->Buffer[i] == L'"') { argStart = i + 1; break; }
+        }
+    } else {
+        // Find first space after the exe path
+        for (USHORT i = 0; i < chars; i++) {
+            if (cmdLine->Buffer[i] == L' ') { argStart = i + 1; break; }
+        }
+    }
+
+    // Skip leading spaces in the argument portion
+    while (argStart < chars && cmdLine->Buffer[argStart] == L' ') argStart++;
+
+    // Fewer than 2 characters of actual arguments = suspicious
+    return (BOOLEAN)((chars - argStart) < 2);
+}
+
+    if (InterlockedCompareExchange(&g_MitigInitDone, 1, 0) == 0) {
+        UNICODE_STRING us;
+        RtlInitUnicodeString(&us, L"PsGetProcessMitigationPolicy");
+        g_PsGetMitig = (pfnPsGetProcessMitigationPolicy)MmGetSystemRoutineAddress(&us);
+    }
+}
+
 BOOLEAN ProcessUtils::isProcessImageTampered() {
 
 	NTSTATUS status;
@@ -179,6 +329,30 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 		if (CreateInfo->CommandLine)
 			ImageUtils::SaveKernelCmdLine(HandleToUlong(PsGetProcessId(Process)),
 			                              CreateInfo->CommandLine);
+
+		// -----------------------------------------------------------------------
+		// Fork-and-run tracker: record this process if it is a known spawnto
+		// host or has a suspiciously empty command line.
+		// -----------------------------------------------------------------------
+		{
+			// Normalise image file name to lowercase ANSI for comparison.
+			char imgLower[16] = {};
+			char* rawName = PsGetProcessImageFileName(Process);
+			if (rawName) {
+				for (int i = 0; i < 15 && rawName[i]; i++) {
+					char c = rawName[i];
+					if (c >= 'A' && c <= 'Z') c |= 0x20;
+					imgLower[i] = c;
+				}
+			}
+
+			BOOLEAN knownHost      = IsKnownSpawntoHost(imgLower);
+			BOOLEAN suspiciousCmd  = IsSuspiciousCmdLine(CreateInfo->CommandLine, imgLower);
+
+			if (knownHost || suspiciousCmd) {
+				ForkRunTracker::TrackProcess(PsGetProcessId(Process), knownHost, suspiciousCmd);
+			}
+		}
 
 		// PE scan: walk the new process VAD for suspicious executable regions
 		PeScanner::ScanProcessVad(Process, CallbackObjects::GetNotifQueue());
@@ -778,8 +952,9 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 		}
 
 	} else {
-		// Process exit — free the cmdline record so the slot can be reused.
+		// Process exit — free the cmdline record and fork-run tracker slot.
 		ImageUtils::RemoveCmdLineRec(HandleToUlong(PsGetProcessId(Process)));
+		ForkRunTracker::Remove(PsGetProcessId(Process));
 	}
 }
 
