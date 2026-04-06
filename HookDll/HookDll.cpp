@@ -311,6 +311,14 @@ static constexpr int kTrampolineSize = 32;
 
 static BYTE* g_trampolinePool = nullptr;
 
+// Saved before any hooking so VerifyHooks() can VirtualProtect without re-entering
+// our own Hook_VirtualProtect stub.
+static BOOL (WINAPI *g_vpOriginal)(LPVOID, SIZE_T, DWORD, PDWORD) = nullptr;
+
+// Hook-integrity watch thread handles.
+static HANDLE g_watchStop   = nullptr;  // auto-reset event — signals thread to exit
+static HANDLE g_watchThread = nullptr;
+
 // Returns false if the first `len` bytes contain instructions that would produce
 // wrong results when copied to a different address (RIP-relative operands or
 // relative branches).
