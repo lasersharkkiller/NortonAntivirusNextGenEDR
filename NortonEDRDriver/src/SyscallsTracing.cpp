@@ -1189,17 +1189,43 @@ VOID SyscallsUtils::NtSetContextThreadHandler(
 	PEPROCESS callerProcess = IoGetCurrentProcess();
 	BOOLEAN   crossProcess  = (targetProcess != callerProcess);
 
-	ULONG64 newRip = 0;
-	if (crossProcess) {
-		__try {
-			newRip = ((PCONTEXT)Context)->Rip;
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {}
+	ULONG64 newRip   = 0;
+	ULONG   ctxFlags = 0;
+	ULONG64 dr0 = 0, dr1 = 0, dr2 = 0, dr3 = 0;
 
+	__try {
+		PCONTEXT ctx = (PCONTEXT)Context;
+		ctxFlags = ctx->ContextFlags;
+		if (crossProcess && (ctxFlags & CONTEXT_CONTROL))
+			newRip = ctx->Rip;
+		if (ctxFlags & CONTEXT_DEBUG_REGISTERS) {
+			dr0 = ctx->Dr0; dr1 = ctx->Dr1;
+			dr2 = ctx->Dr2; dr3 = ctx->Dr3;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+
+	if (crossProcess) {
 		EmitSyscallNotif(
 			newRip,
 			"NtSetContextThread: cross-process thread context hijack",
 			callerProcess, targetProcess, TRUE);
+	}
+
+	// VEH hardware breakpoint bypass detection:
+	// Setting hardware BPs (DR0-DR3) on hooked addresses causes EXCEPTION_SINGLE_STEP
+	// to fire before the inline-hook JMP executes.  A registered VEH can then
+	// redirect RIP past the hook — bypassing our detour entirely.
+	if ((ctxFlags & CONTEXT_DEBUG_REGISTERS) && (dr0 || dr1 || dr2 || dr3)) {
+		char msg[256];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtSetContextThread: CONTEXT_DEBUG_REGISTERS Dr0=0x%llX Dr1=0x%llX "
+			"Dr2=0x%llX Dr3=0x%llX — hardware BP may bypass inline hooks via VEH%s",
+			(unsigned long long)dr0, (unsigned long long)dr1,
+			(unsigned long long)dr2, (unsigned long long)dr3,
+			crossProcess ? " (cross-process)" : "");
+		EmitSyscallNotif(0, msg, callerProcess, crossProcess ? targetProcess : nullptr,
+			crossProcess /* cross-process = Critical, same-process = Warning */);
 	}
 
 	ObDereferenceObject(targetThread);

@@ -99,7 +99,12 @@ enum HookIdx : int {
     IDX_SETWINDOWLONGPTRW       = 40,
     IDX_CERTENUMCERTIFICATES    = 41,  // CRYPT32 callback abuse (score 94, mal 27)
     IDX_CERTFINDCERTIFICATE     = 42,  // CRYPT32 callback abuse (score 94, mal 24)
-    HOOK_COUNT                  = 43
+    // --- VEH hooking bypass: shellcode registered as vectored exception handler ---
+    IDX_ADDVECTOREDEXCEPTIONHANDLER   = 43,  // kernel32.dll (thunks to ntdll)
+    IDX_ADDVECTOREDCONTINUEHANDLER    = 44,  // kernel32.dll
+    IDX_RTLADDVECTOREDEXCEPTIONHANDLER = 45, // ntdll.dll — direct call path
+    IDX_RTLADDVECTOREDCONTINUEHANDLER  = 46, // ntdll.dll — direct call path
+    HOOK_COUNT                  = 47
 };
 
 struct ApiHook {
@@ -165,6 +170,10 @@ static LONG_PTR WINAPI Hook_SetWindowLongPtrA(HWND, int, LONG_PTR);
 static LONG_PTR WINAPI Hook_SetWindowLongPtrW(HWND, int, LONG_PTR);
 static PCCERT_CONTEXT_OPAQUE WINAPI Hook_CertFindCertificateInStore(HCERTSTORE_OPAQUE, DWORD, DWORD, DWORD, const void*, PCCERT_CONTEXT_OPAQUE);
 static PCCERT_CONTEXT_OPAQUE WINAPI Hook_CertEnumCertificatesInStore(HCERTSTORE_OPAQUE, PCCERT_CONTEXT_OPAQUE);
+static PVOID   WINAPI Hook_AddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
+static PVOID   WINAPI Hook_AddVectoredContinueHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
+static PVOID   NTAPI  Hook_RtlAddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
+static PVOID   NTAPI  Hook_RtlAddVectoredContinueHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
 
 static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "VirtualAlloc",         (FARPROC)Hook_VirtualAlloc,        nullptr, nullptr, {}, nullptr, false },
@@ -210,6 +219,10 @@ static ApiHook g_hooks[HOOK_COUNT] = {
     { "user32.dll",   "SetWindowLongPtrW",         (FARPROC)Hook_SetWindowLongPtrW,           nullptr, nullptr, {}, nullptr, false },
     { "crypt32.dll",  "CertFindCertificateInStore",(FARPROC)Hook_CertFindCertificateInStore,   nullptr, nullptr, {}, nullptr, false },
     { "crypt32.dll",  "CertEnumCertificatesInStore",(FARPROC)Hook_CertEnumCertificatesInStore, nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "AddVectoredExceptionHandler",   (FARPROC)Hook_AddVectoredExceptionHandler,    nullptr, nullptr, {}, nullptr, false },
+    { "kernel32.dll", "AddVectoredContinueHandler",    (FARPROC)Hook_AddVectoredContinueHandler,     nullptr, nullptr, {}, nullptr, false },
+    { "ntdll.dll",    "RtlAddVectoredExceptionHandler",(FARPROC)Hook_RtlAddVectoredExceptionHandler, nullptr, nullptr, {}, nullptr, false },
+    { "ntdll.dll",    "RtlAddVectoredContinueHandler", (FARPROC)Hook_RtlAddVectoredContinueHandler,  nullptr, nullptr, {}, nullptr, false },
 };
 
 // Returns the correct call-through address.
@@ -676,7 +689,9 @@ static BOOL WINAPI Hook_SetThreadContext(HANDLE hThread, const CONTEXT* lpContex
     typedef BOOL(WINAPI* Fn)(HANDLE, const CONTEXT*);
     DWORD tid = GetThreadId(hThread);
     DWORD pid = tid ? GetProcessIdOfThread(hThread) : 0;
+
     if (pid && pid != g_selfPid) {
+        // Cross-process context manipulation: RIP redirect or inject via debug regs
         DWORD64 rip = 0;
         if (lpContext && (lpContext->ContextFlags & CONTEXT_CONTROL))
             rip = lpContext->Rip;
@@ -686,6 +701,28 @@ static BOOL WINAPI Hook_SetThreadContext(HANDLE hThread, const CONTEXT* lpContex
             pid, tid, rip);
         SendHookEvent("Critical", "SetThreadContext", pid, det);
     }
+
+    // VEH hardware breakpoint bypass: same-process thread arming DR0-DR3.
+    // An attacker sets a hardware breakpoint on the inline-hook JMP target so
+    // a EXCEPTION_SINGLE_STEP/EXCEPTION_BREAKPOINT fires BEFORE the hook runs,
+    // then redirects RIP from inside the VEH — bypassing our inline hook entirely.
+    // Detect any same-process call that sets at least one DR with CONTEXT_DEBUG_REGISTERS.
+    if (lpContext && (lpContext->ContextFlags & CONTEXT_DEBUG_REGISTERS)) {
+        if (lpContext->Dr0 || lpContext->Dr1 || lpContext->Dr2 || lpContext->Dr3) {
+            char det[200];
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "SetThreadContext(CONTEXT_DEBUG_REGISTERS) tid=%lu "
+                "Dr0=0x%llX Dr1=0x%llX Dr2=0x%llX Dr3=0x%llX — "
+                "hardware BP may be used to bypass inline hooks via VEH",
+                tid,
+                (unsigned long long)lpContext->Dr0,
+                (unsigned long long)lpContext->Dr1,
+                (unsigned long long)lpContext->Dr2,
+                (unsigned long long)lpContext->Dr3);
+            SendHookEvent("High", "SetThreadContext", pid ? pid : g_selfPid, det);
+        }
+    }
+
     return ((Fn)GetCallThrough(IDX_SETTHREADCONTEXT))(hThread, lpContext);
 }
 
@@ -1399,6 +1436,64 @@ static BOOL WINAPI Hook_CreateTimerQueueTimer(
     }
     return ((Fn)GetCallThrough(IDX_CREATETIMERQUEUETIMER))(
         phNewTimer, TimerQueue, Callback, Parameter, DueTime, Period, Flags);
+}
+
+// ---------------------------------------------------------------------------
+// VEH hooking bypass coverage
+//
+// Technique: attacker calls AddVectoredExceptionHandler / RtlAddVectoredExceptionHandler
+// with a shellcode address, then intentionally triggers an exception (div-by-zero,
+// access violation, or a hardware debug breakpoint set via SetThreadContext DR0-DR3).
+// The VEH fires BEFORE the inline hook JMP is reached — bypassing our detour
+// entirely — and the VEH handler can redirect RIP to any address.
+//
+// We flag registrations whose handler address does not belong to any loaded PE
+// module on disk, which is the signature of heap/stack shellcode.
+// ---------------------------------------------------------------------------
+
+// Shared logic for all four VEH registration APIs.
+static void CheckVehHandler(const char* apiName, PVECTORED_EXCEPTION_HANDLER handler) {
+    if (!handler) return;
+    if (!IsAddressInKnownModule((const void*)handler)) {
+        char det[160];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "VEH handler=%p NOT in any loaded module — "
+            "shellcode may be registered as vectored exception handler to bypass inline hooks",
+            (void*)handler);
+        SendHookEvent("Critical", apiName, g_selfPid, det);
+    }
+}
+
+static PVOID WINAPI Hook_AddVectoredExceptionHandler(
+    ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER VectoredHandler)
+{
+    typedef PVOID(WINAPI* Fn)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+    CheckVehHandler("AddVectoredExceptionHandler", VectoredHandler);
+    return ((Fn)GetCallThrough(IDX_ADDVECTOREDEXCEPTIONHANDLER))(FirstHandler, VectoredHandler);
+}
+
+static PVOID WINAPI Hook_AddVectoredContinueHandler(
+    ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER VectoredHandler)
+{
+    typedef PVOID(WINAPI* Fn)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+    CheckVehHandler("AddVectoredContinueHandler", VectoredHandler);
+    return ((Fn)GetCallThrough(IDX_ADDVECTOREDCONTINUEHANDLER))(FirstHandler, VectoredHandler);
+}
+
+static PVOID NTAPI Hook_RtlAddVectoredExceptionHandler(
+    ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER VectoredHandler)
+{
+    typedef PVOID(NTAPI* Fn)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+    CheckVehHandler("RtlAddVectoredExceptionHandler", VectoredHandler);
+    return ((Fn)GetCallThrough(IDX_RTLADDVECTOREDEXCEPTIONHANDLER))(FirstHandler, VectoredHandler);
+}
+
+static PVOID NTAPI Hook_RtlAddVectoredContinueHandler(
+    ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER VectoredHandler)
+{
+    typedef PVOID(NTAPI* Fn)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+    CheckVehHandler("RtlAddVectoredContinueHandler", VectoredHandler);
+    return ((Fn)GetCallThrough(IDX_RTLADDVECTOREDCONTINUEHANDLER))(FirstHandler, VectoredHandler);
 }
 
 // ---------------------------------------------------------------------------
