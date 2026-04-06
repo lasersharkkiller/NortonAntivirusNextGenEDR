@@ -278,6 +278,265 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 		}
 
 		// -----------------------------------------------------------------------
+		// EPROCESS image-file structural anomaly checks (three related signals).
+		//
+		// (1) NULL ImageFilePointer in a non-minimal, non-pico process.
+		//     EPROCESS.ImageFilePointer (FILE_OBJECT*) is set by the kernel to the
+		//     backing FILE_OBJECT of the process image file.  It is NULL when:
+		//       - the process was created from a manually-constructed SEC_IMAGE section
+		//         that has no on-disk file backing (e.g. reflective/shellcode PE loader),
+		//       - the ControlArea was built without a FILE_OBJECT at all.
+		//     Minimal processes (WSL pico, Secure System) legitimately have no image
+		//     file; all others should have one.
+		//
+		// (2) PEB→ProcessParameters→ImagePathName ≠ EPROCESS ImageFileName.
+		//     SeAuditProcessCreationInfo→ImageFileName is set by the kernel at creation
+		//     time and is not writable from user-mode.  ProcessParameters→ImagePathName
+		//     lives in the PEB (user-mode memory) and can be patched before resuming
+		//     the main thread via WriteProcessMemory / NtWriteVirtualMemory.
+		//     Any mismatch in the final path component indicates PEB path spoofing —
+		//     the process appears to tools reading the PEB to be a different binary.
+		//
+		// (3) Ghost-variant: ImageFilePointer non-null but ControlArea FilePointerNull
+		//     flag set (section was built without a file object).  This covers the
+		//     case where the EPROCESS pointer was patched post-creation but the
+		//     ControlArea was never backed by a real file.
+		// -----------------------------------------------------------------------
+		{
+			PKERNEL_STRUCTURES_OFFSET offs = OffsetsMgt::GetOffsets();
+			char* childName   = PsGetProcessImageFileName(Process);
+			char* creatorName = PsGetProcessImageFileName(IoGetCurrentProcess());
+			HANDLE childPid   = PsGetProcessId(Process);
+
+			// --- (1) + (3): NULL ImageFilePointer or ControlArea FilePointerNull ---
+			__try {
+				PVOID imageFilePtrRaw =
+					*(PVOID*)((PUCHAR)Process + offs->ImageFilePointer);
+
+				ULONG flags3 = *(ULONG*)((PUCHAR)Process + offs->Flags3);
+				ULONG flags2 = *(ULONG*)((PUCHAR)Process + offs->Flags2);
+
+				// Flags3 bit 0 = MinimalProcess; Flags2 bit 10 = PicoCreated
+				BOOLEAN isMinimal = (flags3 & 0x1) != 0;
+				BOOLEAN isPico    = (flags2 & 0x400) != 0;
+
+				if (!isMinimal && !isPico) {
+
+					if (!imageFilePtrRaw) {
+						// (1) No FILE_OBJECT for a normal Win32 process — file-less
+						// section creation or post-creation pointer wipe.
+						char msg[220];
+						RtlStringCbPrintfA(msg, sizeof(msg),
+							"Null EPROCESS.ImageFilePointer: '%s' (pid=%llu) creator='%s'"
+							" -- image section has no backing FILE_OBJECT;"
+							" file-less section injection or ghosting variant",
+							childName ? childName : "?",
+							(ULONG64)childPid,
+							creatorName ? creatorName : "?");
+
+						PKERNEL_STRUCTURED_NOTIFICATION n =
+							(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+								POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+						if (n) {
+							RtlZeroMemory(n, sizeof(*n));
+							SET_CRITICAL(*n);
+							SET_SE_AUDIT_INFO_CHECK(*n);
+							n->isPath = FALSE;
+							n->pid    = childPid;
+							if (creatorName) RtlCopyMemory(n->procName, creatorName, 14);
+							SIZE_T msgLen = strlen(msg) + 1;
+							n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+							if (n->msg) {
+								RtlCopyMemory(n->msg, msg, msgLen);
+								n->bufSize = (ULONG)msgLen;
+								if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+									ExFreePool(n->msg); ExFreePool(n);
+								}
+							} else { ExFreePool(n); }
+						}
+					} else {
+						// (3) ImageFilePointer non-null — verify the backing ControlArea
+						// actually has a file object (FilePointerNull == 0 in flags).
+						// Navigate: EPROCESS.ImageFilePointer → FILE_OBJECT →
+						// SectionObjectPointer → DataSectionObject → ControlArea.
+						// Simpler path: walk the process image VAD's ControlArea directly.
+						// ControlArea.Flags.FilePointerNull (bit 19 of u.LongFlags) means
+						// the ControlArea was built without a backing file, i.e. section
+						// created from anonymous or deleted memory.
+						__try {
+							PVOID controlAreaGuess =
+								*(PVOID*)((PUCHAR)imageFilePtrRaw + 0x38);  // FILE_OBJECT.SectionObjectPointer
+
+							// Walk the image section VAD to get the real ControlArea.
+							// This is more reliable than deriving from FILE_OBJECT chains.
+							RTL_AVL_TREE* vadRoot =
+								(RTL_AVL_TREE*)((PUCHAR)Process + offs->VadRoot);
+							if (MmIsAddressValid(vadRoot) && vadRoot->BalancedRoot) {
+								// Fast path: read the main image VadRoot's first VadImageMap node.
+								// Full walk is in WalkVadHiddenMappings; here we just read the
+								// ControlArea from the process VAD known from SectionBaseAddress.
+								PVOID sectionBase =
+									*(PVOID*)((PUCHAR)Process + 0x530); // EPROCESS.SectionBaseAddress
+								if (sectionBase) {
+									ULONG64 vpn = (ULONG64)sectionBase >> 12;
+									// Linear scan not needed — just check via ControlArea flag
+									// on the file object we already have.
+									PVOID secObjPtr =
+										*(PVOID*)((PUCHAR)imageFilePtrRaw + 0x38);
+									if (secObjPtr && MmIsAddressValid(secObjPtr)) {
+										// DataSectionObject → ControlArea
+										PVOID ctrlArea = *(PVOID*)secObjPtr;
+										if (ctrlArea && MmIsAddressValid(ctrlArea)) {
+											ULONG caFlags = *(ULONG*)((PUCHAR)ctrlArea + 0x28);
+											BOOLEAN fpNull = (caFlags & (1UL << 19)) != 0;
+											if (fpNull) {
+												char msg[220];
+												RtlStringCbPrintfA(msg, sizeof(msg),
+													"ControlArea.FilePointerNull: '%s' (pid=%llu)"
+													" creator='%s' -- image section ControlArea"
+													" has no backing file object;"
+													" anonymous or ghosted section",
+													childName  ? childName  : "?",
+													(ULONG64)childPid,
+													creatorName ? creatorName : "?");
+
+												PKERNEL_STRUCTURED_NOTIFICATION n =
+													(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+														POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+												if (n) {
+													RtlZeroMemory(n, sizeof(*n));
+													SET_CRITICAL(*n);
+													SET_SE_AUDIT_INFO_CHECK(*n);
+													n->isPath = FALSE;
+													n->pid    = childPid;
+													if (creatorName) RtlCopyMemory(n->procName, creatorName, 14);
+													SIZE_T msgLen = strlen(msg) + 1;
+													n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+													if (n->msg) {
+														RtlCopyMemory(n->msg, msg, msgLen);
+														n->bufSize = (ULONG)msgLen;
+														if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+															ExFreePool(n->msg); ExFreePool(n);
+														}
+													} else { ExFreePool(n); }
+												}
+											}
+										}
+									}
+								}
+							}
+						} __except (EXCEPTION_EXECUTE_HANDLER) {}
+					}
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+			// --- (2) PEB ImagePathName vs kernel ImageFileName mismatch ---
+			// Only meaningful when both sides are available.
+			SE_AUDIT_PROCESS_CREATION_INFO* seAudit =
+				(SE_AUDIT_PROCESS_CREATION_INFO*)((PUCHAR)Process + offs->SeAuditProcessCreationInfo);
+
+			if (MmIsAddressValid(seAudit) &&
+				seAudit->ImageFileName &&
+				seAudit->ImageFileName->Name.Buffer &&
+				seAudit->ImageFileName->Name.Length > 0) {
+
+				// Extract the last path component from the kernel-authoritative path.
+				// NT path: \Device\HarddiskVolume3\...\notepad.exe → "notepad.exe"
+				const UNICODE_STRING* kPath = &seAudit->ImageFileName->Name;
+				USHORT kChars  = kPath->Length / sizeof(WCHAR);
+				USHORT kSlash  = 0;
+				for (USHORT i = 0; i < kChars; i++)
+					if (kPath->Buffer[i] == L'\\' || kPath->Buffer[i] == L'/') kSlash = i + 1;
+
+				char kName[64] = {};
+				USHORT kCopy = min((USHORT)(kChars - kSlash), (USHORT)(sizeof(kName) - 1));
+				for (USHORT i = 0; i < kCopy; i++) {
+					WCHAR wc = kPath->Buffer[kSlash + i];
+					if (wc >= L'A' && wc <= L'Z') wc |= 0x20;
+					kName[i] = (wc < 128) ? (char)wc : '?';
+				}
+
+				// Now attach and read PEB→ProcessParameters→ImagePathName.
+				// PEB.ProcessParameters at PEB+0x20 (64-bit).
+				// RTL_USER_PROCESS_PARAMETERS.ImagePathName at +0x60.
+				KAPC_STATE apcState;
+				KeStackAttachProcess(Process, &apcState);
+
+				__try {
+					PVOID peb = PsGetProcessPeb(Process);
+					if (peb && MmIsAddressValid(peb)) {
+						PVOID ppRaw = nullptr;
+						ProbeForRead((PUCHAR)peb + 0x20, sizeof(PVOID), sizeof(BYTE));
+						RtlCopyMemory(&ppRaw, (PUCHAR)peb + 0x20, sizeof(PVOID));
+
+						if (ppRaw && MmIsAddressValid(ppRaw)) {
+							// ImagePathName is UNICODE_STRING at +0x60; Buffer pointer at +0x68.
+							UNICODE_STRING pebPath;
+							ProbeForRead((PUCHAR)ppRaw + 0x60, sizeof(UNICODE_STRING), sizeof(BYTE));
+							RtlCopyMemory(&pebPath, (PUCHAR)ppRaw + 0x60, sizeof(UNICODE_STRING));
+
+							if (pebPath.Buffer && pebPath.Length > 0 &&
+								MmIsAddressValid(pebPath.Buffer)) {
+
+								ProbeForRead(pebPath.Buffer, pebPath.Length, sizeof(BYTE));
+
+								USHORT pChars = pebPath.Length / sizeof(WCHAR);
+								USHORT pSlash = 0;
+								for (USHORT i = 0; i < pChars; i++)
+									if (pebPath.Buffer[i] == L'\\' || pebPath.Buffer[i] == L'/')
+										pSlash = i + 1;
+
+								char pName[64] = {};
+								USHORT pCopy = min((USHORT)(pChars - pSlash), (USHORT)(sizeof(pName) - 1));
+								for (USHORT i = 0; i < pCopy; i++) {
+									WCHAR wc = pebPath.Buffer[pSlash + i];
+									if (wc >= L'A' && wc <= L'Z') wc |= 0x20;
+									pName[i] = (wc < 128) ? (char)wc : '?';
+								}
+
+								// Compare the filename components.
+								if (kName[0] && pName[0] && strcmp(kName, pName) != 0) {
+									char msg[280];
+									RtlStringCbPrintfA(msg, sizeof(msg),
+										"PEB path spoofing: '%s' (pid=%llu) creator='%s'"
+										" PEB.ImagePathName='%s' != kernel.ImageFileName='%s'"
+										" -- parent patched PEB before thread resumed",
+										childName  ? childName  : "?",
+										(ULONG64)childPid,
+										creatorName ? creatorName : "?",
+										pName, kName);
+
+									PKERNEL_STRUCTURED_NOTIFICATION n =
+										(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+											POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+									if (n) {
+										RtlZeroMemory(n, sizeof(*n));
+										SET_CRITICAL(*n);
+										SET_SE_AUDIT_INFO_CHECK(*n);
+										n->isPath = FALSE;
+										n->pid    = childPid;
+										if (creatorName) RtlCopyMemory(n->procName, creatorName, 14);
+										SIZE_T msgLen = strlen(msg) + 1;
+										n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+										if (n->msg) {
+											RtlCopyMemory(n->msg, msg, msgLen);
+											n->bufSize = (ULONG)msgLen;
+											if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+												ExFreePool(n->msg); ExFreePool(n);
+											}
+										} else { ExFreePool(n); }
+									}
+								}
+							}
+						}
+					}
+				} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+				KeUnstackDetachProcess(&apcState);
+			}
+		}
+
+		// -----------------------------------------------------------------------
 		// Legacy process creation via NtCreateProcessEx / NtCreateProcess:
 		// kernel signal — FileOpenNameAvailable == 0 with a non-NULL ImageFileName.
 		//

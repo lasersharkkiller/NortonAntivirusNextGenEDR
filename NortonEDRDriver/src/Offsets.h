@@ -15,6 +15,8 @@ typedef struct _KERNEL_STRUCTURES_OFFSETS {
 	ULONG MitigationFlags2Values;
 	ULONG ThreadListHead;
 	ULONG Flags3;
+	ULONG Flags2;               // contains PicoCreated (bit 10)
+	ULONG ImageFilePointer;     // Ptr64 FILE_OBJECT — null for file-less images
 
 	// E/KTHREAD
 	ULONG Header;

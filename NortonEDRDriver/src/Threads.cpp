@@ -101,6 +101,11 @@ VOID ThreadUtils::CreateThreadNotifyRoutine(
 				(ULONG64)startAddr,
 				PsGetProcessImageFileName(creatorProcess));
 
+			// Scan target process VAD for SEC_IMAGE sections not in its LDR —
+			// the attacker likely used NtMapViewOfSection to stage a DLL there
+			// before creating this remote thread to run it.
+			VadUtils::ScanForHiddenMappings(eProcess, CallbackObjects::GetNotifQueue());
+
 			PKERNEL_STRUCTURED_NOTIFICATION kernelNotif =
 				(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
 					POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');

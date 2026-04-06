@@ -317,7 +317,206 @@ VOID VadUtils::exploreVadTreeAndVerifyLdrIngtegrity(
 	}
 	}
 
-	
+
+}
+
+// ---------------------------------------------------------------------------
+// Hidden mapped section detection — find SEC_IMAGE VAD entries with no LDR match.
+//
+// Reflective loaders and manual-map injectors call NtMapViewOfSection to place
+// a PE image into the target process without going through the Windows loader.
+// The result is a VadType==VadImageMap (file-backed SEC_IMAGE) VAD node whose
+// StartingVpn is absent from the PEB LDR InMemoryOrderModuleList.
+//
+// Algorithm:
+//   1. Walk all VAD nodes; filter to VadType==2 (VadImageMap) + executable prot.
+//   2. For each, walk the LDR list looking for a DllBase match.
+//   3. If not found and LDR is initialised with ≥3 entries → Critical alert.
+//
+// Called after cross-process thread injection is detected (CreateThreadNotify)
+// to scan the target process. LDR-readiness guard prevents false positives at
+// early process startup.
+// ---------------------------------------------------------------------------
+
+#define VAD_TYPE_IMAGE_MAP 2  // MMVAD_FLAGS.VadType == 2 → SEC_IMAGE (VadImageMap)
+
+// Returns TRUE if the internal VAD protection value is executable.
+static BOOLEAN IsVadExec(ULONG prot) {
+    return (prot == MM_EXECUTE          ||
+            prot == MM_EXECUTE_READ     ||
+            prot == MM_EXECUTE_READWRITE ||
+            prot == MM_EXECUTE_WRITECOPY);
+}
+
+// Must be called while attached to the process.
+// Returns TRUE if baseVa is in the InMemoryOrderModuleList (= has an LDR entry).
+// Returns TRUE on any read failure (conservative: prefer no false positives).
+static BOOLEAN IsBaseInLdr(PEPROCESS process, ULONG64 baseVa) {
+    __try {
+        PVOID peb = PsGetProcessPeb(process);
+        if (!peb || !MmIsAddressValid(peb)) return TRUE;
+
+        PVOID ldrPtr = nullptr;
+        ProbeForRead((PUCHAR)peb + 0x18, sizeof(PVOID), sizeof(BYTE));
+        RtlCopyMemory(&ldrPtr, (PUCHAR)peb + 0x18, sizeof(PVOID));
+        if (!ldrPtr || !MmIsAddressValid(ldrPtr)) return TRUE;
+
+        PPEB_LDR_DATA ldr = (PPEB_LDR_DATA)ldrPtr;
+        if (!ldr->Initialized) return TRUE;  // loader not yet running
+
+        LIST_ENTRY* head = &ldr->InMemoryOrderModuleList;
+        LIST_ENTRY* cur  = head->Flink;
+
+        for (int limit = 512; cur != head && limit > 0; limit--) {
+            if (!MmIsAddressValid(cur)) return TRUE;  // corrupt list — bail safe
+            PLDR_DATA_TABLE_ENTRY entry =
+                CONTAINING_RECORD(cur, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+            if (MmIsAddressValid(entry) && (ULONG64)entry->DllBase == baseVa)
+                return TRUE;
+            cur = cur->Flink;
+        }
+        return FALSE;  // walked all entries — not found
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return TRUE;  // read fault — skip this address
+    }
+}
+
+// VAD tree walker for hidden mappings.  Must be called while attached.
+static VOID WalkVadHiddenMappings(
+    RTL_BALANCED_NODE* node,
+    PEPROCESS          process,
+    BufferQueue*       queue,
+    ULONG*             alertCount
+) {
+    if (!node || !MmIsAddressValid(node) || *alertCount >= 8) return;
+
+    __try {
+        PMMVAD vad  = (PMMVAD)node;
+        ULONG  vt   = vad->u.VadFlags.VadType;
+        ULONG  prot = vad->u.VadFlags.Protection;
+
+        if (vt == VAD_TYPE_IMAGE_MAP && IsVadExec(prot)) {
+            ULONG64 baseVa = (ULONG64)vad->StartingVpn << 12;
+
+            // Skip null/sub-page and kernel addresses
+            if (baseVa < 0x10000 || baseVa >= 0x7FFF00000000ULL) goto recurse;
+
+            if (!IsBaseInLdr(process, baseVa)) {
+
+                // Extract backing file name from Subsection → ControlArea → FILE_OBJECT
+                char fileName[128] = "<no file>";
+                __try {
+                    _SUBSECTION* sub =
+                        (_SUBSECTION*)*(PVOID*)((PUCHAR)vad + OffsetsMgt::GetOffsets()->Subsection);
+                    if (sub && MmIsAddressValid(sub)) {
+                        PVOID ctrl = *(PVOID*)((PUCHAR)sub + OffsetsMgt::GetOffsets()->ControlArea);
+                        if (ctrl && MmIsAddressValid(ctrl)) {
+                            PVOID rawFp = *(PVOID*)((PUCHAR)ctrl + OffsetsMgt::GetOffsets()->FilePointer);
+                            FILE_OBJECT* fo =
+                                (FILE_OBJECT*)NullifyLastDigit((ULONG64)rawFp);
+                            if (fo && MmIsAddressValid(fo) &&
+                                fo->FileName.Buffer && fo->FileName.Length > 0) {
+                                USHORT cc = min(
+                                    (USHORT)(fo->FileName.Length / sizeof(WCHAR)),
+                                    (USHORT)(sizeof(fileName) - 1));
+                                for (USHORT i = 0; i < cc; i++) {
+                                    WCHAR wc = fo->FileName.Buffer[i];
+                                    fileName[i] = (wc < 128) ? (char)wc : '?';
+                                }
+                                fileName[cc] = '\0';
+                            }
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+                (*alertCount)++;
+                char msg[256];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "Hidden mapped section: SEC_IMAGE at 0x%llX not in LDR"
+                    " -- reflective/manual-map injection; file: %s",
+                    baseVa, fileName);
+
+                char* pn = PsGetProcessImageFileName(process);
+
+                PKERNEL_STRUCTURED_NOTIFICATION notif =
+                    (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'vadh');
+                if (notif) {
+                    RtlZeroMemory(notif, sizeof(*notif));
+                    SET_CRITICAL(*notif);
+                    SET_PROC_VAD_CHECK(*notif);
+                    notif->scoopedAddress = baseVa;
+                    notif->pid            = PsGetProcessId(process);
+                    notif->isPath         = FALSE;
+                    if (pn) RtlCopyMemory(notif->procName, pn, 14);
+                    SIZE_T msgLen = strlen(msg) + 1;
+                    notif->msg = (char*)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED, msgLen, 'vadm');
+                    if (notif->msg) {
+                        RtlCopyMemory(notif->msg, msg, msgLen);
+                        notif->bufSize = (ULONG)msgLen;
+                        if (!queue->Enqueue(notif)) {
+                            ExFreePool(notif->msg);
+                            ExFreePool(notif);
+                        }
+                    } else { ExFreePool(notif); }
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+recurse:
+    WalkVadHiddenMappings(node->Left,  process, queue, alertCount);
+    WalkVadHiddenMappings(node->Right, process, queue, alertCount);
+}
+
+// Public entry point.
+VOID VadUtils::ScanForHiddenMappings(PEPROCESS process, BufferQueue* queue) {
+    if (!process || !queue) return;
+
+    RTL_AVL_TREE* vadRoot =
+        (RTL_AVL_TREE*)((PUCHAR)process + OffsetsMgt::GetOffsets()->VadRoot);
+    if (!MmIsAddressValid(vadRoot)) return;
+
+    RTL_BALANCED_NODE* root = vadRoot->BalancedRoot;
+    if (!root || !MmIsAddressValid(root)) return;
+
+    KAPC_STATE apc;
+    KeStackAttachProcess(process, &apc);
+
+    // Guard: skip if LDR is not yet initialised or has fewer than 3 entries.
+    // At fewer than 3 entries the loader hasn't finished its normal startup
+    // sequence — any missing-LDR result would be a false positive.
+    BOOLEAN ready = FALSE;
+    __try {
+        PVOID peb = PsGetProcessPeb(process);
+        if (peb && MmIsAddressValid(peb)) {
+            PVOID ldrPtr = nullptr;
+            RtlCopyMemory(&ldrPtr, (PUCHAR)peb + 0x18, sizeof(PVOID));
+            if (ldrPtr && MmIsAddressValid(ldrPtr)) {
+                PPEB_LDR_DATA ldr = (PPEB_LDR_DATA)ldrPtr;
+                if (ldr->Initialized) {
+                    int count = 0;
+                    LIST_ENTRY* h = &ldr->InMemoryOrderModuleList;
+                    LIST_ENTRY* c = h->Flink;
+                    while (c != h && MmIsAddressValid(c) && count < 4) {
+                        c = c->Flink;
+                        count++;
+                    }
+                    if (count >= 3) ready = TRUE;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (ready) {
+        ULONG alertCount = 0;
+        WalkVadHiddenMappings(root, process, queue, &alertCount);
+    }
+
+    KeUnstackDetachProcess(&apc);
 }
 
 

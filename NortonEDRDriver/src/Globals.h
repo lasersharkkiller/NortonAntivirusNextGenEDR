@@ -283,6 +283,11 @@ public:
 		return root;
 	}
 
+	// Walk all SEC_IMAGE (VadImageMap) VAD nodes in the target process and alert on any
+	// executable file-backed mapping that has no corresponding entry in the PEB LDR list.
+	// Catches reflective/manual-map DLL injection. Must be called at PASSIVE_LEVEL.
+	static VOID ScanForHiddenMappings(PEPROCESS process, BufferQueue* queue);
+
 };
 
 class StackUtils {

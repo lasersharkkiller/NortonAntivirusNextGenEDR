@@ -26,6 +26,8 @@ BOOLEAN OffsetsMgt::InitWinStructsOffsets() {
         offsets->ThreadListHead = 0x5e0;
         offsets->VadRoot = 0x7d8;
         offsets->Flags3 = 0x87c;
+        offsets->Flags2 = 0x460;
+        offsets->ImageFilePointer = 0x5b0;
         offsets->MitigationFlags2Values = 0x9d4;
         offsets->Subsection = 0x48;
         offsets->Segment = 0x0;
@@ -43,6 +45,8 @@ BOOLEAN OffsetsMgt::InitWinStructsOffsets() {
         offsets->ThreadListHead = 0x5e0;
         offsets->VadRoot = 0x7d8;
         offsets->Flags3 = 0x87c;
+        offsets->Flags2 = 0x460;
+        offsets->ImageFilePointer = 0x5b0;
         offsets->MitigationFlags2Values = 0x9d4;
         offsets->Subsection = 0x48;
         offsets->Segment = 0x0;
@@ -60,6 +64,8 @@ BOOLEAN OffsetsMgt::InitWinStructsOffsets() {
         offsets->ThreadListHead = 0x5e0;
         offsets->VadRoot = 0x7d8;
         offsets->Flags3 = 0x87c;
+        offsets->Flags2 = 0x460;
+        offsets->ImageFilePointer = 0x5b0;
         offsets->MitigationFlags2Values = 0x9d4;
         offsets->Subsection = 0x48;
         offsets->Segment = 0x0;
@@ -77,6 +83,8 @@ BOOLEAN OffsetsMgt::InitWinStructsOffsets() {
         offsets->ThreadListHead = 0x5e0;
         offsets->VadRoot = 0x7d8;
         offsets->Flags3 = 0x87c;
+        offsets->Flags2 = 0x460;
+        offsets->ImageFilePointer = 0x5b0;
         offsets->MitigationFlags2Values = 0x9d4;
         offsets->Subsection = 0x48;
         offsets->Segment = 0x0;
@@ -94,6 +102,8 @@ BOOLEAN OffsetsMgt::InitWinStructsOffsets() {
         offsets->ThreadListHead = 0x5e0;
         offsets->VadRoot = 0x7d8;
         offsets->Flags3 = 0x87c;
+        offsets->Flags2 = 0x460;
+        offsets->ImageFilePointer = 0x5b0;
         offsets->MitigationFlags2Values = 0x9d4;
         offsets->Subsection = 0x48;
         offsets->Segment = 0x0;
@@ -113,6 +123,8 @@ BOOLEAN OffsetsMgt::InitWinStructsOffsets() {
         offsets->ThreadListHead = 0x5e0;
         offsets->VadRoot = 0x7d8;
         offsets->Flags3 = 0x87c;
+        offsets->Flags2 = 0x460;
+        offsets->ImageFilePointer = 0x5b0;
         offsets->MitigationFlags2Values = 0x9d4;
         offsets->Subsection = 0x48;
         offsets->Segment = 0x0;
@@ -130,6 +142,8 @@ BOOLEAN OffsetsMgt::InitWinStructsOffsets() {
         offsets->ThreadListHead = 0x5e0;
         offsets->VadRoot = 0x7d8;
         offsets->Flags3 = 0x87c;
+        offsets->Flags2 = 0x460;
+        offsets->ImageFilePointer = 0x5b0;
         offsets->MitigationFlags2Values = 0x9d4;
         offsets->Subsection = 0x48;
         offsets->Segment = 0x0;
@@ -147,6 +161,8 @@ BOOLEAN OffsetsMgt::InitWinStructsOffsets() {
         offsets->ThreadListHead = 0x5e0;
         offsets->VadRoot = 0x7d8;
         offsets->Flags3 = 0x87c;
+        offsets->Flags2 = 0x460;
+        offsets->ImageFilePointer = 0x5b0;
         offsets->MitigationFlags2Values = 0x9d4;
         offsets->Subsection = 0x48;
         offsets->Segment = 0x0;
