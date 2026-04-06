@@ -185,36 +185,58 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 
 		if (procUtils.isProcessParentPidSpoofed(CreateInfo)) {
 
-			PKERNEL_STRUCTURED_NOTIFICATION kernelNotif = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+			// Build an actionable alert:
+			//   child    = the process being spawned (Process / handle)
+			//   creator  = the real creating process (CreatingThreadId.UniqueProcess)
+			//   fakeParent = the process set via PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+			//
+			// In a clean system these are always equal.  Any mismatch means the
+			// caller used UpdateProcThreadAttribute(PARENT_PROCESS) to masquerade
+			// as a different parent — a foundational technique for blending
+			// malicious child processes into legitimate parent chains.
+			PEPROCESS fakeParentProc = NULL;
+			char fakeParentName[16]  = "<unknown>";
+			if (NT_SUCCESS(PsLookupProcessByProcessId(
+					CreateInfo->ParentProcessId, &fakeParentProc))) {
+				char* n = PsGetProcessImageFileName(fakeParentProc);
+				if (n) RtlStringCbCopyA(fakeParentName, sizeof(fakeParentName), n);
+				ObDereferenceObject(fakeParentProc);
+			}
 
+			char* childName   = PsGetProcessImageFileName(Process);
+			char* creatorName = PsGetProcessImageFileName(IoGetCurrentProcess());
+
+			char msg[240];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"PPID Spoofing: child='%s' (pid=%llu) real_creator='%s' (pid=%llu) "
+				"spoofed_parent='%s' (pid=%llu)",
+				childName   ? childName   : "?", (ULONG64)PsGetProcessId(Process),
+				creatorName ? creatorName : "?", (ULONG64)PsGetProcessId(IoGetCurrentProcess()),
+				fakeParentName,                  (ULONG64)CreateInfo->ParentProcessId);
+
+			SIZE_T msgLen = strlen(msg);
+			PKERNEL_STRUCTURED_NOTIFICATION kernelNotif =
+				(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
 			if (kernelNotif) {
-
-				char* msg = "Parent Process PID (PPID) Seems Spoofed";
-
-				SET_WARNING(*kernelNotif);
+				RtlZeroMemory(kernelNotif, sizeof(*kernelNotif));
+				SET_CRITICAL(*kernelNotif);
 				SET_CALLING_PROC_PID_CHECK(*kernelNotif);
-
-				kernelNotif->bufSize = sizeof(msg);
 				kernelNotif->isPath = FALSE;
-				kernelNotif->pid = PsGetProcessId(IoGetCurrentProcess());
-				kernelNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, strlen(msg) + 1, 'msg');
-
-				char procName[15];
-				RtlCopyMemory(procName, PsGetProcessImageFileName(IoGetCurrentProcess()), 15);
-				RtlCopyMemory(kernelNotif->procName, procName, 15);
-
-
+				kernelNotif->pid    = PsGetProcessId(Process);  // the spawned child
+				if (creatorName)
+					RtlCopyMemory(kernelNotif->procName, creatorName, 14);
+				kernelNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen + 1, 'msg');
 				if (kernelNotif->msg) {
-					RtlCopyMemory(kernelNotif->msg, msg, strlen(msg) + 1);
+					RtlCopyMemory(kernelNotif->msg, msg, msgLen + 1);
+					kernelNotif->bufSize = (ULONG)(msgLen + 1);
 					if (!CallbackObjects::GetNotifQueue()->Enqueue(kernelNotif)) {
 						ExFreePool(kernelNotif->msg);
 						ExFreePool(kernelNotif);
 					}
-				}
-				else {
+				} else {
 					ExFreePool(kernelNotif);
 				}
-
 			}
 		}
 
