@@ -31,6 +31,22 @@ static FS_WRITE_SLOT g_WriteSlots[FS_TRACKER_SLOTS];
 static KSPIN_LOCK    g_WriteSlotLock;
 
 // ---------------------------------------------------------------------------
+// Herpaderping: track FILE_OBJECTs backing active SEC_IMAGE sections.
+// When NtCreateSection(SEC_IMAGE, fileHandle) is called, the FILE_OBJECT is
+// added here. Any subsequent user-mode write to that file object is flagged
+// as a potential Process Herpaderping attempt (write-after-section trick to
+// hide the real on-disk content from scanners while the image runs).
+// ---------------------------------------------------------------------------
+#define HERP_TRACK_MAX 64
+
+typedef struct _HERP_SLOT {
+    PFILE_OBJECT FileObject;  // referenced pointer; NULL = free slot
+} HERP_SLOT;
+
+static HERP_SLOT  g_HerpSlots[HERP_TRACK_MAX];
+static KSPIN_LOCK g_HerpLock;
+
+// ---------------------------------------------------------------------------
 // Sensitive credential file path fragments (lowercase for comparison)
 // ---------------------------------------------------------------------------
 static const PCWSTR kCredPaths[] = {
@@ -191,6 +207,58 @@ static VOID EnqueueFsAlert(
 }
 
 // ---------------------------------------------------------------------------
+// Herpaderping file-object tracker
+// ---------------------------------------------------------------------------
+
+// Called from NtCreateSectionHandler (SyscallsTracing.cpp) when SEC_IMAGE + file handle.
+// Takes an additional reference on FileObject so the slot survives handle closure.
+VOID FsFilter::TrackImageSectionFile(PFILE_OBJECT FileObject) {
+    if (!FileObject) return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_HerpLock, &oldIrql);
+
+    // Avoid duplicates — same file opened twice before first write
+    for (int i = 0; i < HERP_TRACK_MAX; i++) {
+        if (g_HerpSlots[i].FileObject == FileObject) {
+            KeReleaseSpinLock(&g_HerpLock, oldIrql);
+            return;
+        }
+    }
+
+    // Find a free slot
+    for (int i = 0; i < HERP_TRACK_MAX; i++) {
+        if (g_HerpSlots[i].FileObject == nullptr) {
+            ObReferenceObject(FileObject);   // keep alive until write or driver unload
+            g_HerpSlots[i].FileObject = FileObject;
+            KeReleaseSpinLock(&g_HerpLock, oldIrql);
+            return;
+        }
+    }
+
+    // Table full — drop silently (extremely rare; HERP_TRACK_MAX=64 is generous)
+    KeReleaseSpinLock(&g_HerpLock, oldIrql);
+}
+
+// Remove a slot without alerting (e.g. on driver unload cleanup).
+VOID FsFilter::UntrackImageSectionFile(PFILE_OBJECT FileObject) {
+    if (!FileObject) return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_HerpLock, &oldIrql);
+
+    for (int i = 0; i < HERP_TRACK_MAX; i++) {
+        if (g_HerpSlots[i].FileObject == FileObject) {
+            ObDereferenceObject(FileObject);
+            g_HerpSlots[i].FileObject = nullptr;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&g_HerpLock, oldIrql);
+}
+
+// ---------------------------------------------------------------------------
 // Write-burst tracker helpers
 // ---------------------------------------------------------------------------
 static VOID UpdateWriteTracker(HANDLE pid) {
@@ -335,6 +403,8 @@ NTSTATUS FsFilter::Init(PDRIVER_OBJECT DriverObject, NotifQueue* queue) {
     KeInitializeSpinLock(&g_WriteSlotLock);
     RtlZeroMemory(g_DirSlots, sizeof(g_DirSlots));
     KeInitializeSpinLock(&g_DirSlotLock);
+    RtlZeroMemory(g_HerpSlots, sizeof(g_HerpSlots));
+    KeInitializeSpinLock(&g_HerpLock);
 
     NTSTATUS status = FltRegisterFilter(DriverObject, &g_FltRegistration, &g_FilterHandle);
     if (!NT_SUCCESS(status)) {
@@ -355,6 +425,17 @@ NTSTATUS FsFilter::Init(PDRIVER_OBJECT DriverObject, NotifQueue* queue) {
 }
 
 VOID FsFilter::Cleanup() {
+    // Release any outstanding herpaderping FILE_OBJECT references before unregistering
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_HerpLock, &oldIrql);
+    for (int i = 0; i < HERP_TRACK_MAX; i++) {
+        if (g_HerpSlots[i].FileObject) {
+            ObDereferenceObject(g_HerpSlots[i].FileObject);
+            g_HerpSlots[i].FileObject = nullptr;
+        }
+    }
+    KeReleaseSpinLock(&g_HerpLock, oldIrql);
+
     if (g_FilterHandle) {
         FltUnregisterFilter(g_FilterHandle);
         g_FilterHandle = nullptr;
@@ -517,6 +598,37 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreWrite(
 
     HANDLE pid = PsGetProcessId(IoThreadToProcess(Data->Thread));
     if ((ULONG_PTR)pid <= 4) return FLT_PREOP_SUCCESS_NO_CALLBACK;  // skip System/Idle
+
+    // Herpaderping detection: check if this write targets a file that backs an active SEC_IMAGE
+    // section. Pattern: NtCreateSection(SEC_IMAGE, file) → write to same file → overwrite
+    // on-disk content while the malicious image is already mapped and running.
+    PFILE_OBJECT targetFo = Data->Iopb->TargetFileObject;
+    if (targetFo) {
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&g_HerpLock, &oldIrql);
+        BOOLEAN found = FALSE;
+        for (int i = 0; i < HERP_TRACK_MAX; i++) {
+            if (g_HerpSlots[i].FileObject == targetFo) {
+                // Remove from table — one alert per file is enough; further writes are noise
+                ObDereferenceObject(g_HerpSlots[i].FileObject);
+                g_HerpSlots[i].FileObject = nullptr;
+                found = TRUE;
+                break;
+            }
+        }
+        KeReleaseSpinLock(&g_HerpLock, oldIrql);
+
+        if (found) {
+            PEPROCESS proc = IoThreadToProcess(Data->Thread);
+            char* pn = PsGetProcessImageFileName(proc);
+            char msg[192];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "Process Herpaderping: write to SEC_IMAGE-backed file while image section active"
+                " -- '%s' (pid=%llu) overwrote its own image on disk to evade AV scanning",
+                pn ? pn : "<?>", (ULONG64)(ULONG_PTR)pid);
+            EnqueueFsAlert(pid, pn, msg, TRUE);
+        }
+    }
 
     UpdateWriteTracker(pid);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;

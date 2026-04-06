@@ -46,6 +46,8 @@ ULONG SyscallsUtils::NtCreateSectionId = 0;
 ULONG SyscallsUtils::NtUnmapViewOfSectionId = 0;
 ULONG SyscallsUtils::NtLoadDriverId = 0;
 ULONG SyscallsUtils::NtProtectVirtualMemoryId = 0;
+ULONG SyscallsUtils::NtCreateTransactionId = 0;
+ULONG SyscallsUtils::NtRollbackTransactionId = 0;
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -541,6 +543,12 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 			(ULONG)trapFrame->R9       // NewAccessProtection
 		);
 	}
+	else if (NtCreateTransactionId != 0 && id == NtCreateTransactionId) {  // NtCreateTransaction
+		NtCreateTransactionHandler();
+	}
+	else if (NtRollbackTransactionId != 0 && id == NtRollbackTransactionId) {  // NtRollbackTransaction
+		NtRollbackTransactionHandler();
+	}
 
 	return TRUE;
 }
@@ -817,6 +825,14 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtProtectVm;
 	RtlInitUnicodeString(&usNtProtectVm, L"NtProtectVirtualMemory");
 	NtProtectVirtualMemoryId = getSSNByName(ssdtTable, &usNtProtectVm, exportsMap);
+
+	UNICODE_STRING usNtCreateTransaction;
+	RtlInitUnicodeString(&usNtCreateTransaction, L"NtCreateTransaction");
+	NtCreateTransactionId = getSSNByName(ssdtTable, &usNtCreateTransaction, exportsMap);
+
+	UNICODE_STRING usNtRollbackTransaction;
+	RtlInitUnicodeString(&usNtRollbackTransaction, L"NtRollbackTransaction");
+	NtRollbackTransactionId = getSSNByName(ssdtTable, &usNtRollbackTransaction, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -1440,6 +1456,9 @@ VOID SyscallsUtils::NtSuspendThreadHandler(
 }
 
 // NtCreateSection — flag SEC_IMAGE (module stomping) and executable file-backed sections.
+// Also tracks the FILE_OBJECT when SEC_IMAGE + a file handle are both present — this is the
+// herpaderping pattern: malware creates an image section from a malicious file, then overwrites
+// the file with benign content before the process starts, so on-disk != running image.
 VOID SyscallsUtils::NtCreateSectionHandler(
 	PHANDLE        SectionHandle,
 	ACCESS_MASK    DesiredAccess,
@@ -1456,12 +1475,29 @@ VOID SyscallsUtils::NtCreateSectionHandler(
 		(SectionPageProtection & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
 		                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 
+	// Herpaderping: SEC_IMAGE from a file handle — track the FILE_OBJECT so FsFilter can
+	// alert if the backing file is written to while this section remains open.
+	if (isStomp && FileHandle != nullptr) {
+		PVOID fileObject = nullptr;
+		NTSTATUS status = ObReferenceObjectByHandle(
+			FileHandle,
+			0,                   // no specific access required — just need the pointer
+			*IoFileObjectType,
+			KernelMode,
+			&fileObject,
+			nullptr);
+		if (NT_SUCCESS(status) && fileObject) {
+			FsFilter::TrackImageSectionFile((PFILE_OBJECT)fileObject);
+			ObDereferenceObject(fileObject);  // TrackImageSectionFile takes its own reference
+		}
+	}
+
 	if (!isStomp && !isExecMap) return;
 
 	EmitSyscallNotif(
 		0,
 		isStomp
-			? "NtCreateSection: SEC_IMAGE section created (module stomping indicator)"
+			? "NtCreateSection: SEC_IMAGE section created (module stomping / herpaderping indicator)"
 			: "NtCreateSection: file-backed executable section (reflective load indicator)",
 		IoGetCurrentProcess(), nullptr, isStomp);
 }
@@ -1566,6 +1602,41 @@ VOID SyscallsUtils::NtLoadDriverHandler(
 	}
 
 	EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, TRUE);
+}
+
+// NtCreateTransaction — Process Doppelgänging step 1.
+// Malware creates an NTFS transaction, writes a malicious PE into it, creates a section from
+// the transacted file, then rolls back the transaction leaving no on-disk artifact.
+// NtCreateTransaction is almost never called by legitimate user-mode software.
+// Note: process creation from a transacted section is blocked on Win10 1803+ by the kernel,
+// but telemetry of the attempt is still valuable.
+VOID SyscallsUtils::NtCreateTransactionHandler() {
+	char procName[16] = {};
+	char* pn = PsGetProcessImageFileName(IoGetCurrentProcess());
+	if (pn) RtlStringCbCopyA(procName, sizeof(procName), pn);
+
+	char msg[160];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"NtCreateTransaction: NTFS transaction created by '%s' -- "
+		"Process Doppelganging / transacted section technique",
+		procName);
+	EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, FALSE);  // Warning: first step only
+}
+
+// NtRollbackTransaction — Process Doppelgänging step 3 (after SEC_IMAGE section created).
+// Rolling back the transaction while an image section is open erases the on-disk PE —
+// the canonical Doppelgänging cleanup step.
+VOID SyscallsUtils::NtRollbackTransactionHandler() {
+	char procName[16] = {};
+	char* pn = PsGetProcessImageFileName(IoGetCurrentProcess());
+	if (pn) RtlStringCbCopyA(procName, sizeof(procName), pn);
+
+	char msg[160];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"NtRollbackTransaction: transaction rolled back by '%s' -- "
+		"Process Doppelganging cleanup step (erases on-disk PE)",
+		procName);
+	EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, TRUE);  // Critical: cleanup = committed
 }
 
 // NtProtectVirtualMemory — detect ntdll/DLL stomping and cross-process protection changes.

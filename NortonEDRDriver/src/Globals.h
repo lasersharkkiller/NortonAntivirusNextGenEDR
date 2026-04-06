@@ -718,6 +718,8 @@ class SyscallsUtils {
 	static ULONG NtUnmapViewOfSectionId;        // Variable — resolved in InitIds()
 	static ULONG NtLoadDriverId;               // Variable — resolved in InitIds()
 	static ULONG NtProtectVirtualMemoryId;     // Variable — resolved in InitIds()
+	static ULONG NtCreateTransactionId;        // Variable — doppelgänging telemetry
+	static ULONG NtRollbackTransactionId;      // Variable — doppelgänging telemetry
 
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
@@ -921,6 +923,9 @@ public:
 		PUNICODE_STRING  // DriverServiceName
 	);
 
+	static VOID NtCreateTransactionHandler();   // doppelgänging telemetry
+	static VOID NtRollbackTransactionHandler(); // doppelgänging telemetry
+
 	static VOID NtProtectVirtualMemoryHandler(
 		HANDLE   ProcessHandle,
 		PVOID*   BaseAddress,
@@ -1088,6 +1093,11 @@ public:
         PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
 
     static NTSTATUS FLTAPI FilterUnloadCallback(FLT_FILTER_UNLOAD_FLAGS Flags);
+
+    // Herpaderping: track FILE_OBJECTs used to back active SEC_IMAGE sections.
+    // Called from NtCreateSectionHandler when SEC_IMAGE + file handle are both present.
+    static VOID TrackImageSectionFile(PFILE_OBJECT FileObject);
+    static VOID UntrackImageSectionFile(PFILE_OBJECT FileObject);
 };
 
 class DllInjector {
