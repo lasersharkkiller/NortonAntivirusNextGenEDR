@@ -35,7 +35,16 @@ ULONG SyscallsUtils::NtQueueApcThreadExId = 0;
 ULONG SyscallsUtils::NtSetContextThreadId = 0;
 ULONG SyscallsUtils::NtContinueEx = 0;
 // Stable at 0x0041 across Win10 1507 through Win11 24H2 (j00ru's syscall table)
-ULONG SyscallsUtils::NtAdjustPrivilegesTokenId = 0x0041;						
+ULONG SyscallsUtils::NtAdjustPrivilegesTokenId = 0x0041;
+
+// Fixed: NtOpenProcess is 0x0026 across all Win10/11 builds (j00ru's table)
+ULONG SyscallsUtils::NtOpenProcessId = 0x0026;
+// Variable: resolved at runtime via SSDT in InitIds()
+ULONG SyscallsUtils::NtCreateThreadExId = 0;
+ULONG SyscallsUtils::NtSuspendThreadId = 0;
+ULONG SyscallsUtils::NtCreateSectionId = 0;
+ULONG SyscallsUtils::NtUnmapViewOfSectionId = 0;
+ULONG SyscallsUtils::NtLoadDriverId = 0;
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -438,6 +447,90 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 			(PULONG)arg9
 		);
 	}
+	else if (id == NtOpenProcessId) {		// NtOpenProcess
+
+		NtOpenProcessHandler(
+			(HANDLE)trapFrame->Rcx,        // ProcessHandle*
+			(ACCESS_MASK)trapFrame->Rdx,   // DesiredAccess
+			(PVOID)trapFrame->R8,          // ObjectAttributes
+			(PCLIENT_ID)trapFrame->R9      // ClientId
+		);
+	}
+	else if (NtCreateThreadExId != 0 && id == NtCreateThreadExId) {  // NtCreateThreadEx
+
+		PULONGLONG pArg7 = (PULONGLONG)((ULONG_PTR)trapFrame->Rsp + 0x38);
+		ULONGLONG  arg7  = MmIsAddressValid(pArg7) ? *pArg7 : 0;
+
+		NtCreateThreadExHandler(
+			(PHANDLE)trapFrame->Rcx,       // ThreadHandle*
+			(ACCESS_MASK)trapFrame->Rdx,   // DesiredAccess
+			(PVOID)trapFrame->R8,          // ObjectAttributes
+			(HANDLE)trapFrame->R9,         // ProcessHandle
+			(PVOID)arg5,                   // StartRoutine
+			(PVOID)arg6,                   // Argument
+			(ULONG)arg7,                   // CreateFlags
+			0, 0, 0, nullptr               // remaining args not inspected
+		);
+	}
+	else if (NtSuspendThreadId != 0 && id == NtSuspendThreadId) {  // NtSuspendThread
+
+		NtSuspendThreadHandler(
+			(HANDLE)trapFrame->Rcx,   // ThreadHandle
+			(PULONG)trapFrame->Rdx    // PreviousSuspendCount
+		);
+	}
+	else if (NtCreateSectionId != 0 && id == NtCreateSectionId) {  // NtCreateSection
+
+		PULONGLONG pArg7 = (PULONGLONG)((ULONG_PTR)trapFrame->Rsp + 0x38);
+		ULONGLONG  arg7  = MmIsAddressValid(pArg7) ? *pArg7 : 0;
+
+		NtCreateSectionHandler(
+			(PHANDLE)trapFrame->Rcx,          // SectionHandle*
+			(ACCESS_MASK)trapFrame->Rdx,      // DesiredAccess
+			(PVOID)trapFrame->R8,             // ObjectAttributes
+			(PLARGE_INTEGER)trapFrame->R9,    // MaximumSize
+			(ULONG)arg5,                      // SectionPageProtection
+			(ULONG)arg6,                      // AllocationAttributes
+			(HANDLE)arg7                      // FileHandle
+		);
+	}
+	else if (id == NtMapViewOfSectionId) {  // NtMapViewOfSection
+
+		PULONGLONG pArg7  = (PULONGLONG)((ULONG_PTR)trapFrame->Rsp + 0x38);
+		PULONGLONG pArg8  = (PULONGLONG)((ULONG_PTR)trapFrame->Rsp + 0x40);
+		PULONGLONG pArg9  = (PULONGLONG)((ULONG_PTR)trapFrame->Rsp + 0x48);
+		PULONGLONG pArg10 = (PULONGLONG)((ULONG_PTR)trapFrame->Rsp + 0x50);
+		ULONGLONG  arg7   = MmIsAddressValid(pArg7)  ? *pArg7  : 0;
+		ULONGLONG  arg8   = MmIsAddressValid(pArg8)  ? *pArg8  : 0;
+		ULONGLONG  arg9   = MmIsAddressValid(pArg9)  ? *pArg9  : 0;
+		ULONGLONG  arg10  = MmIsAddressValid(pArg10) ? *pArg10 : 0;
+
+		NtMapViewOfSectionHandler(
+			(HANDLE)trapFrame->Rcx,       // SectionHandle
+			(HANDLE)trapFrame->Rdx,       // ProcessHandle
+			(PVOID*)trapFrame->R8,        // BaseAddress*
+			(ULONG_PTR)trapFrame->R9,     // ZeroBits
+			(SIZE_T)arg5,                 // CommitSize
+			(PLARGE_INTEGER)arg6,         // SectionOffset
+			(PSIZE_T)arg7,                // ViewSize
+			(ULONG)arg8,                  // InheritDisposition
+			(ULONG)arg9,                  // AllocationType
+			(ULONG)arg10                  // Win32Protect
+		);
+	}
+	else if (NtUnmapViewOfSectionId != 0 && id == NtUnmapViewOfSectionId) {  // NtUnmapViewOfSection
+
+		NtUnmapViewOfSectionHandler(
+			(HANDLE)trapFrame->Rcx,  // ProcessHandle
+			(PVOID)trapFrame->Rdx    // BaseAddress
+		);
+	}
+	else if (NtLoadDriverId != 0 && id == NtLoadDriverId) {  // NtLoadDriver — always suspicious
+
+		NtLoadDriverHandler(
+			(PUNICODE_STRING)trapFrame->Rcx  // DriverServiceName
+		);
+	}
 
 	return TRUE;
 }
@@ -684,8 +777,32 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtFreeVirtualMemory;
 	RtlInitUnicodeString(&usNtFreeVirtualMemory, L"NtFreeVirtualMemory");
 	ULONG ntFreeSsn = getSSNByName(ssdtTable, &usNtFreeVirtualMemory, exportsMap);
-
 	NtFreeId = ntFreeSsn;
+
+	// Resolve variable SSNs that change across Win10/11 builds
+	UNICODE_STRING usNtMapViewOfSection;
+	RtlInitUnicodeString(&usNtMapViewOfSection, L"NtMapViewOfSection");
+	NtMapViewOfSectionId = getSSNByName(ssdtTable, &usNtMapViewOfSection, exportsMap);
+
+	UNICODE_STRING usNtCreateThreadEx;
+	RtlInitUnicodeString(&usNtCreateThreadEx, L"NtCreateThreadEx");
+	NtCreateThreadExId = getSSNByName(ssdtTable, &usNtCreateThreadEx, exportsMap);
+
+	UNICODE_STRING usNtSuspendThread;
+	RtlInitUnicodeString(&usNtSuspendThread, L"NtSuspendThread");
+	NtSuspendThreadId = getSSNByName(ssdtTable, &usNtSuspendThread, exportsMap);
+
+	UNICODE_STRING usNtCreateSection;
+	RtlInitUnicodeString(&usNtCreateSection, L"NtCreateSection");
+	NtCreateSectionId = getSSNByName(ssdtTable, &usNtCreateSection, exportsMap);
+
+	UNICODE_STRING usNtUnmapViewOfSection;
+	RtlInitUnicodeString(&usNtUnmapViewOfSection, L"NtUnmapViewOfSection");
+	NtUnmapViewOfSectionId = getSSNByName(ssdtTable, &usNtUnmapViewOfSection, exportsMap);
+
+	UNICODE_STRING usNtLoadDriver;
+	RtlInitUnicodeString(&usNtLoadDriver, L"NtLoadDriver");
+	NtLoadDriverId = getSSNByName(ssdtTable, &usNtLoadDriver, exportsMap);
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,6 +1190,195 @@ VOID SyscallsUtils::NtSetContextThreadHandler(
 	}
 
 	ObDereferenceObject(targetThread);
+}
+
+// NtOpenProcess — flag injection-capable access flags on foreign processes.
+// Critical if target is lsass; Warning otherwise.
+VOID SyscallsUtils::NtOpenProcessHandler(
+	HANDLE      ProcessHandle,
+	ACCESS_MASK DesiredAccess,
+	PVOID       ObjectAttributes,
+	PCLIENT_ID  ClientId
+) {
+	// Flag any combination of VM or thread creation rights
+	const ACCESS_MASK kInjectionMask =
+		0x0002 |  // PROCESS_CREATE_THREAD
+		0x0008 |  // PROCESS_VM_OPERATION
+		0x0010 |  // PROCESS_VM_READ
+		0x0020;   // PROCESS_VM_WRITE
+
+	if (!(DesiredAccess & kInjectionMask)) return;
+
+	PEPROCESS targetProcess = nullptr;
+	HANDLE    targetPid     = nullptr;
+	if (ClientId && MmIsAddressValid(ClientId)) {
+		__try { targetPid = ClientId->UniqueProcess; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+	if (targetPid) {
+		PsLookupProcessByProcessId(targetPid, &targetProcess);
+	}
+
+	BOOLEAN isSensitive = FALSE;
+	if (targetProcess) {
+		char lower[15] = {};
+		char* name = PsGetProcessImageFileName(targetProcess);
+		for (int i = 0; i < 14 && name[i]; i++)
+			lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? (char)(name[i] + 32) : name[i];
+		if (RtlCompareMemory(lower, "lsass.exe", 9) == 9) isSensitive = TRUE;
+	}
+
+	EmitSyscallNotif(
+		(ULONG64)targetPid,
+		isSensitive
+			? "NtOpenProcess: injection-capable access to lsass (credential theft)"
+			: "NtOpenProcess: injection-capable access to foreign process",
+		IoGetCurrentProcess(),
+		targetProcess,
+		isSensitive
+	);
+
+	if (targetProcess) ObDereferenceObject(targetProcess);
+}
+
+// NtCreateThreadEx — flag remote thread creation (classic injection) and
+// local thread creation via direct syscall (bypasses CreateThread telemetry).
+VOID SyscallsUtils::NtCreateThreadExHandler(
+	PHANDLE     ThreadHandle,
+	ACCESS_MASK DesiredAccess,
+	PVOID       ObjectAttributes,
+	HANDLE      ProcessHandle,
+	PVOID       StartRoutine,
+	PVOID       Argument,
+	ULONG       CreateFlags,
+	SIZE_T      ZeroBits,
+	SIZE_T      StackSize,
+	SIZE_T      MaximumStackSize,
+	PVOID       AttributeList
+) {
+	BOOLEAN crossProcess = (ProcessHandle != (HANDLE)-1);
+
+	EmitSyscallNotif(
+		(ULONG64)StartRoutine,
+		crossProcess
+			? "NtCreateThreadEx: remote thread creation (classic injection primitive)"
+			: "NtCreateThreadEx: local thread via direct syscall (hook bypass)",
+		IoGetCurrentProcess(),
+		nullptr,
+		crossProcess  // cross-process = Critical; local = Warning
+	);
+}
+
+// NtSuspendThread — flag cross-process suspension (APC injection / hollowing step).
+VOID SyscallsUtils::NtSuspendThreadHandler(
+	HANDLE ThreadHandle,
+	PULONG PreviousSuspendCount
+) {
+	PETHREAD targetThread = nullptr;
+	if (!NT_SUCCESS(ObReferenceObjectByHandle(
+		ThreadHandle, THREAD_QUERY_INFORMATION, nullptr,
+		UserMode, (PVOID*)&targetThread, nullptr))) return;
+
+	PEPROCESS targetProcess = IoThreadToProcess(targetThread);
+	PEPROCESS callerProcess = IoGetCurrentProcess();
+	BOOLEAN   crossProcess  = (targetProcess != callerProcess);
+
+	ObDereferenceObject(targetThread);
+
+	if (!crossProcess) return;
+
+	EmitSyscallNotif(
+		0,
+		"NtSuspendThread: cross-process thread suspension (APC injection / hollowing step)",
+		callerProcess, targetProcess, FALSE);
+}
+
+// NtCreateSection — flag SEC_IMAGE (module stomping) and executable file-backed sections.
+VOID SyscallsUtils::NtCreateSectionHandler(
+	PHANDLE        SectionHandle,
+	ACCESS_MASK    DesiredAccess,
+	PVOID          ObjectAttributes,
+	PLARGE_INTEGER MaximumSize,
+	ULONG          SectionPageProtection,
+	ULONG          AllocationAttributes,
+	HANDLE         FileHandle
+) {
+	// SEC_IMAGE = 0x1000000 — maps a PE as an image (module stomping indicator)
+	BOOLEAN isStomp   = (AllocationAttributes & 0x1000000) != 0;
+	// File-backed section with an execute protection = reflective/stomping variant
+	BOOLEAN isExecMap = (FileHandle != nullptr) &&
+		(SectionPageProtection & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+		                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+
+	if (!isStomp && !isExecMap) return;
+
+	EmitSyscallNotif(
+		0,
+		isStomp
+			? "NtCreateSection: SEC_IMAGE section created (module stomping indicator)"
+			: "NtCreateSection: file-backed executable section (reflective load indicator)",
+		IoGetCurrentProcess(), nullptr, isStomp);
+}
+
+// NtMapViewOfSection — flag cross-process mapping (injection delivery via shared section).
+VOID SyscallsUtils::NtMapViewOfSectionHandler(
+	HANDLE         SectionHandle,
+	HANDLE         ProcessHandle,
+	PVOID*         BaseAddress,
+	ULONG_PTR      ZeroBits,
+	SIZE_T         CommitSize,
+	PLARGE_INTEGER SectionOffset,
+	PSIZE_T        ViewSize,
+	ULONG          InheritDisposition,
+	ULONG          AllocationType,
+	ULONG          Win32Protect
+) {
+	BOOLEAN crossProcess = (ProcessHandle != (HANDLE)-1);
+	if (!crossProcess) return;
+
+	EmitSyscallNotif(
+		(BaseAddress && MmIsAddressValid(BaseAddress)) ? (ULONG64)*BaseAddress : 0,
+		"NtMapViewOfSection: cross-process section mapping (shellcode/injection delivery)",
+		IoGetCurrentProcess(), nullptr, TRUE);
+}
+
+// NtUnmapViewOfSection — flag cross-process unmapping (hollowing / module stomp cleanup).
+VOID SyscallsUtils::NtUnmapViewOfSectionHandler(
+	HANDLE ProcessHandle,
+	PVOID  BaseAddress
+) {
+	BOOLEAN crossProcess = (ProcessHandle != (HANDLE)-1);
+	if (!crossProcess) return;
+
+	EmitSyscallNotif(
+		(ULONG64)BaseAddress,
+		"NtUnmapViewOfSection: cross-process unmap (process hollowing / module stomp cleanup)",
+		IoGetCurrentProcess(), nullptr, TRUE);
+}
+
+// NtLoadDriver — always Critical; no legitimate user-mode software calls this directly.
+// Malware uses it to load a kernel driver without going through SCM.
+VOID SyscallsUtils::NtLoadDriverHandler(
+	PUNICODE_STRING DriverServiceName
+) {
+	char msg[200] = "NtLoadDriver: direct kernel driver load -- service: ";
+	SIZE_T prefixLen = strlen(msg);
+
+	if (DriverServiceName && MmIsAddressValid(DriverServiceName)) {
+		__try {
+			if (DriverServiceName->Buffer && DriverServiceName->Length > 0) {
+				ULONG copyLen = min(
+					(ULONG)(DriverServiceName->Length / sizeof(WCHAR)),
+					(ULONG)(sizeof(msg) - prefixLen - 2));
+				for (ULONG i = 0; i < copyLen; i++) {
+					WCHAR wc = DriverServiceName->Buffer[i];
+					msg[prefixLen + i] = (wc < 128) ? (char)wc : '?';
+				}
+				msg[prefixLen + copyLen] = '\0';
+			}
+		} __except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+
+	EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, TRUE);
 }
 
 VOID SyscallsUtils::DisableAltSyscallFromThreads2() {

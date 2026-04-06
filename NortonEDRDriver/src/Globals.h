@@ -710,6 +710,14 @@ class SyscallsUtils {
 	static ULONG NtContinueEx;
 	static ULONG NtAdjustPrivilegesTokenId;
 
+	// New IDs — cross-process injection, section mapping, driver load
+	static ULONG NtOpenProcessId;        // Fixed: 0x0026 across all Win10/11
+	static ULONG NtCreateThreadExId;     // Variable — resolved in InitIds()
+	static ULONG NtSuspendThreadId;      // Variable — resolved in InitIds()
+	static ULONG NtCreateSectionId;      // Variable — resolved in InitIds()
+	static ULONG NtUnmapViewOfSectionId; // Variable — resolved in InitIds()
+	static ULONG NtLoadDriverId;         // Variable — resolved in InitIds()
+
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
 	static RegionTracker* vmRegionTracker;
@@ -852,6 +860,64 @@ public:
 		ULONG,
 		PTOKEN_PRIVILEGES,
 		PULONG
+	);
+
+	static VOID NtOpenProcessHandler(
+		HANDLE,       // ProcessHandle (out)
+		ACCESS_MASK,  // DesiredAccess
+		PVOID,        // ObjectAttributes
+		PCLIENT_ID    // ClientId
+	);
+
+	static VOID NtCreateThreadExHandler(
+		PHANDLE,      // ThreadHandle (out)
+		ACCESS_MASK,  // DesiredAccess
+		PVOID,        // ObjectAttributes
+		HANDLE,       // ProcessHandle
+		PVOID,        // StartRoutine
+		PVOID,        // Argument
+		ULONG,        // CreateFlags
+		SIZE_T,       // ZeroBits
+		SIZE_T,       // StackSize
+		SIZE_T,       // MaximumStackSize
+		PVOID         // AttributeList
+	);
+
+	static VOID NtSuspendThreadHandler(
+		HANDLE,  // ThreadHandle
+		PULONG   // PreviousSuspendCount
+	);
+
+	static VOID NtCreateSectionHandler(
+		PHANDLE,         // SectionHandle (out)
+		ACCESS_MASK,     // DesiredAccess
+		PVOID,           // ObjectAttributes
+		PLARGE_INTEGER,  // MaximumSize
+		ULONG,           // SectionPageProtection
+		ULONG,           // AllocationAttributes
+		HANDLE           // FileHandle
+	);
+
+	static VOID NtMapViewOfSectionHandler(
+		HANDLE,          // SectionHandle
+		HANDLE,          // ProcessHandle
+		PVOID*,          // BaseAddress (in/out)
+		ULONG_PTR,       // ZeroBits
+		SIZE_T,          // CommitSize
+		PLARGE_INTEGER,  // SectionOffset
+		PSIZE_T,         // ViewSize
+		ULONG,           // InheritDisposition
+		ULONG,           // AllocationType
+		ULONG            // Win32Protect
+	);
+
+	static VOID NtUnmapViewOfSectionHandler(
+		HANDLE,  // ProcessHandle
+		PVOID    // BaseAddress
+	);
+
+	static VOID NtLoadDriverHandler(
+		PUNICODE_STRING  // DriverServiceName
 	);
 
 	static BOOLEAN SetInformationAltSystemCall(
