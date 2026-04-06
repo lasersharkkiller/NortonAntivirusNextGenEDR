@@ -85,6 +85,84 @@ BOOLEAN ProcessUtils::isProcessGhosted() {
 	return FALSE;
 }
 
+// ---------------------------------------------------------------------------
+// Command line argument analysis helpers
+// ---------------------------------------------------------------------------
+
+// Case-insensitive substring search over a UNICODE_STRING.
+// needle must be a lowercase literal — only the haystack characters are
+// lowercased at comparison time (ASCII range only; non-ASCII chars are left
+// as-is, so non-ASCII needles will match exactly).
+static BOOLEAN CmdContains(PCUNICODE_STRING cmd, PCWSTR needle) {
+    if (!cmd || !cmd->Buffer || !needle) return FALSE;
+    SIZE_T nLen = wcslen(needle);
+    if (!nLen) return FALSE;
+    USHORT cmdChars = cmd->Length / sizeof(WCHAR);
+    if (cmdChars < (USHORT)nLen) return FALSE;
+    __try {
+        for (USHORT i = 0; i <= cmdChars - (USHORT)nLen; i++) {
+            BOOLEAN match = TRUE;
+            for (SIZE_T j = 0; j < nLen && match; j++) {
+                WCHAR c = cmd->Buffer[i + j];
+                if (c >= L'A' && c <= L'Z') c |= 0x20;
+                if (c != needle[j]) match = FALSE;
+            }
+            if (match) return TRUE;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return FALSE;
+}
+
+// Allocate and enqueue a command-line alert.  Embeds the first 100 chars of
+// the command line as narrow ASCII so analysts get immediate context without
+// needing a second query.
+static VOID EmitCmdLineAlert(
+    PEPROCESS        newProcess,
+    PCUNICODE_STRING cmdLine,
+    const char*      desc,
+    BOOLEAN          critical)
+{
+    char msg[280];
+    SIZE_T prefixLen = 0;
+    RtlStringCbPrintfA(msg, sizeof(msg), "CmdLine[%s]: ", desc);
+    prefixLen = strlen(msg);
+
+    // Append first 100 WCHAR of cmdline as narrow (non-ASCII → '?')
+    if (cmdLine && cmdLine->Buffer) {
+        SIZE_T cmdChars = cmdLine->Length / sizeof(WCHAR);
+        SIZE_T copy     = min(cmdChars, (SIZE_T)100);
+        __try {
+            for (SIZE_T i = 0; i < copy && (prefixLen + i) < sizeof(msg) - 1; i++) {
+                WCHAR wc = cmdLine->Buffer[i];
+                msg[prefixLen + i] = (wc < 128) ? (char)wc : '?';
+            }
+            msg[prefixLen + copy] = '\0';
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    SIZE_T msgLen = strlen(msg);
+    PKERNEL_STRUCTURED_NOTIFICATION n = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+    if (!n) return;
+    RtlZeroMemory(n, sizeof(*n));
+    if (critical) { SET_CRITICAL(*n); } else { SET_WARNING(*n); }
+    SET_CALLING_PROC_PID_CHECK(*n);
+    n->isPath   = FALSE;
+    n->pid      = PsGetProcessId(newProcess);
+    RtlCopyMemory(n->procName, PsGetProcessImageFileName(newProcess), 14);
+    n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen + 1, 'msg');
+    if (n->msg) {
+        RtlCopyMemory(n->msg, msg, msgLen + 1);
+        n->bufSize = (ULONG)(msgLen + 1);
+        if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+            ExFreePool(n->msg);
+            ExFreePool(n);
+        }
+    } else {
+        ExFreePool(n);
+    }
+}
+
 VOID ProcessUtils::CreateProcessNotifyEx(
 	PEPROCESS Process,
 	HANDLE handle,
@@ -289,6 +367,55 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 							ExFreePool(n);
 						}
 					} else { ExFreePool(n); }
+				}
+			}
+		}
+
+		// -----------------------------------------------------------------------
+		// Command line argument analysis -- flag suspicious patterns used by
+		// living-off-the-land attacks, PowerShell downloaders, LOLBins, and
+		// obfuscated script execution.  Checked against the raw command line so
+		// nothing is lost even when argc/argv parsing is bypassed.
+		// -----------------------------------------------------------------------
+		if (CreateInfo->CommandLine &&
+		    CreateInfo->CommandLine->Buffer &&
+		    CreateInfo->CommandLine->Length > 0)
+		{
+			PCUNICODE_STRING cmd = CreateInfo->CommandLine;
+
+			static const struct {
+				const WCHAR* needle;
+				const char*  desc;
+				BOOLEAN      critical;
+			} kPatterns[] = {
+				// --- Critical: direct download / execution primitives ---
+				{ L"-encodedcommand",       "PowerShell -EncodedCommand (base64 payload)",        TRUE  },
+				{ L" -enc ",                "PowerShell -enc abbreviation (base64 payload)",       TRUE  },
+				{ L"downloadstring(",       "PowerShell DownloadString -- in-memory execution",    TRUE  },
+				{ L"frombase64string(",     "FromBase64String -- encoded payload decoding",         TRUE  },
+				{ L"-urlcache",             "certutil -urlcache download lolbin",                  TRUE  },
+				{ L"/transfer",             "BITS transfer download lolbin",                       TRUE  },
+				{ L"/i:http",               "msiexec /i:http remote install lolbin",               TRUE  },
+				{ L"javascript:",           "javascript: URI -- script execution via shell",        TRUE  },
+				{ L"vbscript:",             "vbscript: URI -- script execution via shell",          TRUE  },
+				{ L"//e:vbscript",          "wscript/cscript //E:vbscript engine override",         TRUE  },
+				{ L"//e:jscript",           "wscript/cscript //E:jscript engine override",          TRUE  },
+				{ L"installutil",           "InstallUtil lolbin -- bypasses AppLocker/SRP",         TRUE  },
+				{ L"regsvr32 /s /u /i:",    "Squiblydoo: regsvr32 COM scriptlet download",          TRUE  },
+				{ L"scrobj.dll",            "scrobj.dll COM scriptlet execution",                   TRUE  },
+				// --- Warning: evasion / stealth options ---
+				{ L"invoke-expression",       "Invoke-Expression (IEX) -- dynamic execution",      FALSE },
+				{ L"-executionpolicy bypass", "PowerShell ExecutionPolicy bypass",                 FALSE },
+				{ L"-exec bypass",            "PowerShell -exec bypass abbreviation",              FALSE },
+				{ L"-windowstyle hidden",     "PowerShell hidden window -- stealth execution",     FALSE },
+				{ L"-w hidden",               "PowerShell -w hidden abbreviation",                 FALSE },
+				{ L"[system.reflection",      "Reflection Assembly load -- in-memory .NET",        FALSE },
+				{ nullptr, nullptr, FALSE }
+			};
+
+			for (int i = 0; kPatterns[i].needle; i++) {
+				if (CmdContains(cmd, kPatterns[i].needle)) {
+					EmitCmdLineAlert(Process, cmd, kPatterns[i].desc, kPatterns[i].critical);
 				}
 			}
 		}
