@@ -3,6 +3,50 @@
 
 KMUTEX ImageUtils::g_HashQueueMutex;
 
+// ---------------------------------------------------------------------------
+// ntdll double-load detection
+//
+// Telemetry context: 0.04% of 27M observed processes loaded ntdll.dll more
+// than once over one month — an extremely rare event in clean populations,
+// and the dominant signature of the ntdll remap / hook-evasion technique
+// (fresh ntdll mapped from disk to get unhooked function pointers or to
+// overwrite the hooked copy in memory).
+//
+// We track the first ntdll load per PID with a spin-lock protected table
+// and emit Critical on any repeat load for the same PID.
+// ---------------------------------------------------------------------------
+#define MAX_NTDLL_TRACKED_PIDS 2048
+static ULONG      g_NtdllSeenPids[MAX_NTDLL_TRACKED_PIDS] = {};
+static LONG       g_NtdllSeenCount = 0;
+static KSPIN_LOCK g_NtdllPidLock;
+
+// Returns TRUE if ntdll.dll has been seen for this PID before; records it on first call.
+static BOOLEAN NtdllSeenBefore(ULONG pid) {
+    KIRQL irql;
+    KeAcquireSpinLock(&g_NtdllPidLock, &irql);
+    for (LONG i = 0; i < g_NtdllSeenCount; i++) {
+        if (g_NtdllSeenPids[i] == pid) {
+            KeReleaseSpinLock(&g_NtdllPidLock, irql);
+            return TRUE;
+        }
+    }
+    if (g_NtdllSeenCount < MAX_NTDLL_TRACKED_PIDS)
+        g_NtdllSeenPids[g_NtdllSeenCount++] = pid;
+    KeReleaseSpinLock(&g_NtdllPidLock, irql);
+    return FALSE;
+}
+
+// Case-insensitive suffix check: does buf (len bytes) end with "ntdll.dll"?
+static BOOLEAN IsNtdllPath(const char* buf, SIZE_T len) {
+    if (len < 9) return FALSE;
+    static const char kSuffix[] = "ntdll.dll";
+    const char* tail = buf + len - 9;
+    for (int i = 0; i < 9; i++) {
+        if ((tail[i] | 0x20) != kSuffix[i]) return FALSE;
+    }
+    return TRUE;
+}
+
 VOID ImageUtils::ImageLoadNotifyRoutine(
     PUNICODE_STRING FullImageName,
     HANDLE ProcessId,
@@ -315,6 +359,45 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                         break;
                                     }
                                 }
+
+                            // ntdll double-load detection: second ntdll.dll image load
+                            // into the same process is an extremely rare event in clean
+                            // populations (0.04% over 27M processes/month) and is the
+                            // primary signature of ntdll remap and hook-evasion tooling.
+                            if (IsNtdllPath(charBuffer, cbLen)) {
+                                ULONG curPid = HandleToUlong(PsGetProcessId(targetProcess));
+                                if (NtdllSeenBefore(curPid)) {
+                                    const char* msg =
+                                        "ntdll.dll loaded more than once into process — "
+                                        "ntdll remap/hook-evasion technique detected";
+                                    SIZE_T msgLen = strlen(msg);
+                                    PKERNEL_STRUCTURED_NOTIFICATION n =
+                                        (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                                            POOL_FLAG_NON_PAGED,
+                                            sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+                                    if (n) {
+                                        RtlZeroMemory(n, sizeof(*n));
+                                        SET_CRITICAL(*n);
+                                        SET_IMAGE_LOAD_PATH_CHECK(*n);
+                                        n->pid    = PsGetProcessId(targetProcess);
+                                        n->isPath = FALSE;
+                                        if (loadingProcess)
+                                            RtlStringCbCopyA(n->procName, sizeof(n->procName),
+                                                             loadingProcess);
+                                        n->msg = (char*)ExAllocatePool2(
+                                            POOL_FLAG_NON_PAGED, msgLen + 1, 'msg');
+                                        if (n->msg) {
+                                            RtlCopyMemory(n->msg, msg, msgLen + 1);
+                                            n->bufSize = (ULONG)(msgLen + 1);
+                                            if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+                                                ExFreePool(n->msg);
+                                                ExFreePool(n);
+                                            }
+                                        } else {
+                                            ExFreePool(n);
+                                        }
+                                    }
+                                }
                             }
 
                             ExFreePool(charBuffer);
@@ -350,6 +433,8 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
 }
 
 VOID ImageUtils::setImageNotificationCallback() {
+
+    KeInitializeSpinLock(&g_NtdllPidLock);
 
 	NTSTATUS status = PsSetLoadImageNotifyRoutine(ImageLoadNotifyRoutine);
 
