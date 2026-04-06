@@ -189,6 +189,12 @@ static TRACEHANDLE       g_tiTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
 static std::atomic<bool> g_tiStop(false);
 
 // ---------------------------------------------------------------------------
+// Microsoft-Windows-Kernel-Process ETW session (PPID spoofing detection)
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_kpSessionHandle  = 0;
+static TRACEHANDLE       g_kpTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+
+// ---------------------------------------------------------------------------
 // PowerShell script-block logging subscription
 // ---------------------------------------------------------------------------
 static EVT_HANDLE        g_psSubscription = nullptr;
@@ -3947,6 +3953,174 @@ static void StopEtwTiSession() {
 }
 
 // ---------------------------------------------------------------------------
+// Microsoft-Windows-Kernel-Process ETW consumer
+// Provider GUID: {22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}
+//
+// Implements the F-Secure "Detecting Parent PID Spoofing" technique:
+//   ProcessStart (event ID 1) carries both:
+//     ParentProcessID  — the claimed parent (spoofable via PROC_THREAD_ATTRIBUTE_PARENT_PROCESS)
+//     EventHeader.ProcessId — the actual creating process (kernel-populated, unforgeable)
+//   A mismatch is PPID spoofing.
+//
+// This is an independent telemetry channel from the kernel driver callback —
+// it fires from the OS's own process accounting, providing a second opinion
+// that remains valid even if the driver is temporarily unloaded.
+//
+// No special privileges required (unlike ETW-TI).
+// ---------------------------------------------------------------------------
+static const GUID kKernelProcessProviderGuid = {
+    0x22FB2CD6, 0x0E7B, 0x422B,
+    {0xA0, 0xC7, 0x2F, 0xAD, 0x1F, 0xD0, 0xE7, 0x16}
+};
+
+static void WINAPI KernelProcessEventCallback(PEVENT_RECORD pEvent)
+{
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kKernelProcessProviderGuid)) return;
+    if (pEvent->EventHeader.EventDescriptor.Id != 1) return;  // ProcessStart only
+    if (pEvent->UserDataLength < 8) return;
+
+    const BYTE* d = static_cast<const BYTE*>(pEvent->UserData);
+    UINT32 newPid    = 0;
+    UINT32 parentPid = 0;
+    memcpy(&newPid,    d + 0, 4);
+    memcpy(&parentPid, d + 4, 4);
+
+    // EventHeader.ProcessId = the actual creating process (kernel-populated)
+    UINT32 creatorPid = pEvent->EventHeader.ProcessId;
+
+    // Skip kernel/system (PID 0/4) and self
+    if (creatorPid == 0 || creatorPid == 4 || newPid == 0) return;
+    if (creatorPid == curPid) return;
+    if (parentPid == creatorPid) return;  // no spoofing
+
+    // ImageName: null-terminated UTF-16 at offset 8
+    std::string imageName;
+    if (pEvent->UserDataLength > 8) {
+        const wchar_t* wname = reinterpret_cast<const wchar_t*>(d + 8);
+        size_t remaining = (pEvent->UserDataLength - 8) / sizeof(wchar_t);
+        size_t nameLen = 0;
+        while (nameLen < remaining && wname[nameLen] != L'\0') nameLen++;
+        if (nameLen > 0 && nameLen < 260) {
+            imageName.resize(nameLen);
+            for (size_t i = 0; i < nameLen; i++)
+                imageName[i] = (wname[i] < 128) ? static_cast<char>(wname[i]) : '?';
+        }
+    }
+    if (imageName.empty()) imageName = "pid=" + std::to_string(newPid);
+
+    std::string creatorName, parentName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(creatorPid);
+        if (it != g_processCache.end()) creatorName = it->second.processName;
+        it = g_processCache.find(parentPid);
+        if (it != g_processCache.end()) parentName = it->second.processName;
+    }
+    if (creatorName.empty()) creatorName = std::to_string(creatorPid);
+    if (parentName.empty())  parentName  = std::to_string(parentPid);
+
+    std::string ts = BuildTimestamp();
+    std::string det = "Date & Time: " + ts +
+        " | Method: ETW Kernel-Process" +
+        " | PPID Spoofing detected" +
+        " | child: " + imageName + " (pid=" + std::to_string(newPid) + ")" +
+        " | real_creator: " + creatorName + " (pid=" + std::to_string(creatorPid) + ")" +
+        " | spoofed_parent: " + parentName + " (pid=" + std::to_string(parentPid) + ")";
+
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [!] [Alert] | " + ts +
+        " | " + creatorName +
+        " | Method: ETW Kernel-Process" +
+        " | PPID Spoofing: child=" + imageName +
+        " spoofed_parent=" + parentName + " (pid=" + std::to_string(parentPid) + ")";
+
+    PushUiDetectionEvent(msg, det, "Method: ETW Kernel-Process | PPID Spoofing",
+                         creatorPid, DetectionSeverity::Critical);
+}
+
+static void KernelProcessSubscriberThread()
+{
+    const wchar_t* kSessionName = L"NortonEDR-KernelProcess";
+    const size_t nameBufBytes   = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize    = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize   = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags        = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode        = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset   = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_kpSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_kpSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-KP] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_kpSessionHandle, &kKernelProcessProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_VERBOSE,
+        0xFFFFFFFFFFFFFFFFULL, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-KP] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_kpSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_kpSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-KP] Session started — consuming Microsoft-Windows-Kernel-Process events\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName          = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode    = PROCESS_TRACE_MODE_REAL_TIME |
+                                  PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = KernelProcessEventCallback;
+
+    g_kpTraceHandle = OpenTraceW(&logFile);
+    if (g_kpTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-KP] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_kpTraceHandle, 1, nullptr, nullptr);
+    g_kpTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopKernelProcessSession()
+{
+    if (g_kpTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_kpTraceHandle);
+        g_kpTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_kpSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_kpSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_kpSessionHandle = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PowerShell script-block logging (EID 4104)
 // Channel: Microsoft-Windows-PowerShell/Operational
 // ---------------------------------------------------------------------------
@@ -5121,6 +5295,7 @@ VOID ShowUI() {
     std::thread sysmonThread(SysmonSubscriberThread);
     std::thread saclThread(SecurityAuditSubscriberThread);
     std::thread tiThread(EtwTiSubscriberThread);
+    std::thread kpThread(KernelProcessSubscriberThread);
     std::thread psThread(PowerShellSubscriberThread);
     std::thread dnsThread(DnsSubscriberThread);
     std::thread winrmThread(WinRmSubscriberThread);
@@ -5183,6 +5358,10 @@ VOID ShowUI() {
     // ETW-TI: unblock ProcessTrace then join
     StopEtwTiSession();
     tiThread.join();
+
+    // ETW Kernel-Process: unblock ProcessTrace then join
+    StopKernelProcessSession();
+    kpThread.join();
 
     g_capaStop = true;
     g_capaCv.notify_all();
