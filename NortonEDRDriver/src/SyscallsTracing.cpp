@@ -803,7 +803,20 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtLoadDriver;
 	RtlInitUnicodeString(&usNtLoadDriver, L"NtLoadDriver");
 	NtLoadDriverId = getSSNByName(ssdtTable, &usNtLoadDriver, exportsMap);
+
+	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
+	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
+	// that caller must free with ExFreePool).
+	UNICODE_STRING usMmGetFileName;
+	RtlInitUnicodeString(&usMmGetFileName, L"MmGetFileNameForSection");
+	g_MmGetFileNameForSection = (pfnMmGetFileNameForSection)
+	    MmGetSystemRoutineAddress(&usMmGetFileName);
 }
+
+// Function pointer for MmGetFileNameForSection — resolved once in InitIds().
+// Signature: returns allocated OBJECT_NAME_INFORMATION; caller frees with ExFreePool.
+typedef NTSTATUS (*pfnMmGetFileNameForSection)(PVOID Section, POBJECT_NAME_INFORMATION* FileName);
+static pfnMmGetFileNameForSection g_MmGetFileNameForSection = nullptr;
 
 // ---------------------------------------------------------------------------
 // Private helper — allocates and enqueues a KERNEL_STRUCTURED_NOTIFICATION
@@ -1319,7 +1332,14 @@ VOID SyscallsUtils::NtCreateSectionHandler(
 		IoGetCurrentProcess(), nullptr, isStomp);
 }
 
-// NtMapViewOfSection — flag cross-process mapping (injection delivery via shared section).
+// NtMapViewOfSection — flag cross-process mapping AND same-process ntdll remapping.
+//
+// Cross-process: Critical — classic section-based injection delivery.
+//
+// Same-process: check the section's backing file via MmGetFileNameForSection.
+// If it is ntdll.dll, the attacker is loading a clean (unhooked) copy into the
+// current process to get unhooked function pointers — a common EDR bypass.
+// This is Critical because the technique directly undermines our user-mode hooks.
 VOID SyscallsUtils::NtMapViewOfSectionHandler(
 	HANDLE         SectionHandle,
 	HANDLE         ProcessHandle,
@@ -1333,12 +1353,45 @@ VOID SyscallsUtils::NtMapViewOfSectionHandler(
 	ULONG          Win32Protect
 ) {
 	BOOLEAN crossProcess = (ProcessHandle != (HANDLE)-1);
-	if (!crossProcess) return;
 
-	EmitSyscallNotif(
-		(BaseAddress && MmIsAddressValid(BaseAddress)) ? (ULONG64)*BaseAddress : 0,
-		"NtMapViewOfSection: cross-process section mapping (shellcode/injection delivery)",
-		IoGetCurrentProcess(), nullptr, TRUE);
+	if (crossProcess) {
+		EmitSyscallNotif(
+			(BaseAddress && MmIsAddressValid(BaseAddress)) ? (ULONG64)*BaseAddress : 0,
+			"NtMapViewOfSection: cross-process section mapping (shellcode/injection delivery)",
+			IoGetCurrentProcess(), nullptr, TRUE);
+		return;
+	}
+
+	// Same-process: resolve the section's backing file and check for ntdll.
+	// Skip null/invalid handles and cases where the resolution API is unavailable.
+	if (!SectionHandle || !g_MmGetFileNameForSection) return;
+
+	PVOID sectionObject = nullptr;
+	if (!NT_SUCCESS(ObReferenceObjectByHandle(
+		SectionHandle,
+		0,                    // no specific access check — we're just reading for detection
+		*MmSectionObjectType,
+		UserMode,
+		&sectionObject,
+		nullptr))) return;
+
+	POBJECT_NAME_INFORMATION nameInfo = nullptr;
+	NTSTATUS status = g_MmGetFileNameForSection(sectionObject, &nameInfo);
+	ObDereferenceObject(sectionObject);
+
+	if (!NT_SUCCESS(status) || !nameInfo) return;
+
+	// UnicodeStringContains does a case-insensitive substring search.
+	// Matches "\Windows\System32\ntdll.dll" and "\KnownDlls\ntdll.dll".
+	BOOLEAN isNtdll = UnicodeStringContains(&nameInfo->Name, L"ntdll.dll");
+	ExFreePool(nameInfo);
+
+	if (isNtdll) {
+		EmitSyscallNotif(
+			0,
+			"NtMapViewOfSection: ntdll.dll remapped same-process (clean-copy hook bypass / unhooking)",
+			IoGetCurrentProcess(), nullptr, TRUE);
+	}
 }
 
 // NtUnmapViewOfSection — flag cross-process unmapping (hollowing / module stomp cleanup).

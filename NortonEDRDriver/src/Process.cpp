@@ -1,5 +1,32 @@
 #include "Globals.h"
 
+// ---------------------------------------------------------------------------
+// PsGetProcessMitigationPolicy — resolved once on first use.
+// Available from Windows 10 1703+.  Returns the same struct layout as the
+// user-mode GetProcessMitigationPolicy for each PROCESS_MITIGATION_POLICY
+// enum value (query buffer is a DWORD of bit-flags).
+//
+// We use this to detect two EDR-evasion mitigations set on a child process:
+//   ProcessSignaturePolicy (8) bit 0 = MicrosoftSignedOnly  → blocks HookDll injection
+//   ProcessDynamicCodePolicy (2) bit 0 = ProhibitDynamicCode → blocks RWX trampoline pool
+// ---------------------------------------------------------------------------
+typedef NTSTATUS (NTAPI *pfnPsGetProcessMitigationPolicy)(
+    PEPROCESS Process,
+    ULONG     MitigationPolicy,   // PROCESS_MITIGATION_POLICY enum value
+    PVOID     Buffer,
+    SIZE_T    BufferSize);
+
+static volatile LONG             g_MitigInitDone = 0;
+static pfnPsGetProcessMitigationPolicy g_PsGetMitig = nullptr;
+
+static VOID EnsureMitigationResolver() {
+    if (InterlockedCompareExchange(&g_MitigInitDone, 1, 0) == 0) {
+        UNICODE_STRING us;
+        RtlInitUnicodeString(&us, L"PsGetProcessMitigationPolicy");
+        g_PsGetMitig = (pfnPsGetProcessMitigationPolicy)MmGetSystemRoutineAddress(&us);
+    }
+}
+
 BOOLEAN ProcessUtils::isProcessImageTampered() {
 
 	NTSTATUS status;
@@ -194,6 +221,75 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				}
 
 				ObDereferenceObject(parentProcess);
+			}
+		}
+
+		// -----------------------------------------------------------------------
+		// Mitigation policy check — detect policies that block our HookDll injection
+		// or prevent trampoline installation, leaving the process unwatched.
+		//
+		// ProcessSignaturePolicy (8), bit 0 = MicrosoftSignedOnly:
+		//   LoadLibraryW(HookDll.dll) will be rejected by the kernel loader because
+		//   HookDll is not Microsoft-signed. Our APC injection silently fails.
+		//
+		// ProcessDynamicCodePolicy (2), bit 0 = ProhibitDynamicCode:
+		//   VirtualAlloc(PAGE_EXECUTE_READWRITE) for the trampoline pool fails even
+		//   if HookDll loads. Inline hooks cannot be installed; only IAT patches apply.
+		// -----------------------------------------------------------------------
+		EnsureMitigationResolver();
+		if (g_PsGetMitig) {
+			DWORD sigFlags = 0, dynFlags = 0;
+
+			BOOLEAN sigBlocked =
+				NT_SUCCESS(g_PsGetMitig(Process, 8 /*ProcessSignaturePolicy*/, &sigFlags, sizeof(sigFlags))) &&
+				(sigFlags & 0x1); // bit 0 = MicrosoftSignedOnly
+
+			BOOLEAN dynBlocked =
+				NT_SUCCESS(g_PsGetMitig(Process, 2 /*ProcessDynamicCodePolicy*/, &dynFlags, sizeof(dynFlags))) &&
+				(dynFlags & 0x1); // bit 0 = ProhibitDynamicCode
+
+			if (sigBlocked) {
+				PKERNEL_STRUCTURED_NOTIFICATION n = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+				if (n) {
+					const char* msg = "ProcessSignaturePolicy:MicrosoftSignedOnly — HookDll injection will be blocked; process has reduced EDR coverage";
+					SET_WARNING(*n);
+					SET_CALLING_PROC_PID_CHECK(*n);
+					n->isPath = FALSE;
+					n->pid = PsGetProcessId(Process);
+					RtlCopyMemory(n->procName, PsGetProcessImageFileName(Process), 14);
+					SIZE_T msgLen = strlen(msg) + 1;
+					n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+					if (n->msg) {
+						RtlCopyMemory(n->msg, msg, msgLen);
+						if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+							ExFreePool(n->msg);
+							ExFreePool(n);
+						}
+					} else { ExFreePool(n); }
+				}
+			}
+
+			if (dynBlocked) {
+				PKERNEL_STRUCTURED_NOTIFICATION n = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+				if (n) {
+					const char* msg = "ProcessDynamicCodePolicy:ProhibitDynamicCode — RWX trampoline pool blocked; HookDll inline hooks will not install";
+					SET_WARNING(*n);
+					SET_CALLING_PROC_PID_CHECK(*n);
+					n->isPath = FALSE;
+					n->pid = PsGetProcessId(Process);
+					RtlCopyMemory(n->procName, PsGetProcessImageFileName(Process), 14);
+					SIZE_T msgLen = strlen(msg) + 1;
+					n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+					if (n->msg) {
+						RtlCopyMemory(n->msg, msg, msgLen);
+						if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+							ExFreePool(n->msg);
+							ExFreePool(n);
+						}
+					} else { ExFreePool(n); }
+				}
 			}
 		}
 

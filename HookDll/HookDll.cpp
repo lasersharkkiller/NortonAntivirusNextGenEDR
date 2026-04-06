@@ -409,14 +409,96 @@ static void RemoveInlineHook(ApiHook& h) {
     h.trampoline    = nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Hook self-integrity
+//
+// VerifyHooks() walks every installed inline hook and checks that the first
+// two bytes of the patched prologue are still 0xFF 0x25 (our indirect JMP).
+// If another tool (Detours, manual unhooking) has overwritten the patch, we:
+//   1. Send a Critical event naming the affected API.
+//   2. Re-apply the 14-byte patch using the saved hookFn address.
+//
+// WatchThreadProc runs in a background thread started at DLL_PROCESS_ATTACH
+// and calls VerifyHooks() every 2 seconds until signalled to stop.
+// ---------------------------------------------------------------------------
+
+static void VerifyHooks() {
+    if (!g_vpOriginal) return;
+
+    for (int i = 0; i < HOOK_COUNT; i++) {
+        ApiHook& h = g_hooks[i];
+        if (!h.inlinePatched || !h.inlineTarget) continue;
+
+        // Check that our patch signature (FF 25) is still in place.
+        bool tampered = false;
+        __try {
+            tampered = (h.inlineTarget[0] != 0xFF || h.inlineTarget[1] != 0x25);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            continue;
+        }
+        if (!tampered) continue;
+
+        // Report the tampering — another hooking layer removed our patch.
+        char det[192];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "inline hook removed/overwritten: %s!%s at %p — bytes now %02X %02X",
+            h.modName, h.funcName, (void*)h.inlineTarget,
+            (unsigned)h.inlineTarget[0], (unsigned)h.inlineTarget[1]);
+        SendHookEvent("Critical", "HookIntegrityViolation", 0, det);
+
+        // Re-apply the 14-byte patch via the raw VirtualProtect pointer so we
+        // don't re-enter Hook_VirtualProtect and generate a spurious alert.
+        BYTE patch[kPatchBytes];
+        patch[0] = 0xFF; patch[1] = 0x25;
+        patch[2] = patch[3] = patch[4] = patch[5] = 0x00;
+        ULONG64 hookAddr = (ULONG64)h.hookFn;
+        memcpy(patch + 6, &hookAddr, sizeof(ULONG64));
+
+        DWORD old = 0;
+        if (g_vpOriginal(h.inlineTarget, kPatchBytes, PAGE_EXECUTE_READWRITE, &old)) {
+            memcpy(h.inlineTarget, patch, kPatchBytes);
+            g_vpOriginal(h.inlineTarget, kPatchBytes, old, &old);
+        }
+    }
+}
+
+static DWORD WINAPI WatchThreadProc(LPVOID) {
+    // WaitForSingleObject with 2000 ms timeout: fires VerifyHooks on each expiry,
+    // exits cleanly when g_watchStop is signalled from RemoveHooks().
+    while (WaitForSingleObject(g_watchStop, 2000) == WAIT_TIMEOUT)
+        VerifyHooks();
+    return 0;
+}
+
 static void InstallAllInlineHooks() {
+    // Capture VirtualProtect before any inline/IAT patching.  Used by
+    // VerifyHooks() to re-apply patches without triggering our own hook stub.
+    g_vpOriginal = (BOOL(WINAPI*)(LPVOID, SIZE_T, DWORD, PDWORD))
+        GetProcAddress(GetModuleHandleA("kernel32.dll"), "VirtualProtect");
+
     g_trampolinePool = (BYTE*)VirtualAlloc(
         nullptr, HOOK_COUNT * kTrampolineSize,
         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!g_trampolinePool) return;
+    if (!g_trampolinePool) {
+        // VirtualAlloc(PAGE_EXECUTE_READWRITE) failed in-process.
+        // Most likely cause: ProcessDynamicCodePolicy (ProhibitDynamicCode) is active,
+        // which the kernel enforces by rejecting RWX allocations.
+        // IAT patches will still be applied but inline hooks cannot be installed —
+        // coverage is significantly reduced (no GetProcAddress-path interception).
+        SendHookEvent("Critical", "DynamicCodePolicy", 0,
+            "VirtualAlloc(RWX) failed — ProcessDynamicCodePolicy likely active; "
+            "trampoline pool not created, inline hooks will NOT be installed");
+        return;
+    }
 
     for (int i = 0; i < HOOK_COUNT; i++)
         InstallInlineHook(g_hooks[i], g_trampolinePool + i * kTrampolineSize);
+
+    // Harden: flip pool RWX → RX.  Any future in-process write to a trampoline
+    // now requires VirtualProtect (which we hook), making the attempt visible.
+    DWORD old = 0;
+    VirtualProtect(g_trampolinePool, (SIZE_T)(HOOK_COUNT * kTrampolineSize),
+                   PAGE_EXECUTE_READ, &old);
 }
 
 static void RemoveAllInlineHooks() {
@@ -1331,9 +1413,29 @@ void InstallHooks() {
     ConnectToPipe();
     InstallAllInlineHooks(); // prologue patches first — catches GetProcAddress callers
     PatchAllModules(false);  // IAT patches catch load-time importers
+
+    // Start the hook-integrity watch thread.
+    // WatchThreadProc is inside HookDll so IsAddressInKnownModule() returns true
+    // for its start address — Hook_CreateThread won't fire a false alarm.
+    g_watchStop = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (g_watchStop)
+        g_watchThread = CreateThread(nullptr, 0, WatchThreadProc, nullptr, 0, nullptr);
 }
 
 void RemoveHooks() {
+    // Stop the watch thread first — it must not run while we're restoring patches,
+    // or it may race on inlinePatched/inlineTarget and re-apply a hook mid-restore.
+    if (g_watchStop) {
+        SetEvent(g_watchStop);
+        if (g_watchThread) {
+            WaitForSingleObject(g_watchThread, 3000);
+            CloseHandle(g_watchThread);
+            g_watchThread = nullptr;
+        }
+        CloseHandle(g_watchStop);
+        g_watchStop = nullptr;
+    }
+
     RemoveAllInlineHooks(); // restore prologues before IAT (avoid re-entry during teardown)
     PatchAllModules(true);
 
