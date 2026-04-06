@@ -720,6 +720,8 @@ class SyscallsUtils {
 	static ULONG NtProtectVirtualMemoryId;     // Variable — resolved in InitIds()
 	static ULONG NtCreateTransactionId;        // Variable — doppelgänging telemetry
 	static ULONG NtRollbackTransactionId;      // Variable — doppelgänging telemetry
+	static ULONG NtCreateProcessExId;          // Variable — legacy section-based process creation
+	static ULONG NtCreateProcessId;            // Variable — even older legacy API (same technique)
 
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
@@ -925,6 +927,9 @@ public:
 
 	static VOID NtCreateTransactionHandler();   // doppelgänging telemetry
 	static VOID NtRollbackTransactionHandler(); // doppelgänging telemetry
+	// Legacy process creation from explicit image section (process injection / doppelgänging)
+	static VOID NtCreateProcessExHandler(ULONG Flags, HANDLE SectionHandle);
+	static VOID NtCreateProcessHandler(HANDLE SectionHandle);  // older 8-arg variant
 
 	static VOID NtProtectVirtualMemoryHandler(
 		HANDLE   ProcessHandle,

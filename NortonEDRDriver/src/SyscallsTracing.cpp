@@ -48,6 +48,8 @@ ULONG SyscallsUtils::NtLoadDriverId = 0;
 ULONG SyscallsUtils::NtProtectVirtualMemoryId = 0;
 ULONG SyscallsUtils::NtCreateTransactionId = 0;
 ULONG SyscallsUtils::NtRollbackTransactionId = 0;
+ULONG SyscallsUtils::NtCreateProcessExId = 0;
+ULONG SyscallsUtils::NtCreateProcessId = 0;
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -549,6 +551,17 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 	else if (NtRollbackTransactionId != 0 && id == NtRollbackTransactionId) {  // NtRollbackTransaction
 		NtRollbackTransactionHandler();
 	}
+	else if (NtCreateProcessExId != 0 && id == NtCreateProcessExId) {  // NtCreateProcessEx
+		// NtCreateProcessEx(ProcessHandle*, Access, ObjAttr, ParentProcess, Flags, SectionHandle, ...)
+		// Flags  = arg5 = [RSP+0x28]
+		// SectionHandle = arg6 = [RSP+0x30]
+		NtCreateProcessExHandler((ULONG)arg5, (HANDLE)arg6);
+	}
+	else if (NtCreateProcessId != 0 && id == NtCreateProcessId) {  // NtCreateProcess (older, 8-arg)
+		// NtCreateProcess(ProcessHandle*, Access, ObjAttr, ParentProcess, InheritObjTable, SectionHandle, ...)
+		// SectionHandle = arg6 = [RSP+0x30]
+		NtCreateProcessHandler((HANDLE)arg6);
+	}
 
 	return TRUE;
 }
@@ -833,6 +846,14 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtRollbackTransaction;
 	RtlInitUnicodeString(&usNtRollbackTransaction, L"NtRollbackTransaction");
 	NtRollbackTransactionId = getSSNByName(ssdtTable, &usNtRollbackTransaction, exportsMap);
+
+	UNICODE_STRING usNtCreateProcessEx;
+	RtlInitUnicodeString(&usNtCreateProcessEx, L"NtCreateProcessEx");
+	NtCreateProcessExId = getSSNByName(ssdtTable, &usNtCreateProcessEx, exportsMap);
+
+	UNICODE_STRING usNtCreateProcess;
+	RtlInitUnicodeString(&usNtCreateProcess, L"NtCreateProcess");
+	NtCreateProcessId = getSSNByName(ssdtTable, &usNtCreateProcess, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -1637,6 +1658,60 @@ VOID SyscallsUtils::NtRollbackTransactionHandler() {
 		"Process Doppelganging cleanup step (erases on-disk PE)",
 		procName);
 	EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, TRUE);  // Critical: cleanup = committed
+}
+
+// NtCreateProcessEx — legacy process creation API that accepts an explicit SectionHandle.
+//
+// Modern CreateProcess calls NtCreateUserProcess. NtCreateProcessEx is used by:
+//   - Process doppelgänging (create from transacted section)
+//   - Direct section injection (create process from a manually crafted SEC_IMAGE section)
+//   - Some debugger internals (ZwCreateProcessEx from kernel; not this path)
+//
+// Any user-mode NtCreateProcessEx call is highly suspicious. A non-null SectionHandle with
+// PROCESS_CREATE_FLAGS_MINIMAL not set (bit 2 of Flags) creates a full non-minimal process
+// from that section — the canonical injection technique.
+VOID SyscallsUtils::NtCreateProcessExHandler(ULONG Flags, HANDLE SectionHandle) {
+	char procName[16] = {};
+	char* pn = PsGetProcessImageFileName(IoGetCurrentProcess());
+	if (pn) RtlStringCbCopyA(procName, sizeof(procName), pn);
+
+	// PROCESS_CREATE_FLAGS_MINIMAL = 0x4 — minimal processes are used by pico providers (WSL, etc.)
+	BOOLEAN isMinimal   = (Flags & 0x4) != 0;
+	BOOLEAN hasSection  = (SectionHandle != nullptr && SectionHandle != (HANDLE)-1);
+
+	char msg[200];
+	if (hasSection && !isMinimal) {
+		// Most suspicious: full non-minimal process created from an explicit image section —
+		// classic process doppelgänging / section-based injection delivery.
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtCreateProcessEx: '%s' creating NON-MINIMAL process from explicit SectionHandle"
+			" (Flags=0x%lx) -- process doppelganging / section injection",
+			procName, Flags);
+		EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, TRUE);  // Critical
+	} else {
+		// Still unusual: legacy API path even without an explicit section or with minimal flag.
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtCreateProcessEx: legacy process creation API called by '%s'"
+			" (Flags=0x%lx, SectionHandle=%s) -- uncommon on modern Windows",
+			procName, Flags, hasSection ? "set" : "null");
+		EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, FALSE);  // Warning
+	}
+}
+
+// NtCreateProcess — even older 8-argument variant (pre-Vista legacy).
+// Same technique, no Flags field — SectionHandle is always arg6.
+VOID SyscallsUtils::NtCreateProcessHandler(HANDLE SectionHandle) {
+	char procName[16] = {};
+	char* pn = PsGetProcessImageFileName(IoGetCurrentProcess());
+	if (pn) RtlStringCbCopyA(procName, sizeof(procName), pn);
+
+	BOOLEAN hasSection = (SectionHandle != nullptr && SectionHandle != (HANDLE)-1);
+	char msg[200];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"NtCreateProcess (legacy): called by '%s' with SectionHandle=%s"
+		" -- direct section-based process creation bypasses NtCreateUserProcess",
+		procName, hasSection ? "set" : "null");
+	EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, hasSection);  // Critical if section set
 }
 
 // NtProtectVirtualMemory — detect ntdll/DLL stomping and cross-process protection changes.

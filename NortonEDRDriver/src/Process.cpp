@@ -277,6 +277,75 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 			CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
 		}
 
+		// -----------------------------------------------------------------------
+		// Legacy process creation via NtCreateProcessEx / NtCreateProcess:
+		// kernel signal — FileOpenNameAvailable == 0 with a non-NULL ImageFileName.
+		//
+		// FileOpenNameAvailable = 1  → image path comes from an actual file open
+		//                              (normal NtCreateUserProcess / CreateProcess path)
+		// FileOpenNameAvailable = 0  → image path is derived from a section object,
+		//                              not from opening a file; the kernel never opened
+		//                              the file on this code path.
+		//
+		// When combined with CommandLine == NULL (NtCreateUserProcess always sets one),
+		// this strongly indicates direct NtCreateProcessEx / NtCreateProcess usage.
+		// Ghosted processes are excluded (they already fire their own Critical alert).
+		// -----------------------------------------------------------------------
+		if (!CreateInfo->FileOpenNameAvailable && !procUtils.isProcessGhosted()) {
+			BOOLEAN noCommandLine = (CreateInfo->CommandLine == nullptr ||
+			                         CreateInfo->CommandLine->Buffer == nullptr ||
+			                         CreateInfo->CommandLine->Length == 0);
+
+			char* childName   = PsGetProcessImageFileName(Process);
+			char* creatorName = PsGetProcessImageFileName(IoGetCurrentProcess());
+
+			char imageNameBuf[128] = "<unknown>";
+			if (CreateInfo->ImageFileName &&
+			    CreateInfo->ImageFileName->Buffer &&
+			    CreateInfo->ImageFileName->Length > 0) {
+				USHORT copyChars = min(
+				    (USHORT)(CreateInfo->ImageFileName->Length / sizeof(WCHAR)),
+				    (USHORT)(sizeof(imageNameBuf) - 1));
+				for (USHORT i = 0; i < copyChars; i++) {
+					WCHAR wc = CreateInfo->ImageFileName->Buffer[i];
+					imageNameBuf[i] = (wc < 128) ? (char)wc : '?';
+				}
+				imageNameBuf[copyChars] = '\0';
+			}
+
+			char msg[280];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"Legacy process creation: '%s' (creator='%s') image loaded from section"
+				" not file (FileOpenNameAvailable=0%s) -- NtCreateProcessEx/NtCreateProcess"
+				" path; image='%s'",
+				childName   ? childName   : "?",
+				creatorName ? creatorName : "?",
+				noCommandLine ? ", CommandLine=NULL" : "",
+				imageNameBuf);
+
+			PKERNEL_STRUCTURED_NOTIFICATION n =
+				(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+			if (n) {
+				RtlZeroMemory(n, sizeof(*n));
+				SET_CRITICAL(*n);
+				SET_SE_AUDIT_INFO_CHECK(*n);
+				n->isPath = FALSE;
+				n->pid    = PsGetProcessId(Process);
+				if (creatorName) RtlCopyMemory(n->procName, creatorName, 14);
+				SIZE_T msgLen = strlen(msg) + 1;
+				n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+				if (n->msg) {
+					RtlCopyMemory(n->msg, msg, msgLen);
+					n->bufSize = (ULONG)msgLen;
+					if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+						ExFreePool(n->msg);
+						ExFreePool(n);
+					}
+				} else { ExFreePool(n); }
+			}
+		}
+
 		// Lateral movement: remote execution host (WMI, WinRM) spawning interactive shell
 		{
 			PEPROCESS parentProcess = NULL;
