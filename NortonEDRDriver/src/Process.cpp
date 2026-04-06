@@ -296,34 +296,66 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 	}
 }
 
+// ---------------------------------------------------------------------------
+// PsSetCreateProcessNotifyRoutineEx2 — Win10 1703+.
+// Extends Ex with PsCreateProcessNotifySubsystems (=0) which additionally
+// fires for Pico processes (WSL1 / Drawbridge).  Resolved at runtime so the
+// driver loads on older systems; falls back to Ex on failure.
+// ---------------------------------------------------------------------------
+typedef NTSTATUS (NTAPI *pfnPsSetCreateProcessNotifyRoutineEx2)(
+    PSCREATEPROCESSNOTIFYTYPE NotifyType,
+    PVOID                     NotifyInformation,
+    BOOLEAN                   Remove);
+
+static pfnPsSetCreateProcessNotifyRoutineEx2 g_pSetProcessEx2 = nullptr;
+static BOOLEAN                               g_usedProcessEx2 = FALSE;
+
 VOID ProcessUtils::setProcessNotificationCallback() {
 
-	NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(
-		CreateProcessNotifyEx,
-		FALSE
-	);
+	// Prefer Ex2 (subsystem-aware) — covers Win32 + Pico (WSL1) processes.
+	UNICODE_STRING usEx2;
+	RtlInitUnicodeString(&usEx2, L"PsSetCreateProcessNotifyRoutineEx2");
+	g_pSetProcessEx2 = (pfnPsSetCreateProcessNotifyRoutineEx2)
+	    MmGetSystemRoutineAddress(&usEx2);
 
-	if (!NT_SUCCESS(status)) {
-		
+	if (g_pSetProcessEx2) {
+		NTSTATUS status = g_pSetProcessEx2(
+		    PsCreateProcessNotifySubsystems,
+		    (PVOID)CreateProcessNotifyEx,
+		    FALSE);
+		if (NT_SUCCESS(status)) {
+			g_usedProcessEx2 = TRUE;
+			DbgPrint("[+] PsSetCreateProcessNotifyRoutineEx2 (subsystems) success\n");
+			return;
+		}
+		DbgPrint("[-] PsSetCreateProcessNotifyRoutineEx2 failed — falling back\n");
+	}
+
+	// Fallback: Win32 only
+	NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(CreateProcessNotifyEx, FALSE);
+	if (!NT_SUCCESS(status))
 		DbgPrint("[-] PsSetCreateProcessNotifyRoutineEx failed\n");
-	}
-	else {
+	else
 		DbgPrint("[+] PsSetCreateProcessNotifyRoutineEx success\n");
-	}
 }
 
 VOID ProcessUtils::unsetProcessNotificationCallback() {
 
-	NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(
-		CreateProcessNotifyEx,
-		TRUE
-	);
-
-	if (!NT_SUCCESS(status)) {
-		DbgPrint("[-] PsSetCreateProcessNotifyRoutineEx failed\n");
+	NTSTATUS status;
+	if (g_usedProcessEx2 && g_pSetProcessEx2) {
+		status = g_pSetProcessEx2(
+		    PsCreateProcessNotifySubsystems,
+		    (PVOID)CreateProcessNotifyEx,
+		    TRUE);
+		if (!NT_SUCCESS(status))
+			DbgPrint("[-] PsSetCreateProcessNotifyRoutineEx2 remove failed\n");
+		else
+			DbgPrint("[+] PsSetCreateProcessNotifyRoutineEx2 remove success\n");
+	} else {
+		status = PsSetCreateProcessNotifyRoutineEx(CreateProcessNotifyEx, TRUE);
+		if (!NT_SUCCESS(status))
+			DbgPrint("[-] PsSetCreateProcessNotifyRoutineEx remove failed\n");
+		else
+			DbgPrint("[+] PsSetCreateProcessNotifyRoutineEx remove success\n");
 	}
-	else {	
-		DbgPrint("[+] PsSetCreateProcessNotifyRoutineEx success\n");
-	}
-
 }

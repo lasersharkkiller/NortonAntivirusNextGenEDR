@@ -432,24 +432,49 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
     }
 }
 
+// ---------------------------------------------------------------------------
+// PsSetLoadImageNotifyRoutineEx — Win10 1709+.
+// Flags = 0 covers standard image loads including Pico process image maps.
+// Resolved at runtime; falls back to PsSetLoadImageNotifyRoutine.
+// Removal always uses PsRemoveLoadImageNotifyRoutine for both variants.
+// ---------------------------------------------------------------------------
+typedef NTSTATUS (NTAPI *pfnPsSetLoadImageNotifyRoutineEx)(
+    PLOAD_IMAGE_NOTIFY_ROUTINE NotifyRoutine,
+    ULONG_PTR                  Flags);
+
+static pfnPsSetLoadImageNotifyRoutineEx g_pSetImageEx = nullptr;
+
 VOID ImageUtils::setImageNotificationCallback() {
 
     KeInitializeSpinLock(&g_NtdllPidLock);
 
-	NTSTATUS status = PsSetLoadImageNotifyRoutine(ImageLoadNotifyRoutine);
+    // Prefer Ex (subsystem-aware, Win10 1709+).
+    UNICODE_STRING usEx;
+    RtlInitUnicodeString(&usEx, L"PsSetLoadImageNotifyRoutineEx");
+    g_pSetImageEx = (pfnPsSetLoadImageNotifyRoutineEx)
+        MmGetSystemRoutineAddress(&usEx);
 
-	if (!NT_SUCCESS(status)) {
+    NTSTATUS status;
+    if (g_pSetImageEx) {
+        status = g_pSetImageEx(ImageLoadNotifyRoutine, 0);
+        if (NT_SUCCESS(status)) {
+            DbgPrint("[+] PsSetLoadImageNotifyRoutineEx (subsystems) success\n");
+            return;
+        }
+        DbgPrint("[-] PsSetLoadImageNotifyRoutineEx failed — falling back\n");
+    }
+
+	status = PsSetLoadImageNotifyRoutine(ImageLoadNotifyRoutine);
+	if (!NT_SUCCESS(status))
 		DbgPrint("[-] PsSetLoadImageNotifyRoutine failed\n");
-    }
-    else {
+    else
 		DbgPrint("[+] PsSetLoadImageNotifyRoutine success\n");
-
-    }
-
 }
 
 VOID ImageUtils::unsetImageNotificationCallback() {
 
+	// PsRemoveLoadImageNotifyRoutine removes callbacks registered by either
+	// PsSetLoadImageNotifyRoutine or PsSetLoadImageNotifyRoutineEx.
 	NTSTATUS status = PsRemoveLoadImageNotifyRoutine(ImageLoadNotifyRoutine);
 
 	if (!NT_SUCCESS(status)) {

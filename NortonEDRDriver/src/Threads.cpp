@@ -56,11 +56,11 @@ VOID ThreadUtils::CreateThreadNotifyRoutine(
 ) {
 	
 	if (Create) {
-	
+
 		ULONG64 outAddr;
 
 		SyscallsUtils::SetInformationAltSystemCall(PsGetCurrentProcessId());
-			
+
 		SyscallsUtils::EnableAltSycallForThread(PsGetCurrentThread());
 
 		PEPROCESS eProcess;
@@ -74,7 +74,62 @@ VOID ThreadUtils::CreateThreadNotifyRoutine(
 		status = PsLookupThreadByThreadId(ThreadId, &eThread);
 		if (!NT_SUCCESS(status)) {
 			DbgPrint("[-] PsLookupThreadByThreadId failed\n");
+			ObDereferenceObject(eProcess);
 			return;
+		}
+
+		// -----------------------------------------------------------------------
+		// Remote thread detection.
+		// CreateThreadNotifyRoutine fires in the context of the CREATING thread.
+		// IoGetCurrentProcess() = creator; eProcess = host of the new thread.
+		// If they differ, this is cross-process thread injection — a foundational
+		// primitive for classic injection, process hollowing, and APC abuse.
+		//
+		// This kernel-callback path catches ALL mechanisms: Win32 API, direct
+		// syscall, and driver-level injection — unlike the user-mode hooks which
+		// only cover API callers in the injecting process.
+		// -----------------------------------------------------------------------
+		PEPROCESS creatorProcess = IoGetCurrentProcess();
+		if (eProcess != creatorProcess) {
+			PVOID startAddr = PsGetThreadWin32StartAddress(eThread);
+
+			char msg[220];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"Remote thread injected into '%s' (pid=%llu) startAddr=0x%llX by '%s'",
+				PsGetProcessImageFileName(eProcess),
+				(ULONG64)PsGetProcessId(eProcess),
+				(ULONG64)startAddr,
+				PsGetProcessImageFileName(creatorProcess));
+
+			PKERNEL_STRUCTURED_NOTIFICATION kernelNotif =
+				(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+			if (kernelNotif) {
+				RtlZeroMemory(kernelNotif, sizeof(*kernelNotif));
+				SET_CRITICAL(*kernelNotif);
+				SET_STACK_BASE_VAD_CHECK(*kernelNotif);
+				kernelNotif->isPath          = FALSE;
+				kernelNotif->pid             = PsGetProcessId(creatorProcess);
+				kernelNotif->scoopedAddress  = (ULONG64)startAddr;
+				RtlCopyMemory(kernelNotif->procName,
+				              PsGetProcessImageFileName(creatorProcess), 14);
+				RtlCopyMemory(kernelNotif->targetProcName,
+				              PsGetProcessImageFileName(eProcess), 14);
+
+				SIZE_T msgLen = strlen(msg);
+				kernelNotif->msg = (char*)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, msgLen + 1, 'msg');
+				if (kernelNotif->msg) {
+					RtlCopyMemory(kernelNotif->msg, msg, msgLen + 1);
+					kernelNotif->bufSize = (ULONG)(msgLen + 1);
+					if (!CallbackObjects::GetNotifQueue()->Enqueue(kernelNotif)) {
+						ExFreePool(kernelNotif->msg);
+						ExFreePool(kernelNotif);
+					}
+				} else {
+					ExFreePool(kernelNotif);
+				}
+			}
 		}
 
 		ThreadUtils threadUtils = ThreadUtils(
@@ -125,7 +180,7 @@ VOID ThreadUtils::CreateThreadNotifyRoutine(
 
 				SET_CRITICAL(*kernelNotif);
 				SET_STACK_BASE_VAD_CHECK(*kernelNotif);
-				
+
 				kernelNotif->bufSize = sizeof(msg);
 				kernelNotif->isPath = FALSE;
 				kernelNotif->pid = PsGetProcessId(IoGetCurrentProcess());
@@ -135,7 +190,6 @@ VOID ThreadUtils::CreateThreadNotifyRoutine(
 				char procName[15];
 				RtlCopyMemory(procName, PsGetProcessImageFileName(IoGetCurrentProcess()), 15);
 				RtlCopyMemory(kernelNotif->procName, procName, 15);
-
 
 				if (kernelNotif->msg) {
 					RtlCopyMemory(kernelNotif->msg, msg, strlen(msg) + 1);
@@ -147,36 +201,65 @@ VOID ThreadUtils::CreateThreadNotifyRoutine(
 				else {
 					ExFreePool(kernelNotif);
 				}
-
 			}
 		}
 
+		ObDereferenceObject(eThread);
+		ObDereferenceObject(eProcess);
 	}
 	else {
 		SyscallsUtils::DisableAltSycallForThread(PsGetCurrentThread());
 	}
 }
 
+// ---------------------------------------------------------------------------
+// PsSetCreateThreadNotifyRoutineEx — Win10 1703+.
+// PsCreateThreadNotifySubsystems (=0) extends coverage to Pico process
+// threads (WSL1).  Resolved at runtime; falls back to base routine.
+// Removal always uses PsRemoveCreateThreadNotifyRoutine for both variants.
+// ---------------------------------------------------------------------------
+typedef NTSTATUS (NTAPI *pfnPsSetCreateThreadNotifyRoutineEx)(
+    PSCREATETHREADNOTIFYTYPE NotifyType,
+    PVOID                    NotifyInformation);
+
+static pfnPsSetCreateThreadNotifyRoutineEx g_pSetThreadEx  = nullptr;
+static BOOLEAN                             g_usedThreadEx  = FALSE;
+
 VOID ThreadUtils::setThreadNotificationCallback() {
 
-	NTSTATUS status = PsSetCreateThreadNotifyRoutine(CreateThreadNotifyRoutine);
-	if (!NT_SUCCESS(status)) {
-		DbgPrint("[-] PsSetCreateThreadNotifyRoutine failed\n");
-	}
-	else {	
+	// Prefer Ex (subsystem-aware) — covers Win32 + Pico (WSL1) threads.
+	UNICODE_STRING usEx;
+	RtlInitUnicodeString(&usEx, L"PsSetCreateThreadNotifyRoutineEx");
+	g_pSetThreadEx = (pfnPsSetCreateThreadNotifyRoutineEx)
+	    MmGetSystemRoutineAddress(&usEx);
 
-		DbgPrint("[+] PsSetCreateThreadNotifyRoutine success\n");
+	if (g_pSetThreadEx) {
+		NTSTATUS status = g_pSetThreadEx(
+		    PsCreateThreadNotifySubsystems,
+		    (PVOID)CreateThreadNotifyRoutine);
+		if (NT_SUCCESS(status)) {
+			g_usedThreadEx = TRUE;
+			DbgPrint("[+] PsSetCreateThreadNotifyRoutineEx (subsystems) success\n");
+			return;
+		}
+		DbgPrint("[-] PsSetCreateThreadNotifyRoutineEx failed — falling back\n");
 	}
+
+	// Fallback: Win32 only
+	NTSTATUS status = PsSetCreateThreadNotifyRoutine(CreateThreadNotifyRoutine);
+	if (!NT_SUCCESS(status))
+		DbgPrint("[-] PsSetCreateThreadNotifyRoutine failed\n");
+	else
+		DbgPrint("[+] PsSetCreateThreadNotifyRoutine success\n");
 }
 
 VOID ThreadUtils::unsetThreadNotificationCallback() {
 
+	// PsRemoveCreateThreadNotifyRoutine removes callbacks registered by either
+	// PsSetCreateThreadNotifyRoutine or PsSetCreateThreadNotifyRoutineEx.
 	NTSTATUS status = PsRemoveCreateThreadNotifyRoutine(CreateThreadNotifyRoutine);
-	if (!NT_SUCCESS(status)) {
+	if (!NT_SUCCESS(status))
 		DbgPrint("[-] PsRemoveCreateThreadNotifyRoutine failed\n");
-	}
-	else {
-
+	else
 		DbgPrint("[+] PsRemoveCreateThreadNotifyRoutine success\n");
-	}
 }
