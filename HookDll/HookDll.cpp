@@ -1003,15 +1003,27 @@ static HANDLE WINAPI Hook_OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle
 // Catches in-process shellcode staging that doesn't go through VirtualAlloc.
 static BOOL WINAPI Hook_VirtualProtect(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect) {
     typedef BOOL(WINAPI* Fn)(LPVOID, SIZE_T, DWORD, PDWORD);
+    BOOL inModule = lpAddress ? IsAddressInKnownModule(lpAddress) : FALSE;
+
     if (flNewProtect == PAGE_EXECUTE_READWRITE || flNewProtect == PAGE_EXECUTE_WRITECOPY) {
-        BOOL inModule = IsAddressInKnownModule(lpAddress);
-        char det[128];
+        char det[160];
         _snprintf_s(det, sizeof(det), _TRUNCATE,
             "addr=%p size=0x%llX prot=0x%lX inModule=%d",
             lpAddress, (ULONG64)dwSize, flNewProtect, (int)inModule);
-        // Only Critical if the address is outside all known modules (shellcode staging)
+        // RWX outside a module = shellcode staging (Critical); inside = trampoline noise (Info)
         SendHookEvent(inModule ? "Info" : "Critical", "VirtualProtect", 0, det);
+    } else if ((flNewProtect == PAGE_READWRITE || flNewProtect == PAGE_WRITECOPY) && inModule) {
+        // Write-only on a loaded module's code section — ntdll/DLL stomp pattern.
+        // PAGE_READWRITE is the protection malware uses before memcpy'ing clean ntdll bytes
+        // over our inline hooks; it doesn't trigger the RWX check above so needs its own path.
+        char det[200];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "addr=%p size=0x%llX prot=0x%lX — write permission on loaded module "
+            "(ntdll/DLL stomp pattern)",
+            lpAddress, (ULONG64)dwSize, flNewProtect);
+        SendHookEvent("Critical", "VirtualProtect", 0, det);
     }
+
     return ((Fn)GetCallThrough(IDX_VIRTUALPROTECT))(lpAddress, dwSize, flNewProtect, lpflOldProtect);
 }
 

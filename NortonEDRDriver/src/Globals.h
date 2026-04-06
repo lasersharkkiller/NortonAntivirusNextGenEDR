@@ -715,8 +715,9 @@ class SyscallsUtils {
 	static ULONG NtCreateThreadExId;     // Variable — resolved in InitIds()
 	static ULONG NtSuspendThreadId;      // Variable — resolved in InitIds()
 	static ULONG NtCreateSectionId;      // Variable — resolved in InitIds()
-	static ULONG NtUnmapViewOfSectionId; // Variable — resolved in InitIds()
-	static ULONG NtLoadDriverId;         // Variable — resolved in InitIds()
+	static ULONG NtUnmapViewOfSectionId;        // Variable — resolved in InitIds()
+	static ULONG NtLoadDriverId;               // Variable — resolved in InitIds()
+	static ULONG NtProtectVirtualMemoryId;     // Variable — resolved in InitIds()
 
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
@@ -918,6 +919,13 @@ public:
 
 	static VOID NtLoadDriverHandler(
 		PUNICODE_STRING  // DriverServiceName
+	);
+
+	static VOID NtProtectVirtualMemoryHandler(
+		HANDLE   ProcessHandle,
+		PVOID*   BaseAddress,
+		PSIZE_T  RegionSize,
+		ULONG    NewProtect
 	);
 
 	static BOOLEAN SetInformationAltSystemCall(

@@ -45,6 +45,7 @@ ULONG SyscallsUtils::NtSuspendThreadId = 0;
 ULONG SyscallsUtils::NtCreateSectionId = 0;
 ULONG SyscallsUtils::NtUnmapViewOfSectionId = 0;
 ULONG SyscallsUtils::NtLoadDriverId = 0;
+ULONG SyscallsUtils::NtProtectVirtualMemoryId = 0;
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -531,6 +532,15 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 			(PUNICODE_STRING)trapFrame->Rcx  // DriverServiceName
 		);
 	}
+	else if (NtProtectVirtualMemoryId != 0 && id == NtProtectVirtualMemoryId) {  // NtProtectVirtualMemory
+
+		NtProtectVirtualMemoryHandler(
+			(HANDLE)trapFrame->Rcx,    // ProcessHandle
+			(PVOID*)trapFrame->Rdx,    // *BaseAddress
+			(PSIZE_T)trapFrame->R8,    // *NumberOfBytesToProtect
+			(ULONG)trapFrame->R9       // NewAccessProtection
+		);
+	}
 
 	return TRUE;
 }
@@ -803,6 +813,10 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtLoadDriver;
 	RtlInitUnicodeString(&usNtLoadDriver, L"NtLoadDriver");
 	NtLoadDriverId = getSSNByName(ssdtTable, &usNtLoadDriver, exportsMap);
+
+	UNICODE_STRING usNtProtectVm;
+	RtlInitUnicodeString(&usNtProtectVm, L"NtProtectVirtualMemory");
+	NtProtectVirtualMemoryId = getSSNByName(ssdtTable, &usNtProtectVm, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -1458,6 +1472,79 @@ VOID SyscallsUtils::NtLoadDriverHandler(
 	}
 
 	EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, TRUE);
+}
+
+// NtProtectVirtualMemory — detect ntdll/DLL stomping and cross-process protection changes.
+//
+// Stomping technique: attacker maps a fresh ntdll.dll from disk (SEC_IMAGE or FILE_MAP_READ),
+// calls NtProtectVirtualMemory(NtCurrentProcess, ntdll_text_base, ..., PAGE_READWRITE) to
+// make the live hooked ntdll writable, then memcpy's clean bytes over it to remove our hooks.
+// PAGE_READWRITE does NOT trigger the existing PAGE_EXECUTE_READWRITE guard in HookDll, so
+// this is the kernel backstop for that bypass path.
+VOID SyscallsUtils::NtProtectVirtualMemoryHandler(
+	HANDLE  ProcessHandle,
+	PVOID*  BaseAddress,
+	PSIZE_T RegionSize,
+	ULONG   NewProtect
+) {
+	// Only care when write permission is being granted
+	const ULONG kWriteMask = PAGE_READWRITE | PAGE_WRITECOPY |
+	                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+	if (!(NewProtect & kWriteMask)) return;
+
+	// Resolve target process
+	PEPROCESS targetProcess = nullptr;
+	BOOLEAN   pseudoHandle  = (ProcessHandle == (HANDLE)-1);
+	if (pseudoHandle) {
+		targetProcess = IoGetCurrentProcess();
+		ObReferenceObject(targetProcess);
+	} else {
+		if (!NT_SUCCESS(ObReferenceObjectByHandle(
+				ProcessHandle, PROCESS_VM_OPERATION, nullptr,
+				UserMode, (PVOID*)&targetProcess, nullptr))) return;
+	}
+
+	PEPROCESS callerProcess = IoGetCurrentProcess();
+	BOOLEAN   crossProcess  = (targetProcess != callerProcess);
+
+	PVOID  base = nullptr;
+	SIZE_T size = 0;
+	if (BaseAddress && MmIsAddressValid(BaseAddress)) {
+		__try { base = *BaseAddress; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+	if (RegionSize && MmIsAddressValid(RegionSize)) {
+		__try { size = *RegionSize; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+
+	if (crossProcess) {
+		// Any write grant on a foreign process is suspicious (process hollowing / injection staging)
+		char msg[220];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtProtectVirtualMemory: cross-process write permission granted "
+			"addr=0x%llX size=0x%llX prot=0x%lX",
+			(ULONG64)base, (ULONG64)size, NewProtect);
+		EmitSyscallNotif((ULONG64)base, msg, callerProcess, targetProcess, TRUE);
+	} else if (base) {
+		// Same-process: flag only if the target is image-backed memory (ntdll / loaded DLL).
+		// MEM_IMAGE (0x1000000) means the region is mapped from an image section — granting
+		// write on such a region is the ntdll-stomp signature.
+		MEMORY_BASIC_INFORMATION mbi = {};
+		SIZE_T retLen = 0;
+		NTSTATUS s = ZwQueryVirtualMemory(
+			NtCurrentProcess(), base,
+			(MEMORY_INFORMATION_CLASS)0,  // MemoryBasicInformation
+			&mbi, sizeof(mbi), &retLen);
+		if (NT_SUCCESS(s) && mbi.Type == 0x1000000 /* MEM_IMAGE */) {
+			char msg[240];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtProtectVirtualMemory: write permission on image-mapped region "
+				"addr=0x%llX size=0x%llX prot=0x%lX — ntdll/DLL stomp attempt",
+				(ULONG64)base, (ULONG64)size, NewProtect);
+			EmitSyscallNotif((ULONG64)base, msg, callerProcess, nullptr, TRUE);
+		}
+	}
+
+	ObDereferenceObject(targetProcess);
 }
 
 VOID SyscallsUtils::DisableAltSyscallFromThreads2() {
