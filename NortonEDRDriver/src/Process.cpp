@@ -173,6 +173,13 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 	
 	if (CreateInfo) {
 
+		// Save kernel-authentic command line for later discrepancy detection.
+		// Must happen before any other work so the record exists when the child's
+		// first DLL load fires ImageLoadNotifyRoutine.
+		if (CreateInfo->CommandLine)
+			ImageUtils::SaveKernelCmdLine(HandleToUlong(PsGetProcessId(Process)),
+			                              CreateInfo->CommandLine);
+
 		// PE scan: walk the new process VAD for suspicious executable regions
 		PeScanner::ScanProcessVad(Process, CallbackObjects::GetNotifQueue());
 
@@ -420,6 +427,9 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 			}
 		}
 
+	} else {
+		// Process exit — free the cmdline record so the slot can be reused.
+		ImageUtils::RemoveCmdLineRec(HandleToUlong(PsGetProcessId(Process)));
 	}
 }
 

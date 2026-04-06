@@ -36,6 +36,160 @@ static BOOLEAN NtdllSeenBefore(ULONG pid) {
     return FALSE;
 }
 
+// ---------------------------------------------------------------------------
+// Argument-spoofing discrepancy detection (Adam Chester / Cobalt Strike "argue")
+//
+// At CreateProcessNotifyEx time the kernel gives us CreateInfo->CommandLine —
+// the ORIGINAL command line passed to NtCreateUserProcess, before any parent
+// can patch the child's PEB.  We save that per-PID here.
+//
+// When the child resumes and loads its first user DLL (kernel32, etc.), our
+// ImageLoadNotifyRoutine fires while still attached to the process.  At that
+// point the parent's PEB patch (if any) has already been applied.  We read
+// PEB->ProcessParameters->CommandLine and compare to the saved kernel copy.
+// A length or content difference = argument spoofing in progress.
+// ---------------------------------------------------------------------------
+#define MAX_CMDLINE_RECORDS   512
+#define MAX_CMDLINE_CHARS     256
+
+struct CMDLINE_RECORD {
+	ULONG   pid;
+	WCHAR   kernelCmd[MAX_CMDLINE_CHARS + 1];
+	USHORT  kernelLen;    // chars
+	BOOLEAN checked;      // TRUE once we've compared — only fire once per process
+};
+
+static CMDLINE_RECORD g_CmdLineRecs[MAX_CMDLINE_RECORDS] = {};
+static LONG           g_CmdLineRecCount = 0;
+static KSPIN_LOCK     g_CmdLineRecLock;
+
+VOID ImageUtils::SaveKernelCmdLine(ULONG pid, PCUNICODE_STRING cmd)
+{
+	if (!cmd || !cmd->Buffer || !cmd->Length) return;
+	KIRQL irql;
+	KeAcquireSpinLock(&g_CmdLineRecLock, &irql);
+	// Don't double-add the same PID
+	for (LONG i = 0; i < g_CmdLineRecCount; i++) {
+		if (g_CmdLineRecs[i].pid == pid) {
+			KeReleaseSpinLock(&g_CmdLineRecLock, irql);
+			return;
+		}
+	}
+	if (g_CmdLineRecCount < MAX_CMDLINE_RECORDS) {
+		CMDLINE_RECORD* rec = &g_CmdLineRecs[g_CmdLineRecCount++];
+		rec->pid     = pid;
+		rec->checked = FALSE;
+		USHORT chars = cmd->Length / sizeof(WCHAR);
+		if (chars > MAX_CMDLINE_CHARS) chars = MAX_CMDLINE_CHARS;
+		RtlCopyMemory(rec->kernelCmd, cmd->Buffer, chars * sizeof(WCHAR));
+		rec->kernelCmd[chars] = L'\0';
+		rec->kernelLen = chars;
+	}
+	KeReleaseSpinLock(&g_CmdLineRecLock, irql);
+}
+
+VOID ImageUtils::RemoveCmdLineRec(ULONG pid)
+{
+	KIRQL irql;
+	KeAcquireSpinLock(&g_CmdLineRecLock, &irql);
+	for (LONG i = 0; i < g_CmdLineRecCount; i++) {
+		if (g_CmdLineRecs[i].pid == pid) {
+			g_CmdLineRecs[i] = g_CmdLineRecs[--g_CmdLineRecCount];
+			break;
+		}
+	}
+	KeReleaseSpinLock(&g_CmdLineRecLock, irql);
+}
+
+// Must be called while already KeStackAttachProcess'd to proc.
+VOID ImageUtils::CheckCmdLineDiscrepancy(ULONG pid, PEPROCESS proc)
+{
+	// Step 1: grab kernel cmdline copy under spinlock, mark as checked
+	WCHAR  kernelBuf[MAX_CMDLINE_CHARS + 1] = {};
+	USHORT kernelLen = 0;
+
+	KIRQL irql;
+	KeAcquireSpinLock(&g_CmdLineRecLock, &irql);
+	for (LONG i = 0; i < g_CmdLineRecCount; i++) {
+		if (g_CmdLineRecs[i].pid == pid && !g_CmdLineRecs[i].checked) {
+			g_CmdLineRecs[i].checked = TRUE;
+			kernelLen = g_CmdLineRecs[i].kernelLen;
+			RtlCopyMemory(kernelBuf, g_CmdLineRecs[i].kernelCmd, kernelLen * sizeof(WCHAR));
+			break;
+		}
+	}
+	KeReleaseSpinLock(&g_CmdLineRecLock, irql);
+
+	if (kernelLen == 0) return;
+
+	// Step 2: read PEB->ProcessParameters->CommandLine (caller is attached)
+	WCHAR  pebBuf[MAX_CMDLINE_CHARS + 1] = {};
+	USHORT pebLen = 0;
+
+	__try {
+		PPEB peb = (PPEB)PsGetProcessPeb(proc);
+		if (!peb || !MmIsAddressValid(peb)) return;
+		PRTL_USER_PROCESS_PARAMETERS params = peb->ProcessParameters;
+		if (!params || !MmIsAddressValid(params)) return;
+		PWSTR  cmdBuf = params->CommandLine.Buffer;
+		USHORT cmdLen = params->CommandLine.Length;
+		if (!cmdBuf || !cmdLen) return;
+		pebLen = cmdLen / sizeof(WCHAR);
+		if (pebLen > MAX_CMDLINE_CHARS) pebLen = MAX_CMDLINE_CHARS;
+		if (!MmIsAddressValid(cmdBuf)) return;
+		RtlCopyMemory(pebBuf, cmdBuf, pebLen * sizeof(WCHAR));
+		pebBuf[pebLen] = L'\0';
+	} __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+
+	// Step 3: case-insensitive comparison (ASCII range only)
+	BOOLEAN mismatch = (pebLen != kernelLen);
+	if (!mismatch) {
+		for (USHORT i = 0; i < kernelLen && !mismatch; i++) {
+			WCHAR k = kernelBuf[i], p = pebBuf[i];
+			if (k >= L'A' && k <= L'Z') k |= 0x20;
+			if (p >= L'A' && p <= L'Z') p |= 0x20;
+			if (k != p) mismatch = TRUE;
+		}
+	}
+	if (!mismatch) return;
+
+	// Step 4: emit Critical alert with both copies (first 80 chars, narrow)
+	char kernelNarrow[81] = {}, pebNarrow[81] = {};
+	for (int i = 0; i < 80 && i < kernelLen; i++)
+		kernelNarrow[i] = (kernelBuf[i] < 128) ? (char)kernelBuf[i] : '?';
+	for (int i = 0; i < 80 && i < pebLen; i++)
+		pebNarrow[i] = (pebBuf[i] < 128) ? (char)pebBuf[i] : '?';
+
+	char msg[320];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"Argument Spoofing: kernel cmdline != PEB cmdline | "
+		"kernel=[%s] peb=[%s]",
+		kernelNarrow, pebNarrow);
+
+	SIZE_T msgLen = strlen(msg);
+	PKERNEL_STRUCTURED_NOTIFICATION n = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+		POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+	if (!n) return;
+	RtlZeroMemory(n, sizeof(*n));
+	SET_CRITICAL(*n);
+	SET_CALLING_PROC_PID_CHECK(*n);
+	n->pid    = (HANDLE)(ULONG_PTR)pid;
+	n->isPath = FALSE;
+	char* procName = PsGetProcessImageFileName(proc);
+	if (procName) RtlStringCbCopyA(n->procName, sizeof(n->procName), procName);
+	n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen + 1, 'msg');
+	if (n->msg) {
+		RtlCopyMemory(n->msg, msg, msgLen + 1);
+		n->bufSize = (ULONG)(msgLen + 1);
+		if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+			ExFreePool(n->msg);
+			ExFreePool(n);
+		}
+	} else {
+		ExFreePool(n);
+	}
+}
+
 // Case-insensitive suffix check: does buf (len bytes) end with "ntdll.dll"?
 static BOOLEAN IsNtdllPath(const char* buf, SIZE_T len) {
     if (len < 9) return FALSE;
@@ -400,6 +554,13 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                 }
                             }
 
+                            // Argument-spoofing discrepancy check (Adam Chester / CS "argue"):
+                            // compare the kernel's authentic cmdline (saved at CreateProcessNotifyEx)
+                            // with what's now in the PEB, while still attached to the process.
+                            // By the time the first user DLL loads, any parent PEB patch has occurred.
+                            ImageUtils::CheckCmdLineDiscrepancy(
+                                HandleToUlong(ProcessId), targetProcess);
+
                             ExFreePool(charBuffer);
                         }
                         else {
@@ -447,6 +608,7 @@ static pfnPsSetLoadImageNotifyRoutineEx g_pSetImageEx = nullptr;
 VOID ImageUtils::setImageNotificationCallback() {
 
     KeInitializeSpinLock(&g_NtdllPidLock);
+    KeInitializeSpinLock(&g_CmdLineRecLock);
 
     // Prefer Ex (subsystem-aware, Win10 1709+).
     UNICODE_STRING usEx;

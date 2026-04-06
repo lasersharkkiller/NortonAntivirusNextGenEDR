@@ -946,6 +946,100 @@ VOID SyscallsUtils::NtWriteVmHandler(
 	SIZE_T NumberOfBytesToWrite,
 	PSIZE_T NumberOfBytesWritten
 ) {
+	BOOLEAN isSelf = (ProcessHandle == NtCurrentProcess());
+
+	// -----------------------------------------------------------------------
+	// Argument-spoofing / PEB CommandLine tampering (Adam Chester technique).
+	// Catches direct NtWriteVirtualMemory syscalls that bypass the user-mode
+	// WriteProcessMemory hook in HookDll.
+	//
+	// For cross-process writes: attach to target and check whether the write
+	// range overlaps PEB->ProcessParameters->CommandLine.
+	// For same-process writes: check the current process's own PEB.
+	// -----------------------------------------------------------------------
+	if (BaseAddress && NumberOfBytesToWrite > 0) {
+		PEPROCESS targetProcess = NULL;
+		BOOLEAN   attached      = FALSE;
+		KAPC_STATE apcState     = {};
+
+		if (isSelf) {
+			targetProcess = PsGetCurrentProcess();
+		} else {
+			ObReferenceObjectByHandle(ProcessHandle, 0, *PsProcessType,
+			                         UserMode, (PVOID*)&targetProcess, NULL);
+		}
+
+		if (targetProcess) {
+			PPEB peb = (PPEB)PsGetProcessPeb(targetProcess);
+			if (peb) {
+				if (!isSelf) {
+					KeStackAttachProcess(targetProcess, &apcState);
+					attached = TRUE;
+				}
+				BOOLEAN hit = FALSE;
+				__try {
+					if (MmIsAddressValid(peb)) {
+						PRTL_USER_PROCESS_PARAMETERS params = peb->ProcessParameters;
+						if (params && MmIsAddressValid(params)) {
+							PWSTR  cmdBuf    = params->CommandLine.Buffer;
+							USHORT cmdMaxLen = params->CommandLine.MaximumLength;
+							if (cmdBuf && cmdMaxLen > 0 && MmIsAddressValid(cmdBuf)) {
+								BYTE* ws = (BYTE*)BaseAddress;
+								BYTE* we = ws + NumberOfBytesToWrite;
+								BYTE* cs = (BYTE*)cmdBuf;
+								BYTE* ce = cs + cmdMaxLen;
+								if (ws < ce && we > cs) hit = TRUE;
+							}
+						}
+					}
+				} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+				if (attached) KeUnstackDetachProcess(&apcState);
+
+				if (hit) {
+					char spoofMsg[200];
+					PEPROCESS caller = PsGetCurrentProcess();
+					if (isSelf) {
+						RtlStringCbPrintfA(spoofMsg, sizeof(spoofMsg),
+							"PEB CommandLine self-modification (scanner evasion): "
+							"dst=0x%llX size=0x%llX by '%s'",
+							(ULONG64)BaseAddress, (ULONG64)NumberOfBytesToWrite,
+							PsGetProcessImageFileName(caller));
+					} else {
+						RtlStringCbPrintfA(spoofMsg, sizeof(spoofMsg),
+							"Argument Spoofing: NtWriteVirtualMemory targets PEB CommandLine "
+							"of '%s' (pid=%llu) dst=0x%llX size=0x%llX by '%s'",
+							PsGetProcessImageFileName(targetProcess),
+							(ULONG64)PsGetProcessId(targetProcess),
+							(ULONG64)BaseAddress, (ULONG64)NumberOfBytesToWrite,
+							PsGetProcessImageFileName(caller));
+					}
+					SIZE_T msgLen = strlen(spoofMsg);
+					PKERNEL_STRUCTURED_NOTIFICATION n =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+					if (n) {
+						RtlZeroMemory(n, sizeof(*n));
+						SET_CRITICAL(*n);
+						SET_CALLING_PROC_PID_CHECK(*n);
+						n->pid    = PsGetProcessId(caller);
+						n->isPath = FALSE;
+						RtlCopyMemory(n->procName, PsGetProcessImageFileName(caller), 14);
+						n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen + 1, 'msg');
+						if (n->msg) {
+							RtlCopyMemory(n->msg, spoofMsg, msgLen + 1);
+							n->bufSize = (ULONG)(msgLen + 1);
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+								ExFreePool(n->msg);
+								ExFreePool(n);
+							}
+						} else { ExFreePool(n); }
+					}
+				}
+			}
+			if (!isSelf) ObDereferenceObject(targetProcess);
+		}
+	}
 
 	PVOID buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, NumberOfBytesToWrite, 'msg');
 
@@ -954,7 +1048,7 @@ VOID SyscallsUtils::NtWriteVmHandler(
 		RtlCopyMemory(buffer, Buffer, NumberOfBytesToWrite);
 
 		// PE scan: flag cross-process writes that carry a PE header
-		if (ProcessHandle != (HANDLE)-1) {
+		if (!isSelf) {
 			PeScanner::CheckBufferForPeHeader(
 				buffer,
 				NumberOfBytesToWrite,

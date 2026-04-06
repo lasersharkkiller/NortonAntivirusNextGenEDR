@@ -564,13 +564,67 @@ static LPVOID WINAPI Hook_VirtualAllocEx(
         hProcess, lpAddress, dwSize, flAllocationType, flProtect);
 }
 
+// ---------------------------------------------------------------------------
+// Checks whether [lpBaseAddress, lpBaseAddress+nSize) overlaps with the
+// target process's PEB->ProcessParameters->CommandLine buffer.
+//
+// Used to detect argument-spoofing: attacker spawns child with CREATE_SUSPENDED
+// + benign-looking args, then overwrites the PEB CommandLine before resume so
+// the child runs with different args than what NtCreateUserProcess recorded.
+// Also catches self-modification (process hiding its own launch args from
+// scanners that read user-mode PEB).
+//
+// Offsets are 64-bit Windows layout:
+//   PEB+0x20          → ProcessParameters pointer
+//   ProcessParameters+0x72 → CommandLine.MaximumLength (USHORT)
+//   ProcessParameters+0x78 → CommandLine.Buffer (PWSTR)
+// ---------------------------------------------------------------------------
+static BOOL IsWriteTargetingCmdLine(HANDLE hProcess, LPCVOID lpBaseAddress, SIZE_T nSize)
+{
+    typedef NTSTATUS (NTAPI *NtQIP_t)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+    static NtQIP_t fnNtQIP = nullptr;
+    if (!fnNtQIP)
+        fnNtQIP = (NtQIP_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                                           "NtQueryInformationProcess");
+    if (!fnNtQIP) return FALSE;
+
+    PROCESS_BASIC_INFORMATION pbi = {};
+    if (!NT_SUCCESS(fnNtQIP(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), nullptr)))
+        return FALSE;
+
+    BYTE* pebBase = (BYTE*)pbi.PebBaseAddress;
+    if (!pebBase) return FALSE;
+
+    // Read PEB->ProcessParameters pointer (offset 0x20 in 64-bit PEB)
+    ULONG_PTR pParamsAddr = 0;
+    if (!ReadProcessMemory(hProcess, pebBase + 0x20, &pParamsAddr, sizeof(pParamsAddr), nullptr) || !pParamsAddr)
+        return FALSE;
+
+    // Read CommandLine.MaximumLength (offset 0x72) and .Buffer (offset 0x78)
+    USHORT   cmdMaxLen  = 0;
+    ULONG_PTR cmdBufPtr = 0;
+    if (!ReadProcessMemory(hProcess, (BYTE*)pParamsAddr + 0x72, &cmdMaxLen,  sizeof(cmdMaxLen),  nullptr) || !cmdMaxLen)
+        return FALSE;
+    if (!ReadProcessMemory(hProcess, (BYTE*)pParamsAddr + 0x78, &cmdBufPtr,  sizeof(cmdBufPtr),  nullptr) || !cmdBufPtr)
+        return FALSE;
+
+    BYTE* writeStart = (BYTE*)lpBaseAddress;
+    BYTE* writeEnd   = writeStart + nSize;
+    BYTE* cmdStart   = (BYTE*)cmdBufPtr;
+    BYTE* cmdEnd     = cmdStart + cmdMaxLen;
+    return (writeStart < cmdEnd && writeEnd > cmdStart) ? TRUE : FALSE;
+}
+
 static BOOL WINAPI Hook_WriteProcessMemory(
     HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuffer,
     SIZE_T nSize, SIZE_T* lpNumberOfBytesWritten)
 {
     typedef BOOL(WINAPI* Fn)(HANDLE, LPVOID, LPCVOID, SIZE_T, SIZE_T*);
-    DWORD targetPid = GetProcessId(hProcess);
+    DWORD targetPid    = GetProcessId(hProcess);
+    DWORD effectivePid = targetPid ? targetPid : g_selfPid;  // pseudo-handle (-1) → self
+
     if (targetPid && targetPid != g_selfPid) {
+        // Cross-process write — always suspicious
         const char* tag = "";
         if (nSize >= 2 && lpBuffer) {
             __try { if (*(const WORD*)lpBuffer == 0x5A4D) tag = " [MZ]"; }
@@ -582,6 +636,20 @@ static BOOL WINAPI Hook_WriteProcessMemory(
             targetPid, lpBaseAddress, (ULONG64)nSize, tag);
         SendHookEvent("Critical", "WriteProcessMemory", targetPid, det);
     }
+
+    // Argument spoofing / self-hiding: does this write land on the target's
+    // PEB CommandLine buffer?  Fires for both cross-process and self-writes.
+    if (nSize > 0 && IsWriteTargetingCmdLine(hProcess, lpBaseAddress, nSize)) {
+        char spoof[192];
+        _snprintf_s(spoof, sizeof(spoof), _TRUNCATE,
+            "%s: write targets PEB CommandLine of pid=%lu dst=%p size=0x%llX",
+            (effectivePid == g_selfPid)
+                ? "PEB CommandLine self-modification (scanner evasion)"
+                : "Argument spoofing: cross-process PEB CommandLine overwrite",
+            effectivePid, lpBaseAddress, (ULONG64)nSize);
+        SendHookEvent("Critical", "WriteProcessMemory", effectivePid, spoof);
+    }
+
     return ((Fn)GetCallThrough(IDX_WRITEPROCESSMEMORY))(
         hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesWritten);
 }

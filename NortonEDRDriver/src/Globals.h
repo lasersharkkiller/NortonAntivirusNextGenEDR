@@ -1125,6 +1125,16 @@ public:
 	VOID InitializeHashQueueMutex() {
 		KeInitializeMutex(&g_HashQueueMutex, 0);
 	}
+
+	// Argument-spoofing discrepancy detection (Adam Chester / CS "argue" technique).
+	// SaveKernelCmdLine: called at CreateProcessNotifyEx time to record the kernel's
+	//   authentic copy before any parent can patch the child's PEB.
+	// RemoveCmdLineRec:  called at process exit to free the table slot.
+	// CheckCmdLineDiscrepancy: called from ImageLoadNotifyRoutine while already
+	//   KeStackAttachProcess'd — reads the PEB copy and compares; emits Critical if they differ.
+	static VOID SaveKernelCmdLine(ULONG pid, PCUNICODE_STRING cmd);
+	static VOID RemoveCmdLineRec(ULONG pid);
+	static VOID CheckCmdLineDiscrepancy(ULONG pid, PEPROCESS proc);
 };
 
 class ThreadUtils : public ProcessUtils {
