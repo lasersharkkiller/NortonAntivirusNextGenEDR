@@ -1345,6 +1345,17 @@ public:
     );
 };
 
+// ---------------------------------------------------------------------------
+// AntiTamper — periodic integrity re-verification and driver self-protection.
+// Init() must be called once from DriverEntry after all other subsystems are up.
+// Cleanup() must be called from UnloadDriver before any other teardown.
+// ---------------------------------------------------------------------------
+class AntiTamper {
+public:
+    static VOID Init(PDRIVER_OBJECT driverObject, BufferQueue* queue);
+    static VOID Cleanup();
+};
+
 class HookDetector {
 
     static PSSDT_BASELINE_ENTRY ssdtBaseline;

@@ -46,6 +46,7 @@ VOID UnloadDriver(PDRIVER_OBJECT DriverObject) {
 
 	g_callbackObjects->unsetNotificationsGlobal();
 
+	AntiTamper::Cleanup();
 	DeceptionEngine::Cleanup();
 	FsFilter::Cleanup();
 	EtwProvider::Cleanup();
@@ -385,6 +386,11 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	} else {
 		DbgPrint("[-] Failed to allocate WdfTcpipUtils\n");
 	}
+
+	// Anti-tamper: bump driver refcount and start periodic integrity re-checks.
+	// Must be initialized after HookDetector (which establishes the SSDT baseline)
+	// so the first periodic check has a valid snapshot to compare against.
+	AntiTamper::Init(DriverObject, g_hashQueue);
 
 	// Initialize deception engine — honeypot registry keys and file traps.
 	// Non-fatal: the driver functions normally if SECURITY hive is inaccessible.

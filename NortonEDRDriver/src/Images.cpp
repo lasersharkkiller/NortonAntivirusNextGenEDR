@@ -190,6 +190,63 @@ VOID ImageUtils::CheckCmdLineDiscrepancy(ULONG pid, PEPROCESS proc)
 	}
 }
 
+// ---------------------------------------------------------------------------
+// LOLDriver runtime detection.
+//
+// The ELAM driver blocks known-bad drivers at boot.  This catches drivers
+// loaded post-boot via NtLoadDriver (which fires an image-load notification
+// with ProcessId == 0, i.e., kernel image).  We check the basename of each
+// kernel image against a list of known vulnerable/malicious driver basenames.
+//
+// Sources: loldrivers.io, MSRC driver blocklist, public Sigma rules.
+// ---------------------------------------------------------------------------
+
+static const char* kLolDriverNames[] = {
+    // Exploit / privilege escalation
+    "winring0x64.sys",    // WinRing0 — CPUID/MSR abuse, used by ransomware
+    "winring0.sys",
+    "rtcore64.sys",       // MSI Afterburner — arbitrary kernel R/W (CVE-2019-16098)
+    "rtcore32.sys",
+    "dbutil_2_3.sys",     // Dell DBUtil — local priv-esc (CVE-2021-21551)
+    "asrdrv103.sys",      // ASRock — arbitrary kernel R/W (CVE-2020-15368)
+    "gdrv.sys",           // GIGABYTE — arbitrary kernel R/W
+    "speedfan.sys",       // SpeedFan — arbitrary port I/O
+    "physmem.sys",        // WinPmem — physical memory access
+    "rwdrv.sys",          // RWEverything — arbitrary kernel R/W
+    "elby clonecd.sys",   // CloneCD — SCSI passthrough
+    "kprocesshacker.sys", // Process Hacker — kernel object access
+    "procexp152.sys",     // Process Explorer (old signed) — kernel handle access
+    "nvflash.sys",        // NVIDIA flash — ring-0 access
+    "atillk64.sys",       // ATI Tray Tools — arbitrary kernel R/W
+    "bs_hwmio64_w10.sys", // BattlEye — abused version
+    "mhyprot2.sys",       // miHoYo anti-cheat — arbitrary R/W, used by ransomware
+    "zemana.sys",         // Zemana AntiMalware driver — abused for termination
+    "asio.sys",           // ASIO — abused for ring-0 access
+    nullptr
+};
+
+// Case-insensitive check: does charBuf contain the given needle as a path component?
+static BOOLEAN IsLolDriverName(const char* charBuf, SIZE_T charLen, const char* needle)
+{
+    SIZE_T needleLen = 0;
+    while (needle[needleLen]) needleLen++;
+    if (charLen < needleLen) return FALSE;
+
+    // Search from the right — we want the filename component match
+    for (SIZE_T i = 0; i <= charLen - needleLen; i++) {
+        BOOLEAN match = TRUE;
+        for (SIZE_T j = 0; j < needleLen; j++) {
+            if ((charBuf[i + j] | 0x20) != needle[j]) { match = FALSE; break; }
+        }
+        if (match) {
+            // Ensure we matched at a path separator boundary (or start of string)
+            if (i == 0 || charBuf[i - 1] == '\\' || charBuf[i - 1] == '/')
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 // Case-insensitive suffix check: does buf (len bytes) end with "ntdll.dll"?
 static BOOLEAN IsNtdllPath(const char* buf, SIZE_T len) {
     if (len < 9) return FALSE;
@@ -213,6 +270,65 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
 
     if (ImageInfo->ImageSize == 0) {
         DbgPrint("[-] Image size is zero\n");
+        return;
+    }
+
+    // -----------------------------------------------------------------
+    // LOLDriver runtime check — fires for every kernel image load
+    // (ProcessId == NULL means the image is loading into kernel space).
+    // Matches the filename component of FullImageName against the
+    // known-vulnerable driver basename list.
+    // -----------------------------------------------------------------
+    if (ProcessId == NULL) {
+        // Convert full image path to narrow for matching
+        ULONG charBufSz = FullImageName->Length / sizeof(WCHAR) + 1;
+        char* charBuf = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, charBufSz, 'loln');
+        if (charBuf) {
+            UNICODE_STRING us;
+            RtlInitUnicodeString(&us, FullImageName->Buffer);
+            ANSI_STRING ansi;
+            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, &us, TRUE))) {
+                RtlCopyMemory(charBuf, ansi.Buffer, ansi.Length);
+                charBuf[ansi.Length] = '\0';
+                SIZE_T cbLen = (SIZE_T)ansi.Length;
+                RtlFreeAnsiString(&ansi);
+
+                for (int li = 0; kLolDriverNames[li]; li++) {
+                    if (IsLolDriverName(charBuf, cbLen, kLolDriverNames[li])) {
+                        char lolMsg[200];
+                        RtlStringCbPrintfA(lolMsg, sizeof(lolMsg),
+                            "LOLDriver loaded: %s — known vulnerable/malicious kernel driver",
+                            kLolDriverNames[li]);
+                        SIZE_T lolLen = strlen(lolMsg) + 1;
+
+                        PKERNEL_STRUCTURED_NOTIFICATION lolNotif =
+                            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                                POOL_FLAG_NON_PAGED,
+                                sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'ldrn');
+                        if (lolNotif) {
+                            RtlZeroMemory(lolNotif, sizeof(*lolNotif));
+                            SET_CRITICAL(*lolNotif);
+                            SET_IMAGE_LOAD_PATH_CHECK(*lolNotif);
+                            lolNotif->pid    = PsGetProcessId(PsGetCurrentProcess());
+                            lolNotif->isPath = FALSE;
+                            lolNotif->msg = (char*)ExAllocatePool2(
+                                POOL_FLAG_NON_PAGED, lolLen, 'ldrm');
+                            lolNotif->bufSize = (ULONG)lolLen;
+                            if (lolNotif->msg) {
+                                RtlCopyMemory(lolNotif->msg, lolMsg, lolLen);
+                                if (!CallbackObjects::GetNotifQueue()->Enqueue(lolNotif)) {
+                                    ExFreePool(lolNotif->msg);
+                                    ExFreePool(lolNotif);
+                                }
+                            } else { ExFreePool(lolNotif); }
+                        }
+                        break; // one alert per image load
+                    }
+                }
+            }
+            ExFreePool(charBuf);
+        }
+        // Kernel image — no further per-process analysis needed.
         return;
     }
 

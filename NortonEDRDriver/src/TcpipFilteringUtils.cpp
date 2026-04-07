@@ -1,6 +1,101 @@
 #include "Globals.h"
 
 // ---------------------------------------------------------------------------
+// Kerberoasting / DCSync rate-tracking table.
+//
+// Kerberoasting: an attacker issues many AS-REQ / TGS-REQ packets (port 88)
+// for service accounts in rapid succession to request Kerberos tickets.
+// Legitimate processes issue a handful of Kerberos packets per minute;
+// tooling like Rubeus / Impacket typically issues 10–200+ per minute.
+// We track outbound port-88 connections per PID and alert when the count
+// exceeds KERB_ALERT_THRESHOLD within the rolling KERB_WINDOW_MS window.
+//
+// DCSync: mimikatz/secretsdump uses MS-DRSR (LDAP/LDAPS/GC ports 389, 636,
+// 3268, 3269) from a non-domain-controller machine to replicate credentials.
+// We flag when a non-System process opens connections to LDAP/GC ports since
+// normal workstations should only contact DC LDAP via authenticated sessions
+// established by lsass — not arbitrary user processes.
+// ---------------------------------------------------------------------------
+
+#define KERB_TRACK_MAX     64
+#define KERB_ALERT_THRESHOLD 15       // connections to port 88 within window
+#define KERB_WINDOW_MS       30000LL  // 30-second rolling window (100ns units = * 10000)
+
+typedef struct _KERB_TRACK_ENTRY {
+    UINT64   Pid;
+    LONG     Count;
+    LONGLONG WindowStart; // KeQueryInterruptTime() units (100 ns)
+    BOOLEAN  Alerted;
+} KERB_TRACK_ENTRY;
+
+static KSPIN_LOCK      g_KerbLock;
+static KERB_TRACK_ENTRY g_KerbSlots[KERB_TRACK_MAX];
+static LONG            g_KerbInitDone = 0;
+
+static VOID KerbTrackInit()
+{
+    if (InterlockedCompareExchange(&g_KerbInitDone, 1, 0) == 0) {
+        RtlZeroMemory(g_KerbSlots, sizeof(g_KerbSlots));
+        KeInitializeSpinLock(&g_KerbLock);
+    }
+}
+
+// Returns TRUE if this PID has exceeded the Kerberos connection threshold
+// and has not yet been alerted in the current window.
+static BOOLEAN KerbCheckAndCount(UINT64 pid)
+{
+    LONGLONG now = (LONGLONG)KeQueryInterruptTime();
+    LONGLONG windowNs = KERB_WINDOW_MS * 10000LL; // ms → 100ns units
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_KerbLock, &irql);
+
+    // Find or create slot for this PID
+    INT freeSlot = -1;
+    for (INT i = 0; i < KERB_TRACK_MAX; i++) {
+        if (g_KerbSlots[i].Pid == pid) {
+            // Existing slot — check window expiry
+            if ((now - g_KerbSlots[i].WindowStart) > windowNs) {
+                // Window expired — reset
+                g_KerbSlots[i].WindowStart = now;
+                g_KerbSlots[i].Count       = 1;
+                g_KerbSlots[i].Alerted     = FALSE;
+                KeReleaseSpinLock(&g_KerbLock, irql);
+                return FALSE;
+            }
+            g_KerbSlots[i].Count++;
+            BOOLEAN alert = (!g_KerbSlots[i].Alerted &&
+                             g_KerbSlots[i].Count >= KERB_ALERT_THRESHOLD);
+            if (alert) g_KerbSlots[i].Alerted = TRUE;
+            KeReleaseSpinLock(&g_KerbLock, irql);
+            return alert;
+        }
+        if (freeSlot < 0 && g_KerbSlots[i].Pid == 0)
+            freeSlot = i;
+    }
+
+    // New PID — allocate a slot
+    if (freeSlot >= 0) {
+        g_KerbSlots[freeSlot].Pid         = pid;
+        g_KerbSlots[freeSlot].Count       = 1;
+        g_KerbSlots[freeSlot].WindowStart = now;
+        g_KerbSlots[freeSlot].Alerted     = FALSE;
+    }
+    // Table full: silently drop — 64 concurrent PIDs is ample
+    KeReleaseSpinLock(&g_KerbLock, irql);
+    return FALSE;
+}
+
+// Port helpers
+static BOOLEAN IsKerberosPort(UINT16 port) { return port == 88 || port == 750; }
+static BOOLEAN IsLdapPort(UINT16 port) {
+    return port == 389 || port == 636 || port == 3268 || port == 3269;
+}
+
+// System processes that legitimately contact LDAP/Kerberos ports
+static BOOLEAN IsSystemProcess(UINT64 pid) { return pid == 0 || pid == 4; }
+
+// ---------------------------------------------------------------------------
 // Configurable blocked-port list (written from user-mode via IOCTL).
 // ---------------------------------------------------------------------------
 static KSPIN_LOCK g_WfpBlocklistLock;
@@ -109,11 +204,111 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
 
     // Suppress lateral-movement-port alerts for System (PID 4) and Idle (PID 0)
     // — they legitimately use SMB/DCOM/RDP at the OS level.
-    if (suspicious && (pid == 0 || pid == 4)) {
+    if (suspicious && IsSystemProcess(pid)) {
         suspicious = FALSE;
     }
 
     classifyOut->actionType = blocked ? FWP_ACTION_BLOCK : FWP_ACTION_PERMIT;
+
+    NotifQueue* queue = CallbackObjects::GetNotifQueue();
+
+    // -----------------------------------------------------------------
+    // Kerberoasting detection — high-rate outbound Kerberos (port 88).
+    // Legitimate processes issue at most a few TGS-REQs per minute.
+    // Rubeus / Impacket GetUserSPNs issue hundreds; threshold is 15/30s.
+    // Suppress for System/lsass (pid 0/4) which do normal Kerberos auth.
+    // -----------------------------------------------------------------
+    if (IsKerberosPort(remotePort) && !IsSystemProcess(pid) && queue) {
+        if (KerbCheckAndCount(pid)) {
+            char kMsg[200] = {};
+            RtlStringCchPrintfA(kMsg, sizeof(kMsg),
+                "Kerberoasting: pid=%llu issued >=%d Kerberos (port 88) connections "
+                "within 30 s — possible AS-REQ/TGS-REQ spray (Rubeus/Impacket)",
+                pid, KERB_ALERT_THRESHOLD);
+
+            PKERNEL_STRUCTURED_NOTIFICATION kNotif =
+                (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krbr');
+            if (kNotif) {
+                RtlZeroMemory(kNotif, sizeof(*kNotif));
+                SET_CRITICAL(*kNotif);
+                SET_NETWORK_CHECK(*kNotif);
+                kNotif->pid            = (HANDLE)(ULONG_PTR)pid;
+                kNotif->scoopedAddress = (ULONG64)(ULONG_PTR)remoteAddress;
+                kNotif->isPath         = FALSE;
+                SIZE_T kLen = strlen(kMsg) + 1;
+                kNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, kLen, 'krbm');
+                kNotif->bufSize = (ULONG)kLen;
+                if (kNotif->msg) {
+                    RtlCopyMemory(kNotif->msg, kMsg, kLen);
+                    if (!queue->Enqueue(kNotif)) {
+                        ExFreePool(kNotif->msg);
+                        ExFreePool(kNotif);
+                    }
+                } else { ExFreePool(kNotif); }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // DCSync detection — outbound LDAP/LDAPS/GC from a non-system process.
+    //
+    // The MS-DRSR replication protocol rides over LDAP (389/636) and
+    // the Global Catalog ports (3268/3269).  Legitimate workstations do
+    // not initiate LDAP replication; only domain controllers do.
+    // Flag any non-system, non-lsass process contacting these ports as a
+    // potential DCSync / secretsdump / mimikatz DC-replication attack.
+    //
+    // Note: lsass (PID varies) does use LDAP for normal auth queries but
+    // NOT for GetNCChanges replication. The HookDll-level LsaIAmABackupDC
+    // and DRSGetNCChanges hooks are the primary signal; this is backstop.
+    // -----------------------------------------------------------------
+    if (IsLdapPort(remotePort) && !IsSystemProcess(pid) && queue) {
+        // Retrieve process name for the alert — kernel at DPC level so
+        // we use the PID we got from WFP metadata and a quick lookup.
+        // PsLookupProcessByProcessId is safe at DISPATCH_LEVEL.
+        PEPROCESS ldapProc = nullptr;
+        char ldapProcName[16] = "<unknown>";
+        if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &ldapProc))) {
+            char* n = PsGetProcessImageFileName(ldapProc);
+            if (n) RtlCopyMemory(ldapProcName, n, 15);
+            ObDereferenceObject(ldapProc);
+        }
+
+        // Allow lsass — it legitimately binds to LDAP for authentication.
+        BOOLEAN isLsass = (RtlCompareMemory(ldapProcName, "lsass.exe", 9) == 9);
+        if (!isLsass) {
+            char dcMsg[240] = {};
+            RtlStringCchPrintfA(dcMsg, sizeof(dcMsg),
+                "DCSync/LDAP: pid=%llu (%s) connecting to LDAP port %u "
+                "-> %u.%u.%u.%u — possible DCSync/secretsdump replication",
+                pid, ldapProcName, remotePort,
+                FORMAT_ADDR(remoteAddress));
+
+            PKERNEL_STRUCTURED_NOTIFICATION dcNotif =
+                (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'dcnt');
+            if (dcNotif) {
+                RtlZeroMemory(dcNotif, sizeof(*dcNotif));
+                SET_CRITICAL(*dcNotif);
+                SET_NETWORK_CHECK(*dcNotif);
+                dcNotif->pid            = (HANDLE)(ULONG_PTR)pid;
+                dcNotif->scoopedAddress = (ULONG64)(ULONG_PTR)remoteAddress;
+                dcNotif->isPath         = FALSE;
+                RtlCopyMemory(dcNotif->procName, ldapProcName, 15);
+                SIZE_T dcLen = strlen(dcMsg) + 1;
+                dcNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, dcLen, 'dcmg');
+                dcNotif->bufSize = (ULONG)dcLen;
+                if (dcNotif->msg) {
+                    RtlCopyMemory(dcNotif->msg, dcMsg, dcLen);
+                    if (!queue->Enqueue(dcNotif)) {
+                        ExFreePool(dcNotif->msg);
+                        ExFreePool(dcNotif);
+                    }
+                } else { ExFreePool(dcNotif); }
+            }
+        }
+    }
 
     // Skip enqueueing routine Info-level connections to avoid queue saturation.
     // Always surface blocked and suspicious connections.
@@ -124,7 +319,6 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
         return;
     }
 
-    NotifQueue* queue = CallbackObjects::GetNotifQueue();
     if (!queue) return;
 
     const char* tag = blocked ? " [BLOCKED]" : " [SUSPICIOUS PORT]";
@@ -268,6 +462,7 @@ VOID WdfTcpipUtils::UnitializeWfp() {
 NTSTATUS WdfTcpipUtils::InitWfp() {
 
     KeInitializeSpinLock(&g_WfpBlocklistLock);
+    KerbTrackInit();
 
     NTSTATUS status = FwpmEngineOpen0(NULL, RPC_C_AUTHN_WINNT, NULL, NULL, &EngineHandle);
     if (!NT_SUCCESS(status)) goto failure;

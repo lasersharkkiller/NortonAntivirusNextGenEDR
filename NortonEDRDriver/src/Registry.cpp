@@ -3,18 +3,90 @@
 
 LARGE_INTEGER RegistryUtils::cookie = { 0 };
 
+// Registry paths associated with persistence, firmware abuse, and supply-chain
+// staging.  Grouped by threat category for clarity.
+static const WCHAR* kPersistencePaths[] = {
+    // --- Classic autorun ---
+    L"\\CurrentVersion\\Run",
+    L"\\CurrentVersion\\RunOnce",
+    L"\\CurrentVersion\\RunOnce\\Setup",
+    L"\\CurrentVersion\\RunServices",
+    L"\\CurrentVersion\\RunServicesOnce",
+
+    // --- Boot-execute / session manager (firmware / pre-OS persistence) ---
+    // BootExecute is run before the Win32 subsystem starts — FancyBear / VPNFilter pattern.
+    L"\\Session Manager\\BootExecute",
+    // PendingFileRenameOperations is abused to drop malware on next reboot.
+    L"\\Session Manager\\PendingFileRenameOperations",
+    L"\\Session Manager\\PendingFileRenameOperations2",
+    // SetupExecute and Execute are early-boot execution points.
+    L"\\Session Manager\\SetupExecute",
+    L"\\Session Manager\\Execute",
+
+    // --- Service image path (new service installation = lateral movement / persistence) ---
+    L"\\Services\\",   // broad — catches new service registry key creation
+
+    // --- Image File Execution Options (IFEO) debugger hijack, Sticky Keys) ---
+    L"Image File Execution Options",
+
+    // --- AppInit_DLLs (deprecated but still active on non-SB systems) ---
+    L"\\Windows NT\\CurrentVersion\\Windows\\AppInit_DLLs",
+
+    // --- Winlogon shell / userinit hijack ---
+    L"\\Winlogon\\Shell",
+    L"\\Winlogon\\Userinit",
+    L"\\Winlogon\\Notify",
+
+    // --- COM object hijack (persistence via InprocServer32) ---
+    // Too broad to include globally; covered by LOLBin/supply-chain pattern instead.
+
+    // --- Boot configuration / EFI (firmware tampering, BlackLotus) ---
+    // HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot is read-only from usermode
+    // normally; any write attempt is suspicious.
+    L"\\Control\\SecureBoot",
+    // EFI variables via registry path (Windows exposes some EFI vars here)
+    L"\\Firmware\\ESRT",
+
+    // --- Scheduled task COM / legacy task paths ---
+    L"\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Schedule",
+
+    // --- WMI subscription persistence (fileless) ---
+    // WMI event subscriptions write to this hive path.
+    L"\\Microsoft\\WBEM",
+
+    nullptr
+};
+
+// Per-path alert severity (mirrors position in kPersistencePaths).
+// TRUE = Critical, FALSE = Warning.
+static const BOOLEAN kPersistenceCritical[] = {
+    FALSE, FALSE, FALSE, FALSE, FALSE, // Classic autorun — Warning
+    TRUE,  TRUE,  TRUE,  TRUE,  TRUE,  // Boot-execute / SessionMgr — Critical
+    TRUE,                              // Services — Critical
+    TRUE,                              // IFEO — Critical
+    TRUE,                              // AppInit_DLLs — Critical
+    TRUE,  TRUE,  TRUE,               // Winlogon — Critical
+    TRUE,  TRUE,                       // SecureBoot / EFI — Critical
+    FALSE,                             // Scheduled tasks — Warning
+    FALSE,                             // WMI — Warning
+};
+
 BOOLEAN RegistryUtils::isRegistryPersistenceBehavior(
 	PUNICODE_STRING regPath
 ) {
-
-	if (UnicodeStringContains(regPath, L"\\CurrentVersion\\Run")
-		|| UnicodeStringContains(regPath, L"\\CurrentVersion\\RunOnce")
-		|| UnicodeStringContains(regPath, L"\\CurrentVersion\\RunOnce\\Setup")
-		) {
-
-		return TRUE;
+	for (int i = 0; kPersistencePaths[i]; i++) {
+		if (UnicodeStringContains(regPath, kPersistencePaths[i]))
+			return TRUE;
 	}
-	
+	return FALSE;
+}
+
+// Returns the severity for a matched persistence path (TRUE = Critical).
+static BOOLEAN PersistencePathIsCritical(PUNICODE_STRING regPath) {
+	for (int i = 0; kPersistencePaths[i]; i++) {
+		if (UnicodeStringContains(regPath, kPersistencePaths[i]))
+			return kPersistenceCritical[i];
+	}
 	return FALSE;
 }
 
@@ -33,6 +105,8 @@ NTSTATUS RegistryUtils::RegOpNotifyCallback(
 	REG_NOTIFY_CLASS regNotifyClass = (REG_NOTIFY_CLASS)(ULONG_PTR)Arg1;
 
 	switch (regNotifyClass) {
+	case RegNtPreSetValueKey:
+	// fall through — same analysis applies to value writes as to key creates
 	case RegNtPreCreateKeyEx:
 
 		queryKeyInfo = (PREG_POST_OPERATION_INFORMATION)Arg2;
@@ -71,32 +145,52 @@ NTSTATUS RegistryUtils::RegOpNotifyCallback(
 
 			if (isRegistryPersistenceBehavior((PUNICODE_STRING)regPath)) {
 
-				PKERNEL_STRUCTURED_NOTIFICATION kernelNotif = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+				BOOLEAN isCritical = PersistencePathIsCritical((PUNICODE_STRING)regPath);
+
+				// Build a descriptive message that includes the key path (first 120 chars).
+				char pathNarrow[121] = {};
+				if (regPath->Buffer && regPath->Length > 0) {
+					USHORT chars = regPath->Length / sizeof(WCHAR);
+					if (chars > 120) chars = 120;
+					for (USHORT ci = 0; ci < chars; ci++)
+						pathNarrow[ci] = (regPath->Buffer[ci] < 128)
+						                 ? (char)regPath->Buffer[ci] : '?';
+				}
+
+				char alertMsg[200];
+				RtlStringCbPrintfA(alertMsg, sizeof(alertMsg),
+					"%s Registry persistence/boot key write: %s",
+					isCritical ? "CRITICAL" : "Warning",
+					pathNarrow);
+				SIZE_T alertLen = strlen(alertMsg) + 1;
+
+				PKERNEL_STRUCTURED_NOTIFICATION kernelNotif =
+					(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+						POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
 
 				if (kernelNotif) {
+					RtlZeroMemory(kernelNotif, sizeof(*kernelNotif));
 
-					char* msg = "Persistence-Like Registry peration";
-
-					SET_WARNING(*kernelNotif);
+					if (isCritical) { SET_CRITICAL(*kernelNotif); }
+					else            { SET_WARNING(*kernelNotif);  }
 					SET_SYSCALL_CHECK(*kernelNotif);
 
-					kernelNotif->bufSize = sizeof(msg);
-					kernelNotif->isPath = FALSE;
-					kernelNotif->pid = PsGetProcessId(IoGetCurrentProcess());
-					kernelNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, strlen(msg) + 1, 'msg');
+					kernelNotif->bufSize = (ULONG)alertLen;
+					kernelNotif->isPath  = FALSE;
+					kernelNotif->pid     = PsGetProcessId(IoGetCurrentProcess());
+					kernelNotif->msg     = (char*)ExAllocatePool2(
+						POOL_FLAG_NON_PAGED, alertLen, 'msg');
 
-					char procName[15];
-					RtlCopyMemory(procName, PsGetProcessImageFileName(IoGetCurrentProcess()), 15);
-					RtlCopyMemory(kernelNotif->procName, procName, 15);
+					RtlCopyMemory(kernelNotif->procName,
+					              PsGetProcessImageFileName(IoGetCurrentProcess()), 14);
 
 					if (kernelNotif->msg) {
-						RtlCopyMemory(kernelNotif->msg, msg, strlen(msg) + 1);
+						RtlCopyMemory(kernelNotif->msg, alertMsg, alertLen);
 						if (!CallbackObjects::GetNotifQueue()->Enqueue(kernelNotif)) {
 							ExFreePool(kernelNotif->msg);
 							ExFreePool(kernelNotif);
 						}
-					}
-					else {
+					} else {
 						ExFreePool(kernelNotif);
 					}
 				}
