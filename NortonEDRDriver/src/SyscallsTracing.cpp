@@ -2193,6 +2193,18 @@ VOID SyscallsUtils::NtQuerySystemInformationHandler(ULONG SystemInformationClass
 	BOOLEAN     critical = FALSE;
 
 	switch (SystemInformationClass) {
+	case 16:   // SystemHandleInformation — enumerate all system handles
+		msg      = "Handle recon: NtQuerySystemInformation(16=HandleInfo) "
+		           "— enumerating all system handles (handle theft recon; handlekatz/Mimikatz)";
+		critical = FALSE;
+		break;
+
+	case 64:   // SystemExtendedHandleInformation — extended handle enum with access masks
+		msg      = "Handle recon: NtQuerySystemInformation(64=ExtendedHandleInfo) "
+		           "— enumerating all handles with access mask details (modern handle theft recon)";
+		critical = FALSE;
+		break;
+
 	case 57:   // SystemObjectTypeInformation — callback list enumeration
 		msg      = "EDR recon: NtQuerySystemInformation(57=ObjectTypeInfo) "
 		           "— mapping ObCallback lists (EDRSandblast/Terminator)";
