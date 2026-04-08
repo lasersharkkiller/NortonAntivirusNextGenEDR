@@ -12,6 +12,10 @@ ObCallbackSnapshot   HookDetector::s_ProcessCbSnapshot = {};
 ObCallbackSnapshot   HookDetector::s_ThreadCbSnapshot  = {};
 BOOLEAN              HookDetector::s_CbSnapshotTaken   = FALSE;
 
+PsCallbackSnapshot   HookDetector::s_ProcNotifyCbSnap   = {};
+PsCallbackSnapshot   HookDetector::s_ThreadNotifyCbSnap = {};
+PsCallbackSnapshot   HookDetector::s_ImageNotifyCbSnap  = {};
+
 // ---------------------------------------------------------------------------
 // Private helper: classify the first bytes of a function as a hook type.
 // ---------------------------------------------------------------------------
@@ -459,6 +463,20 @@ VOID HookDetector::CheckAltSyscallHandlerIntegrity(BufferQueue* bufQueue) {
 #define OBJECT_TYPE_CALLBACKLIST_OFFSET    0xC8u
 #define CALLBACK_ENTRY_PREOPERATION_OFFSET 0x28u
 
+// EX_CALLBACK and EX_CALLBACK_ROUTINE_BLOCK (Ps*Notify arrays)
+// EX_CALLBACK_ROUTINE_BLOCK.Function is at offset 8 on x64 (after EX_RUNDOWN_REF).
+// Stable since Vista; verified through Win11 24H2.
+#define EX_CALLBACK_FUNCTION_OFFSET   0x08u
+// EX_FAST_REF low 4 bits are ref count on x64 — mask them to get the block pointer.
+#define EX_FAST_REF_MASK              0xFull
+
+static inline PVOID ExCallbackGetFunction(PVOID fastRefValue) {
+	PVOID block = (PVOID)((ULONG_PTR)fastRefValue & ~EX_FAST_REF_MASK);
+	if (!block || !MmIsAddressValid(block)) return nullptr;
+	PVOID* fnSlot = (PVOID*)((PUCHAR)block + EX_CALLBACK_FUNCTION_OFFSET);
+	return MmIsAddressValid(fnSlot) ? *fnSlot : nullptr;
+}
+
 // Collect all PreOp pointers currently in a CallbackList into dst[].
 // Returns number of entries written (capped at OB_CALLBACK_SNAPSHOT_MAX).
 static ULONG CollectCallbackPreOps(POBJECT_TYPE objType, PVOID* dst, ULONG dstMax)
@@ -525,6 +543,82 @@ static VOID EmitObAlert(BufferQueue* bufQueue, const char* msg, PVOID addr)
 }
 
 // ---------------------------------------------------------------------------
+// FindPsNotifyArrayBase — locate PspCreate*NotifyRoutine[] via LEA scan.
+//
+// Scans the first 0x200 bytes of setFn (a Ps*Set*NotifyRoutine* function) for LEA
+// [RIP+disp32] instructions (any GPR destination). For each candidate resolved
+// address, validates by scanning up to 64 slots looking for ourCallback.
+// Returns array base if found, else null.
+// ---------------------------------------------------------------------------
+
+static const UCHAR g_LeaSecondBytes[] = { 0x05,0x0D,0x15,0x1D,0x25,0x2D,0x35,0x3D };
+
+static PVOID FindPsNotifyArrayBase(PVOID setFn, PVOID ourCallback)
+{
+	if (!setFn || !MmIsAddressValid(setFn)) return nullptr;
+
+	PUCHAR p = (PUCHAR)setFn;
+	__try {
+		for (ULONG i = 0; i < 0x200 - 7; i++) {
+			// REX.W prefix (0x48 or 0x4C) + LEA opcode (0x8D) + ModRM
+			if ((p[i] != 0x48 && p[i] != 0x4C) || p[i+1] != 0x8D)
+				continue;
+			BOOLEAN validModRM = FALSE;
+			for (ULONG b = 0; b < ARRAYSIZE(g_LeaSecondBytes); b++)
+				if (p[i+2] == g_LeaSecondBytes[b]) { validModRM = TRUE; break; }
+			if (!validModRM) continue;
+
+			// Decode 4-byte RIP-relative displacement
+			LONG disp = *(LONG*)(p + i + 3);
+			PVOID candidate = (PVOID)(p + i + 7 + disp);  // RIP = instr end = p+i+7
+			if (!MmIsAddressValid(candidate)) continue;
+
+			// Validate: walk up to 64 EX_CALLBACK slots (8 bytes each) looking for ourCallback
+			PUCHAR arr = (PUCHAR)candidate;
+			for (ULONG slot = 0; slot < 64; slot++) {
+				PVOID* slotPtr = (PVOID*)(arr + slot * 8);
+				if (!MmIsAddressValid(slotPtr)) break;
+				PVOID fn = ExCallbackGetFunction(*slotPtr);
+				if (fn == ourCallback) return candidate;  // confirmed
+			}
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+
+	return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// EmitPsCallbackAlert — emit a CRITICAL alert for Ps*Notify callback removal.
+// ---------------------------------------------------------------------------
+
+static VOID EmitPsCallbackAlert(BufferQueue* bufQueue, const char* msg, PVOID addr)
+{
+	SIZE_T msgLen = strlen(msg) + 1;
+	PKERNEL_STRUCTURED_NOTIFICATION notif =
+		(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+			POOL_FLAG_NON_PAGED,
+			sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'pscb');
+	if (!notif) return;
+	RtlZeroMemory(notif, sizeof(*notif));
+	SET_CRITICAL(*notif);
+	SET_PS_CALLBACK_CHECK(*notif);
+	notif->scoopedAddress = (ULONG64)addr;
+	RtlCopyMemory(notif->procName, "NortonEDR", 9);
+	notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'psmg');
+	notif->bufSize = (ULONG)msgLen;
+	if (notif->msg) {
+		RtlCopyMemory(notif->msg, msg, msgLen);
+		if (!bufQueue->Enqueue(notif)) {
+			ExFreePool(notif->msg);
+			ExFreePool(notif);
+		}
+	} else {
+		ExFreePool(notif);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TakeObCallbackSnapshot — called once after ObRegisterCallbacks succeeds.
 // Records every PreOp pointer currently registered on PsProcessType and
 // PsThreadType.  This becomes the whitelist for periodic integrity checks.
@@ -554,6 +648,103 @@ VOID HookDetector::TakeObCallbackSnapshot()
     }
 
     s_CbSnapshotTaken = TRUE;
+}
+
+// ---------------------------------------------------------------------------
+// TakePsCallbackSnapshot — called once after all Ps* callbacks are registered.
+// Locates PspCreate*NotifyRoutine[] arrays via LEA scan of Ps*Set*NotifyRoutine*
+// functions and records our callback function pointers.
+// ---------------------------------------------------------------------------
+
+VOID HookDetector::TakePsCallbackSnapshot()
+{
+	const struct {
+		const WCHAR*       setFnName;    // PsSet*NotifyRoutine* to scan
+		const WCHAR*       setFnFallback; // older API if Ex not found (image only)
+		PVOID              ourCallback;  // our registered function pointer
+		PsCallbackSnapshot* snap;
+	} desc[] = {
+		{ L"PsSetCreateProcessNotifyRoutineEx", nullptr,
+			ProcessUtils::s_NotifyFn,  &s_ProcNotifyCbSnap   },
+		{ L"PsSetCreateThreadNotifyRoutineEx",  nullptr,
+			ThreadUtils::s_NotifyFn,   &s_ThreadNotifyCbSnap },
+		{ L"PsSetLoadImageNotifyRoutineEx",     L"PsSetLoadImageNotifyRoutine",
+			ImageUtils::s_NotifyFn,    &s_ImageNotifyCbSnap  },
+	};
+
+	for (int i = 0; i < 3; i++) {
+		UNICODE_STRING uName;
+		RtlInitUnicodeString(&uName, desc[i].setFnName);
+		PVOID setFn = MmGetSystemRoutineAddress(&uName);
+
+		if (!setFn && desc[i].setFnFallback) {
+			RtlInitUnicodeString(&uName, desc[i].setFnFallback);
+			setFn = MmGetSystemRoutineAddress(&uName);
+		}
+
+		desc[i].snap->ourCallback = desc[i].ourCallback;
+		desc[i].snap->valid       = FALSE;
+
+		if (!setFn) {
+			DbgPrint("[-] HookDetector: %ws not found — Ps notify snap skipped\n",
+				desc[i].setFnName);
+			continue;
+		}
+
+		PVOID arr = FindPsNotifyArrayBase(setFn, desc[i].ourCallback);
+		if (arr) {
+			desc[i].snap->arrayBase = arr;
+			desc[i].snap->valid     = TRUE;
+			DbgPrint("[+] HookDetector: Ps notify array for %ws at %p\n",
+				desc[i].setFnName, arr);
+		} else {
+			DbgPrint("[-] HookDetector: LEA scan failed for %ws\n", desc[i].setFnName);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CheckPsCallbackIntegrity — verify our Ps*Notify callbacks are still registered.
+// Called on each periodic scan; emits CRITICAL alert if any callback missing.
+// ---------------------------------------------------------------------------
+
+VOID HookDetector::CheckPsCallbackIntegrity(BufferQueue* bufQueue)
+{
+	const struct {
+		const char*         label;
+		PsCallbackSnapshot* snap;
+	} checks[] = {
+		{ "Process",     &s_ProcNotifyCbSnap   },
+		{ "Thread",      &s_ThreadNotifyCbSnap },
+		{ "ImageLoad",   &s_ImageNotifyCbSnap  },
+	};
+
+	for (int i = 0; i < 3; i++) {
+		PsCallbackSnapshot* snap = checks[i].snap;
+		if (!snap->valid || !snap->arrayBase || !snap->ourCallback) continue;
+
+		BOOLEAN found = FALSE;
+		PUCHAR arr    = (PUCHAR)snap->arrayBase;
+
+		__try {
+			for (ULONG slot = 0; slot < 64 && !found; slot++) {
+				PVOID* slotPtr = (PVOID*)(arr + slot * 8);
+				if (!MmIsAddressValid(slotPtr)) break;
+				PVOID fn = ExCallbackGetFunction(*slotPtr);
+				if (fn == snap->ourCallback) found = TRUE;
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+
+		if (!found) {
+			char msg[128];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"ANTI-TAMPER: Ps%sNotify callback unregistered from internal array — "
+				"EDR telemetry silenced (PsRemoveCreate*NotifyRoutine or direct patch)",
+				checks[i].label);
+			EmitPsCallbackAlert(bufQueue, msg, snap->ourCallback);
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +849,7 @@ VOID HookDetector::RunAllHookChecks(
     BOOLEAN etw  = CheckEtwHooks(bufQueue);
     CheckAltSyscallHandlerIntegrity(bufQueue);
     CheckObCallbackIntegrity(bufQueue);
+    CheckPsCallbackIntegrity(bufQueue);
 
     DbgPrint("[*] HookDetector results — SSDT=%lu Inline=%lu EAT=%lu ETW=%d\n",
         ssdt, inl, eat, (int)etw);

@@ -958,6 +958,9 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 	}
 }
 
+// Exposed for Ps*Notify integrity check in HookDetection
+PVOID ProcessUtils::s_NotifyFn = (PVOID)CreateProcessNotifyEx;
+
 // ---------------------------------------------------------------------------
 // PsSetCreateProcessNotifyRoutineEx2 — Win10 1703+.
 // Extends Ex with PsCreateProcessNotifySubsystems (=0) which additionally

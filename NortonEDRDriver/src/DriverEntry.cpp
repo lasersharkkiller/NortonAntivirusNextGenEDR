@@ -365,6 +365,10 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	// that the periodic check has a valid whitelist of known-good PreOp pointers.
 	HookDetector::TakeObCallbackSnapshot();
 
+	// Snapshot PspCreate*NotifyRoutine[] arrays immediately after our Ps* callbacks
+	// are registered (inside setupNotificationsGlobal() above).
+	HookDetector::TakePsCallbackSnapshot();
+
 	EtwProvider::Init();
 
 	// Take SSDT baseline snapshot and run full hook scan

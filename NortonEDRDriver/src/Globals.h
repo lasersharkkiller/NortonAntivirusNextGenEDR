@@ -733,6 +733,7 @@ class SyscallsUtils {
 	static ULONG NtCreateProcessExId;          // Variable — legacy section-based process creation
 	static ULONG NtCreateProcessId;            // Variable — even older legacy API (same technique)
 	static ULONG NtQuerySystemInformationId;   // Variable — EDR callback enumeration recon
+	static ULONG NtSetInformationProcessId;    // Variable — PPL-strip detection (ProcessProtectionLevel = 0x3D)
 
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
@@ -1139,6 +1140,9 @@ public:
     // Called from NtCreateSectionHandler when SEC_IMAGE + file handle are both present.
     static VOID TrackImageSectionFile(PFILE_OBJECT FileObject);
     static VOID UntrackImageSectionFile(PFILE_OBJECT FileObject);
+
+    // Pointer to CreateProcessNotifyEx callback — exposed for Ps*Notify integrity check.
+    static PVOID s_NotifyFn;
 };
 
 // ---------------------------------------------------------------------------
@@ -1236,6 +1240,9 @@ public:
 	static VOID SaveKernelCmdLine(ULONG pid, PCUNICODE_STRING cmd);
 	static VOID RemoveCmdLineRec(ULONG pid);
 	static VOID CheckCmdLineDiscrepancy(ULONG pid, PEPROCESS proc);
+
+	// Pointer to ImageLoadNotifyRoutine callback — exposed for Ps*Notify integrity check.
+	static PVOID s_NotifyFn;
 };
 
 class ThreadUtils : public ProcessUtils {
@@ -1279,9 +1286,12 @@ public:
 	);
 
 	VOID setThreadNotificationCallback();
-	
+
 	VOID unsetThreadNotificationCallback();
-	
+
+	// Pointer to CreateThreadNotifyRoutine callback — exposed for Ps*Notify integrity check.
+	static PVOID s_NotifyFn;
+
 };
 
 class RegistryUtils {
@@ -1396,6 +1406,15 @@ struct ObCallbackSnapshot {
     ULONG count;
 };
 
+// Snapshot of Ps*Notify callback arrays (PspCreateProcessNotifyRoutine[], etc).
+// Locates the array via LEA scan of PsSet*NotifyRoutine* and records our callback pointer.
+// Used to detect PsRemoveCreate*NotifyRoutine or direct memory patch attacks.
+struct PsCallbackSnapshot {
+    PVOID  arrayBase;    // base of PspCreate*NotifyRoutine[64]
+    PVOID  ourCallback;  // our registered function pointer (what to look for)
+    BOOLEAN valid;       // FALSE if LEA scan failed — check is skipped
+};
+
 class HookDetector {
 
     static PSSDT_BASELINE_ENTRY ssdtBaseline;
@@ -1408,6 +1427,12 @@ class HookDetector {
     static ObCallbackSnapshot   s_ProcessCbSnapshot;
     static ObCallbackSnapshot   s_ThreadCbSnapshot;
     static BOOLEAN              s_CbSnapshotTaken;
+
+    // Snapshots of PspCreate*NotifyRoutine[] arrays.  Locate via LEA scan, record our
+    // callback pointers.  Checked periodically to detect removal/patching.
+    static PsCallbackSnapshot   s_ProcNotifyCbSnap;
+    static PsCallbackSnapshot   s_ThreadNotifyCbSnap;
+    static PsCallbackSnapshot   s_ImageNotifyCbSnap;
 
     static UCHAR DetectInlineHookType(PVOID functionAddress);
     static PVOID ResolveHookTarget(PVOID functionAddress, UCHAR hookType);
@@ -1433,6 +1458,14 @@ public:
     // since the snapshot.  Catches both unlinking (EDRSandblast) and rogue
     // callback registration (offensive PreOp to strip rights from defenders).
     static VOID     CheckObCallbackIntegrity(BufferQueue* bufQueue);
+
+    // Locate PspCreate*NotifyRoutine[] arrays via LEA scan of the Ps*Set* functions and
+    // record our callback function pointers.  Call once after all Ps callbacks registered.
+    static VOID     TakePsCallbackSnapshot();
+
+    // Verify our process/thread/image callbacks are still present in the internal arrays.
+    // Fires CRITICAL alert if any are missing.  Added to RunAllHookChecks().
+    static VOID     CheckPsCallbackIntegrity(BufferQueue* bufQueue);
 
     static VOID RunAllHookChecks(
         PFUNCTION_MAP exportsMap,

@@ -217,6 +217,9 @@ VOID ThreadUtils::CreateThreadNotifyRoutine(
 	}
 }
 
+// Exposed for Ps*Notify integrity check in HookDetection
+PVOID ThreadUtils::s_NotifyFn = (PVOID)CreateThreadNotifyRoutine;
+
 // ---------------------------------------------------------------------------
 // PsSetCreateThreadNotifyRoutineEx — Win10 1703+.
 // PsCreateThreadNotifySubsystems (=0) extends coverage to Pico process

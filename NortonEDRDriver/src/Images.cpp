@@ -709,6 +709,9 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
     }
 }
 
+// Exposed for Ps*Notify integrity check in HookDetection
+PVOID ImageUtils::s_NotifyFn = (PVOID)ImageLoadNotifyRoutine;
+
 // ---------------------------------------------------------------------------
 // PsSetLoadImageNotifyRoutineEx — Win10 1709+.
 // Flags = 0 covers standard image loads including Pico process image maps.

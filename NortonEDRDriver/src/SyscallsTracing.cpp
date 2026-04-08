@@ -9,6 +9,9 @@
 #define THREAD_QUERY_INFORMATION  0x0040
 #endif
 
+// Process information classes
+#define PROCESS_PROTECTION_LEVEL_CLASS  0x3Du   // ProcessProtectionLevel (61)
+
 PSSDT_TABLE SyscallsUtils::ssdtTable = nullptr;
 PFUNCTION_MAP SyscallsUtils::exportsMap = nullptr;
 ZwSetInformationProcess SyscallsUtils::pZwSetInformationProcess = nullptr;
@@ -51,6 +54,7 @@ ULONG SyscallsUtils::NtRollbackTransactionId = 0;
 ULONG SyscallsUtils::NtCreateProcessExId = 0;
 ULONG SyscallsUtils::NtCreateProcessId = 0;
 ULONG SyscallsUtils::NtQuerySystemInformationId = 0;
+ULONG SyscallsUtils::NtSetInformationProcessId = 0;
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -568,6 +572,15 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		// Class = RCX (arg1)
 		NtQuerySystemInformationHandler((ULONG)trapFrame->Rcx);
 	}
+	else if (NtSetInformationProcessId != 0 && id == NtSetInformationProcessId) {
+		// NtSetInformationProcess(ProcessHandle, ProcessInformationClass, Info, InfoLen)
+		// RCX=handle  RDX=class  R8=info ptr  R9=len
+		NtSetInformationProcessHandler(
+			(HANDLE)trapFrame->Rcx,
+			(ULONG)trapFrame->Rdx,
+			(PVOID)trapFrame->R8,
+			(ULONG)trapFrame->R9);
+	}
 
 	return TRUE;
 }
@@ -864,6 +877,10 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtQuerySysInfo;
 	RtlInitUnicodeString(&usNtQuerySysInfo, L"NtQuerySystemInformation");
 	NtQuerySystemInformationId = getSSNByName(ssdtTable, &usNtQuerySysInfo, exportsMap);
+
+	UNICODE_STRING usNtSetInfoProcess;
+	RtlInitUnicodeString(&usNtSetInfoProcess, L"NtSetInformationProcess");
+	NtSetInformationProcessId = getSSNByName(ssdtTable, &usNtSetInfoProcess, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -1871,6 +1888,71 @@ VOID SyscallsUtils::NtQuerySystemInformationHandler(ULONG SystemInformationClass
 	if (prot && prot->Level != 0) return;
 
 	EmitSyscallNotif(0, msg, proc, nullptr, critical);
+}
+
+// NtSetInformationProcess — detect PPL stripping attacks (Gabriel Landau / PPLdump).
+//
+// Attackers call NtSetInformationProcess(ProcessProtectionLevel=0x3D, ..., Level=0) to strip
+// PPL from an unrelated process, silencing its EDR callbacks. This handler fires on any
+// user-mode (non-PPL) caller attempting to modify ProcessProtectionLevel on any process.
+VOID SyscallsUtils::NtSetInformationProcessHandler(
+	HANDLE ProcessHandle,
+	ULONG  ProcessInformationClass,
+	PVOID  ProcessInformation,
+	ULONG  ProcessInformationLength)
+{
+	UNREFERENCED_PARAMETER(ProcessInformation);
+	UNREFERENCED_PARAMETER(ProcessInformationLength);
+
+	// Only care about ProcessProtectionLevel (class 0x3D = 61)
+	if (ProcessInformationClass != PROCESS_PROTECTION_LEVEL_CLASS)
+		return;
+
+	PEPROCESS caller = IoGetCurrentProcess();
+
+	// Skip if caller is PPL or kernel — same guard used everywhere in the driver
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0)
+		return;
+
+	// Resolve target process from handle
+	PEPROCESS target    = nullptr;
+	BOOLEAN   ownedRef  = FALSE;
+
+	if (ProcessHandle == NtCurrentProcess()) {
+		target    = caller;
+		ObReferenceObject(target);
+		ownedRef  = TRUE;
+	} else {
+		NTSTATUS st = ObReferenceObjectByHandle(
+			ProcessHandle,
+			PROCESS_QUERY_INFORMATION,
+			*PsProcessType,
+			UserMode,
+			(PVOID*)&target,
+			nullptr);
+		if (NT_SUCCESS(st)) ownedRef = TRUE;
+	}
+
+	char msg[128];
+	if (target) {
+		char targetName[15] = {};
+		PUCHAR imgName = PsGetProcessImageFileName(target);
+		if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
+
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"ANTI-TAMPER: PPL-strip attempt via NtSetInformationProcess"
+			"(ProcessProtectionLevel) on '%s' — Gabriel Landau / PPLdump technique",
+			targetName);
+	} else {
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"ANTI-TAMPER: PPL-strip attempt via NtSetInformationProcess"
+			"(ProcessProtectionLevel) — target handle unresolvable");
+	}
+
+	EmitSyscallNotif(0, msg, caller, target, TRUE /* critical */);
+
+	if (ownedRef && target) ObDereferenceObject(target);
 }
 
 // NtProtectVirtualMemory — detect ntdll/DLL stomping and cross-process protection changes.
