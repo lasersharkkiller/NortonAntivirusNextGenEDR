@@ -293,6 +293,10 @@ public:
 	// Catches reflective/manual-map DLL injection. Must be called at PASSIVE_LEVEL.
 	static VOID ScanForHiddenMappings(PEPROCESS process, BufferQueue* queue);
 
+	// Check if an address falls in a private, executable VAD region (shellcode/RWX alloc).
+	// Used to detect indirect syscalls originating from attacker code rather than DLLs.
+	static BOOLEAN IsAddressInPrivateExecVad(PRTL_BALANCED_NODE root, ULONG64 address);
+
 };
 
 class StackUtils {
@@ -739,6 +743,8 @@ class SyscallsUtils {
 	static ULONG NtSetInformationThreadId;    // Variable — token impersonation detection
 	static ULONG NtTraceControlId;            // Variable — ETW manipulation detection
 	static ULONG NtCreateNamedPipeFileId;     // Variable — named pipe C2 detection
+	static ULONG NtOpenThreadId;              // Variable — thread hijack / context scrape detection
+	static ULONG NtFlushInstructionCacheId;   // Variable — post-injection cache flush detection
 
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
@@ -990,6 +996,21 @@ public:
 	// Named pipe C2 / lateral movement detection
 	static VOID NtCreateNamedPipeFileHandler(
 		PVOID ObjectAttributes
+	);
+
+	// Thread hijack / context scrape detection
+	static VOID NtOpenThreadHandler(
+		HANDLE      ThreadHandle,
+		ACCESS_MASK DesiredAccess,
+		PVOID       ObjectAttributes,
+		PCLIENT_ID  ClientId
+	);
+
+	// Post-injection cache flush detection
+	static VOID NtFlushInstructionCacheHandler(
+		HANDLE ProcessHandle,
+		PVOID  BaseAddress,
+		SIZE_T Length
 	);
 
 	static VOID NtProtectVirtualMemoryHandler(

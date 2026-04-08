@@ -60,6 +60,8 @@ ULONG SyscallsUtils::NtDebugActiveProcessId = 0;       // Resolve dynamically
 ULONG SyscallsUtils::NtSetInformationThreadId = 0;     // Resolve dynamically
 ULONG SyscallsUtils::NtTraceControlId = 0;             // Resolve dynamically
 ULONG SyscallsUtils::NtCreateNamedPipeFileId = 0;      // Resolve dynamically
+ULONG SyscallsUtils::NtOpenThreadId = 0;               // Resolve dynamically
+ULONG SyscallsUtils::NtFlushInstructionCacheId = 0;    // Resolve dynamically
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -625,6 +627,25 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		PVOID objAttr = (PVOID)trapFrame->Rdx;
 		NtCreateNamedPipeFileHandler(objAttr);
 	}
+	else if (NtOpenThreadId != 0 && id == NtOpenThreadId) {
+		// NtOpenThread(ThreadHandle*, DesiredAccess, ObjectAttributes, ClientId)
+		// RCX=handle ptr, RDX=access, R8=ObjAttr, R9=ClientId
+		NtOpenThreadHandler(
+			(HANDLE)trapFrame->Rcx,
+			(ACCESS_MASK)trapFrame->Rdx,
+			(PVOID)trapFrame->R8,
+			(PCLIENT_ID)trapFrame->R9
+		);
+	}
+	else if (NtFlushInstructionCacheId != 0 && id == NtFlushInstructionCacheId) {
+		// NtFlushInstructionCache(ProcessHandle, BaseAddress, Length)
+		// RCX=proc, RDX=base, R8=len
+		NtFlushInstructionCacheHandler(
+			(HANDLE)trapFrame->Rcx,
+			(PVOID)trapFrame->Rdx,
+			(SIZE_T)trapFrame->R8
+		);
+	}
 
 	return TRUE;
 }
@@ -671,32 +692,72 @@ BOOLEAN SyscallsUtils::isSyscallDirect(ULONG64 Rip, char* syscallName)
 			isSyscallDirect = isAddressOutOfSystem32Ntdll;
 		}
 
-		if (isSyscallDirect && op == 0xC3) {
+		if (isSyscallDirect) {
+			// Tier 1 (WARNING): any direct syscall outside ntdll
+			char msgBuf[200];
+			RtlStringCbPrintfA(msgBuf, sizeof(msgBuf),
+				"Direct syscall: '%s' return address 0x%llX outside ntdll — "
+				"possible SysWhispers / Hell's Gate / manual stub",
+				syscallName, Rip);
 
-			PKERNEL_STRUCTURED_NOTIFICATION kernelNotif = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+			PKERNEL_STRUCTURED_NOTIFICATION notif1 = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+				POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
 
-			if (kernelNotif) {
+			if (notif1) {
+				RtlZeroMemory(notif1, sizeof(*notif1));
+				SET_WARNING(*notif1);
+				SET_SYSCALL_CHECK(*notif1);
+				notif1->pid = PsGetProcessId(IoGetCurrentProcess());
+				notif1->isPath = FALSE;
+				RtlCopyMemory(notif1->procName, PsGetProcessImageFileName(IoGetCurrentProcess()), 14);
 
-				char* msg = "NT Syscall did not came from Ntdll";
+				SIZE_T msgLen = strlen(msgBuf) + 1;
+				notif1->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+				notif1->bufSize = (ULONG)msgLen;
 
-				SET_WARNING(*kernelNotif);
-				SET_SYSCALL_CHECK(*kernelNotif);
-
-				kernelNotif->bufSize = sizeof(msg);
-				kernelNotif->isPath = FALSE;
-				kernelNotif->pid = PsGetProcessId(IoGetCurrentProcess());
-				kernelNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, strlen(msg) + 1, 'msg');
-
-				RtlCopyMemory(kernelNotif->procName, PsGetProcessImageFileName(IoGetCurrentProcess()), 15);
-
-				if (kernelNotif->msg) {
-					RtlCopyMemory(kernelNotif->msg, msg, strlen(msg) + 1);
-					if (!CallbackObjects::GetNotifQueue()->Enqueue(kernelNotif)) {
-						ExFreePool(kernelNotif->msg);
-						ExFreePool(kernelNotif);
+				if (notif1->msg) {
+					RtlCopyMemory(notif1->msg, msgBuf, msgLen);
+					if (!CallbackObjects::GetNotifQueue()->Enqueue(notif1)) {
+						ExFreePool(notif1->msg);
+						ExFreePool(notif1);
 					}
 				} else {
-					ExFreePool(kernelNotif);
+					ExFreePool(notif1);
+				}
+			}
+
+			// Tier 2 (CRITICAL): SYSCALL;RET trampoline outside ntdll
+			if (op == 0xC3) {
+				char msgBuf2[200];
+				RtlStringCbPrintfA(msgBuf2, sizeof(msgBuf2),
+					"Direct syscall trampoline: '%s' SYSCALL;RET stub at 0x%llX "
+					"outside ntdll — classic SysWhispers1 pattern",
+					syscallName, Rip);
+
+				PKERNEL_STRUCTURED_NOTIFICATION notif2 = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+
+				if (notif2) {
+					RtlZeroMemory(notif2, sizeof(*notif2));
+					SET_CRITICAL(*notif2);
+					SET_SYSCALL_CHECK(*notif2);
+					notif2->pid = PsGetProcessId(IoGetCurrentProcess());
+					notif2->isPath = FALSE;
+					RtlCopyMemory(notif2->procName, PsGetProcessImageFileName(IoGetCurrentProcess()), 14);
+
+					SIZE_T msgLen2 = strlen(msgBuf2) + 1;
+					notif2->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen2, 'msg');
+					notif2->bufSize = (ULONG)msgLen2;
+
+					if (notif2->msg) {
+						RtlCopyMemory(notif2->msg, msgBuf2, msgLen2);
+						if (!CallbackObjects::GetNotifQueue()->Enqueue(notif2)) {
+							ExFreePool(notif2->msg);
+							ExFreePool(notif2);
+						}
+					} else {
+						ExFreePool(notif2);
+					}
 				}
 			}
 		}
@@ -705,6 +766,88 @@ BOOLEAN SyscallsUtils::isSyscallDirect(ULONG64 Rip, char* syscallName)
 	}
 
 	return FALSE;
+}
+
+// ---------------------------------------------------------------------------
+// isSyscallIndirect — detects shellcode-originated indirect syscalls.
+//
+// When RIP is inside ntdll, we inspect the return address at RSP. For a
+// legitimate kernel32 → ntdll call, this address is inside a file-backed DLL.
+// For SysWhispers3 / Tartarus Gate (JMP into ntdll's SYSCALL gadget), the
+// return address is in a private executable VAD (attacker's shellcode).
+//
+// Only fires for processes without CET (CET shadow stack already catches Type 2).
+// ---------------------------------------------------------------------------
+BOOLEAN SyscallsUtils::isSyscallIndirect(ULONG64 Rsp)
+{
+	PEPROCESS curproc = IoGetCurrentProcess();
+	PPS_PROTECTION prot = PsGetProcessProtection(curproc);
+	if (prot && prot->Level != 0) return FALSE;
+
+	// Skip if CET is active — shadow stack check already covers this case.
+	if (stackUtils && stackUtils->isCETEnabled()) return FALSE;
+
+	// Read the immediate return address at RSP.
+	PVOID retAddr = nullptr;
+	KAPC_STATE apcState;
+	KeStackAttachProcess(curproc, &apcState);
+
+	__try {
+		PULONG_PTR pRsp = (PULONG_PTR)Rsp;
+		if (MmIsAddressValid(pRsp)) {
+			retAddr = (PVOID)*pRsp;
+		}
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		retAddr = nullptr;
+	}
+
+	BOOLEAN result = FALSE;
+	if (retAddr) {
+		RTL_AVL_TREE* root = (RTL_AVL_TREE*)
+			((PUCHAR)curproc + OffsetsMgt::GetOffsets()->VadRoot);
+
+		result = VadUtils::IsAddressInPrivateExecVad(
+			(PRTL_BALANCED_NODE)root, (ULONG64)retAddr);
+
+		if (result) {
+			char msgBuf[200];
+			RtlStringCbPrintfA(msgBuf, sizeof(msgBuf),
+				"Indirect syscall: return address 0x%llX is in private executable "
+				"region — shellcode jump-to-ntdll-syscall-gadget (SysWhispers3/Tartarus)",
+				(ULONG64)retAddr);
+
+			PKERNEL_STRUCTURED_NOTIFICATION notif =
+				(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED,
+					sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'isci');
+
+			if (notif) {
+				RtlZeroMemory(notif, sizeof(*notif));
+				SET_WARNING(*notif);
+				SET_SYSCALL_CHECK(*notif);
+				notif->pid    = PsGetProcessId(curproc);
+				notif->isPath = FALSE;
+				RtlCopyMemory(notif->procName, PsGetProcessImageFileName(curproc), 14);
+
+				SIZE_T msgLen = strlen(msgBuf) + 1;
+				notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'iscm');
+				notif->bufSize = (ULONG)msgLen;
+
+				if (notif->msg) {
+					RtlCopyMemory(notif->msg, msgBuf, msgLen);
+					if (!CallbackObjects::GetNotifQueue()->Enqueue(notif)) {
+						ExFreePool(notif->msg);
+						ExFreePool(notif);
+					}
+				} else {
+					ExFreePool(notif);
+				}
+			}
+		}
+	}
+
+	KeUnstackDetachProcess(&apcState);
+	return result;
 }
 
 VOID SyscallsUtils::UnInitAltSyscallHandler() {
@@ -941,6 +1084,14 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtCreateNamedPipeFile;
 	RtlInitUnicodeString(&usNtCreateNamedPipeFile, L"NtCreateNamedPipeFile");
 	NtCreateNamedPipeFileId = getSSNByName(ssdtTable, &usNtCreateNamedPipeFile, exportsMap);
+
+	UNICODE_STRING usNtOpenThread;
+	RtlInitUnicodeString(&usNtOpenThread, L"NtOpenThread");
+	NtOpenThreadId = getSSNByName(ssdtTable, &usNtOpenThread, exportsMap);
+
+	UNICODE_STRING usNtFlushIC;
+	RtlInitUnicodeString(&usNtFlushIC, L"NtFlushInstructionCache");
+	NtFlushInstructionCacheId = getSSNByName(ssdtTable, &usNtFlushIC, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -2312,6 +2463,115 @@ VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes)
 			"NtCreateNamedPipeFile: non-system process creating named pipe — possible C2 transport");
 		EmitSyscallNotif(0, msg, caller, nullptr, FALSE); // WARNING
 	}
+}
+
+// ---------------------------------------------------------------------------
+// NtOpenThread — detect thread hijacking and context scraping.
+//
+// Attacker opens a handle to a thread in a sensitive process (lsass, csrss, etc.)
+// with THREAD_SET_CONTEXT or THREAD_GET_CONTEXT to perform thread hijacking or
+// credential scraping via context manipulation.
+// ---------------------------------------------------------------------------
+
+VOID SyscallsUtils::NtOpenThreadHandler(
+	HANDLE      ThreadHandle,
+	ACCESS_MASK DesiredAccess,
+	PVOID       ObjectAttributes,
+	PCLIENT_ID  ClientId)
+{
+	UNREFERENCED_PARAMETER(ThreadHandle);
+	UNREFERENCED_PARAMETER(ObjectAttributes);
+
+	PPS_PROTECTION prot = PsGetProcessProtection(IoGetCurrentProcess());
+	if (prot && prot->Level != 0) return;
+
+	// Rights that enable thread hijacking / context scraping
+	const ACCESS_MASK kDangerMask =
+		THREAD_SET_CONTEXT |
+		THREAD_GET_CONTEXT |
+		THREAD_SUSPEND_RESUME;
+
+	if (!(DesiredAccess & kDangerMask)) return;
+
+	// Resolve target thread's owning process
+	PEPROCESS targetProc = nullptr;
+	if (ClientId) {
+		__try {
+			HANDLE tid = ClientId->UniqueThread;
+			PETHREAD th = nullptr;
+			if (NT_SUCCESS(PsLookupThreadByThreadId(tid, &th))) {
+				targetProc = IoThreadToProcess(th);
+				ObReferenceObject(targetProc);
+				ObDereferenceObject(th);
+			}
+		} __except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+
+	BOOLEAN isSensitive = targetProc ? ObjectUtils::IsSensitiveProcess(targetProc) : FALSE;
+	BOOLEAN isLsass     = targetProc ? ObjectUtils::IsLsass(targetProc)            : FALSE;
+
+	char msgBuf[220];
+	RtlStringCbPrintfA(msgBuf, sizeof(msgBuf),
+		"NtOpenThread: dangerous rights (0x%08lX) requested on %s thread — "
+		"thread hijack / context scrape",
+		DesiredAccess,
+		isLsass     ? "lsass"     :
+		isSensitive ? "sensitive OS process" :
+		              "foreign process");
+
+	EmitSyscallNotif(
+		targetProc ? (ULONG64)PsGetProcessId(targetProc) : 0,
+		msgBuf,
+		IoGetCurrentProcess(),
+		targetProc,
+		isSensitive);
+
+	if (targetProc) ObDereferenceObject(targetProc);
+}
+
+// ---------------------------------------------------------------------------
+// NtFlushInstructionCache — detect post-injection cache flush.
+//
+// After injecting shellcode via NtWriteVirtualMemory, attackers call
+// NtFlushInstructionCache to ensure the CPU instruction cache is updated.
+// A cross-process flush is a strong post-injection indicator.
+// ---------------------------------------------------------------------------
+
+VOID SyscallsUtils::NtFlushInstructionCacheHandler(
+	HANDLE ProcessHandle,
+	PVOID  BaseAddress,
+	SIZE_T Length)
+{
+	// Only flag cross-process flushes (NtCurrentProcess() == (HANDLE)-1)
+	if (ProcessHandle == NtCurrentProcess()) return;
+	if ((LONG_PTR)ProcessHandle == -1) return;
+
+	PPS_PROTECTION prot = PsGetProcessProtection(IoGetCurrentProcess());
+	if (prot && prot->Level != 0) return;
+
+	PEPROCESS targetProc = nullptr;
+	NTSTATUS  st = ObReferenceObjectByHandle(ProcessHandle, PROCESS_QUERY_INFORMATION,
+		                *PsProcessType, KernelMode, (PVOID*)&targetProc, nullptr);
+
+	char msgBuf[220];
+	if (NT_SUCCESS(st)) {
+		BOOLEAN wholeProcFlush = (BaseAddress == nullptr && Length == 0);
+		RtlStringCbPrintfA(msgBuf, sizeof(msgBuf),
+			"NtFlushInstructionCache: cross-process flush on '%s' (pid=%llu) "
+			"base=0x%llX len=0x%llX — post-injection indicator%s",
+			PsGetProcessImageFileName(targetProc),
+			(ULONG64)PsGetProcessId(targetProc),
+			(ULONG64)BaseAddress, (ULONG64)Length,
+			wholeProcFlush ? " [full process flush]" : "");
+		ObDereferenceObject(targetProc);
+	} else {
+		RtlStringCbPrintfA(msgBuf, sizeof(msgBuf),
+			"NtFlushInstructionCache: cross-process flush (handle resolution failed) "
+			"base=0x%llX len=0x%llX — post-injection indicator",
+			(ULONG64)BaseAddress, (ULONG64)Length);
+	}
+
+	EmitSyscallNotif(0, msgBuf, IoGetCurrentProcess(), nullptr, FALSE);
 }
 
 // NtProtectVirtualMemory — detect ntdll/DLL stomping and cross-process protection changes.

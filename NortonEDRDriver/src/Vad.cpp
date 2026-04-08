@@ -519,6 +519,46 @@ VOID VadUtils::ScanForHiddenMappings(PEPROCESS process, BufferQueue* queue) {
     KeUnstackDetachProcess(&apc);
 }
 
+// ---------------------------------------------------------------------------
+// IsAddressInPrivateExecVad — detect if an address falls in a private,
+// executable VAD region (shellcode).  Used to identify indirect syscalls
+// originating from attacker-controlled memory rather than loaded DLLs.
+// ---------------------------------------------------------------------------
+
+static BOOLEAN WalkVadForPrivateExec(RTL_BALANCED_NODE* node, ULONG64 address)
+{
+    if (!node || !MmIsAddressValid(node)) return FALSE;
+
+    __try {
+        PMMVAD vad  = (PMMVAD)node;
+        ULONG64 startVa = (ULONG64)vad->StartingVpn << 12;
+        ULONG64 endVa   = ((ULONG64)vad->EndingVpn << 12) | 0xFFF;
+
+        if (address >= startVa && address <= endVa) {
+            return vad->u.VadFlags.PrivateMemory &&
+                   (vad->u.VadFlags.Protection == MM_EXECUTE          ||
+                    vad->u.VadFlags.Protection == MM_EXECUTE_READ     ||
+                    vad->u.VadFlags.Protection == MM_EXECUTE_READWRITE ||
+                    vad->u.VadFlags.Protection == MM_EXECUTE_WRITECOPY);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+
+    // Not in this node — recurse left and right
+    if (WalkVadForPrivateExec(((PMMVAD)node)->LeftChild ?
+            (RTL_BALANCED_NODE*)((PMMVAD)node)->LeftChild : nullptr, address))
+        return TRUE;
+
+    return WalkVadForPrivateExec(((PMMVAD)node)->RightChild ?
+            (RTL_BALANCED_NODE*)((PMMVAD)node)->RightChild : nullptr, address);
+}
+
+BOOLEAN VadUtils::IsAddressInPrivateExecVad(PRTL_BALANCED_NODE root, ULONG64 address)
+{
+    if (!root || address < 0x10000 || address >= 0x7FFF00000000ULL) return FALSE;
+    return WalkVadForPrivateExec(root, address);
+}
 
 //VOID VadUtils::exploreVadTreeAndVerifyLdrIngtegrity(
 //	RTL_BALANCED_NODE* node,
