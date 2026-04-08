@@ -78,6 +78,51 @@ static VOID EmitAntitamperAlert(const char* msg)
 }
 
 // ---------------------------------------------------------------------------
+// EmitKernelCheckAlert — like EmitAntitamperAlert but sets a method4 bit.
+// Used for DKOM, DSE, and unsigned module detections.
+// ---------------------------------------------------------------------------
+
+typedef VOID (*PFN_SET_METHOD4)(PKERNEL_STRUCTURED_NOTIFICATION);
+
+static VOID SetDkomBit(PKERNEL_STRUCTURED_NOTIFICATION n) { SET_DKOM_CHECK(*n); }
+static VOID SetDseBit (PKERNEL_STRUCTURED_NOTIFICATION n) { SET_DSE_BYPASS_CHECK(*n); }
+static VOID SetUmodBit(PKERNEL_STRUCTURED_NOTIFICATION n) { SET_UNSIGNED_MODULE_CHECK(*n); }
+
+static VOID EmitKernelCheckAlert(const char* msg, PFN_SET_METHOD4 m4setter)
+{
+    BufferQueue* q = s_Queue;
+    if (!q || !msg) return;
+
+    SIZE_T msgLen = 0;
+    while (msg[msgLen] && msgLen < 511) msgLen++;
+
+    PKERNEL_STRUCTURED_NOTIFICATION notif =
+        (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'kicn');
+    if (!notif) return;
+
+    RtlZeroMemory(notif, sizeof(*notif));
+    SET_CRITICAL(*notif);
+    if (m4setter) m4setter(notif);
+    notif->pid    = 0;
+    notif->isPath = FALSE;
+    RtlCopyMemory(notif->procName, "NortonEDR", 9);
+
+    notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen + 1, 'kimg');
+    if (notif->msg) {
+        RtlCopyMemory(notif->msg, msg, msgLen + 1);
+        notif->bufSize = (ULONG)(msgLen + 1);
+        if (!q->Enqueue(notif)) {
+            ExFreePool(notif->msg);
+            ExFreePool(notif);
+        }
+    } else {
+        ExFreePool(notif);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CheckModuleVisibility — verify NortonEDR is still linked in
 // PsLoadedModuleList via the DriverSection LDR_DATA_TABLE_ENTRY.
 //
@@ -136,6 +181,302 @@ static VOID CheckModuleVisibility()
 }
 
 // ---------------------------------------------------------------------------
+// CheckDkomHiding — cross-reference EPROCESS kernel list vs ZwQSI(5) API.
+//
+// A DKOM rootkit unlinks EPROCESS.ActiveProcessLinks so the process is absent
+// from ZwQuerySystemInformation(SystemProcessInformation=5) but still present
+// in the kernel doubly-linked list.  We walk both and diff.
+//
+// EPROCESS.ActiveProcessLinks offset = 0x448 on Win10 19041 through Win11 22632.
+// PsInitialSystemProcess is the list head (System process, PID 4).
+// ---------------------------------------------------------------------------
+
+#define EPROCESS_ACTIVE_PROCESS_LINKS_OFFSET 0x448u
+#define DKOM_MAX_PROCS 1024u
+
+static VOID CheckDkomHiding()
+{
+    // --- Build kernel-visible PID set by walking ActiveProcessLinks ---
+    ULONG kernelPids[DKOM_MAX_PROCS] = {};
+    ULONG kernelCount = 0;
+
+    __try {
+        PLIST_ENTRY head = (PLIST_ENTRY)
+            ((ULONG_PTR)PsInitialSystemProcess + EPROCESS_ACTIVE_PROCESS_LINKS_OFFSET);
+        PLIST_ENTRY entry = head->Flink;
+
+        while (entry != head && kernelCount < DKOM_MAX_PROCS) {
+            if (!MmIsAddressValid(entry)) break;
+            PEPROCESS proc = (PEPROCESS)
+                ((ULONG_PTR)entry - EPROCESS_ACTIVE_PROCESS_LINKS_OFFSET);
+            HANDLE pid = PsGetProcessId(proc);
+            kernelPids[kernelCount++] = HandleToUlong(pid);
+            entry = entry->Flink;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] DKOM check: exception walking ActiveProcessLinks\n");
+        return;
+    }
+
+    if (kernelCount == 0) return;
+
+    // --- Query API-visible PIDs via ZwQuerySystemInformation(5) ---
+    ULONG bufferSize = 256 * 1024;
+    PVOID buffer = ExAllocatePool2(POOL_FLAG_PAGED, bufferSize, 'dkqb');
+    if (!buffer) return;
+
+    ULONG retLen = 0;
+    NTSTATUS status = ZwQuerySystemInformation(5, buffer, bufferSize, &retLen);
+    if (status == STATUS_INFO_LENGTH_MISMATCH && retLen > bufferSize) {
+        ExFreePool(buffer);
+        buffer = ExAllocatePool2(POOL_FLAG_PAGED, retLen, 'dkqb');
+        if (!buffer) return;
+        bufferSize = retLen;
+        status = ZwQuerySystemInformation(5, buffer, bufferSize, &retLen);
+    }
+
+    if (!NT_SUCCESS(status)) {
+        ExFreePool(buffer);
+        DbgPrint("[-] DKOM check: ZwQuerySystemInformation failed 0x%x\n", status);
+        return;
+    }
+
+    // Build API PID set
+    ULONG apiPids[DKOM_MAX_PROCS] = {};
+    ULONG apiCount = 0;
+
+    PSYSTEM_PROCESS_INFORMATION spi = (PSYSTEM_PROCESS_INFORMATION)buffer;
+    while (apiCount < DKOM_MAX_PROCS) {
+        apiPids[apiCount++] = HandleToUlong(spi->UniqueProcessId);
+        if (spi->NextEntryOffset == 0) break;
+        spi = (PSYSTEM_PROCESS_INFORMATION)((ULONG_PTR)spi + spi->NextEntryOffset);
+    }
+
+    ExFreePool(buffer);
+
+    // --- Diff: kernel PID not in API list → DKOM hidden ---
+    for (ULONG i = 0; i < kernelCount; i++) {
+        ULONG kpid = kernelPids[i];
+        if (kpid == 0) continue; // idle
+
+        BOOLEAN found = FALSE;
+        for (ULONG j = 0; j < apiCount; j++) {
+            if (apiPids[j] == kpid) { found = TRUE; break; }
+        }
+
+        if (!found) {
+            PEPROCESS proc = nullptr;
+            char msgBuf[220];
+            if (NT_SUCCESS(PsLookupProcessByProcessId(UlongToHandle(kpid), &proc))) {
+                RtlStringCbPrintfA(msgBuf, sizeof(msgBuf),
+                    "DKOM: process '%s' (pid=%lu) hidden from ZwQuerySystemInformation — "
+                    "EPROCESS unlinked from ActiveProcessLinks",
+                    PsGetProcessImageFileName(proc), kpid);
+                ObDereferenceObject(proc);
+            } else {
+                RtlStringCbPrintfA(msgBuf, sizeof(msgBuf),
+                    "DKOM: pid=%lu hidden from ZwQuerySystemInformation — "
+                    "EPROCESS unlinked from ActiveProcessLinks", kpid);
+            }
+            EmitKernelCheckAlert(msgBuf, SetDkomBit);
+        }
+    }
+
+    DbgPrint("[+] AntiTamper: DKOM check complete (%lu kernel / %lu API procs)\n",
+             kernelCount, apiCount);
+}
+
+// ---------------------------------------------------------------------------
+// CheckDseIntegrity — read g_CiEnabled from ci.dll's export table.
+//
+// g_CiEnabled is a DWORD in ci.dll that CI reads on each load decision.
+// Patching it to 0 disables driver signature enforcement for the remainder of
+// the boot session.  We read it from the live in-memory PE export table.
+//
+// Expected value: non-zero (typically 6 in normal production mode).
+// Suspicious:     0 → DSE fully disabled.
+// ---------------------------------------------------------------------------
+
+static VOID CheckDseIntegrity()
+{
+    __try {
+        // --- Find ci.dll in PsLoadedModuleList ---
+        PLIST_ENTRY head  = PsLoadedModuleList;
+        PLIST_ENTRY entry = head->Flink;
+        PVOID ciBase = nullptr;
+
+        while (entry != head) {
+            if (!MmIsAddressValid(entry)) break;
+            PLDR_DATA_TABLE_ENTRY ldte =
+                CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+
+            if (ldte->BaseDllName.Buffer &&
+                ldte->BaseDllName.Length >= 6 * 2 /* "ci.dll" = 6 chars */ ) {
+
+                // Case-insensitive match on the short name
+                WCHAR lower[16] = {};
+                USHORT copyLen = min(ldte->BaseDllName.Length / sizeof(WCHAR), 15u);
+                for (USHORT i = 0; i < copyLen; i++) {
+                    WCHAR c = ldte->BaseDllName.Buffer[i];
+                    lower[i] = (c >= L'A' && c <= L'Z') ? c + 32 : c;
+                }
+                if (lower[0] == L'c' && lower[1] == L'i' &&
+                    lower[2] == L'.' && lower[3] == L'd' &&
+                    lower[4] == L'l' && lower[5] == L'l' && lower[6] == 0) {
+                    ciBase = ldte->DllBase;
+                    break;
+                }
+            }
+            entry = entry->Flink;
+        }
+
+        if (!ciBase || !MmIsAddressValid(ciBase)) {
+            DbgPrint("[-] DSE check: ci.dll not found in PsLoadedModuleList\n");
+            return;
+        }
+
+        // --- Walk PE export table ---
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)ciBase;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)
+            ((ULONG_PTR)ciBase + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+        ULONG expDirRva = nt->OptionalHeader
+            .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        if (!expDirRva) return;
+
+        PIMAGE_EXPORT_DIRECTORY expDir =
+            (PIMAGE_EXPORT_DIRECTORY)((ULONG_PTR)ciBase + expDirRva);
+        if (!MmIsAddressValid(expDir)) return;
+
+        PULONG  names    = (PULONG) ((ULONG_PTR)ciBase + expDir->AddressOfNames);
+        PUSHORT ordinals = (PUSHORT)((ULONG_PTR)ciBase + expDir->AddressOfNameOrdinals);
+        PULONG  funcs    = (PULONG) ((ULONG_PTR)ciBase + expDir->AddressOfFunctions);
+
+        PULONG gCiEnabled = nullptr;
+        for (ULONG i = 0; i < expDir->NumberOfNames; i++) {
+            const char* name = (const char*)((ULONG_PTR)ciBase + names[i]);
+            if (!MmIsAddressValid((PVOID)name)) continue;
+            if (strcmp(name, "g_CiEnabled") == 0) {
+                USHORT ord = ordinals[i];
+                gCiEnabled = (PULONG)((ULONG_PTR)ciBase + funcs[ord]);
+                break;
+            }
+        }
+
+        if (!gCiEnabled || !MmIsAddressValid(gCiEnabled)) {
+            DbgPrint("[-] DSE check: g_CiEnabled not found in ci.dll exports\n");
+            return;
+        }
+
+        ULONG ciVal = *gCiEnabled;
+        DbgPrint("[+] AntiTamper: g_CiEnabled = %lu\n", ciVal);
+
+        if (ciVal == 0) {
+            char msg[160];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "DSE BYPASS: g_CiEnabled in ci.dll = 0 — "
+                "driver signature enforcement disabled, unsigned kernel code may be loaded");
+            EmitKernelCheckAlert(msg, SetDseBit);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] DSE check: exception reading ci.dll export\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CheckUnsignedModules — walk PsLoadedModuleList for drivers missing the
+// LDRP_IMAGE_INTEGRITY_FORCED flag (0x20000000).
+//
+// CI sets this flag in KLDR_DATA_TABLE_ENTRY.Flags for every image it verifies.
+// A driver loaded via DSE bypass, vulnerable driver exploit (BYOVD), or direct
+// kernel memory write will lack this flag.
+//
+// False-positive note: very old legacy-signed drivers (pre-Win10) may not have
+// this flag.  Whitelist ntoskrnl.exe and hal.dll which are loaded before CI.
+// ---------------------------------------------------------------------------
+
+#define LDRP_IMAGE_INTEGRITY_FORCED 0x20000000u
+
+// Modules loaded before CI initialises — they legitimately lack the flag.
+static const WCHAR* kPreCiModules[] = {
+    L"ntoskrnl.exe", L"ntkrnlmp.exe", L"ntkrnlpa.exe", L"ntkrpamp.exe",
+    L"hal.dll",
+    nullptr
+};
+
+static BOOLEAN IsPreCiModule(PCUNICODE_STRING name)
+{
+    if (!name || !name->Buffer) return FALSE;
+    for (int i = 0; kPreCiModules[i]; i++) {
+        UNICODE_STRING candidate;
+        RtlInitUnicodeString(&candidate, kPreCiModules[i]);
+        if (RtlEqualUnicodeString(name, &candidate, TRUE)) return TRUE;
+    }
+    return FALSE;
+}
+
+static VOID CheckUnsignedModules()
+{
+    __try {
+        PLIST_ENTRY head  = PsLoadedModuleList;
+        PLIST_ENTRY entry = head->Flink;
+
+        while (entry != head) {
+            if (!MmIsAddressValid(entry)) break;
+            PLDR_DATA_TABLE_ENTRY ldte =
+                CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+
+            // Skip entries with invalid DllBase or zero size
+            if (!ldte->DllBase || ldte->SizeOfImage == 0) {
+                entry = entry->Flink;
+                continue;
+            }
+
+            // Skip pre-CI bootstrap modules
+            if (IsPreCiModule(&ldte->BaseDllName)) {
+                entry = entry->Flink;
+                continue;
+            }
+
+            if (!(ldte->Flags & LDRP_IMAGE_INTEGRITY_FORCED)) {
+                char modName[64] = "<unknown>";
+                if (ldte->BaseDllName.Buffer && ldte->BaseDllName.Length > 0) {
+                    ULONG copyLen = min(
+                        (ULONG)(ldte->BaseDllName.Length / sizeof(WCHAR)), 63u);
+                    for (ULONG i = 0; i < copyLen; i++) {
+                        WCHAR c = ldte->BaseDllName.Buffer[i];
+                        modName[i] = (c < 128) ? (char)c : '?';
+                    }
+                    modName[copyLen] = '\0';
+                }
+
+                char msg[220];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "UNSIGNED MODULE: '%s' at 0x%llX size=0x%lX — "
+                    "LDRP_IMAGE_INTEGRITY_FORCED not set; possible BYOVD/rootkit payload",
+                    modName,
+                    (ULONG64)ldte->DllBase,
+                    ldte->SizeOfImage);
+
+                EmitKernelCheckAlert(msg, SetUmodBit);
+            }
+
+            entry = entry->Flink;
+        }
+
+        DbgPrint("[+] AntiTamper: unsigned module check complete\n");
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] Unsigned module check: exception\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IntegrityWorkRoutine — runs at PASSIVE_LEVEL via system worker thread.
 // Executes the full hook / integrity check suite.
 // ---------------------------------------------------------------------------
@@ -164,6 +505,15 @@ static VOID IntegrityWorkRoutine(PVOID ctx)
 
     // --- PsLoadedModuleList delink detection ---
     CheckModuleVisibility();
+
+    // --- DKOM process hiding detection ---
+    CheckDkomHiding();
+
+    // --- DSE (Code Integrity) bypass detection ---
+    CheckDseIntegrity();
+
+    // --- Unsigned kernel module detection ---
+    CheckUnsignedModules();
 
     DbgPrint("[*] AntiTamper: periodic check complete\n");
 }

@@ -63,6 +63,9 @@
 #define SET_PNP_CHECK(notification)                 ((notification).PnpCheck               = 1)
 #define SET_OB_CALLBACK_CHECK(notification)         ((notification).ObCallbackCheck        = 1)
 #define SET_PS_CALLBACK_CHECK(notification)         ((notification).PsNotifyCallbackCheck   = 1)
+#define SET_DKOM_CHECK(notification)            ((notification).DkomCheck            = 1)
+#define SET_DSE_BYPASS_CHECK(notification)      ((notification).DseBypassCheck       = 1)
+#define SET_UNSIGNED_MODULE_CHECK(notification) ((notification).UnsignedModuleCheck  = 1)
 
 typedef unsigned short WORD;
 typedef unsigned char BYTE;
@@ -730,6 +733,16 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
             unsigned char Reserved : 5; // Align
         };
         unsigned char Level;
+    };
+
+    union {
+        struct {
+            unsigned char DkomCheck          : 1;
+            unsigned char DseBypassCheck     : 1;
+            unsigned char UnsignedModuleCheck: 1;
+            unsigned char Reserved4          : 5;
+        };
+        unsigned char method4;
     };
 
     char* msg;
