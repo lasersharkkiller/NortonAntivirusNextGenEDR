@@ -8,6 +8,10 @@ PSSDT_BASELINE_ENTRY HookDetector::ssdtBaseline       = nullptr;
 ULONG                HookDetector::ssdtBaselineCount   = 0;
 PVOID                HookDetector::cachedKiServiceTable = nullptr;
 
+ObCallbackSnapshot   HookDetector::s_ProcessCbSnapshot = {};
+ObCallbackSnapshot   HookDetector::s_ThreadCbSnapshot  = {};
+BOOLEAN              HookDetector::s_CbSnapshotTaken   = FALSE;
+
 // ---------------------------------------------------------------------------
 // Private helper: classify the first bytes of a function as a hook type.
 // ---------------------------------------------------------------------------
@@ -442,121 +446,196 @@ VOID HookDetector::CheckAltSyscallHandlerIntegrity(BufferQueue* bufQueue) {
 }
 
 // ---------------------------------------------------------------------------
-// CheckObCallbackIntegrity — verify that our ObRegisterCallbacks entries are
-// still linked into PsProcessType->CallbackList and PsThreadType->CallbackList.
+// ObCallback list helpers
 //
-// Attack: EDRSandblast / Terminator walk the undocumented CallbackList inside
-// OBJECT_TYPE and unlink our _CALLBACK_ENTRY_ITEM nodes.  After unlinking, the
-// OS no longer calls our PreOperation callbacks, silently disabling handle-right
-// stripping and process/thread self-protection.
-//
-// Layout used (stable Win10 1507 – Win11 24H2, x64):
+// Layout (stable Win10 1507 – Win11 24H2, x64):
 //   OBJECT_TYPE.CallbackList        : LIST_ENTRY at offset +0xC8
 //   CALLBACK_ENTRY_ITEM.PreOperation: POB_PRE_OPERATION_CALLBACK at offset +0x28
-//     from the LIST_ENTRY node (i.e., from the Flink/Blink pointer itself)
+//     from the start of the LIST_ENTRY node embedded in CALLBACK_ENTRY_ITEM
 //
-// PsProcessType and PsThreadType are exported by ntoskrnl as POBJECT_TYPE*
-// (pointer-to-pointer), so we dereference once to reach the OBJECT_TYPE.
+// PsProcessType / PsThreadType are exported as POBJECT_TYPE* (ptr-to-ptr).
 // ---------------------------------------------------------------------------
 
-#define OBJECT_TYPE_CALLBACKLIST_OFFSET  0xC8u
+#define OBJECT_TYPE_CALLBACKLIST_OFFSET    0xC8u
 #define CALLBACK_ENTRY_PREOPERATION_OFFSET 0x28u
+
+// Collect all PreOp pointers currently in a CallbackList into dst[].
+// Returns number of entries written (capped at OB_CALLBACK_SNAPSHOT_MAX).
+static ULONG CollectCallbackPreOps(POBJECT_TYPE objType, PVOID* dst, ULONG dstMax)
+{
+    ULONG count = 0;
+    if (!objType || !MmIsAddressValid(objType) || !dst || dstMax == 0) return 0;
+
+    PLIST_ENTRY head = (PLIST_ENTRY)((PUCHAR)objType + OBJECT_TYPE_CALLBACKLIST_OFFSET);
+    if (!MmIsAddressValid(head)) return 0;
+
+    ULONG limit = 64;
+    __try {
+        for (PLIST_ENTRY e = head->Flink;
+             e != head && limit-- > 0 && count < dstMax;
+             e = e->Flink)
+        {
+            if (!MmIsAddressValid(e)) break;
+            PVOID* preOpSlot = (PVOID*)((PUCHAR)e + CALLBACK_ENTRY_PREOPERATION_OFFSET);
+            if (MmIsAddressValid(preOpSlot) && *preOpSlot)
+                dst[count++] = *preOpSlot;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    return count;
+}
+
+static BOOLEAN IsKnownInSnapshot(PVOID ptr, const ObCallbackSnapshot* snap)
+{
+    for (ULONG i = 0; i < snap->count; i++)
+        if (snap->preOpPointers[i] == ptr) return TRUE;
+    return FALSE;
+}
+
+static VOID EmitObAlert(BufferQueue* bufQueue, const char* msg, PVOID addr)
+{
+    SIZE_T msgLen = strlen(msg) + 1;
+    PKERNEL_STRUCTURED_NOTIFICATION notif =
+        (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            sizeof(KERNEL_STRUCTURED_NOTIFICATION),
+            'obck');
+    if (!notif) return;
+
+    RtlZeroMemory(notif, sizeof(*notif));
+    SET_CRITICAL(*notif);
+    SET_OB_CALLBACK_CHECK(*notif);
+    notif->pid            = 0;
+    notif->isPath         = FALSE;
+    notif->scoopedAddress = (ULONG64)addr;
+    RtlCopyMemory(notif->procName, "NortonEDR", 9);
+
+    notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'obmg');
+    notif->bufSize = (ULONG)msgLen;
+    if (notif->msg) {
+        RtlCopyMemory(notif->msg, msg, msgLen);
+        if (!bufQueue->Enqueue(notif)) {
+            ExFreePool(notif->msg);
+            ExFreePool(notif);
+        }
+    } else {
+        ExFreePool(notif);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TakeObCallbackSnapshot — called once after ObRegisterCallbacks succeeds.
+// Records every PreOp pointer currently registered on PsProcessType and
+// PsThreadType.  This becomes the whitelist for periodic integrity checks.
+// ---------------------------------------------------------------------------
+
+VOID HookDetector::TakeObCallbackSnapshot()
+{
+    const struct { const WCHAR* name; ObCallbackSnapshot* snap; } types[] = {
+        { L"PsProcessType", &s_ProcessCbSnapshot },
+        { L"PsThreadType",  &s_ThreadCbSnapshot  },
+    };
+
+    for (int i = 0; i < 2; i++) {
+        UNICODE_STRING uName;
+        RtlInitUnicodeString(&uName, types[i].name);
+        POBJECT_TYPE* ppType = (POBJECT_TYPE*)MmGetSystemRoutineAddress(&uName);
+        if (!ppType || !MmIsAddressValid(ppType)) continue;
+
+        RtlZeroMemory(types[i].snap, sizeof(ObCallbackSnapshot));
+        types[i].snap->count = CollectCallbackPreOps(
+            *ppType,
+            types[i].snap->preOpPointers,
+            OB_CALLBACK_SNAPSHOT_MAX);
+
+        DbgPrint("[+] HookDetector: %ws snapshot — %lu PreOp entries\n",
+            types[i].name, types[i].snap->count);
+    }
+
+    s_CbSnapshotTaken = TRUE;
+}
+
+// ---------------------------------------------------------------------------
+// CheckObCallbackIntegrity — run on each periodic scan.
+//
+// For each of PsProcessType and PsThreadType:
+//
+//   1. MISSING check: our own ProcessPreCallback / ThreadPreCallback must still
+//      be present.  Absence = EDRSandblast/Terminator unlink attack.
+//
+//   2. FOREIGN check (requires snapshot): any PreOp pointer NOT in the init-time
+//      snapshot is a new registration.  A rogue driver registering after us can
+//      use its PreOp to re-strip rights that our PreOp grants (e.g., strip
+//      PROCESS_TERMINATE from the EDR's handle to the attacker's process before
+//      we see the request, or strip PROCESS_VM_READ from handles to lsass to
+//      blind credential-dump detection).  Alert on every unknown entry.
+// ---------------------------------------------------------------------------
 
 VOID HookDetector::CheckObCallbackIntegrity(BufferQueue* bufQueue)
 {
     if (!bufQueue) return;
 
     struct TypeDesc {
-        const WCHAR* exportName;
-        PVOID        expectedPreOp;
-        const char*  label;
+        const WCHAR*       exportName;
+        PVOID              expectedPreOp;
+        const char*        label;
+        ObCallbackSnapshot* snap;
     } checks[] = {
-        { L"PsProcessType", (PVOID)ObjectUtils::ProcessPreCallback, "Process" },
-        { L"PsThreadType",  (PVOID)ObjectUtils::ThreadPreCallback,  "Thread"  },
+        { L"PsProcessType", (PVOID)ObjectUtils::ProcessPreCallback,
+          "Process", &s_ProcessCbSnapshot },
+        { L"PsThreadType",  (PVOID)ObjectUtils::ThreadPreCallback,
+          "Thread",  &s_ThreadCbSnapshot  },
     };
 
     for (int i = 0; i < 2; i++) {
 
         UNICODE_STRING uName;
         RtlInitUnicodeString(&uName, checks[i].exportName);
-
-        // PsProcessType / PsThreadType are exported as POBJECT_TYPE* (ptr-to-ptr).
         POBJECT_TYPE* ppType = (POBJECT_TYPE*)MmGetSystemRoutineAddress(&uName);
-        if (!ppType || !MmIsAddressValid(ppType)) {
-            DbgPrint("[-] HookDetector: could not resolve %ws\n", checks[i].exportName);
-            continue;
-        }
+        if (!ppType || !MmIsAddressValid(ppType)) continue;
 
         POBJECT_TYPE objType = *ppType;
         if (!objType || !MmIsAddressValid(objType)) continue;
 
-        // Locate the CallbackList head embedded in the OBJECT_TYPE.
-        PLIST_ENTRY head = (PLIST_ENTRY)((PUCHAR)objType + OBJECT_TYPE_CALLBACKLIST_OFFSET);
-        if (!MmIsAddressValid(head)) continue;
+        // Collect current live PreOp pointers.
+        PVOID current[OB_CALLBACK_SNAPSHOT_MAX] = {};
+        ULONG currentCount = CollectCallbackPreOps(objType, current, OB_CALLBACK_SNAPSHOT_MAX);
 
-        BOOLEAN found = FALSE;
-        ULONG   limit = 64;   // guard against a corrupt/circular list
-
-        __try {
-            for (PLIST_ENTRY entry = head->Flink;
-                 entry != head && limit-- > 0;
-                 entry = entry->Flink)
-            {
-                if (!MmIsAddressValid(entry)) break;
-
-                // PreOperation pointer lives at +0x28 from the LIST_ENTRY node.
-                PVOID* preOpSlot = (PVOID*)((PUCHAR)entry + CALLBACK_ENTRY_PREOPERATION_OFFSET);
-                if (MmIsAddressValid(preOpSlot) && *preOpSlot == checks[i].expectedPreOp) {
-                    found = TRUE;
-                    break;
-                }
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            DbgPrint("[-] HookDetector: exception walking %s CallbackList\n", checks[i].label);
+        // --- Check 1: our callback must still be present ---
+        BOOLEAN ourFound = FALSE;
+        for (ULONG j = 0; j < currentCount; j++) {
+            if (current[j] == checks[i].expectedPreOp) { ourFound = TRUE; break; }
         }
 
-        if (found) {
-            DbgPrint("[+] HookDetector: Ob%sCallback integrity OK\n", checks[i].label);
-            continue;
-        }
-
-        // Our callback is missing — emit a Critical alert.
-        DbgPrint("[!] HookDetector: Ob%sCallback unlinked from CallbackList!\n", checks[i].label);
-
-        char msg[160];
-        RtlStringCbPrintfA(msg, sizeof(msg),
-            "ANTI-TAMPER: Ob%sCallback unlinked from OBJECT_TYPE.CallbackList "
-            "— EDRSandblast/Terminator-style attack",
-            checks[i].label);
-
-        SIZE_T msgLen = strlen(msg) + 1;
-
-        PKERNEL_STRUCTURED_NOTIFICATION notif =
-            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
-                POOL_FLAG_NON_PAGED,
-                sizeof(KERNEL_STRUCTURED_NOTIFICATION),
-                'obck');
-        if (!notif) continue;
-
-        RtlZeroMemory(notif, sizeof(*notif));
-        SET_CRITICAL(*notif);
-        SET_OB_CALLBACK_CHECK(*notif);
-        notif->pid           = 0;
-        notif->isPath        = FALSE;
-        notif->scoopedAddress = (ULONG64)checks[i].expectedPreOp;
-        RtlCopyMemory(notif->procName, "NortonEDR", 9);
-
-        notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'obmg');
-        notif->bufSize = (ULONG)msgLen;
-        if (notif->msg) {
-            RtlCopyMemory(notif->msg, msg, msgLen);
-            if (!bufQueue->Enqueue(notif)) {
-                ExFreePool(notif->msg);
-                ExFreePool(notif);
-            }
+        if (!ourFound) {
+            DbgPrint("[!] HookDetector: Ob%sCallback unlinked!\n", checks[i].label);
+            char msg[180];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "ANTI-TAMPER: Ob%sCallback unlinked from OBJECT_TYPE.CallbackList "
+                "— EDRSandblast/Terminator-style attack",
+                checks[i].label);
+            EmitObAlert(bufQueue, msg, checks[i].expectedPreOp);
         } else {
-            ExFreePool(notif);
+            DbgPrint("[+] HookDetector: Ob%sCallback present\n", checks[i].label);
+        }
+
+        // --- Check 2: no unknown PreOp pointers (requires snapshot) ---
+        if (!s_CbSnapshotTaken) continue;
+
+        for (ULONG j = 0; j < currentCount; j++) {
+            if (IsKnownInSnapshot(current[j], checks[i].snap)) continue;
+
+            // Unknown entry: a driver registered a new callback after our init.
+            DbgPrint("[!] HookDetector: foreign Ob%sCallback registered: %p\n",
+                checks[i].label, current[j]);
+
+            char msg[220];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "ROGUE ObCallback: unknown %s PreOp at %p registered after EDR init "
+                "— may strip handle rights from defenders / protect attacker process",
+                checks[i].label, current[j]);
+            EmitObAlert(bufQueue, msg, current[j]);
         }
     }
 }

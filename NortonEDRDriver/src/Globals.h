@@ -1387,11 +1387,27 @@ public:
     static VOID Cleanup();
 };
 
+// Snapshot of one PreOperation pointer captured in a CallbackList at init time.
+// Used to detect foreign callbacks registered after our driver loads.
+#define OB_CALLBACK_SNAPSHOT_MAX 32
+
+struct ObCallbackSnapshot {
+    PVOID preOpPointers[OB_CALLBACK_SNAPSHOT_MAX];  // sorted array of known-good PreOp ptrs
+    ULONG count;
+};
+
 class HookDetector {
 
     static PSSDT_BASELINE_ENTRY ssdtBaseline;
     static ULONG                ssdtBaselineCount;
     static PVOID                cachedKiServiceTable;
+
+    // Baseline snapshots of PsProcessType and PsThreadType CallbackLists.
+    // Taken once at Init() after ObRegisterCallbacks.  Checked periodically
+    // for new (foreign/rogue) entries appearing in the list.
+    static ObCallbackSnapshot   s_ProcessCbSnapshot;
+    static ObCallbackSnapshot   s_ThreadCbSnapshot;
+    static BOOLEAN              s_CbSnapshotTaken;
 
     static UCHAR DetectInlineHookType(PVOID functionAddress);
     static PVOID ResolveHookTarget(PVOID functionAddress, UCHAR hookType);
@@ -1409,9 +1425,13 @@ public:
     static BOOLEAN  CheckEtwHooks(BufferQueue* bufQueue);
     static VOID     CheckAltSyscallHandlerIntegrity(BufferQueue* bufQueue);
 
-    // Verify our ObRegisterCallbacks entries are still present in
-    // PsProcessType->CallbackList and PsThreadType->CallbackList.
-    // Catches EDRSandblast-style list unlinking attacks.
+    // Snapshot PsProcessType/PsThreadType CallbackLists immediately after
+    // ObRegisterCallbacks.  Must be called once at init, before periodic checks.
+    static VOID     TakeObCallbackSnapshot();
+
+    // Verify our entries are still present AND no new foreign callbacks appeared
+    // since the snapshot.  Catches both unlinking (EDRSandblast) and rogue
+    // callback registration (offensive PreOp to strip rights from defenders).
     static VOID     CheckObCallbackIntegrity(BufferQueue* bufQueue);
 
     static VOID RunAllHookChecks(

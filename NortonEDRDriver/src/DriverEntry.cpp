@@ -360,6 +360,11 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 
 	g_callbackObjects->setupNotificationsGlobal();
 
+	// Snapshot the ObCallback lists immediately after our ObRegisterCallbacks calls.
+	// Must happen before HookDetector::RunAllHookChecks or AntiTamper starts, so
+	// that the periodic check has a valid whitelist of known-good PreOp pointers.
+	HookDetector::TakeObCallbackSnapshot();
+
 	EtwProvider::Init();
 
 	// Take SSDT baseline snapshot and run full hook scan
