@@ -736,6 +736,9 @@ class SyscallsUtils {
 	static ULONG NtSetInformationProcessId;    // Variable — PPL-strip detection (ProcessProtectionLevel = 0x3D)
 	static ULONG NtDuplicateObjectId;         // Stable at 0x003C — handle duplication detection
 	static ULONG NtDebugActiveProcessId;      // Variable — debug-attach credential dump detection
+	static ULONG NtSetInformationThreadId;    // Variable — token impersonation detection
+	static ULONG NtTraceControlId;            // Variable — ETW manipulation detection
+	static ULONG NtCreateNamedPipeFileId;     // Variable — named pipe C2 detection
 
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
@@ -969,6 +972,24 @@ public:
 	static VOID NtDebugActiveProcessHandler(
 		HANDLE ProcessHandle,
 		HANDLE DebugObjectHandle
+	);
+
+	// Token impersonation with privilege escalation
+	static VOID NtSetInformationThreadHandler(
+		HANDLE ThreadHandle,
+		ULONG  ThreadInformationClass,
+		PVOID  ThreadInformation,
+		ULONG  ThreadInformationLength
+	);
+
+	// ETW provider/session manipulation bypass
+	static VOID NtTraceControlHandler(
+		ULONG FunctionCode
+	);
+
+	// Named pipe C2 / lateral movement detection
+	static VOID NtCreateNamedPipeFileHandler(
+		PVOID ObjectAttributes
 	);
 
 	static VOID NtProtectVirtualMemoryHandler(

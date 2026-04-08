@@ -57,6 +57,9 @@ ULONG SyscallsUtils::NtQuerySystemInformationId = 0;
 ULONG SyscallsUtils::NtSetInformationProcessId = 0;
 ULONG SyscallsUtils::NtDuplicateObjectId = 0x003C;     // Stable across Win10 1507–Win11 24H2
 ULONG SyscallsUtils::NtDebugActiveProcessId = 0;       // Resolve dynamically
+ULONG SyscallsUtils::NtSetInformationThreadId = 0;     // Resolve dynamically
+ULONG SyscallsUtils::NtTraceControlId = 0;             // Resolve dynamically
+ULONG SyscallsUtils::NtCreateNamedPipeFileId = 0;      // Resolve dynamically
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -602,6 +605,26 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 			(HANDLE)trapFrame->Rcx,
 			(HANDLE)trapFrame->Rdx);
 	}
+	else if (NtSetInformationThreadId != 0 && id == NtSetInformationThreadId) {
+		// NtSetInformationThread(ThreadHandle, ThreadInformationClass, ThreadInformation, ThreadInformationLength)
+		// RCX=thread  RDX=class  R8=info  R9=len
+		NtSetInformationThreadHandler(
+			(HANDLE)trapFrame->Rcx,
+			(ULONG)trapFrame->Rdx,
+			(PVOID)trapFrame->R8,
+			(ULONG)trapFrame->R9);
+	}
+	else if (NtTraceControlId != 0 && id == NtTraceControlId) {
+		// NtTraceControl(TraceHandle, FunctionCode, InBuffer, InBufferLen, OutBuffer, OutBufferLen, ReturnLength)
+		// RCX=handle  RDX=funcCode  R8=inBuf  R9=inLen  [RSP+0x28]=outBuf  [RSP+0x30]=outLen  [RSP+0x38]=retLen
+		NtTraceControlHandler((ULONG)trapFrame->Rdx);
+	}
+	else if (NtCreateNamedPipeFileId != 0 && id == NtCreateNamedPipeFileId) {
+		// NtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, TypeBits, ReadModeBits, CompletionMode, MaxInstances, InboundQuota, OutboundQuota, Timeout)
+		// We care about the pipe name in ObjectAttributes->ObjectName
+		PVOID objAttr = (PVOID)trapFrame->Rdx;
+		NtCreateNamedPipeFileHandler(objAttr);
+	}
 
 	return TRUE;
 }
@@ -906,6 +929,18 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtDebugActiveProcess;
 	RtlInitUnicodeString(&usNtDebugActiveProcess, L"NtDebugActiveProcess");
 	NtDebugActiveProcessId = getSSNByName(ssdtTable, &usNtDebugActiveProcess, exportsMap);
+
+	UNICODE_STRING usNtSetInfoThread;
+	RtlInitUnicodeString(&usNtSetInfoThread, L"NtSetInformationThread");
+	NtSetInformationThreadId = getSSNByName(ssdtTable, &usNtSetInfoThread, exportsMap);
+
+	UNICODE_STRING usNtTraceControl;
+	RtlInitUnicodeString(&usNtTraceControl, L"NtTraceControl");
+	NtTraceControlId = getSSNByName(ssdtTable, &usNtTraceControl, exportsMap);
+
+	UNICODE_STRING usNtCreateNamedPipeFile;
+	RtlInitUnicodeString(&usNtCreateNamedPipeFile, L"NtCreateNamedPipeFile");
+	NtCreateNamedPipeFileId = getSSNByName(ssdtTable, &usNtCreateNamedPipeFile, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -2103,6 +2138,180 @@ VOID SyscallsUtils::NtDebugActiveProcessHandler(
 	EmitSyscallNotif(0, msg, caller, targetProcess, isLsass || isSensitive);
 
 	if (ownedRef && targetProcess) ObDereferenceObject(targetProcess);
+}
+
+// NtSetInformationThread(ThreadImpersonationToken) — detect token impersonation escalation.
+//
+// When an attacker steals a privileged token (SYSTEM, debug-capable, etc.) and assigns it
+// to their own thread via NtSetInformationThread(ThreadImpersonationToken = 0x5), this syscall
+// fires. TokenMonitor catches orphaned tokens post-session-teardown; this catches the
+// impersonation act itself by checking token privilege level.
+VOID SyscallsUtils::NtSetInformationThreadHandler(
+	HANDLE ThreadHandle,
+	ULONG  ThreadInformationClass,
+	PVOID  ThreadInformation,
+	ULONG  ThreadInformationLength)
+{
+	// Only interested in ThreadImpersonationToken (0x5)
+	if (ThreadInformationClass != 0x5) return;
+
+	PEPROCESS caller = IoGetCurrentProcess();
+
+	// Skip PPL callers
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	// Read the token handle from ThreadInformation safely
+	if (!ThreadInformation || ThreadInformationLength < sizeof(HANDLE)) return;
+
+	HANDLE tokenHandle = nullptr;
+	__try {
+		if (MmIsAddressValid(ThreadInformation)) {
+			tokenHandle = *(PHANDLE)ThreadInformation;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return;
+	}
+
+	if (!tokenHandle) return;
+
+	// Resolve token
+	PVOID token = nullptr;
+	NTSTATUS st = ObReferenceObjectByHandle(tokenHandle, TOKEN_QUERY, NULL, UserMode, &token, nullptr);
+	if (!NT_SUCCESS(st) || !token) return;
+
+	// Query token info — check for dangerous privileges
+	// SeDebugPrivilege and SeTcbPrivilege are the highest-value escalations
+	TOKEN_PRIVILEGES* privs = nullptr;
+	ULONG privSize = 0;
+
+	__try {
+		st = SeQueryInformationToken(token, TokenPrivileges, &privs);
+		if (NT_SUCCESS(st) && privs) {
+			BOOLEAN hasDebugPriv = FALSE, hasTcbPriv = FALSE, hasImpersonatePriv = FALSE;
+
+			for (ULONG i = 0; i < privs->PrivilegeCount; i++) {
+				if (privs->Privileges[i].Luid.LowPart == SE_DEBUG_PRIVILEGE)
+					hasDebugPriv = TRUE;
+				else if (privs->Privileges[i].Luid.LowPart == SE_TCB_PRIVILEGE)
+					hasTcbPriv = TRUE;
+				else if (privs->Privileges[i].Luid.LowPart == SE_IMPERSONATE_PRIVILEGE)
+					hasImpersonatePriv = TRUE;
+			}
+
+			char msg[128];
+			BOOLEAN critical = hasDebugPriv || hasTcbPriv;
+
+			if (hasDebugPriv || hasTcbPriv) {
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"CRITICAL: NtSetInformationThread(ThreadImpersonationToken) assigning %s token — privilege escalation",
+					hasDebugPriv ? "SeDebugPrivilege" : "SeTcbPrivilege");
+			} else if (hasImpersonatePriv) {
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"NtSetInformationThread(ThreadImpersonationToken) assigning SeImpersonatePrivilege token");
+				critical = FALSE;
+			} else {
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"NtSetInformationThread(ThreadImpersonationToken) — token impersonation");
+				critical = FALSE;
+			}
+
+			EmitSyscallNotif(0, msg, caller, nullptr, critical);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+
+	ObDereferenceObject(token);
+}
+
+// NtTraceControl — detect ETW provider/session manipulation.
+//
+// ETW can be disabled or manipulated via NtTraceControl without hooking any ETW functions.
+// Dangerous function codes: 5 (update/enable trace), 31 (disable provider).
+VOID SyscallsUtils::NtTraceControlHandler(ULONG FunctionCode)
+{
+	PEPROCESS caller = IoGetCurrentProcess();
+
+	// Skip PPL/system callers
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	// Flag update-trace and disable-provider operations
+	if (FunctionCode == 5 || FunctionCode == 31) {
+		const char* action = (FunctionCode == 5) ? "update/enable trace" : "disable provider";
+		char msg[128];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtTraceControl: user-mode process calling ETW %s — possible ETW bypass",
+			action);
+		EmitSyscallNotif(0, msg, caller, nullptr, FALSE); // WARNING
+	}
+}
+
+// NtCreateNamedPipeFile — detect named pipe C2 / lateral movement.
+//
+// Cobalt Strike SMB beacons and PsExec lateral movement use named pipes as C2 transport.
+// Alert on named pipe creation from non-system processes, especially pipes not in
+// well-known system list.
+VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes)
+{
+	// Static list of system-owned named pipes (legitimate)
+	static const WCHAR* kSystemPipes[] = {
+		L"\\Device\\NamedPipe\\lsass",
+		L"\\Device\\NamedPipe\\winlogon",
+		L"\\Device\\NamedPipe\\wininit",
+		L"\\Device\\NamedPipe\\svcctl",
+		L"\\Device\\NamedPipe\\samr",
+		L"\\Device\\NamedPipe\\ntsvcs",
+		L"\\Device\\NamedPipe\\protected_storage",
+		nullptr
+	};
+
+	PEPROCESS caller = IoGetCurrentProcess();
+
+	// Skip kernel/PPL callers
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	// Skip system/kernel processes
+	char* name = PsGetProcessImageFileName(caller);
+	if (!name) return;
+	char lower[16] = {};
+	for (int i = 0; i < 15 && name[i]; i++)
+		lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i];
+
+	// Whitelist: services.exe, svchost.exe, lsass.exe, wininit.exe, csrss.exe, System
+	if (strcmp(lower, "services.exe") == 0 || strcmp(lower, "svchost.exe") == 0 ||
+		strcmp(lower, "lsass.exe") == 0 || strcmp(lower, "wininit.exe") == 0 ||
+		strcmp(lower, "csrss.exe") == 0 || strcmp(lower, "system") == 0)
+		return;
+
+	// Extract pipe name from ObjectAttributes
+	if (!ObjectAttributes || !MmIsAddressValid(ObjectAttributes)) return;
+
+	OBJECT_ATTRIBUTES* objAttr = (OBJECT_ATTRIBUTES*)ObjectAttributes;
+	if (!objAttr->ObjectName || !MmIsAddressValid(objAttr->ObjectName)) return;
+
+	UNICODE_STRING* pipeName = (UNICODE_STRING*)objAttr->ObjectName;
+	if (!pipeName->Length || !MmIsAddressValid(pipeName->Buffer)) return;
+
+	// Check against system pipe list
+	BOOLEAN isSystemPipe = FALSE;
+	for (int i = 0; kSystemPipes[i]; i++) {
+		UNICODE_STRING sysPipe;
+		RtlInitUnicodeString(&sysPipe, kSystemPipes[i]);
+		if (RtlEqualUnicodeString(pipeName, &sysPipe, TRUE)) {
+			isSystemPipe = TRUE;
+			break;
+		}
+	}
+
+	if (!isSystemPipe) {
+		char msg[128];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtCreateNamedPipeFile: non-system process creating named pipe — possible C2 transport");
+		EmitSyscallNotif(0, msg, caller, nullptr, FALSE); // WARNING
+	}
 }
 
 // NtProtectVirtualMemory — detect ntdll/DLL stomping and cross-process protection changes.
