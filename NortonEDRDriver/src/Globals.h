@@ -951,8 +951,9 @@ public:
 	static VOID NtCreateTransactionHandler();   // doppelgänging telemetry
 	static VOID NtRollbackTransactionHandler(); // doppelgänging telemetry
 	// Legacy process creation from explicit image section (process injection / doppelgänging)
-	static VOID NtCreateProcessExHandler(ULONG Flags, HANDLE SectionHandle);
-	static VOID NtCreateProcessHandler(HANDLE SectionHandle);  // older 8-arg variant
+	// Also detects process cloning (lsass/sensitive parent process)
+	static VOID NtCreateProcessExHandler(HANDLE ParentProcess, ULONG Flags, HANDLE SectionHandle);
+	static VOID NtCreateProcessHandler(HANDLE ParentProcess, HANDLE SectionHandle);  // older 8-arg variant
 
 	// EDR callback enumeration recon — suspicious SystemInformationClass values
 	static VOID NtQuerySystemInformationHandler(ULONG SystemInformationClass);

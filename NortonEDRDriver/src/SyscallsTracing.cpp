@@ -598,14 +598,16 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 	}
 	else if (NtCreateProcessExId != 0 && id == NtCreateProcessExId) {  // NtCreateProcessEx
 		// NtCreateProcessEx(ProcessHandle*, Access, ObjAttr, ParentProcess, Flags, SectionHandle, ...)
+		// ParentProcess = arg4 = R9
 		// Flags  = arg5 = [RSP+0x28]
 		// SectionHandle = arg6 = [RSP+0x30]
-		NtCreateProcessExHandler((ULONG)arg5, (HANDLE)arg6);
+		NtCreateProcessExHandler((HANDLE)trapFrame->R9, (ULONG)arg5, (HANDLE)arg6);
 	}
 	else if (NtCreateProcessId != 0 && id == NtCreateProcessId) {  // NtCreateProcess (older, 8-arg)
 		// NtCreateProcess(ProcessHandle*, Access, ObjAttr, ParentProcess, InheritObjTable, SectionHandle, ...)
+		// ParentProcess = arg4 = R9
 		// SectionHandle = arg6 = [RSP+0x30]
-		NtCreateProcessHandler((HANDLE)arg6);
+		NtCreateProcessHandler((HANDLE)trapFrame->R9, (HANDLE)arg6);
 	}
 	else if (NtQuerySystemInformationId != 0 && id == NtQuerySystemInformationId) {
 		// NtQuerySystemInformation(SystemInformationClass, SystemInformation, Length, ReturnLength)
@@ -1946,12 +1948,19 @@ VOID SyscallsUtils::NtCreateSectionHandler(
 	ULONG          AllocationAttributes,
 	HANDLE         FileHandle
 ) {
+	#define SEC_COMMIT 0x8000000
+
 	// SEC_IMAGE = 0x1000000 — maps a PE as an image (module stomping indicator)
 	BOOLEAN isStomp   = (AllocationAttributes & 0x1000000) != 0;
 	// File-backed section with an execute protection = reflective/stomping variant
 	BOOLEAN isExecMap = (FileHandle != nullptr) &&
 		(SectionPageProtection & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
 		                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+	// Memory-backed section with no file handle: pagefile-backed section.
+	// Used as an intermediate step in process cloning (NanoDump, LetMeowIn).
+	BOOLEAN isMemBacked = (FileHandle == nullptr) &&
+		((AllocationAttributes & SEC_COMMIT) != 0) &&
+		!(AllocationAttributes & 0x1000000);  // exclude SEC_IMAGE (already handled)
 
 	// Herpaderping: SEC_IMAGE from a file handle — track the FILE_OBJECT so FsFilter can
 	// alert if the backing file is written to while this section remains open.
@@ -1970,13 +1979,16 @@ VOID SyscallsUtils::NtCreateSectionHandler(
 		}
 	}
 
-	if (!isStomp && !isExecMap) return;
+	if (!isStomp && !isExecMap && !isMemBacked) return;
 
 	EmitSyscallNotif(
 		0,
 		isStomp
 			? "NtCreateSection: SEC_IMAGE section created (module stomping / herpaderping indicator)"
-			: "NtCreateSection: file-backed executable section (reflective load indicator)",
+			: isMemBacked
+				? "NtCreateSection: pagefile-backed memory section, no file handle "
+				  "(process cloning / lsass clone intermediate step)"
+				: "NtCreateSection: file-backed executable section (reflective load indicator)",
 		IoGetCurrentProcess(), nullptr, isStomp);
 }
 
@@ -2122,12 +2134,39 @@ VOID SyscallsUtils::NtRollbackTransactionHandler() {
 // Modern CreateProcess calls NtCreateUserProcess. NtCreateProcessEx is used by:
 //   - Process doppelgänging (create from transacted section)
 //   - Direct section injection (create process from a manually crafted SEC_IMAGE section)
+//   - Process cloning (lsass/sensitive parent) — offline dumps (LetMeowIn, NanoDump)
 //   - Some debugger internals (ZwCreateProcessEx from kernel; not this path)
 //
 // Any user-mode NtCreateProcessEx call is highly suspicious. A non-null SectionHandle with
 // PROCESS_CREATE_FLAGS_MINIMAL not set (bit 2 of Flags) creates a full non-minimal process
 // from that section — the canonical injection technique.
-VOID SyscallsUtils::NtCreateProcessExHandler(ULONG Flags, HANDLE SectionHandle) {
+VOID SyscallsUtils::NtCreateProcessExHandler(HANDLE ParentProcess, ULONG Flags, HANDLE SectionHandle) {
+	// --- NEW: lsass / sensitive parent check (process cloning) ---
+	if (ParentProcess && ParentProcess != NtCurrentProcess()) {
+		PEPROCESS parentProc = nullptr;
+		NTSTATUS st = ObReferenceObjectByHandle(
+			ParentProcess,
+			PROCESS_QUERY_INFORMATION,
+			*PsProcessType,
+			UserMode,
+			(PVOID*)&parentProc,
+			nullptr);
+		if (NT_SUCCESS(st) && parentProc) {
+			BOOLEAN parentIsLsass     = ObjectUtils::IsLsass(parentProc);
+			BOOLEAN parentIsSensitive = ObjectUtils::IsSensitiveProcess(parentProc);
+			if (parentIsLsass || parentIsSensitive) {
+				char cloneMsg[240];
+				char* parentName = PsGetProcessImageFileName(parentProc);
+				RtlStringCbPrintfA(cloneMsg, sizeof(cloneMsg),
+					"NtCreateProcessEx: cloning %s via ParentProcess handle "
+					"(offline lsass clone / credential dump evasion)",
+					parentName ? parentName : "sensitive process");
+				EmitSyscallNotif(0, cloneMsg, IoGetCurrentProcess(), parentProc, TRUE);
+			}
+			ObDereferenceObject(parentProc);
+		}
+	}
+
 	char procName[16] = {};
 	char* pn = PsGetProcessImageFileName(IoGetCurrentProcess());
 	if (pn) RtlStringCbCopyA(procName, sizeof(procName), pn);
@@ -2157,7 +2196,31 @@ VOID SyscallsUtils::NtCreateProcessExHandler(ULONG Flags, HANDLE SectionHandle) 
 
 // NtCreateProcess — even older 8-argument variant (pre-Vista legacy).
 // Same technique, no Flags field — SectionHandle is always arg6.
-VOID SyscallsUtils::NtCreateProcessHandler(HANDLE SectionHandle) {
+VOID SyscallsUtils::NtCreateProcessHandler(HANDLE ParentProcess, HANDLE SectionHandle) {
+	// --- NEW: lsass / sensitive parent check ---
+	if (ParentProcess && ParentProcess != NtCurrentProcess()) {
+		PEPROCESS parentProc = nullptr;
+		NTSTATUS st = ObReferenceObjectByHandle(
+			ParentProcess,
+			PROCESS_QUERY_INFORMATION,
+			*PsProcessType,
+			UserMode,
+			(PVOID*)&parentProc,
+			nullptr);
+		if (NT_SUCCESS(st) && parentProc) {
+			if (ObjectUtils::IsLsass(parentProc) || ObjectUtils::IsSensitiveProcess(parentProc)) {
+				char cloneMsg[240];
+				char* parentName = PsGetProcessImageFileName(parentProc);
+				RtlStringCbPrintfA(cloneMsg, sizeof(cloneMsg),
+					"NtCreateProcess: cloning %s via ParentProcess handle "
+					"(offline lsass clone / credential dump evasion)",
+					parentName ? parentName : "sensitive process");
+				EmitSyscallNotif(0, cloneMsg, IoGetCurrentProcess(), parentProc, TRUE);
+			}
+			ObDereferenceObject(parentProc);
+		}
+	}
+
 	char procName[16] = {};
 	char* pn = PsGetProcessImageFileName(IoGetCurrentProcess());
 	if (pn) RtlStringCbCopyA(procName, sizeof(procName), pn);
