@@ -1663,6 +1663,76 @@ VOID SyscallsUtils::NtSetContextThreadHandler(
 	ObDereferenceObject(targetThread);
 }
 
+// ---------------------------------------------------------------------------
+// ClassifyProcessAccessMask — heuristic-based access mask anomaly detection.
+//
+// Phase 1: excessive / structurally wrong masks (tool fingerprinting).
+// Phase 2: known tool-specific patterns (signature-level IDs).
+//
+// Returns a description string when anomalous, nullptr when clean.
+// *outCritical is set to TRUE for known tool patterns, FALSE for generic excess.
+// ---------------------------------------------------------------------------
+
+#define PROCESS_ALL_ACCESS_WIN10  0x1F0FFF
+#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
+
+static const char* ClassifyProcessAccessMask(ACCESS_MASK mask, BOOLEAN* outCritical)
+{
+	*outCritical = FALSE;
+
+	// --- Phase 1: Excessive / structurally anomalous ---
+
+	// PROCESS_ALL_ACCESS: only legitimate for kernel/system callers.
+	// Offensive tools frequently use this as a lazy "give me everything" shortcut.
+	if ((mask & PROCESS_ALL_ACCESS_WIN10) == PROCESS_ALL_ACCESS_WIN10) {
+		*outCritical = FALSE;
+		return "PROCESS_ALL_ACCESS requested — offensive tools use this as a lazy "
+		       "catch-all; minimal rights never require all bits set";
+	}
+
+	// VM_WRITE without VM_READ: write-only cross-process access is structurally odd.
+	// Legitimate debuggers/profilers always pair write with read.
+	if ((mask & 0x0020) && !(mask & 0x0010)) {  // VM_WRITE without VM_READ
+		*outCritical = FALSE;
+		return "PROCESS_VM_WRITE without PROCESS_VM_READ — structurally anomalous; "
+		       "legitimate debuggers always pair write with read";
+	}
+
+	// Full manipulation combo: VM_WRITE + VM_OPERATION + SUSPEND_RESUME but no QUERY.
+	// This is the exact set needed for shellcode injection with execution control.
+	const ACCESS_MASK kInjectSuite =
+		0x0008 |   // PROCESS_VM_OPERATION
+		0x0020 |   // PROCESS_VM_WRITE
+		0x0800;    // PROCESS_SUSPEND_RESUME
+	if ((mask & kInjectSuite) == kInjectSuite &&
+		!(mask & 0x0400) &&   // no PROCESS_QUERY_INFORMATION
+		!(mask & 0x1000)) {   // no PROCESS_QUERY_LIMITED_INFORMATION
+		*outCritical = FALSE;
+		return "VM_OPERATION | VM_WRITE | SUSPEND_RESUME without any QUERY rights — "
+		       "classic injection capability set; legitimate tools always include QUERY";
+	}
+
+	// --- Phase 2: Known tool signatures ---
+
+	// Mimikatz sekurlsa::logonpasswords / sekurlsa::wdigest:
+	// Opens lsass with exactly PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION.
+	if (mask == (0x0010 | 0x1000)) {  // VM_READ | QUERY_LIMITED
+		*outCritical = TRUE;
+		return "Access mask matches Mimikatz sekurlsa pattern: "
+		       "PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION";
+	}
+
+	// Meterpreter / common Metasploit migrate module:
+	// Requests: VM_OPERATION | VM_WRITE | VM_READ | CREATE_THREAD | QUERY_INFORMATION
+	if (mask == (0x0008 | 0x0020 | 0x0010 | 0x0002 | 0x0400)) {
+		*outCritical = TRUE;
+		return "Access mask matches Meterpreter process-migrate pattern: "
+		       "CREATE_THREAD | VM_OPERATION | VM_READ | VM_WRITE | QUERY_INFORMATION";
+	}
+
+	return nullptr;  // nothing anomalous
+}
+
 // NtOpenProcess — flag injection-capable access flags on foreign processes.
 // Critical if target is lsass; Warning otherwise.
 VOID SyscallsUtils::NtOpenProcessHandler(
@@ -1701,6 +1771,26 @@ VOID SyscallsUtils::NtOpenProcessHandler(
 		targetProcess,
 		isSensitive   // Critical for all 6 sensitive processes now, not just lsass
 	);
+
+	// Access mask anomaly check — fires a second, distinct alert characterizing the tool
+	BOOLEAN maskCritical = FALSE;
+	const char* maskTag = ClassifyProcessAccessMask(DesiredAccess, &maskCritical);
+	if (maskTag) {
+		char maskMsg[256];
+		RtlStringCbPrintfA(maskMsg, sizeof(maskMsg),
+			"NtOpenProcess access mask anomaly (0x%08lX) on %s: %s",
+			DesiredAccess,
+			isLsass     ? "lsass"     :
+			isSensitive ? "sensitive OS process" :
+			              "foreign process",
+			maskTag);
+		EmitSyscallNotif(
+			(ULONG64)targetPid,
+			maskMsg,
+			IoGetCurrentProcess(),
+			targetProcess,
+			maskCritical || isSensitive);
+	}
 
 	if (targetProcess) ObDereferenceObject(targetProcess);
 }
@@ -2261,6 +2351,22 @@ VOID SyscallsUtils::NtDuplicateObjectHandler(
 
 	EmitSyscallNotif(0, msg, caller, targetProcess, isSensitive || isLsass);
 
+	// Access mask anomaly check on duplication
+	if (DesiredAccess != 0) {
+		BOOLEAN dupMaskCritical = FALSE;
+		const char* dupMaskTag = ClassifyProcessAccessMask(DesiredAccess, &dupMaskCritical);
+		if (dupMaskTag) {
+			char dupMsg[256];
+			RtlStringCbPrintfA(dupMsg, sizeof(dupMsg),
+				"NtDuplicateObject access mask anomaly (0x%08lX) %s: %s",
+				DesiredAccess,
+				isSensitive ? "(sensitive process)" : "",
+				dupMaskTag);
+			EmitSyscallNotif(0, dupMsg, caller, targetProcess,
+				dupMaskCritical || isSensitive || isLsass);
+		}
+	}
+
 	if (ownedRef && targetProcess) ObDereferenceObject(targetProcess);
 }
 
@@ -2499,6 +2605,39 @@ VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes)
 }
 
 // ---------------------------------------------------------------------------
+// ClassifyThreadAccessMask — thread-level access mask anomaly detection.
+// ---------------------------------------------------------------------------
+
+static const char* ClassifyThreadAccessMask(ACCESS_MASK mask, BOOLEAN* outCritical)
+{
+	*outCritical = FALSE;
+
+	// THREAD_ALL_ACCESS: same lazy-spray pattern as PROCESS_ALL_ACCESS.
+	// 0x1FFFFF on Win10/11
+	if ((mask & 0x1FFFFF) == 0x1FFFFF) {
+		return "THREAD_ALL_ACCESS requested — offensive tools spray this "
+		       "instead of requesting minimal rights";
+	}
+
+	// SET_CONTEXT without GET_CONTEXT: write-only thread context is unusual.
+	// Legitimate debuggers always read context before writing it back.
+	if ((mask & THREAD_SET_CONTEXT) && !(mask & THREAD_GET_CONTEXT)) {
+		return "THREAD_SET_CONTEXT without THREAD_GET_CONTEXT — anomalous; "
+		       "legitimate debuggers read context before overwriting it";
+	}
+
+	// Known Mimikatz sekurlsa thread pattern:
+	// Opens a thread in lsass with exactly THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME
+	if (mask == (THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME)) {
+		*outCritical = TRUE;
+		return "Access mask matches Mimikatz sekurlsa thread pattern: "
+		       "THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME";
+	}
+
+	return nullptr;
+}
+
+// ---------------------------------------------------------------------------
 // NtOpenThread — detect thread hijacking and context scraping.
 //
 // Attacker opens a handle to a thread in a sensitive process (lsass, csrss, etc.)
@@ -2558,6 +2697,26 @@ VOID SyscallsUtils::NtOpenThreadHandler(
 		IoGetCurrentProcess(),
 		targetProc,
 		isSensitive);
+
+	// Thread access mask anomaly check
+	BOOLEAN tMaskCritical = FALSE;
+	const char* tMaskTag = ClassifyThreadAccessMask(DesiredAccess, &tMaskCritical);
+	if (tMaskTag) {
+		char tMaskMsg[256];
+		RtlStringCbPrintfA(tMaskMsg, sizeof(tMaskMsg),
+			"NtOpenThread access mask anomaly (0x%08lX) on %s thread: %s",
+			DesiredAccess,
+			isLsass     ? "lsass"     :
+			isSensitive ? "sensitive OS process" :
+			              "foreign process",
+			tMaskTag);
+		EmitSyscallNotif(
+			targetProc ? (ULONG64)PsGetProcessId(targetProc) : 0,
+			tMaskMsg,
+			IoGetCurrentProcess(),
+			targetProc,
+			tMaskCritical || isSensitive);
+	}
 
 	if (targetProc) ObDereferenceObject(targetProc);
 }
