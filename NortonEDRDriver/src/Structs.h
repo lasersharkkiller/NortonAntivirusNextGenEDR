@@ -61,6 +61,7 @@
 #define SET_FSFILTER_CHECK(notification)            ((notification).FsFilterCheck          = 1)
 #define SET_TOKEN_CHECK(notification)               ((notification).TokenCheck             = 1)
 #define SET_PNP_CHECK(notification)                 ((notification).PnpCheck               = 1)
+#define SET_OB_CALLBACK_CHECK(notification)         ((notification).ObCallbackCheck        = 1)
 
 typedef unsigned short WORD;
 typedef unsigned char BYTE;
@@ -702,11 +703,12 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
 
     union {
         struct {
-            unsigned char NetworkCheck  : 1;
-            unsigned char FsFilterCheck : 1;
-            unsigned char TokenCheck    : 1;
-            unsigned char PnpCheck      : 1;
-            unsigned char Reserved3     : 4;
+            unsigned char NetworkCheck     : 1;
+            unsigned char FsFilterCheck   : 1;
+            unsigned char TokenCheck      : 1;
+            unsigned char PnpCheck        : 1;
+            unsigned char ObCallbackCheck : 1;
+            unsigned char Reserved3       : 3;
         };
         unsigned char method3;
     };

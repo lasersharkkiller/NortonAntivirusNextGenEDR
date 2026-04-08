@@ -442,8 +442,128 @@ VOID HookDetector::CheckAltSyscallHandlerIntegrity(BufferQueue* bufQueue) {
 }
 
 // ---------------------------------------------------------------------------
-// RunAllHookChecks — run all four detection routines in sequence.
-// Call after driver init is complete.
+// CheckObCallbackIntegrity — verify that our ObRegisterCallbacks entries are
+// still linked into PsProcessType->CallbackList and PsThreadType->CallbackList.
+//
+// Attack: EDRSandblast / Terminator walk the undocumented CallbackList inside
+// OBJECT_TYPE and unlink our _CALLBACK_ENTRY_ITEM nodes.  After unlinking, the
+// OS no longer calls our PreOperation callbacks, silently disabling handle-right
+// stripping and process/thread self-protection.
+//
+// Layout used (stable Win10 1507 – Win11 24H2, x64):
+//   OBJECT_TYPE.CallbackList        : LIST_ENTRY at offset +0xC8
+//   CALLBACK_ENTRY_ITEM.PreOperation: POB_PRE_OPERATION_CALLBACK at offset +0x28
+//     from the LIST_ENTRY node (i.e., from the Flink/Blink pointer itself)
+//
+// PsProcessType and PsThreadType are exported by ntoskrnl as POBJECT_TYPE*
+// (pointer-to-pointer), so we dereference once to reach the OBJECT_TYPE.
+// ---------------------------------------------------------------------------
+
+#define OBJECT_TYPE_CALLBACKLIST_OFFSET  0xC8u
+#define CALLBACK_ENTRY_PREOPERATION_OFFSET 0x28u
+
+VOID HookDetector::CheckObCallbackIntegrity(BufferQueue* bufQueue)
+{
+    if (!bufQueue) return;
+
+    struct TypeDesc {
+        const WCHAR* exportName;
+        PVOID        expectedPreOp;
+        const char*  label;
+    } checks[] = {
+        { L"PsProcessType", (PVOID)ObjectUtils::ProcessPreCallback, "Process" },
+        { L"PsThreadType",  (PVOID)ObjectUtils::ThreadPreCallback,  "Thread"  },
+    };
+
+    for (int i = 0; i < 2; i++) {
+
+        UNICODE_STRING uName;
+        RtlInitUnicodeString(&uName, checks[i].exportName);
+
+        // PsProcessType / PsThreadType are exported as POBJECT_TYPE* (ptr-to-ptr).
+        POBJECT_TYPE* ppType = (POBJECT_TYPE*)MmGetSystemRoutineAddress(&uName);
+        if (!ppType || !MmIsAddressValid(ppType)) {
+            DbgPrint("[-] HookDetector: could not resolve %ws\n", checks[i].exportName);
+            continue;
+        }
+
+        POBJECT_TYPE objType = *ppType;
+        if (!objType || !MmIsAddressValid(objType)) continue;
+
+        // Locate the CallbackList head embedded in the OBJECT_TYPE.
+        PLIST_ENTRY head = (PLIST_ENTRY)((PUCHAR)objType + OBJECT_TYPE_CALLBACKLIST_OFFSET);
+        if (!MmIsAddressValid(head)) continue;
+
+        BOOLEAN found = FALSE;
+        ULONG   limit = 64;   // guard against a corrupt/circular list
+
+        __try {
+            for (PLIST_ENTRY entry = head->Flink;
+                 entry != head && limit-- > 0;
+                 entry = entry->Flink)
+            {
+                if (!MmIsAddressValid(entry)) break;
+
+                // PreOperation pointer lives at +0x28 from the LIST_ENTRY node.
+                PVOID* preOpSlot = (PVOID*)((PUCHAR)entry + CALLBACK_ENTRY_PREOPERATION_OFFSET);
+                if (MmIsAddressValid(preOpSlot) && *preOpSlot == checks[i].expectedPreOp) {
+                    found = TRUE;
+                    break;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrint("[-] HookDetector: exception walking %s CallbackList\n", checks[i].label);
+        }
+
+        if (found) {
+            DbgPrint("[+] HookDetector: Ob%sCallback integrity OK\n", checks[i].label);
+            continue;
+        }
+
+        // Our callback is missing — emit a Critical alert.
+        DbgPrint("[!] HookDetector: Ob%sCallback unlinked from CallbackList!\n", checks[i].label);
+
+        char msg[160];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "ANTI-TAMPER: Ob%sCallback unlinked from OBJECT_TYPE.CallbackList "
+            "— EDRSandblast/Terminator-style attack",
+            checks[i].label);
+
+        SIZE_T msgLen = strlen(msg) + 1;
+
+        PKERNEL_STRUCTURED_NOTIFICATION notif =
+            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED,
+                sizeof(KERNEL_STRUCTURED_NOTIFICATION),
+                'obck');
+        if (!notif) continue;
+
+        RtlZeroMemory(notif, sizeof(*notif));
+        SET_CRITICAL(*notif);
+        SET_OB_CALLBACK_CHECK(*notif);
+        notif->pid           = 0;
+        notif->isPath        = FALSE;
+        notif->scoopedAddress = (ULONG64)checks[i].expectedPreOp;
+        RtlCopyMemory(notif->procName, "NortonEDR", 9);
+
+        notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'obmg');
+        notif->bufSize = (ULONG)msgLen;
+        if (notif->msg) {
+            RtlCopyMemory(notif->msg, msg, msgLen);
+            if (!bufQueue->Enqueue(notif)) {
+                ExFreePool(notif->msg);
+                ExFreePool(notif);
+            }
+        } else {
+            ExFreePool(notif);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RunAllHookChecks — run all detection routines in sequence.
+// Call after driver init is complete (and periodically from AntiTamper).
 // ---------------------------------------------------------------------------
 
 VOID HookDetector::RunAllHookChecks(
@@ -458,6 +578,7 @@ VOID HookDetector::RunAllHookChecks(
     ULONG eat    = ScanKernelEatHooks(moduleBase, bufQueue);
     BOOLEAN etw  = CheckEtwHooks(bufQueue);
     CheckAltSyscallHandlerIntegrity(bufQueue);
+    CheckObCallbackIntegrity(bufQueue);
 
     DbgPrint("[*] HookDetector results — SSDT=%lu Inline=%lu EAT=%lu ETW=%d\n",
         ssdt, inl, eat, (int)etw);

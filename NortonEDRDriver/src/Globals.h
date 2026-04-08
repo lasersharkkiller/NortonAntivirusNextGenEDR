@@ -732,6 +732,7 @@ class SyscallsUtils {
 	static ULONG NtRollbackTransactionId;      // Variable — doppelgänging telemetry
 	static ULONG NtCreateProcessExId;          // Variable — legacy section-based process creation
 	static ULONG NtCreateProcessId;            // Variable — even older legacy API (same technique)
+	static ULONG NtQuerySystemInformationId;   // Variable — EDR callback enumeration recon
 
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
@@ -940,6 +941,9 @@ public:
 	// Legacy process creation from explicit image section (process injection / doppelgänging)
 	static VOID NtCreateProcessExHandler(ULONG Flags, HANDLE SectionHandle);
 	static VOID NtCreateProcessHandler(HANDLE SectionHandle);  // older 8-arg variant
+
+	// EDR callback enumeration recon — suspicious SystemInformationClass values
+	static VOID NtQuerySystemInformationHandler(ULONG SystemInformationClass);
 
 	static VOID NtProtectVirtualMemoryHandler(
 		HANDLE   ProcessHandle,
@@ -1404,6 +1408,11 @@ public:
     static ULONG    ScanKernelEatHooks(PVOID moduleBase, BufferQueue* bufQueue);
     static BOOLEAN  CheckEtwHooks(BufferQueue* bufQueue);
     static VOID     CheckAltSyscallHandlerIntegrity(BufferQueue* bufQueue);
+
+    // Verify our ObRegisterCallbacks entries are still present in
+    // PsProcessType->CallbackList and PsThreadType->CallbackList.
+    // Catches EDRSandblast-style list unlinking attacks.
+    static VOID     CheckObCallbackIntegrity(BufferQueue* bufQueue);
 
     static VOID RunAllHookChecks(
         PFUNCTION_MAP exportsMap,

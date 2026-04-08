@@ -50,6 +50,7 @@ ULONG SyscallsUtils::NtCreateTransactionId = 0;
 ULONG SyscallsUtils::NtRollbackTransactionId = 0;
 ULONG SyscallsUtils::NtCreateProcessExId = 0;
 ULONG SyscallsUtils::NtCreateProcessId = 0;
+ULONG SyscallsUtils::NtQuerySystemInformationId = 0;
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -562,6 +563,11 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		// SectionHandle = arg6 = [RSP+0x30]
 		NtCreateProcessHandler((HANDLE)arg6);
 	}
+	else if (NtQuerySystemInformationId != 0 && id == NtQuerySystemInformationId) {
+		// NtQuerySystemInformation(SystemInformationClass, SystemInformation, Length, ReturnLength)
+		// Class = RCX (arg1)
+		NtQuerySystemInformationHandler((ULONG)trapFrame->Rcx);
+	}
 
 	return TRUE;
 }
@@ -854,6 +860,10 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtCreateProcess;
 	RtlInitUnicodeString(&usNtCreateProcess, L"NtCreateProcess");
 	NtCreateProcessId = getSSNByName(ssdtTable, &usNtCreateProcess, exportsMap);
+
+	UNICODE_STRING usNtQuerySysInfo;
+	RtlInitUnicodeString(&usNtQuerySysInfo, L"NtQuerySystemInformation");
+	NtQuerySystemInformationId = getSSNByName(ssdtTable, &usNtQuerySysInfo, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -1814,6 +1824,53 @@ VOID SyscallsUtils::NtCreateProcessHandler(HANDLE SectionHandle) {
 		" -- direct section-based process creation bypasses NtCreateUserProcess",
 		procName, hasSection ? "set" : "null");
 	EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, hasSection);  // Critical if section set
+}
+
+// NtQuerySystemInformation — intercept classes used by EDR-killer tools to recon the kernel.
+//
+// Class 57 = SystemObjectTypeInformation:
+//   Used by EDRSandblast to enumerate all OBJECT_TYPE descriptors and locate the
+//   CallbackList for PsProcessType/PsThreadType.  Iterating that list reveals our
+//   ObRegisterCallbacks entries, which the attacker then unlinks.
+//   No legitimate user-mode software queries this class — Critical.
+//
+// Class 11 = SystemModuleInformation:
+//   Returns loaded kernel module names and base addresses.  Used by Terminator /
+//   PPLdump / EDRSandblast to locate the EDR driver's kernel base for subsequent
+//   patching.  Legitimate uses exist (sysinternals), but in a monitored process
+//   context it is high-fidelity recon — Warning.
+//
+// Called only when the current process is opted into AltSyscall monitoring, so
+// system processes and PPL callers do not trigger this path.
+VOID SyscallsUtils::NtQuerySystemInformationHandler(ULONG SystemInformationClass)
+{
+	const char* msg      = nullptr;
+	BOOLEAN     critical = FALSE;
+
+	switch (SystemInformationClass) {
+	case 57:   // SystemObjectTypeInformation — callback list enumeration
+		msg      = "EDR recon: NtQuerySystemInformation(57=ObjectTypeInfo) "
+		           "— mapping ObCallback lists (EDRSandblast/Terminator)";
+		critical = TRUE;
+		break;
+
+	case 11:   // SystemModuleInformation — kernel module base recon
+		msg      = "EDR recon: NtQuerySystemInformation(11=ModuleInfo) "
+		           "— enumerating kernel module base addresses";
+		critical = FALSE;
+		break;
+
+	default:
+		return;
+	}
+
+	PEPROCESS proc = IoGetCurrentProcess();
+
+	// Skip PPL / antimalware protected processes — they have legitimate recon needs.
+	PPS_PROTECTION prot = PsGetProcessProtection(proc);
+	if (prot && prot->Level != 0) return;
+
+	EmitSyscallNotif(0, msg, proc, nullptr, critical);
 }
 
 // NtProtectVirtualMemory — detect ntdll/DLL stomping and cross-process protection changes.
