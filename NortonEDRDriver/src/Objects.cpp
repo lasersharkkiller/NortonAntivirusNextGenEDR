@@ -21,7 +21,7 @@ static const char* kSensitiveProcesses[] = {
     nullptr
 };
 
-static BOOLEAN IsSensitiveProcess(PEPROCESS proc)
+BOOLEAN ObjectUtils::IsSensitiveProcess(PEPROCESS proc)
 {
     if (!proc) return FALSE;
     char* name = PsGetProcessImageFileName(proc);
@@ -37,7 +37,7 @@ static BOOLEAN IsSensitiveProcess(PEPROCESS proc)
     return FALSE;
 }
 
-static BOOLEAN IsLsass(PEPROCESS proc)
+BOOLEAN ObjectUtils::IsLsass(PEPROCESS proc)
 {
     if (!proc) return FALSE;
     char* name = PsGetProcessImageFileName(proc);
@@ -214,6 +214,18 @@ OB_PREOP_CALLBACK_STATUS ObjectUtils::ProcessPreCallback(
         EmitObjectAlert(callerProc, targetProc, original, PROCESS_VM_READ,
             "PROCESS_VM_READ stripped from handle to sensitive OS process (credential dump attempt)",
             IsLsass(targetProc) /* lsass = Critical, others = Warning */);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rule 4: PROCESS_VM_READ on any foreign process — visibility into memory
+    // scraping even when target is not a "sensitive" OS process.
+    // Only alert — don't strip. The caller may have a legitimate reason
+    // (debugger, profiler). We want visibility, not breakage.
+    // -----------------------------------------------------------------------
+    if ((original & PROCESS_VM_READ) && !IsSensitiveProcess(targetProc) && !toStrip) {
+        EmitObjectAlert(callerProc, targetProc, original, 0 /*nothing stripped*/,
+            "PROCESS_VM_READ on foreign process — possible memory scraping / credential harvest",
+            FALSE /* Warning */);
     }
 
     return OB_PREOP_SUCCESS;

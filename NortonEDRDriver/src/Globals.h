@@ -734,6 +734,8 @@ class SyscallsUtils {
 	static ULONG NtCreateProcessId;            // Variable — even older legacy API (same technique)
 	static ULONG NtQuerySystemInformationId;   // Variable — EDR callback enumeration recon
 	static ULONG NtSetInformationProcessId;    // Variable — PPL-strip detection (ProcessProtectionLevel = 0x3D)
+	static ULONG NtDuplicateObjectId;         // Stable at 0x003C — handle duplication detection
+	static ULONG NtDebugActiveProcessId;      // Variable — debug-attach credential dump detection
 
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
@@ -946,6 +948,29 @@ public:
 	// EDR callback enumeration recon — suspicious SystemInformationClass values
 	static VOID NtQuerySystemInformationHandler(ULONG SystemInformationClass);
 
+	// PPL-strip detection (ProcessProtectionLevel = 0x3D)
+	static VOID NtSetInformationProcessHandler(
+		HANDLE ProcessHandle,
+		ULONG  ProcessInformationClass,
+		PVOID  ProcessInformation,
+		ULONG  ProcessInformationLength
+	);
+
+	// Handle duplication with dangerous access masks
+	static VOID NtDuplicateObjectHandler(
+		HANDLE SourceProcessHandle,
+		HANDLE SourceHandle,
+		HANDLE TargetProcessHandle,
+		PVOID  TargetHandle,
+		ACCESS_MASK DesiredAccess
+	);
+
+	// Debug-attach credential dump bypass (alternative to PROCESS_VM_READ)
+	static VOID NtDebugActiveProcessHandler(
+		HANDLE ProcessHandle,
+		HANDLE DebugObjectHandle
+	);
+
 	static VOID NtProtectVirtualMemoryHandler(
 		HANDLE   ProcessHandle,
 		PVOID*   BaseAddress,
@@ -1045,6 +1070,10 @@ public:
 		InterlockedExchange(&g_ServicePid, (LONG)pid);
 		DbgPrint("[+] ObjectUtils: EDR service PID registered: %lu\n", pid);
 	}
+
+	// Process-classification helpers — used by Objects.cpp and SyscallsTracing.cpp.
+	static BOOLEAN IsSensitiveProcess(PEPROCESS proc);
+	static BOOLEAN IsLsass(PEPROCESS proc);
 
 	static OB_PREOP_CALLBACK_STATUS ProcessPreCallback(
 		PVOID,

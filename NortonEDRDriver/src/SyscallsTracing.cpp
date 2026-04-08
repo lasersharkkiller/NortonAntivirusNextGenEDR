@@ -55,6 +55,8 @@ ULONG SyscallsUtils::NtCreateProcessExId = 0;
 ULONG SyscallsUtils::NtCreateProcessId = 0;
 ULONG SyscallsUtils::NtQuerySystemInformationId = 0;
 ULONG SyscallsUtils::NtSetInformationProcessId = 0;
+ULONG SyscallsUtils::NtDuplicateObjectId = 0x003C;     // Stable across Win10 1507–Win11 24H2
+ULONG SyscallsUtils::NtDebugActiveProcessId = 0;       // Resolve dynamically
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -581,6 +583,25 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 			(PVOID)trapFrame->R8,
 			(ULONG)trapFrame->R9);
 	}
+	else if (id == NtDuplicateObjectId) {
+		// NtDuplicateObject(SourceProcessHandle, SourceHandle, TargetProcessHandle, TargetHandle, DesiredAccess, HandleAttributes, Options)
+		// RCX=srcProc  RDX=srcHandle  R8=tgtProc  R9=tgtHandle  [RSP+0x28]=access  [RSP+0x30]=attrs  [RSP+0x38]=opts
+		PULONGLONG pAccess = (PULONGLONG)((ULONG_PTR)trapFrame->Rsp + 0x28);
+		ACCESS_MASK access = (ACCESS_MASK)(MmIsAddressValid(pAccess) ? *pAccess : 0);
+		NtDuplicateObjectHandler(
+			(HANDLE)trapFrame->Rcx,
+			(HANDLE)trapFrame->Rdx,
+			(HANDLE)trapFrame->R8,
+			(PVOID)trapFrame->R9,
+			access);
+	}
+	else if (NtDebugActiveProcessId != 0 && id == NtDebugActiveProcessId) {
+		// NtDebugActiveProcess(ProcessHandle, DebugObjectHandle)
+		// RCX=process  RDX=debugObject
+		NtDebugActiveProcessHandler(
+			(HANDLE)trapFrame->Rcx,
+			(HANDLE)trapFrame->Rdx);
+	}
 
 	return TRUE;
 }
@@ -881,6 +902,10 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtSetInfoProcess;
 	RtlInitUnicodeString(&usNtSetInfoProcess, L"NtSetInformationProcess");
 	NtSetInformationProcessId = getSSNByName(ssdtTable, &usNtSetInfoProcess, exportsMap);
+
+	UNICODE_STRING usNtDebugActiveProcess;
+	RtlInitUnicodeString(&usNtDebugActiveProcess, L"NtDebugActiveProcess");
+	NtDebugActiveProcessId = getSSNByName(ssdtTable, &usNtDebugActiveProcess, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -1445,23 +1470,17 @@ VOID SyscallsUtils::NtOpenProcessHandler(
 		PsLookupProcessByProcessId(targetPid, &targetProcess);
 	}
 
-	BOOLEAN isSensitive = FALSE;
-	if (targetProcess) {
-		char lower[15] = {};
-		char* name = PsGetProcessImageFileName(targetProcess);
-		for (int i = 0; i < 14 && name[i]; i++)
-			lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? (char)(name[i] + 32) : name[i];
-		if (RtlCompareMemory(lower, "lsass.exe", 9) == 9) isSensitive = TRUE;
-	}
+	BOOLEAN isSensitive = targetProcess ? ObjectUtils::IsSensitiveProcess(targetProcess) : FALSE;
+	BOOLEAN isLsass     = targetProcess ? ObjectUtils::IsLsass(targetProcess)            : FALSE;
 
 	EmitSyscallNotif(
 		(ULONG64)targetPid,
-		isSensitive
-			? "NtOpenProcess: injection-capable access to lsass (credential theft)"
-			: "NtOpenProcess: injection-capable access to foreign process",
+		isLsass     ? "NtOpenProcess: injection-capable access to lsass (credential theft)"   :
+		isSensitive ? "NtOpenProcess: injection-capable access to sensitive OS process"        :
+		              "NtOpenProcess: injection-capable access to foreign process",
 		IoGetCurrentProcess(),
 		targetProcess,
-		isSensitive
+		isSensitive   // Critical for all 6 sensitive processes now, not just lsass
 	);
 
 	if (targetProcess) ObDereferenceObject(targetProcess);
@@ -1953,6 +1972,137 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 	EmitSyscallNotif(0, msg, caller, target, TRUE /* critical */);
 
 	if (ownedRef && target) ObDereferenceObject(target);
+}
+
+// NtDuplicateObject — detect handle duplication with dangerous access masks.
+//
+// An attacker can call NtDuplicateObject to inherit dangerous access rights (PROCESS_VM_WRITE,
+// PROCESS_VM_READ, PROCESS_CREATE_THREAD, etc.) from another process's handle table.
+// This syscall-layer detection provides earlier alerting than the OB callback alone.
+VOID SyscallsUtils::NtDuplicateObjectHandler(
+	HANDLE SourceProcessHandle,
+	HANDLE SourceHandle,
+	HANDLE TargetProcessHandle,
+	PVOID  TargetHandle,
+	ACCESS_MASK DesiredAccess)
+{
+	UNREFERENCED_PARAMETER(SourceHandle);
+	UNREFERENCED_PARAMETER(TargetHandle);
+
+	// Injection-capable access mask
+	const ACCESS_MASK kInjectionMask =
+		0x0002 |  // PROCESS_CREATE_THREAD
+		0x0008 |  // PROCESS_VM_OPERATION
+		0x0010 |  // PROCESS_VM_READ
+		0x0020;   // PROCESS_VM_WRITE
+
+	// If access mask has no dangerous bits, or is 0 (inherit all), skip
+	BOOLEAN isSuspicious = (DesiredAccess & kInjectionMask) || (DesiredAccess == 0);
+	if (!isSuspicious) return;
+
+	PEPROCESS caller = IoGetCurrentProcess();
+
+	// Skip PPL callers
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	// Resolve target process
+	PEPROCESS targetProcess = nullptr;
+	BOOLEAN ownedRef = FALSE;
+
+	if (TargetProcessHandle == NtCurrentProcess()) {
+		targetProcess = caller;
+		ObReferenceObject(targetProcess);
+		ownedRef = TRUE;
+	} else {
+		NTSTATUS st = ObReferenceObjectByHandle(
+			TargetProcessHandle,
+			PROCESS_QUERY_INFORMATION,
+			*PsProcessType,
+			UserMode,
+			(PVOID*)&targetProcess,
+			nullptr);
+		if (NT_SUCCESS(st)) ownedRef = TRUE;
+	}
+
+	char msg[128];
+	BOOLEAN isSensitive = targetProcess ? ObjectUtils::IsSensitiveProcess(targetProcess) : FALSE;
+	BOOLEAN isLsass = targetProcess ? ObjectUtils::IsLsass(targetProcess) : FALSE;
+
+	if (DesiredAccess == 0) {
+		// Duplication with "inherit all" access
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtDuplicateObject: duplicating handle with INHERIT_ALL access %s",
+			isSensitive ? "(targeting sensitive process)" : "(dangerous access mask)");
+	} else {
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtDuplicateObject: duplicating handle with injection-capable access (0x%X) %s",
+			DesiredAccess, isSensitive ? "(sensitive process)" : "");
+	}
+
+	EmitSyscallNotif(0, msg, caller, targetProcess, isSensitive || isLsass);
+
+	if (ownedRef && targetProcess) ObDereferenceObject(targetProcess);
+}
+
+// NtDebugActiveProcess — detect debug-attach credential dump bypass.
+//
+// Instead of calling NtOpenProcess with PROCESS_VM_READ (which triggers ObCallback stripping),
+// an attacker can call NtDebugActiveProcess to attach a debug object to lsass and use
+// NtReadVirtualMemory through the debug channel. This is the technique used by Mimikatz's
+// sekurlsa::minidump and similar tools.
+VOID SyscallsUtils::NtDebugActiveProcessHandler(
+	HANDLE ProcessHandle,
+	HANDLE DebugObjectHandle)
+{
+	UNREFERENCED_PARAMETER(DebugObjectHandle);
+
+	PEPROCESS caller = IoGetCurrentProcess();
+
+	// Skip PPL callers
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	// Resolve target process
+	PEPROCESS targetProcess = nullptr;
+	BOOLEAN ownedRef = FALSE;
+
+	if (ProcessHandle == NtCurrentProcess()) {
+		targetProcess = caller;
+		ObReferenceObject(targetProcess);
+		ownedRef = TRUE;
+	} else {
+		NTSTATUS st = ObReferenceObjectByHandle(
+			ProcessHandle,
+			PROCESS_QUERY_INFORMATION,
+			*PsProcessType,
+			UserMode,
+			(PVOID*)&targetProcess,
+			nullptr);
+		if (NT_SUCCESS(st)) ownedRef = TRUE;
+	}
+
+	if (!targetProcess) return;
+
+	// Check if target is lsass or any sensitive process
+	BOOLEAN isLsass = ObjectUtils::IsLsass(targetProcess);
+	BOOLEAN isSensitive = ObjectUtils::IsSensitiveProcess(targetProcess);
+
+	char msg[128];
+	if (isLsass) {
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"ANTI-TAMPER: NtDebugActiveProcess on lsass — debug-attach credential dump bypass");
+	} else if (isSensitive) {
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"ANTI-TAMPER: NtDebugActiveProcess on sensitive OS process — potential code injection");
+	} else {
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtDebugActiveProcess: attaching debugger to foreign process");
+	}
+
+	EmitSyscallNotif(0, msg, caller, targetProcess, isLsass || isSensitive);
+
+	if (ownedRef && targetProcess) ObDereferenceObject(targetProcess);
 }
 
 // NtProtectVirtualMemory — detect ntdll/DLL stomping and cross-process protection changes.
