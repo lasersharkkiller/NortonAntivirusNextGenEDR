@@ -51,6 +51,11 @@
 
 #define END_THAT_PROCESS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x216, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// Input: UINT32 PID — registers the caller as the EDR service process.
+// The kernel will then strip PROCESS_TERMINATE / VM_WRITE from any handle
+// opened to that PID (self-protection, like CrowdStrike's CSAgent protection).
+#define NORTONAV_REGISTER_SERVICE_PID CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 // Payload sent from user mode to configure DllInjector.
 // LoadLibraryWAddress is the VA of LoadLibraryW in the NortonEDR process;
 // it is valid in all processes because system DLLs are mapped at the same VA
@@ -1007,9 +1012,9 @@ public:
 class ObjectUtils {
 
 private:
-	
+
 	UNICODE_STRING altitude;
-	
+
 	PVOID regHandle1;
 	PVOID regHandle2;
 
@@ -1017,18 +1022,40 @@ private:
 	OB_CALLBACK_REGISTRATION objOpCallbackRegistration2;
 
 	OB_OPERATION_REGISTRATION regPreOpRegistration;
-	OB_OPERATION_REGISTRATION setThreadContextPostOpOperation;
+	OB_OPERATION_REGISTRATION regPreOpDupRegistration;
+	OB_OPERATION_REGISTRATION threadPreOpRegistration;
+
+	// PID of the NortonEDR user-mode service — set via NORTONAV_REGISTER_SERVICE_PID IOCTL.
+	// Handles opened to this process have PROCESS_TERMINATE / VM_WRITE stripped (self-protection).
+	static volatile LONG g_ServicePid;
 
 public:
 
 	VOID setObjectNotificationCallback();
-	
+
 	VOID unsetObjectNotificationCallback();
 
-	static OB_PREOP_CALLBACK_STATUS PreOperationCallback(
+	// Called from DriverIoControl when NORTONAV_REGISTER_SERVICE_PID arrives.
+	static VOID RegisterServicePid(ULONG pid) {
+		InterlockedExchange(&g_ServicePid, (LONG)pid);
+		DbgPrint("[+] ObjectUtils: EDR service PID registered: %lu\n", pid);
+	}
+
+	static OB_PREOP_CALLBACK_STATUS ProcessPreCallback(
 		PVOID,
 		POB_PRE_OPERATION_INFORMATION
 	);
+
+	static OB_PREOP_CALLBACK_STATUS ThreadPreCallback(
+		PVOID,
+		POB_PRE_OPERATION_INFORMATION
+	);
+
+	// Legacy names kept so existing call-sites compile unchanged
+	static OB_PREOP_CALLBACK_STATUS PreOperationCallback(
+		PVOID ctx, POB_PRE_OPERATION_INFORMATION op) {
+		return ProcessPreCallback(ctx, op);
+	}
 
 	static POB_POST_OPERATION_CALLBACK PostOperationCallback(
 		PVOID,
@@ -1383,6 +1410,29 @@ public:
         PVOID         moduleBase,
         BufferQueue*  bufQueue
     );
+};
+
+// ---------------------------------------------------------------------------
+// TokenMonitor — logon-session termination callback.
+// Detects processes that retain a primary token for a dead logon session,
+// which is the kernel-visible signature of pass-the-token / token theft.
+// Init must be called at PASSIVE_LEVEL from DriverEntry.
+// ---------------------------------------------------------------------------
+class TokenMonitor {
+public:
+    static VOID Init(NotifQueue* queue);
+    static VOID Cleanup();
+};
+
+// ---------------------------------------------------------------------------
+// PnpMonitor — IoRegisterPlugPlayNotification for HID and removable disk.
+// Alerts on BadUSB/HID-injection devices and suspicious USB mass storage.
+// InitWithDriver must be called from DriverEntry (requires PDRIVER_OBJECT).
+// ---------------------------------------------------------------------------
+class PnpMonitor {
+public:
+    static VOID InitWithDriver(PDRIVER_OBJECT driverObject, NotifQueue* queue);
+    static VOID Cleanup();
 };
 
 class CallbackObjects :

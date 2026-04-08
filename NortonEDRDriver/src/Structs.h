@@ -59,6 +59,8 @@
 #define SET_AMSI_BYPASS_CHECK(notification)         ((notification).AmsiBypassCheck        = 1)
 #define SET_NETWORK_CHECK(notification)             ((notification).NetworkCheck           = 1)
 #define SET_FSFILTER_CHECK(notification)            ((notification).FsFilterCheck          = 1)
+#define SET_TOKEN_CHECK(notification)               ((notification).TokenCheck             = 1)
+#define SET_PNP_CHECK(notification)                 ((notification).PnpCheck               = 1)
 
 typedef unsigned short WORD;
 typedef unsigned char BYTE;
@@ -702,7 +704,9 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
         struct {
             unsigned char NetworkCheck  : 1;
             unsigned char FsFilterCheck : 1;
-            unsigned char Reserved3     : 6;
+            unsigned char TokenCheck    : 1;
+            unsigned char PnpCheck      : 1;
+            unsigned char Reserved3     : 4;
         };
         unsigned char method3;
     };

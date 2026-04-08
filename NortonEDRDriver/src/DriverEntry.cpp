@@ -47,6 +47,8 @@ VOID UnloadDriver(PDRIVER_OBJECT DriverObject) {
 	g_callbackObjects->unsetNotificationsGlobal();
 
 	AntiTamper::Cleanup();
+	TokenMonitor::Cleanup();
+	PnpMonitor::Cleanup();
 	DeceptionEngine::Cleanup();
 	FsFilter::Cleanup();
 	EtwProvider::Cleanup();
@@ -256,6 +258,17 @@ NTSTATUS DriverIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 				status = STATUS_SUCCESS;
 			}
 		}
+		else if (stack->Parameters.DeviceIoControl.IoControlCode == NORTONAV_REGISTER_SERVICE_PID) {
+
+			if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(UINT32)) {
+				status = STATUS_INVALID_PARAMETER;
+				__leave;
+			}
+
+			UINT32 svcPid = *(UINT32*)Irp->AssociatedIrp.SystemBuffer;
+			ObjectUtils::RegisterServicePid(svcPid);
+			status = STATUS_SUCCESS;
+		}
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 		DbgPrint("[!] Exception occurred in DriverIoControl\n");
@@ -391,6 +404,13 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	// Must be initialized after HookDetector (which establishes the SSDT baseline)
 	// so the first periodic check has a valid snapshot to compare against.
 	AntiTamper::Init(DriverObject, g_hashQueue);
+
+	// Token theft detection: fire on every logon-session teardown and alert
+	// on any process that still holds a token tied to the dead session.
+	TokenMonitor::Init(g_hashQueue);
+
+	// PnP monitoring: alert on BadUSB/HID-injection devices and removable disks.
+	PnpMonitor::InitWithDriver(DriverObject, g_hashQueue);
 
 	// Initialize deception engine — honeypot registry keys and file traps.
 	// Non-fatal: the driver functions normally if SECURITY hive is inaccessible.
