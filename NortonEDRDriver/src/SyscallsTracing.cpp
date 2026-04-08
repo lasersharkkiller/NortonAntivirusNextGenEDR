@@ -256,6 +256,28 @@ VOID SyscallsUtils::NtVersionPreCheck() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// IdToName — map syscall SSN to human-readable name for alerts.
+// ---------------------------------------------------------------------------
+static const char* IdToName(ULONG id) {
+	if (id == 0x0018) return "NtAllocateVirtualMemory";
+	if (id == 0x003a) return "NtWriteVirtualMemory";
+	if (id == 0x0050) return "NtProtectVirtualMemory";
+	if (id == 0x0054) return "NtReadVirtualMemory";
+	if (id == 0x0045) return "NtQueueApcThread";
+	if (id == NtQueueApcThreadExId) return "NtQueueApcThreadEx";
+	if (id == NtSetContextThreadId) return "NtSetContextThread";
+	if (id == NtOpenProcessId) return "NtOpenProcess";
+	if (id == NtMapViewOfSectionId) return "NtMapViewOfSection";
+	if (id == NtDuplicateObjectId) return "NtDuplicateObject";
+	if (id == NtDebugActiveProcessId) return "NtDebugActiveProcess";
+	if (id == NtResumeThreadId) return "NtResumeThread";
+	if (id == NtContinueId) return "NtContinue";
+	if (id == NtCreateThreadExId) return "NtCreateThreadEx";
+	if (id == NtOpenThreadId) return "NtOpenThread";
+	return "Unknown";
+}
+
 BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 
 	PVOID spoofedAddr = NULL;
@@ -266,45 +288,62 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		return FALSE;
 	}
 
-	if (id == NtAllocId || id == NtWriteId || id == NtProtectId) {
-		
-			if(stackUtils->isStackCorruptedRtlCET(&spoofedAddr)) {
+	// --- Pre-dispatch: unified call-origin and CET checks for attack-relevant syscalls ---
+	// These syscalls are the primary injection/evasion attack surface: memory operations,
+	// process/thread access, APC queuing, section/file operations, context manipulation.
 
-			lastNotifedCidStackCorrupt = PsGetCurrentProcessId();
+	BOOLEAN isAttackRelevant =
+		(id == NtAllocId                || id == NtWriteId               || id == NtProtectId           ||
+		 id == 0x0054                   || id == 0x0045                  || id == NtQueueApcThreadExId  ||
+		 id == NtSetContextThreadId     || id == NtOpenProcessId         || id == NtMapViewOfSectionId  ||
+		 id == NtDuplicateObjectId      || id == NtDebugActiveProcessId  || id == NtResumeThreadId      ||
+		 id == NtContinueId             || id == NtCreateThreadExId      || id == NtOpenThreadId);
 
-			PKERNEL_STRUCTURED_NOTIFICATION kernelNotif = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+	if (isAttackRelevant) {
+		// CET shadow stack check — catches Type 2 indirect syscalls on CET-capable hardware
+		if (id == NtAllocId || id == NtWriteId || id == NtProtectId) {
+			if (stackUtils && stackUtils->isStackCorruptedRtlCET(&spoofedAddr)) {
+				if (lastNotifedCidStackCorrupt != PsGetCurrentProcessId()) {
+					lastNotifedCidStackCorrupt = PsGetCurrentProcessId();
 
-			if (kernelNotif) { 
+					PKERNEL_STRUCTURED_NOTIFICATION kernelNotif = (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+						POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
 
-				char* msg = "Corrupted Thread Call Stack";
+					if (kernelNotif) {
+						char* msg = "Corrupted Thread Call Stack";
+						RtlZeroMemory(kernelNotif, sizeof(*kernelNotif));
+						SET_WARNING(*kernelNotif);
+						SET_SHADOW_STACK_CHECK(*kernelNotif);
+						kernelNotif->scoopedAddress = (ULONG64)spoofedAddr;
+						kernelNotif->bufSize = sizeof(msg);
+						kernelNotif->isPath = FALSE;
+						kernelNotif->pid = PsGetProcessId(IoGetCurrentProcess());
+						RtlCopyMemory(kernelNotif->procName, PsGetProcessImageFileName(IoGetCurrentProcess()), 14);
 
-				SET_WARNING(*kernelNotif);
-				SET_SHADOW_STACK_CHECK(*kernelNotif);
-
-				kernelNotif->scoopedAddress = (ULONG64)spoofedAddr;
-				kernelNotif->bufSize = sizeof(msg);
-				kernelNotif->isPath = FALSE;
-				kernelNotif->pid = PsGetProcessId(IoGetCurrentProcess());
-				kernelNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, strlen(msg) + 1, 'msg');
-
-				RtlCopyMemory(kernelNotif->procName, PsGetProcessImageFileName(IoGetCurrentProcess()), 15);
-
-				if (kernelNotif->msg) {
-					RtlCopyMemory(kernelNotif->msg, msg, strlen(msg) + 1);
-					if (!CallbackObjects::GetNotifQueue()->Enqueue(kernelNotif)) {
-						ExFreePool(kernelNotif->msg);
-						ExFreePool(kernelNotif);
+						kernelNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, strlen(msg) + 1, 'msg');
+						if (kernelNotif->msg) {
+							RtlCopyMemory(kernelNotif->msg, msg, strlen(msg) + 1);
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(kernelNotif)) {
+								ExFreePool(kernelNotif->msg);
+								ExFreePool(kernelNotif);
+							}
+						} else {
+							ExFreePool(kernelNotif);
+						}
 					}
 				}
-				else {
-					ExFreePool(kernelNotif);
-				}
+				return FALSE;
 			}
-			return FALSE;
 		}
+
+		// Call-origin check — catches Type 1 direct syscalls on all hardware
+		isSyscallDirect(trapFrame->Rip, (char*)IdToName(id));
+
+		// Indirect syscall check — catches Type 2 from shellcode (non-CET systems)
+		isSyscallIndirect(trapFrame->Rsp);
 	}
-	
-	
+
+
 
 	PULONGLONG pArg5 = (PULONGLONG)((ULONG_PTR)trapFrame->Rsp + 0x28);
 	PULONGLONG pArg6 = (PULONGLONG)((ULONG_PTR)trapFrame->Rsp + 0x30);
@@ -347,8 +386,6 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 	}
 	else if (id == 0x0050) {			// NtProtectVirtualMemory | Win 10 -> Win11 24H2
 
-		isSyscallDirect(trapFrame->Rip, "NtProtectVirtualMemory");
-
 		NtProtectVmHandler(
 			(HANDLE)trapFrame->Rcx,
 			(PVOID)trapFrame->Rdx,
@@ -358,8 +395,6 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		);
 	}
 	else if (id == 0x003a) {			// NtWriteVirtualMemory | Win 10 -> Win11 24H2
-
-		isSyscallDirect(trapFrame->Rip, "NtWriteVirtualMemory");
 
 		NtWriteVmHandler(				
 			(HANDLE)trapFrame->Rcx,
@@ -410,8 +445,6 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		);
 	}
 	else if (id == 0x0054) {	        // NtReadVirtualMemory | Win 10 -> Win11 24H2
-
-		isSyscallDirect(trapFrame->Rip, "NtReadVirtualMemory");
 
 		NtReadVmHandler(
 			(HANDLE)trapFrame->Rcx,
