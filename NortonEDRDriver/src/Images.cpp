@@ -555,6 +555,7 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                     { "secur32.dll",  11, "LsaCallAuthenticationPackage / SSP credential abuse",    TRUE  },
                                     { "netapi32.dll", 12, "Domain replication attack (I_NetServerAuthenticate2)",   TRUE  },
                                     { "comsvcs.dll",  12, "LOLBin MiniDump export — rundll32 comsvcs.dll,MiniDump lsass dump", TRUE },
+                                    { "system.identitymodel.dll", 26, "Kerberos S4U delegation abuse (Rubeus/S4U2Self/S4U2Proxy)", TRUE },
                                     { nullptr, 0, nullptr, FALSE }
                                 };
 

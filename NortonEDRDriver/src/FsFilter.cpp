@@ -56,6 +56,9 @@ static const PCWSTR kCredPaths[] = {
     L"\\ntds\\ntds.dit",
     L"lsass.dmp",
     L"\\memory.dmp",
+    L".kirbi",              // Mimikatz/Rubeus Kerberos ticket export format
+    L".ccache",             // Impacket/MIT Kerberos credential cache
+    L"krb5cc_",             // MIT Kerberos default ccache filename prefix
 };
 
 // ---------------------------------------------------------------------------

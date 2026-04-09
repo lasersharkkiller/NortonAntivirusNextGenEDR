@@ -891,6 +891,69 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 			}
 		}
 
+		// --- Kerberos delegation / ticket attack tool detection ---
+		// Detect known Kerberos attack tool binaries at process creation.
+		{
+			static const WCHAR* kKerberosAttackTools[] = {
+				L"rubeus.exe",     // C# Kerberos abuse (S4U, delegation, AS-REP roast)
+				L"kekeo.exe",      // Kerberos toolbox (TGT/TGS manipulation, delegation)
+				L"klist.exe",      // Built-in but suspicious from non-system context
+				nullptr
+			};
+
+			char* krbProcName = PsGetProcessImageFileName(Process);
+			if (krbProcName && CreateInfo->ImageFileName && CreateInfo->ImageFileName->Buffer) {
+				for (int i = 0; kKerberosAttackTools[i]; i++) {
+					if (!UnicodeStringContains(CreateInfo->ImageFileName, kKerberosAttackTools[i]))
+						continue;
+
+					// klist.exe is legitimate from System32 — only flag from other paths
+					if (i == 2) {
+						if (UnicodeStringContains(CreateInfo->ImageFileName, L"\\Windows\\System32\\") ||
+							UnicodeStringContains(CreateInfo->ImageFileName, L"\\Windows\\SysWOW64\\"))
+							continue;
+					}
+
+					char narrowPath[256] = {};
+					USHORT copyChars = min(
+						(USHORT)(CreateInfo->ImageFileName->Length / sizeof(WCHAR)),
+						(USHORT)(sizeof(narrowPath) - 1));
+					for (USHORT j = 0; j < copyChars; j++) {
+						WCHAR wc = CreateInfo->ImageFileName->Buffer[j];
+						narrowPath[j] = (wc < 128) ? (char)wc : '?';
+					}
+
+					char msg[320];
+					RtlStringCbPrintfA(msg, sizeof(msg),
+						"Kerberos attack tool: '%s' launched from '%s' "
+						"(delegation abuse / ticket manipulation — Rubeus/Kekeo/Impacket)",
+						krbProcName, narrowPath);
+
+					PKERNEL_STRUCTURED_NOTIFICATION n =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+					if (n) {
+						RtlZeroMemory(n, sizeof(*n));
+						SET_CRITICAL(*n);
+						SET_CALLING_PROC_PID_CHECK(*n);
+						n->isPath = FALSE;
+						n->pid    = PsGetProcessId(Process);
+						if (krbProcName) RtlCopyMemory(n->procName, krbProcName, 14);
+						SIZE_T msgLen = strlen(msg) + 1;
+						n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+						if (n->msg) {
+							RtlCopyMemory(n->msg, msg, msgLen);
+							n->bufSize = (ULONG)msgLen;
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+								ExFreePool(n->msg); ExFreePool(n);
+							}
+						} else { ExFreePool(n); }
+					}
+					break;
+				}
+			}
+		}
+
 		// -----------------------------------------------------------------------
 		// Mitigation policy check — detect policies that block our HookDll injection
 		// or prevent trampoline installation, leaving the process unwatched.
