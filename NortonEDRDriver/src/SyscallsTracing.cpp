@@ -1427,6 +1427,53 @@ VOID SyscallsUtils::NtWriteFileHandler(
 			ExFreePool(rawBuf.buffer);
 		}
 	}
+
+	// --- System binary replacement detection ---
+	PFILE_OBJECT fileObject = nullptr;
+	if (NT_SUCCESS(ObReferenceObjectByHandle(
+			FileHandle, 0, *IoFileObjectType, KernelMode, (PVOID*)&fileObject, nullptr))
+		&& fileObject)
+	{
+		if (MmIsAddressValid(&fileObject->FileName) &&
+			fileObject->FileName.Buffer && fileObject->FileName.Length > 0)
+		{
+			BOOLEAN inSystem32 =
+				UnicodeStringContains(&fileObject->FileName, L"\\Windows\\System32\\") ||
+				UnicodeStringContains(&fileObject->FileName, L"\\Windows\\SysWOW64\\");
+
+			if (inSystem32) {
+				static const WCHAR* kAccessibilityExes[] = {
+					L"sethc.exe", L"utilman.exe", L"osk.exe",
+					L"narrator.exe", L"magnify.exe", L"displayswitch.exe", nullptr
+				};
+				BOOLEAN isSensitiveBinary = FALSE;
+				for (int i = 0; kAccessibilityExes[i]; i++) {
+					if (UnicodeStringContains(&fileObject->FileName, kAccessibilityExes[i])) {
+						isSensitiveBinary = TRUE; break;
+					}
+				}
+
+				char pathBuf[128] = {};
+				USHORT copyLen = min(
+					fileObject->FileName.Length / sizeof(WCHAR), (USHORT)(sizeof(pathBuf) - 1));
+				for (USHORT i = 0; i < copyLen; i++) {
+					WCHAR wc = fileObject->FileName.Buffer[i];
+					pathBuf[i] = (wc < 128) ? (char)wc : '?';
+				}
+
+				char sysMsg[256];
+				RtlStringCbPrintfA(sysMsg, sizeof(sysMsg),
+					isSensitiveBinary
+						? "NtWriteFile: write to protected system binary '%s' "
+						  "(sticky keys / accessibility tool UAC bypass)"
+						: "NtWriteFile: write to System32 path '%s' "
+						  "(system binary replacement attempt)",
+					pathBuf);
+				EmitSyscallNotif(0, sysMsg, IoGetCurrentProcess(), nullptr, isSensitiveBinary);
+			}
+		}
+		ObDereferenceObject(fileObject);
+	}
 }
 
 // NtReadVirtualMemory — cross-process reads only; Critical if target is lsass.

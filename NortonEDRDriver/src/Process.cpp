@@ -833,6 +833,64 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 			}
 		}
 
+		// --- System binary masquerade detection ---
+		// Attacker copies cmd.exe (or accessibility tool) to a non-standard path
+		// and executes from there to avoid name-based detection.
+		if (CreateInfo->ImageFileName && CreateInfo->ImageFileName->Buffer &&
+			CreateInfo->ImageFileName->Length > 0)
+		{
+			static const WCHAR* kSensitiveBinaries[] = {
+				L"cmd.exe", L"powershell.exe", L"sethc.exe", L"utilman.exe",
+				L"osk.exe", L"narrator.exe", L"magnify.exe", L"displayswitch.exe", nullptr
+			};
+			for (int i = 0; kSensitiveBinaries[i]; i++) {
+				if (UnicodeStringContains(CreateInfo->ImageFileName, kSensitiveBinaries[i])) {
+					BOOLEAN fromLegitPath =
+						UnicodeStringContains(CreateInfo->ImageFileName, L"\\Windows\\System32\\") ||
+						UnicodeStringContains(CreateInfo->ImageFileName, L"\\Windows\\SysWOW64\\") ||
+						UnicodeStringContains(CreateInfo->ImageFileName, L"\\Windows\\WinSxS\\");
+					if (!fromLegitPath) {
+						char narrowPath[256] = "<unknown>";
+						USHORT copyChars = min(
+							(USHORT)(CreateInfo->ImageFileName->Length / sizeof(WCHAR)),
+							(USHORT)(sizeof(narrowPath) - 1));
+						for (USHORT j = 0; j < copyChars; j++) {
+							WCHAR wc = CreateInfo->ImageFileName->Buffer[j];
+							narrowPath[j] = (wc < 128) ? (char)wc : '?';
+						}
+						char* procName = PsGetProcessImageFileName(Process);
+						char msg[320];
+						RtlStringCbPrintfA(msg, sizeof(msg),
+							"Masquerading: '%s' running from non-standard path '%s' "
+							"(copied system binary / sticky keys replacement executed)",
+							procName ? procName : "?", narrowPath);
+
+						PKERNEL_STRUCTURED_NOTIFICATION n =
+							(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+								POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+						if (n) {
+							RtlZeroMemory(n, sizeof(*n));
+							SET_CRITICAL(*n);
+							SET_CALLING_PROC_PID_CHECK(*n);
+							n->isPath = FALSE;
+							n->pid    = PsGetProcessId(Process);
+							if (procName) RtlCopyMemory(n->procName, procName, 14);
+							SIZE_T msgLen = strlen(msg) + 1;
+							n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+							if (n->msg) {
+								RtlCopyMemory(n->msg, msg, msgLen);
+								n->bufSize = (ULONG)msgLen;
+								if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+									ExFreePool(n->msg); ExFreePool(n);
+								}
+							} else { ExFreePool(n); }
+						}
+					}
+					break;
+				}
+			}
+		}
+
 		// -----------------------------------------------------------------------
 		// Mitigation policy check — detect policies that block our HookDll injection
 		// or prevent trampoline installation, leaving the process unwatched.
