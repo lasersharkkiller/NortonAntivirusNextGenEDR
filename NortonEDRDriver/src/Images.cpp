@@ -554,6 +554,7 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                     { "dbghelp.dll",  11, "MiniDumpWriteDump — LSASS/process memory dump",          TRUE  },
                                     { "secur32.dll",  11, "LsaCallAuthenticationPackage / SSP credential abuse",    TRUE  },
                                     { "netapi32.dll", 12, "Domain replication attack (I_NetServerAuthenticate2)",   TRUE  },
+                                    { "comsvcs.dll",  12, "LOLBin MiniDump export — rundll32 comsvcs.dll,MiniDump lsass dump", TRUE },
                                     { nullptr, 0, nullptr, FALSE }
                                 };
 
