@@ -222,6 +222,18 @@ static const char* kLolDriverNames[] = {
     "mhyprot2.sys",       // miHoYo anti-cheat — arbitrary R/W, used by ransomware
     "zemana.sys",         // Zemana AntiMalware driver — abused for termination
     "asio.sys",           // ASIO — abused for ring-0 access
+
+    // DMA attack / physical memory access (IOMMU bypass)
+    "pcileech.sys",       // PCILeech — direct PCIe DMA framework
+    "leechcore.sys",      // LeechCore — PCILeech core driver
+    "oxpcie.sys",         // OxPCIe — Oxford PCIe UART (PCILeech FPGA)
+    "fpga_driver.sys",    // Generic PCILeech FPGA driver
+    "km.sys",             // PCILeech km.sys payload carrier
+    "pmxdrv.sys",         // PassMark — physical memory read (CVE abused by DMA tools)
+    "iomem64.sys",        // IOMemory — arbitrary physical memory access
+    "memdrv.sys",         // Generic memory access driver
+    "asmmap64.sys",       // ASMedia — arbitrary physical memory map
+    "inpoutx64.sys",      // InpOut — direct port I/O / physical memory
     nullptr
 };
 

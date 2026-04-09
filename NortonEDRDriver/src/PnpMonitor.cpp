@@ -42,10 +42,11 @@
 // Module state
 // ---------------------------------------------------------------------------
 
-static PVOID s_HidNotifHandle  = nullptr;
-static PVOID s_UsbNotifHandle  = nullptr;
-static PVOID s_DiskNotifHandle = nullptr;
-static NotifQueue* s_PnpQueue  = nullptr;
+static PVOID s_HidNotifHandle   = nullptr;
+static PVOID s_UsbNotifHandle   = nullptr;
+static PVOID s_DiskNotifHandle  = nullptr;
+static PVOID s_1394NotifHandle  = nullptr;
+static NotifQueue* s_PnpQueue   = nullptr;
 
 // ---------------------------------------------------------------------------
 // EmitPnpAlert
@@ -219,6 +220,41 @@ static NTSTATUS NTAPI DiskArrivalCallback(
 }
 
 // ---------------------------------------------------------------------------
+// FireWireArrivalCallback — fires for every IEEE 1394 (FireWire) device arrival.
+// 1394 has DMA by design via the OHCI spec; classic hardware DMA attack vector.
+// ---------------------------------------------------------------------------
+
+static NTSTATUS NTAPI FireWireArrivalCallback(
+    _In_ PVOID NotificationStructure,
+    _In_opt_ PVOID Context)
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    PDEVICE_INTERFACE_CHANGE_NOTIFICATION notif =
+        (PDEVICE_INTERFACE_CHANGE_NOTIFICATION)NotificationStructure;
+
+    // Only care about arrivals, not removals.
+    if (!IsEqualGUID(notif->Event, GUID_DEVICE_INTERFACE_ARRIVAL)) {
+        return STATUS_SUCCESS;
+    }
+
+    char symNarrow[200] = {};
+    NarrowSymLink(notif->SymbolicLinkName, symNarrow, sizeof(symNarrow));
+
+    char msg[320];
+    RtlStringCbPrintfA(msg, sizeof(msg),
+        "DMA threat: FireWire/IEEE 1394 device arrived — %s "
+        "— 1394 has DMA by design (OHCI); classic hardware DMA/IOMMU bypass vector "
+        "(Inception, PCILeech 1394 attack)",
+        symNarrow);
+
+    DbgPrint("[PnpMonitor] FireWire arrival: %s\n", symNarrow);
+    EmitPnpAlert(msg, TRUE);  // CRITICAL
+
+    return STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
 // PnpMonitor::Init / Cleanup
 // ---------------------------------------------------------------------------
 
@@ -255,6 +291,21 @@ VOID PnpMonitor::InitWithDriver(PDRIVER_OBJECT driverObject, NotifQueue* queue)
         DbgPrint("[-] PnpMonitor: disk registration failed: 0x%x\n", s);
     else
         DbgPrint("[+] PnpMonitor: disk notification registered\n");
+
+    // FireWire/IEEE 1394 arrival — DMA by design via OHCI spec.
+    s = IoRegisterPlugPlayNotification(
+        EventCategoryDeviceInterfaceChange,
+        PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
+        (PVOID)&GUID_DEVINTERFACE_1394_LOCAL,
+        driverObject,
+        FireWireArrivalCallback,
+        nullptr,
+        &s_1394NotifHandle);
+
+    if (!NT_SUCCESS(s))
+        DbgPrint("[-] PnpMonitor: 1394 registration failed: 0x%x\n", s);
+    else
+        DbgPrint("[+] PnpMonitor: 1394 notification registered\n");
 }
 
 VOID PnpMonitor::Cleanup()
@@ -270,6 +321,10 @@ VOID PnpMonitor::Cleanup()
     if (s_DiskNotifHandle) {
         IoUnregisterPlugPlayNotificationEx(s_DiskNotifHandle);
         s_DiskNotifHandle = nullptr;
+    }
+    if (s_1394NotifHandle) {
+        IoUnregisterPlugPlayNotificationEx(s_1394NotifHandle);
+        s_1394NotifHandle = nullptr;
     }
     s_PnpQueue = nullptr;
     DbgPrint("[+] PnpMonitor: cleanup complete\n");

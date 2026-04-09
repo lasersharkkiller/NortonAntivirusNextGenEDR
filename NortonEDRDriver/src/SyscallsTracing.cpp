@@ -62,6 +62,7 @@ ULONG SyscallsUtils::NtTraceControlId = 0;             // Resolve dynamically
 ULONG SyscallsUtils::NtCreateNamedPipeFileId = 0;      // Resolve dynamically
 ULONG SyscallsUtils::NtOpenThreadId = 0;               // Resolve dynamically
 ULONG SyscallsUtils::NtFlushInstructionCacheId = 0;    // Resolve dynamically
+ULONG SyscallsUtils::NtCreateFileId = 0;              // Resolve dynamically — physical memory / raw device access detection
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -681,6 +682,11 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 			(SIZE_T)trapFrame->R8
 		);
 	}
+	else if (NtCreateFileId != 0 && id == NtCreateFileId) {
+		// NtCreateFile(FileHandle*, DesiredAccess, ObjectAttributes*, IoStatusBlock*, ...)
+		// ObjectAttributes = arg3 = R8
+		NtCreateFileHandler((PVOID)trapFrame->R8);
+	}
 
 	return TRUE;
 }
@@ -1127,6 +1133,10 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtFlushIC;
 	RtlInitUnicodeString(&usNtFlushIC, L"NtFlushInstructionCache");
 	NtFlushInstructionCacheId = getSSNByName(ssdtTable, &usNtFlushIC, exportsMap);
+
+	UNICODE_STRING usNtCreateFile;
+	RtlInitUnicodeString(&usNtCreateFile, L"NtCreateFile");
+	NtCreateFileId = getSSNByName(ssdtTable, &usNtCreateFile, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -1980,6 +1990,65 @@ VOID SyscallsUtils::NtSuspendThreadHandler(
 		0,
 		"NtSuspendThread: cross-process thread suspension (APC injection / hollowing step)",
 		callerProcess, targetProcess, FALSE);
+}
+
+// NtCreateFile — detect raw physical memory and raw device access.
+//
+// Dangerous paths that indicate DMA / physical memory attacks:
+//   \Device\PhysicalMemory   — maps physical RAM into virtual address space
+//   \Device\Rawdisk*         — raw disk controller DMA bypass
+//   \Device\Harddisk*\Partition0 — raw unpartitioned disk access (sector 0)
+//
+// MmMapIoSpace (kernel API) is not interceptable via SSDT; raw device opens
+// are the usermode-accessible equivalent and equally dangerous.
+VOID SyscallsUtils::NtCreateFileHandler(PVOID ObjectAttributes)
+{
+	if (!ObjectAttributes || !MmIsAddressValid(ObjectAttributes)) return;
+
+	static const WCHAR* kDangerousPaths[] = {
+		L"\\Device\\PhysicalMemory",
+		L"\\Device\\Rawdisk",
+		L"\\Device\\Harddisk",
+		nullptr
+	};
+	// Severity: PhysicalMemory = CRITICAL; others = WARNING unless Partition0
+	static const BOOLEAN kPathCritical[] = {
+		TRUE,   // PhysicalMemory
+		TRUE,   // Rawdisk
+		FALSE,  // Harddisk (generic — escalate to CRITICAL if \Partition0)
+	};
+
+	__try {
+		OBJECT_ATTRIBUTES* oa = (OBJECT_ATTRIBUTES*)ObjectAttributes;
+		if (!oa->ObjectName || !MmIsAddressValid(oa->ObjectName)) return;
+		UNICODE_STRING* name = (UNICODE_STRING*)oa->ObjectName;
+		if (!name->Length || !name->Buffer || !MmIsAddressValid(name->Buffer)) return;
+
+		for (int i = 0; kDangerousPaths[i]; i++) {
+			if (!UnicodeStringContains(name, kDangerousPaths[i])) continue;
+
+			// Escalate Harddisk to CRITICAL if targeting Partition0 (raw sector access)
+			BOOLEAN critical = kPathCritical[i];
+			if (!critical && UnicodeStringContains(name, L"\\Partition0"))
+				critical = TRUE;
+
+			// Convert path to narrow for alert message
+			char pathBuf[128] = {};
+			USHORT copyLen = min(name->Length / sizeof(WCHAR), (USHORT)(sizeof(pathBuf) - 1));
+			for (USHORT j = 0; j < copyLen; j++) {
+				WCHAR wc = name->Buffer[j];
+				pathBuf[j] = (wc < 128) ? (char)wc : '?';
+			}
+
+			char msg[256];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtCreateFile: dangerous device path opened '%s' "
+				"(physical memory / raw DMA access — IOMMU bypass indicator)",
+				pathBuf);
+			EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, critical);
+			break;
+		}
+	} __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 // NtCreateSection — flag SEC_IMAGE (module stomping) and executable file-backed sections.

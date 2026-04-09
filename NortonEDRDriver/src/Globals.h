@@ -745,6 +745,7 @@ class SyscallsUtils {
 	static ULONG NtCreateNamedPipeFileId;     // Variable — named pipe C2 detection
 	static ULONG NtOpenThreadId;              // Variable — thread hijack / context scrape detection
 	static ULONG NtFlushInstructionCacheId;   // Variable — post-injection cache flush detection
+	static ULONG NtCreateFileId;             // Variable — physical memory / raw device access detection (IOMMU bypass)
 
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
@@ -992,6 +993,11 @@ public:
 	// ETW provider/session manipulation bypass
 	static VOID NtTraceControlHandler(
 		ULONG FunctionCode
+	);
+
+	// Physical memory / raw device access detection (IOMMU bypass)
+	static VOID NtCreateFileHandler(
+		PVOID ObjectAttributes
 	);
 
 	// Named pipe C2 / lateral movement detection
