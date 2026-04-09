@@ -897,6 +897,8 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 			static const WCHAR* kKerberosAttackTools[] = {
 				L"rubeus.exe",     // C# Kerberos abuse (S4U, delegation, AS-REP roast)
 				L"kekeo.exe",      // Kerberos toolbox (TGT/TGS manipulation, delegation)
+				L"rodcpwn.exe",    // RODC golden ticket / key list attack (Elad Shamir)
+				L"getcchanges.exe",// RODC replication abuse / credential extraction
 				L"klist.exe",      // Built-in but suspicious from non-system context
 				nullptr
 			};
@@ -908,7 +910,7 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 						continue;
 
 					// klist.exe is legitimate from System32 — only flag from other paths
-					if (i == 2) {
+					if (i == 4) {
 						if (UnicodeStringContains(CreateInfo->ImageFileName, L"\\Windows\\System32\\") ||
 							UnicodeStringContains(CreateInfo->ImageFileName, L"\\Windows\\SysWOW64\\"))
 							continue;
