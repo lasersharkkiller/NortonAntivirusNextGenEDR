@@ -348,6 +348,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	}
 
 	ForkRunTracker::Init();
+	InjectionTaintTracker::Init();
 
 	g_syscallsUtils->NtVersionPreCheck();
 	g_syscallsUtils->InitIds();

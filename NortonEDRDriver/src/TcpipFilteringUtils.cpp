@@ -150,8 +150,15 @@ static BOOLEAN IsC2BlendPort(UINT16 port) {
 }
 
 // Processes that legitimately sustain high connection rates to a single host.
+// EXCEPTION: if the process has been flagged by the injection taint tracker
+// (VAD anomaly, remote write, remote thread, shellcode detected, etc.),
+// it loses allowlist immunity — injected svchost/chrome traffic gets scrutinized.
 static BOOLEAN IsC2AllowedProcess(UINT64 pid) {
     if (IsSystemProcess(pid)) return TRUE;
+
+    // Tainted processes are never allowed, even if they're browsers or system services.
+    // This is the key cross-reference: injection detection feeds into C2 detection.
+    if (InjectionTaintTracker::IsTainted(pid)) return FALSE;
 
     PEPROCESS proc = nullptr;
     if (!NT_SUCCESS(PsLookupProcessByProcessId(
@@ -479,13 +486,18 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
                 ObDereferenceObject(c2Proc);
             }
 
-            char c2Msg[300] = {};
+            BOOLEAN tainted = InjectionTaintTracker::IsTainted(pid);
+
+            char c2Msg[350] = {};
             RtlStringCchPrintfA(c2Msg, sizeof(c2Msg),
                 "Interactive C2 session: pid=%llu (%s) made >=%d connections "
                 "to %u.%u.%u.%u:%u within 60s — possible sleep~0 beacon / "
-                "SOCKS proxy (Cobalt Strike, Sliver, Mythic)",
+                "SOCKS proxy (Cobalt Strike, Sliver, Mythic)%s",
                 pid, c2ProcName, C2_ALERT_THRESHOLD,
-                FORMAT_ADDR(remoteAddress), remotePort);
+                FORMAT_ADDR(remoteAddress), remotePort,
+                tainted
+                    ? " [INJECTION-TAINTED: prior code injection detected in this process]"
+                    : "");
 
             PKERNEL_STRUCTURED_NOTIFICATION c2Notif =
                 (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
@@ -493,7 +505,10 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
                     sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'c2nt');
             if (c2Notif) {
                 RtlZeroMemory(c2Notif, sizeof(*c2Notif));
-                SET_WARNING(*c2Notif);
+                // Tainted process beaconing = CRITICAL (confirmed injection + C2);
+                // untainted = WARNING (could be a legitimate non-allowlisted app).
+                if (tainted) { SET_CRITICAL(*c2Notif); }
+                else         { SET_WARNING(*c2Notif);  }
                 SET_NETWORK_CHECK(*c2Notif);
                 c2Notif->pid            = (HANDLE)(ULONG_PTR)pid;
                 c2Notif->scoopedAddress = (ULONG64)(ULONG_PTR)remoteAddress;

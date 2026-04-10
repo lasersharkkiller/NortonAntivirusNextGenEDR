@@ -152,6 +152,7 @@ VOID ThreadUtils::CreateThreadNotifyRoutine(
 
 				SET_CRITICAL(*kernelNotif);
 				SET_PROC_VAD_CHECK(*kernelNotif);
+				InjectionTaintTracker::MarkTainted(PsGetCurrentProcessId());
 
 				kernelNotif->bufSize = sizeof(msg);
 				kernelNotif->isPath = FALSE;

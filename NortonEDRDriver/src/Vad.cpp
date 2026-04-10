@@ -446,6 +446,7 @@ static VOID WalkVadHiddenMappings(
                     RtlZeroMemory(notif, sizeof(*notif));
                     SET_CRITICAL(*notif);
                     SET_PROC_VAD_CHECK(*notif);
+                    InjectionTaintTracker::MarkTainted(PsGetProcessId(process));
                     notif->scoopedAddress = baseVa;
                     notif->pid            = PsGetProcessId(process);
                     notif->isPath         = FALSE;

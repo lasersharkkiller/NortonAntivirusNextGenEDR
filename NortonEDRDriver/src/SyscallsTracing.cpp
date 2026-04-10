@@ -316,6 +316,7 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 						RtlZeroMemory(kernelNotif, sizeof(*kernelNotif));
 						SET_WARNING(*kernelNotif);
 						SET_SHADOW_STACK_CHECK(*kernelNotif);
+						InjectionTaintTracker::MarkTainted(PsGetCurrentProcessId());
 						kernelNotif->scoopedAddress = (ULONG64)spoofedAddr;
 						kernelNotif->bufSize = sizeof(msg);
 						kernelNotif->isPath = FALSE;
@@ -857,6 +858,8 @@ BOOLEAN SyscallsUtils::isSyscallIndirect(ULONG64 Rsp)
 			(PRTL_BALANCED_NODE)root, (ULONG64)retAddr);
 
 		if (result) {
+			InjectionTaintTracker::MarkTainted(PsGetProcessId(curproc));
+
 			char msgBuf[200];
 			RtlStringCbPrintfA(msgBuf, sizeof(msgBuf),
 				"Indirect syscall: return address 0x%llX is in private executable "
@@ -1220,6 +1223,17 @@ VOID SyscallsUtils::NtAllocVmHandler(
 		? "NtAllocateVirtualMemory: remote RWX allocation (cross-process shellcode staging)"
 		: "NtAllocateVirtualMemory: local RWX allocation";
 
+	// Taint the target process so the C2 frequency tracker strips allowlist immunity.
+	if (remote) {
+		PEPROCESS targetProc = nullptr;
+		if (NT_SUCCESS(ObReferenceObjectByHandle(
+				ProcessHandle, 0, *PsProcessType, UserMode,
+				(PVOID*)&targetProc, nullptr)) && targetProc) {
+			InjectionTaintTracker::MarkTainted(PsGetProcessId(targetProc));
+			ObDereferenceObject(targetProc);
+		}
+	}
+
 	EmitSyscallNotif(
 		BaseAddress && MmIsAddressValid(BaseAddress) ? (ULONG64)*BaseAddress : 0,
 		msg,
@@ -1369,8 +1383,10 @@ VOID SyscallsUtils::NtWriteVmHandler(
 			}
 			// Fork-and-run correlation: mark this PID as written-to so that
 			// a subsequent NtCreateThreadEx into it triggers a combined alert.
-			if (!isSelf)
+			if (!isSelf) {
 				ForkRunTracker::MarkWritten(PsGetProcessId(targetProcess));
+				InjectionTaintTracker::MarkTainted(PsGetProcessId(targetProcess));
+			}
 
 			if (!isSelf) ObDereferenceObject(targetProcess);
 		}
@@ -1935,6 +1951,8 @@ VOID SyscallsUtils::NtCreateThreadExHandler(
 			HANDLE targetPid = PsGetProcessId(targetProc);
 			char*  targetName = PsGetProcessImageFileName(targetProc);
 			char*  callerName = PsGetProcessImageFileName(IoGetCurrentProcess());
+
+			InjectionTaintTracker::MarkTainted(targetPid);
 
 			if (ForkRunTracker::CheckForkRun(targetPid)) {
 				// Sequence complete: spawn → write → thread.  Emit the combined alert.

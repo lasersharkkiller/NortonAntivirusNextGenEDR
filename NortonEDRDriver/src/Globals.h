@@ -1285,6 +1285,42 @@ public:
     static VOID Remove(HANDLE pid);
 };
 
+// ---------------------------------------------------------------------------
+// Injection taint tracker — cross-references injection detections with
+// the C2 beaconing frequency detector.
+//
+// When any subsystem detects code injection into a process (VAD anomaly,
+// PE header in cross-process write, remote RWX allocation, remote thread
+// creation, CLR injection, shadow stack hit, etc.), it calls MarkTainted()
+// with the target PID.  The WFP C2 frequency tracker then strips allowlist
+// immunity for that PID — even if it's chrome.exe or svchost.exe.
+//
+// Table is fixed-size (256 entries), oldest entry evicted on overflow.
+// Entries expire after 10 minutes to avoid permanent false tainting.
+// ---------------------------------------------------------------------------
+#define TAINT_TABLE_MAX     256
+#define TAINT_EXPIRY_MS     (10LL * 60LL * 1000LL)  // 10 minutes
+
+struct TaintEntry {
+    ULONG    Pid;
+    LONGLONG Timestamp;  // KeQueryInterruptTime() ticks (100ns units)
+    BOOLEAN  Used;
+};
+
+class InjectionTaintTracker {
+public:
+    static VOID Init();
+
+    // Mark a PID as injection-tainted.  Safe to call from any IRQL <= DISPATCH.
+    static VOID MarkTainted(HANDLE pid);
+
+    // Returns TRUE if the PID has been tainted and the entry hasn't expired.
+    static BOOLEAN IsTainted(UINT64 pid);
+
+    // Cleanup slot when process exits (optional — entries also expire).
+    static VOID Remove(HANDLE pid);
+};
+
 class DllInjector {
 public:
     static VOID Initialize();

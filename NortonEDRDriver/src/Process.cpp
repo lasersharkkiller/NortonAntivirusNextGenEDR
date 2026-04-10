@@ -114,6 +114,111 @@ VOID ForkRunTracker::Remove(HANDLE pid) {
     KeReleaseSpinLock(&g_ForkLock, irql);
 }
 
+// ---------------------------------------------------------------------------
+// InjectionTaintTracker implementation
+//
+// When any subsystem detects code injection into a process, it calls
+// MarkTainted(pid).  The WFP C2 beaconing detector then strips allowlist
+// immunity for that PID so traffic from injected svchost/chrome/etc. gets
+// frequency-checked.  Entries expire after TAINT_EXPIRY_MS (10 min).
+// ---------------------------------------------------------------------------
+
+static TaintEntry   g_TaintSlots[TAINT_TABLE_MAX];
+static KSPIN_LOCK   g_TaintLock;
+static LONG         g_TaintInitDone = 0;
+
+VOID InjectionTaintTracker::Init() {
+    if (InterlockedCompareExchange(&g_TaintInitDone, 1, 0) == 0) {
+        RtlZeroMemory(g_TaintSlots, sizeof(g_TaintSlots));
+        KeInitializeSpinLock(&g_TaintLock);
+    }
+}
+
+VOID InjectionTaintTracker::MarkTainted(HANDLE pid) {
+    if (!pid) return;
+    ULONG uPid = HandleToUlong(pid);
+    LONGLONG now = (LONGLONG)KeQueryInterruptTime();
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_TaintLock, &irql);
+
+    // Check if already present
+    for (int i = 0; i < TAINT_TABLE_MAX; i++) {
+        if (g_TaintSlots[i].Used && g_TaintSlots[i].Pid == uPid) {
+            g_TaintSlots[i].Timestamp = now;  // refresh expiry
+            KeReleaseSpinLock(&g_TaintLock, irql);
+            return;
+        }
+    }
+
+    // Find a free or expired slot
+    LONGLONG expiryTicks = TAINT_EXPIRY_MS * 10000LL;
+    int freeSlot  = -1;
+    int oldestIdx = 0;
+    LONGLONG oldestTs = 0x7FFFFFFFFFFFFFFFLL;
+
+    for (int i = 0; i < TAINT_TABLE_MAX; i++) {
+        if (!g_TaintSlots[i].Used) {
+            if (freeSlot < 0) freeSlot = i;
+            continue;
+        }
+        // Evict expired entries opportunistically
+        if ((now - g_TaintSlots[i].Timestamp) > expiryTicks) {
+            g_TaintSlots[i].Used = FALSE;
+            if (freeSlot < 0) freeSlot = i;
+            continue;
+        }
+        if (g_TaintSlots[i].Timestamp < oldestTs) {
+            oldestTs  = g_TaintSlots[i].Timestamp;
+            oldestIdx = i;
+        }
+    }
+
+    int slot = (freeSlot >= 0) ? freeSlot : oldestIdx;  // evict oldest if full
+    g_TaintSlots[slot].Pid       = uPid;
+    g_TaintSlots[slot].Timestamp = now;
+    g_TaintSlots[slot].Used      = TRUE;
+
+    KeReleaseSpinLock(&g_TaintLock, irql);
+    DbgPrint("[+] InjectionTaintTracker: PID %lu tainted\n", uPid);
+}
+
+BOOLEAN InjectionTaintTracker::IsTainted(UINT64 pid) {
+    ULONG uPid = (ULONG)pid;
+    LONGLONG now = (LONGLONG)KeQueryInterruptTime();
+    LONGLONG expiryTicks = TAINT_EXPIRY_MS * 10000LL;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_TaintLock, &irql);
+    for (int i = 0; i < TAINT_TABLE_MAX; i++) {
+        if (g_TaintSlots[i].Used && g_TaintSlots[i].Pid == uPid) {
+            if ((now - g_TaintSlots[i].Timestamp) > expiryTicks) {
+                g_TaintSlots[i].Used = FALSE;  // expired
+                KeReleaseSpinLock(&g_TaintLock, irql);
+                return FALSE;
+            }
+            KeReleaseSpinLock(&g_TaintLock, irql);
+            return TRUE;
+        }
+    }
+    KeReleaseSpinLock(&g_TaintLock, irql);
+    return FALSE;
+}
+
+VOID InjectionTaintTracker::Remove(HANDLE pid) {
+    if (!pid) return;
+    ULONG uPid = HandleToUlong(pid);
+    KIRQL irql;
+    KeAcquireSpinLock(&g_TaintLock, &irql);
+    for (int i = 0; i < TAINT_TABLE_MAX; i++) {
+        if (g_TaintSlots[i].Used && g_TaintSlots[i].Pid == uPid) {
+            g_TaintSlots[i].Used = FALSE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_TaintLock, irql);
+}
+
 // Known Cobalt Strike spawnto / process-injection host binaries (lowercase).
 // This list covers CS defaults and the most common attacker-configured targets.
 static const char* kSpawntoHosts[] = {
@@ -1288,9 +1393,10 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 		}
 
 	} else {
-		// Process exit — free the cmdline record and fork-run tracker slot.
+		// Process exit — free the cmdline record, fork-run tracker, and taint slot.
 		ImageUtils::RemoveCmdLineRec(HandleToUlong(PsGetProcessId(Process)));
 		ForkRunTracker::Remove(PsGetProcessId(Process));
+		InjectionTaintTracker::Remove(PsGetProcessId(Process));
 	}
 }
 

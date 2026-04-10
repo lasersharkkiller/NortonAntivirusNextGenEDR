@@ -1319,6 +1319,9 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                     }
 
                                     if (!isAllowedClrHost) {
+                                        InjectionTaintTracker::MarkTainted(
+                                            PsGetProcessId(targetProcess));
+
                                         char clrMsg[200];
                                         RtlStringCbPrintfA(clrMsg, sizeof(clrMsg),
                                             "CLR loaded into non-.NET process '%s' — "
