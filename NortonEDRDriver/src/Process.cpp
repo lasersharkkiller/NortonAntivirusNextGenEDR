@@ -1393,8 +1393,10 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 		}
 
 	} else {
-		// Process exit — free the cmdline record, fork-run tracker, and taint slot.
-		ImageUtils::RemoveCmdLineRec(HandleToUlong(PsGetProcessId(Process)));
+		// Process exit — free the cmdline record, fork-run tracker, taint, and ntdll tracker slots.
+		ULONG exitPid = HandleToUlong(PsGetProcessId(Process));
+		ImageUtils::RemoveCmdLineRec(exitPid);
+		ImageUtils::RemoveSecondaryNtdll(exitPid);
 		ForkRunTracker::Remove(PsGetProcessId(Process));
 		InjectionTaintTracker::Remove(PsGetProcessId(Process));
 	}

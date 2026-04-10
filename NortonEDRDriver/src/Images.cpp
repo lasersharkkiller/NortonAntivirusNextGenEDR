@@ -37,6 +37,96 @@ static BOOLEAN NtdllSeenBefore(ULONG pid) {
 }
 
 // ---------------------------------------------------------------------------
+// Secondary ntdll mapping tracker
+//
+// When a second copy of ntdll.dll is mapped into a process (hook evasion,
+// or a kernel driver resolving LdrLoadDll from a fresh mapped copy), we
+// record the base address and size of that secondary mapping.
+//
+// This allows the APC and thread-creation handlers to detect when an APC
+// NormalRoutine or a StartRoutine points into a secondary ntdll copy
+// rather than the primary loader-managed one — the hallmark of a driver
+// resolving LdrLoadDll from a privately mapped ntdll to bypass user-mode
+// hooks and ASLR.
+//
+// The primary ntdll (first load per PID) is NOT recorded here — only
+// the second+ mappings.
+// ---------------------------------------------------------------------------
+#define MAX_SECONDARY_NTDLL 256
+
+struct SecondaryNtdllEntry {
+    ULONG  pid;
+    PVOID  imageBase;
+    SIZE_T imageSize;
+    BOOLEAN used;
+};
+
+static SecondaryNtdllEntry g_SecNtdll[MAX_SECONDARY_NTDLL] = {};
+static KSPIN_LOCK          g_SecNtdllLock;
+
+static VOID RecordSecondaryNtdll(ULONG pid, PVOID base, SIZE_T size) {
+    KIRQL irql;
+    KeAcquireSpinLock(&g_SecNtdllLock, &irql);
+    // Check for duplicate
+    for (int i = 0; i < MAX_SECONDARY_NTDLL; i++) {
+        if (g_SecNtdll[i].used && g_SecNtdll[i].pid == pid &&
+            g_SecNtdll[i].imageBase == base) {
+            KeReleaseSpinLock(&g_SecNtdllLock, irql);
+            return;
+        }
+    }
+    // Find free slot
+    for (int i = 0; i < MAX_SECONDARY_NTDLL; i++) {
+        if (!g_SecNtdll[i].used) {
+            g_SecNtdll[i].pid       = pid;
+            g_SecNtdll[i].imageBase = base;
+            g_SecNtdll[i].imageSize = size;
+            g_SecNtdll[i].used      = TRUE;
+            KeReleaseSpinLock(&g_SecNtdllLock, irql);
+            DbgPrint("[!] Secondary ntdll mapping recorded: pid=%lu base=%p size=0x%llX\n",
+                     pid, base, (ULONG64)size);
+            return;
+        }
+    }
+    KeReleaseSpinLock(&g_SecNtdllLock, irql);
+}
+
+// Exported: checks if an address falls within a secondary ntdll mapping for any PID.
+// Used by NtQueueApcThread/NtCreateThreadEx to detect LdrLoadDll-from-remap attacks.
+BOOLEAN ImageUtils::IsAddressInSecondaryNtdll(ULONG pid, ULONG64 address) {
+    KIRQL irql;
+    KeAcquireSpinLock(&g_SecNtdllLock, &irql);
+    for (int i = 0; i < MAX_SECONDARY_NTDLL; i++) {
+        if (g_SecNtdll[i].used && g_SecNtdll[i].pid == pid) {
+            ULONG64 base = (ULONG64)g_SecNtdll[i].imageBase;
+            ULONG64 end  = base + g_SecNtdll[i].imageSize;
+            if (address >= base && address < end) {
+                KeReleaseSpinLock(&g_SecNtdllLock, irql);
+                return TRUE;
+            }
+        }
+    }
+    KeReleaseSpinLock(&g_SecNtdllLock, irql);
+    return FALSE;
+}
+
+// Cleanup on process exit
+VOID ImageUtils::RemoveSecondaryNtdll(ULONG pid) {
+    KIRQL irql;
+    KeAcquireSpinLock(&g_SecNtdllLock, &irql);
+    for (int i = 0; i < MAX_SECONDARY_NTDLL; i++) {
+        if (g_SecNtdll[i].used && g_SecNtdll[i].pid == pid)
+            g_SecNtdll[i].used = FALSE;
+    }
+    KeReleaseSpinLock(&g_SecNtdllLock, irql);
+}
+
+// Initialize spinlock — called from ImageUtils init path
+VOID ImageUtils::InitSecondaryNtdllTracker() {
+    KeInitializeSpinLock(&g_SecNtdllLock);
+}
+
+// ---------------------------------------------------------------------------
 // Image hash verification — anti-phantom-DLL defense (Fast and Furious)
 //
 // SHA256 critical DLLs at ImageLoadNotifyRoutine time, then re-verify 200ms
@@ -1368,6 +1458,12 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                             if (IsNtdllPath(charBuffer, cbLen)) {
                                 ULONG curPid = HandleToUlong(PsGetProcessId(targetProcess));
                                 if (NtdllSeenBefore(curPid)) {
+                                    // Record the secondary mapping so APC/thread handlers
+                                    // can detect LdrLoadDll resolved from this private copy.
+                                    if (ImageInfo->ImageBase && ImageInfo->ImageSize > 0)
+                                        RecordSecondaryNtdll(curPid,
+                                            ImageInfo->ImageBase, ImageInfo->ImageSize);
+
                                     const char* msg =
                                         "ntdll.dll loaded more than once into process — "
                                         "ntdll remap/hook-evasion technique detected";
@@ -1716,6 +1812,7 @@ VOID ImageUtils::setImageNotificationCallback() {
     KeInitializeSpinLock(&g_NtdllPidLock);
     KeInitializeSpinLock(&g_CmdLineRecLock);
     KeInitializeSpinLock(&g_ImageHashLock);
+    InitSecondaryNtdllTracker();
 
     // Prefer Ex (subsystem-aware, Win10 1709+).
     UNICODE_STRING usEx;

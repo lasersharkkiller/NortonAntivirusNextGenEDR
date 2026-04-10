@@ -1568,7 +1568,69 @@ VOID SyscallsUtils::NtReadVmHandler(
 	ObDereferenceObject(targetProcess);
 }
 
-// NtQueueApcThread — flag cross-process APC injection.
+// ---------------------------------------------------------------------------
+// APC / thread-start target validation against secondary ntdll mappings.
+//
+// When a kernel driver (malicious or BYOVD) maps a second copy of ntdll.dll
+// into a process, it can resolve LdrLoadDll from the mapped export table —
+// ASLR is irrelevant because the image is already in the process address
+// space.  The driver then queues an APC (or creates a thread) whose routine
+// points into this secondary copy rather than the primary loader-managed one.
+//
+// This check fires for BOTH same-process and cross-process APCs — the
+// attack is equally viable either way, and no legitimate code ever targets
+// a function in a duplicate ntdll mapping.
+// ---------------------------------------------------------------------------
+static VOID CheckApcTargetSecondaryNtdll(
+	ULONG64      routineAddr,
+	PEPROCESS    targetProcess,
+	PEPROCESS    callerProcess,
+	const char*  syscallName)
+{
+	ULONG targetPid = HandleToUlong(PsGetProcessId(targetProcess));
+	if (!ImageUtils::IsAddressInSecondaryNtdll(targetPid, routineAddr))
+		return;
+
+	char msg[300];
+	char* callerName = PsGetProcessImageFileName(callerProcess);
+	char* targetName = PsGetProcessImageFileName(targetProcess);
+
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"%s: APC routine at 0x%llX targets secondary ntdll mapping in "
+		"'%s' (pid=%lu) — LdrLoadDll resolved from privately mapped ntdll "
+		"copy (kernel driver injection / ASLR bypass)",
+		syscallName, routineAddr,
+		targetName ? targetName : "?", targetPid);
+
+	PKERNEL_STRUCTURED_NOTIFICATION notif =
+		(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+			POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'sntd');
+	if (!notif) return;
+
+	RtlZeroMemory(notif, sizeof(*notif));
+	SET_CRITICAL(*notif);
+	SET_SYSCALL_CHECK(*notif);
+	notif->scoopedAddress = routineAddr;
+	notif->pid            = PsGetProcessId(targetProcess);
+	notif->isPath         = FALSE;
+	if (callerName) RtlCopyMemory(notif->procName, callerName, 14);
+	if (targetName) RtlCopyMemory(notif->targetProcName, targetName, 14);
+
+	SIZE_T msgLen = strlen(msg) + 1;
+	notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'sntm');
+	if (notif->msg) {
+		RtlCopyMemory(notif->msg, msg, msgLen);
+		notif->bufSize = (ULONG)msgLen;
+		if (!CallbackObjects::GetNotifQueue()->Enqueue(notif)) {
+			ExFreePool(notif->msg);
+			ExFreePool(notif);
+		}
+	} else { ExFreePool(notif); }
+
+	InjectionTaintTracker::MarkTainted(PsGetProcessId(targetProcess));
+}
+
+// NtQueueApcThread — flag cross-process APC injection and secondary ntdll targets.
 VOID SyscallsUtils::NtQueueApcThreadHandler(
 	HANDLE ThreadHandle,
 	PPS_APC_ROUTINE ApcRoutine,
@@ -1593,6 +1655,14 @@ VOID SyscallsUtils::NtQueueApcThreadHandler(
 			"NtQueueApcThread: cross-process APC injection",
 			callerProcess, targetProcess, TRUE);
 	}
+
+	// Check if APC targets a function in a secondary ntdll mapping.
+	// Fires for both same-process and cross-process — a kernel driver
+	// mapping ntdll into the CURRENT process and queuing a same-process
+	// APC with LdrLoadDll from that copy is the standard technique.
+	CheckApcTargetSecondaryNtdll(
+		(ULONG64)ApcRoutine, targetProcess, callerProcess,
+		"NtQueueApcThread");
 
 	ObDereferenceObject(targetThread);
 }
@@ -1622,6 +1692,10 @@ VOID SyscallsUtils::NtQueueApcThreadExHandler(
 			"NtQueueApcThreadEx: cross-process APC injection (extended)",
 			callerProcess, targetProcess, TRUE);
 	}
+
+	CheckApcTargetSecondaryNtdll(
+		(ULONG64)ApcRoutine, targetProcess, callerProcess,
+		"NtQueueApcThreadEx");
 
 	ObDereferenceObject(targetThread);
 }
@@ -1940,6 +2014,16 @@ VOID SyscallsUtils::NtCreateThreadExHandler(
 		crossProcess  // cross-process = Critical; local = Warning
 	);
 
+	// Secondary ntdll check — StartRoutine pointing into a privately mapped
+	// ntdll copy (LdrLoadDll resolved from remap) for same-process threads.
+	// Cross-process case is handled below where we have targetProc resolved.
+	if (!crossProcess) {
+		CheckApcTargetSecondaryNtdll(
+			(ULONG64)StartRoutine,
+			IoGetCurrentProcess(), IoGetCurrentProcess(),
+			"NtCreateThreadEx");
+	}
+
 	// Fork-and-run correlation: resolve the target process PID and check
 	// whether it has already been written to by this caller (step 2 of 3).
 	if (crossProcess) {
@@ -1953,6 +2037,12 @@ VOID SyscallsUtils::NtCreateThreadExHandler(
 			char*  callerName = PsGetProcessImageFileName(IoGetCurrentProcess());
 
 			InjectionTaintTracker::MarkTainted(targetPid);
+
+			// Check if StartRoutine targets a secondary ntdll in the target process
+			CheckApcTargetSecondaryNtdll(
+				(ULONG64)StartRoutine,
+				targetProc, IoGetCurrentProcess(),
+				"NtCreateThreadEx");
 
 			if (ForkRunTracker::CheckForkRun(targetPid)) {
 				// Sequence complete: spawn → write → thread.  Emit the combined alert.
@@ -2248,9 +2338,20 @@ VOID SyscallsUtils::NtMapViewOfSectionHandler(
 
 	if (isNtdll) {
 		EmitSyscallNotif(
-			0,
-			"NtMapViewOfSection: ntdll.dll remapped same-process (clean-copy hook bypass / unhooking)",
+			(BaseAddress && MmIsAddressValid(BaseAddress)) ? (ULONG64)*BaseAddress : 0,
+			"NtMapViewOfSection: ntdll.dll remapped same-process "
+			"(clean-copy hook bypass / unhooking — LdrLoadDll from remap possible)",
 			IoGetCurrentProcess(), nullptr, TRUE);
+
+		// Taint this process — it just remapped ntdll, likely to resolve
+		// LdrLoadDll or other functions from the clean copy.
+		InjectionTaintTracker::MarkTainted(PsGetCurrentProcessId());
+
+		// Note: the secondary mapping base/size is definitively recorded by
+		// ImageLoadNotifyRoutine (via RecordSecondaryNtdll) when the kernel
+		// fires the image load callback for this mapping.  We don't duplicate
+		// that here because BaseAddress is an in/out parameter that may not
+		// be populated yet at pre-syscall time.
 	}
 }
 

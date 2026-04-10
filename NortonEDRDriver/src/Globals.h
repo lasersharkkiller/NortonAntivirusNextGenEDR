@@ -1373,6 +1373,13 @@ public:
 
 	// Pointer to ImageLoadNotifyRoutine callback — exposed for Ps*Notify integrity check.
 	static PVOID s_NotifyFn;
+
+	// Secondary ntdll mapping tracker — records base/size of second+ ntdll copies
+	// so APC/thread handlers can detect LdrLoadDll resolved from a privately mapped
+	// ntdll (bypasses ASLR since the image is in the current process address space).
+	static VOID InitSecondaryNtdllTracker();
+	static BOOLEAN IsAddressInSecondaryNtdll(ULONG pid, ULONG64 address);
+	static VOID RemoveSecondaryNtdll(ULONG pid);
 };
 
 class ThreadUtils : public ProcessUtils {
