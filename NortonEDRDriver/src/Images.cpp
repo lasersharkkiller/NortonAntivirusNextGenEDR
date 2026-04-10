@@ -404,9 +404,77 @@ static const char* kLolDriverNames[] = {
     "asmmap64.sys",       // ASMedia — arbitrary physical memory map
     "inpoutx64.sys",      // InpOut — direct port I/O / physical memory
 
-    // RegPhantom rootkit IOCs (Nextron Systems threat analysis, March 2026)
-    // CmRegisterCallback-as-C2-channel + reflective kernel PE loader,
-    // signed with valid Chinese certificates (Guangzhou Xuanfeng, Autel).
+    // --- Active ransomware / EDR killer campaigns (2024-2026) ---
+
+    // Zemana family — single most weaponized driver family across Terminator,
+    // Spyboy, Killer Ultra, EDRKillShifter, BlackByte, BlackCat, Qilin, RansomHub.
+    "zamguard64.sys",     // Zemana Anti-Malware (CVE-2024-1853) — arbitrary process kill
+    "zamguard32.sys",
+    "zam64.sys",          // Zemana Anti-Logger — same codebase as zamguard
+    "zam32.sys",
+    "amsdk.sys",          // WatchDog/Zemana SDK — Silver Fox APT / ValleyRAT
+    "wamsdk.sys",         // alias for amsdk
+
+    "truesight.sys",      // RogueKiller Antirootkit — 2500+ tampered variants, HiddenGh0st RAT
+    "aswarpot.sys",       // Avast Anti-Rootkit — GHOSTENGINE cryptojacker, EDR killers
+    "iobitunlocker.sys",  // IOBit Unlocker — GHOSTENGINE (kernel file deletion of EDR binaries)
+    "smuol.sys",          // ABYSSWORKER fake CrowdStrike driver — Medusa ransomware (2024-2025)
+    "rentdrv2.sys",       // RentDrv2 — EDRKillShifter (RansomHub), process termination
+    "tfsysmon.sys",       // ThreatFire SysMon — EDRKillShifter, BianLian, Medusa, Play
+    "iqvw64e.sys",        // Intel Ethernet diag — arbitrary kernel exec (CVE-2015-2291), Scattered Spider
+    "biontdrv.sys",       // Paragon Partition Mgr — five kernel write CVEs (CVE-2025-0285..0289), 0-day
+    "nseckrnl.sys",       // NSecKrnl — Reynolds/Warlock ransomware (2026)
+    "402.sys",            // alias for nseckrnl
+    "enportv.sys",        // EnCase forensic — 18+ IOCTLs incl KillProc, DKOM (Huntress Jan 2026)
+    "dbutildrv2.sys",     // Dell DBUtilDrv2 v2.5-2.7 (CVE-2021-36276) — Metasploit module
+    "procexp.sys",        // Old Process Explorer v16.32 — AuKill, Medusa Locker, LockBit
+    "echo_driver.sys",    // Inspect Element — token theft (CVE-2023-38817), cert revoked
+
+    // --- MS blocklist / Sigma rules / documented BYOVD tooling ---
+    "ene.sys",            // ENE Technology RGB — UNC2970 APT LIGHTSHOW tool
+    "lenovodiagnosticsdriver.sys",  // Lenovo Diag — phys/virt mem R/W (CVE-2022-3699)
+    "capcom.sys",         // Capcom anti-cheat — direct kernel code exec from usermode
+    "dbk64.sys",          // Cheat Engine kernel — arbitrary kernel R/W, process manipulation
+    "dbk32.sys",
+    "hw.sys",             // HWiNFO — arbitrary physical memory / port I/O
+    "ntiolib_x64.sys",    // MSI NTIOLib — arbitrary phys mem and MSR access
+    "ntiolib.sys",
+    "winio64.sys",        // WinIO library — arbitrary I/O port and phys mem (CVE-2024-55407)
+    "winio32.sys",
+    "directio64.sys",     // DirectIO — arbitrary port I/O and phys mem map
+    "directio.sys",
+    "rzpnk.sys",          // Razer Synapse — arbitrary kernel R/W
+    "cpuz141.sys",        // CPU-Z — MSR / phys mem access
+    "cpuz_x64.sys",
+    "lnvmsrio.sys",       // Lenovo Dispatcher MSR I/O — kernel code exec (CVE-2025-8061)
+    "iqvw64.sys",         // Intel Network Adapter Diag — kernel code exec (CVE-2015-2291) variant
+    "iqvw32.sys",
+    "asrdrv104.sys",      // ASRock variants beyond asrdrv103
+    "asrdrv106.sys",
+    "asrdrv101.sys",
+    "asrdrv10.sys",
+    "vboxdrv.sys",        // VirtualBox kernel — arbitrary kernel R/W via IOCTL
+    "gmer64.sys",         // GMER anti-rootkit — weaponized as EDR killer
+    "gmer.sys",
+    "blackbonedrv10.sys", // Blackbone — kernel mem R/W, manual mapping, offensive tooling
+
+    // --- Lower frequency, still documented BYOVD targets ---
+    "semav6msr.sys",      // SEMAV6 MSR — arbitrary MSR R/W
+    "elrawdsk.sys",       // ElRawDisk — raw disk sector access (Shamoon-style wiping)
+    "amifldrv64.sys",     // AMI BIOS flash — ring-0 phys mem access
+    "alsysio64.sys",      // Alcor Micro USB — arbitrary phys mem / port I/O
+    "bdapiutil64.sys",    // Baidu Antivirus — process termination (ESET 2026 EDR killer research)
+    "piddrv64.sys",       // ProtectID — arbitrary kernel mem R/W
+    "piddrv.sys",
+    "phymemx64.sys",      // Physical memory access variants
+    "phymem64.sys",
+    "stdcdrv64.sys",      // Intel Graphics diag — arbitrary phys mem access
+    "netflt.sys",         // Netfilter rootkit — Microsoft-signed malicious driver (2021)
+    "netfilterdrv.sys",
+    "msio64.sys",         // MICSYS MSI I/O — arbitrary phys mem / port access
+    "msio32.sys",
+
+    // --- RegPhantom rootkit IOCs (Nextron Systems, March 2026) ---
     "mapdriver.sys",
     "mydriver.sys",
     "testdriver.sys",
@@ -1327,6 +1395,169 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                             ExFreePool(n);
                                         }
                                     }
+                                }
+                            }
+
+                            // -------------------------------------------------------
+                            // DLL sideloading detection (MITRE T1574.002)
+                            //
+                            // Adversaries place a malicious copy of a Windows system
+                            // DLL in the same directory as a legitimate signed exe.
+                            // Windows DLL search order loads the local copy first,
+                            // executing attacker code inside a trusted process.
+                            //
+                            // Detection: when a known system DLL loads from outside
+                            // \Windows\System32\, \Windows\SysWOW64\, or
+                            // \Windows\WinSxS\, emit a WARNING.
+                            //
+                            // Common usage: APT41 (version.dll), Lazarus (winhttp),
+                            // MuddyWater (winmm), SolarWinds toolchain, numerous
+                            // ransomware initial-access loaders.
+                            // -------------------------------------------------------
+                            {
+                                struct {
+                                    const char* name;
+                                    SIZE_T      nameLen;
+                                } kSideloadTargets[] = {
+                                    { "version.dll",          11 },  // #1 sideloaded DLL globally
+                                    { "winmm.dll",             9 },  // Audio API — APT10, MuddyWater
+                                    { "winhttp.dll",          11 },  // HTTP client — Lazarus, APT29
+                                    { "cryptbase.dll",        13 },  // Crypto primitives
+                                    { "cryptsp.dll",          10 },  // Crypto service provider
+                                    { "profapi.dll",          11 },  // User profile API
+                                    { "sspicli.dll",          11 },  // SSPI auth client
+                                    { "dwmapi.dll",           10 },  // Desktop Window Manager API
+                                    { "propsys.dll",          11 },  // Property system
+                                    { "wtsapi32.dll",         12 },  // Terminal services API
+                                    { "uxtheme.dll",          11 },  // Visual theme engine
+                                    { "msimg32.dll",          11 },  // Image manipulation
+                                    { "userenv.dll",          11 },  // User environment/profile
+                                    { "iphlpapi.dll",         12 },  // Network interface enum
+                                    { "netutils.dll",         12 },  // Network utility functions
+                                    { "npmproxy.dll",         12 },  // Network provider proxy
+                                    { "dpapi.dll",             9 },  // Data protection API
+                                    { "edgegdi.dll",          11 },  // GDI proxy — SUNBURST chain
+                                    { nullptr, 0 }
+                                };
+
+                                // System directories where these DLLs legitimately reside.
+                                // Compared case-insensitively against the full NT path.
+                                static const char* kLegitDirs[] = {
+                                    "\\windows\\system32\\",
+                                    "\\windows\\syswow64\\",
+                                    "\\windows\\winsxs\\",
+                                    "\\windows\\systemapps\\",
+                                    "\\windows\\microsoft.net\\",
+                                    nullptr
+                                };
+
+                                // Extract just the filename from charBuffer
+                                const char* slLastSlash = nullptr;
+                                for (SIZE_T si = 0; si < cbLen; si++) {
+                                    if (charBuffer[si] == '\\')
+                                        slLastSlash = &charBuffer[si];
+                                }
+                                const char* slFileName = slLastSlash
+                                    ? (slLastSlash + 1) : charBuffer;
+                                SIZE_T slNameLen = cbLen -
+                                    (SIZE_T)(slFileName - charBuffer);
+
+                                for (int st = 0; kSideloadTargets[st].name; st++) {
+                                    if (slNameLen != kSideloadTargets[st].nameLen)
+                                        continue;
+
+                                    // Case-insensitive filename compare
+                                    BOOLEAN nameHit = TRUE;
+                                    for (SIZE_T ci = 0; ci < slNameLen; ci++) {
+                                        char a = slFileName[ci];
+                                        char b = kSideloadTargets[st].name[ci];
+                                        if (a >= 'A' && a <= 'Z') a |= 0x20;
+                                        if (b >= 'A' && b <= 'Z') b |= 0x20;
+                                        if (a != b) {
+                                            nameHit = FALSE;
+                                            break;
+                                        }
+                                    }
+                                    if (!nameHit) continue;
+
+                                    // Name matches — verify path is a system directory
+                                    BOOLEAN fromSysDir = FALSE;
+                                    for (int ld = 0; kLegitDirs[ld]; ld++) {
+                                        SIZE_T ldLen = strlen(kLegitDirs[ld]);
+                                        if (cbLen < ldLen) continue;
+                                        for (SIZE_T sp = 0;
+                                             sp <= cbLen - ldLen; sp++) {
+                                            BOOLEAN dm = TRUE;
+                                            for (SIZE_T sm = 0; sm < ldLen;
+                                                 sm++) {
+                                                char c = charBuffer[sp + sm];
+                                                if (c >= 'A' && c <= 'Z')
+                                                    c |= 0x20;
+                                                if (c != kLegitDirs[ld][sm]) {
+                                                    dm = FALSE;
+                                                    break;
+                                                }
+                                            }
+                                            if (dm) {
+                                                fromSysDir = TRUE;
+                                                break;
+                                            }
+                                        }
+                                        if (fromSysDir) break;
+                                    }
+
+                                    if (!fromSysDir) {
+                                        char slMsg[350];
+                                        RtlStringCbPrintfA(slMsg, sizeof(slMsg),
+                                            "DLL sideloading (T1574.002): "
+                                            "'%s' loaded from non-system "
+                                            "path '%.*s' by '%s'",
+                                            kSideloadTargets[st].name,
+                                            (int)(cbLen > 200 ? 200 : cbLen),
+                                            charBuffer,
+                                            loadingProcess
+                                                ? loadingProcess : "?");
+                                        SIZE_T slLen = strlen(slMsg) + 1;
+
+                                        PKERNEL_STRUCTURED_NOTIFICATION slN =
+                                            (PKERNEL_STRUCTURED_NOTIFICATION)
+                                            ExAllocatePool2(
+                                                POOL_FLAG_NON_PAGED,
+                                                sizeof(KERNEL_STRUCTURED_NOTIFICATION),
+                                                'krnl');
+                                        if (slN) {
+                                            RtlZeroMemory(slN, sizeof(*slN));
+                                            SET_WARNING(*slN);
+                                            SET_IMAGE_LOAD_PATH_CHECK(*slN);
+                                            SET_CALLING_PROC_PID_CHECK(*slN);
+                                            slN->pid = PsGetProcessId(
+                                                targetProcess);
+                                            slN->isPath = TRUE;
+                                            if (loadingProcess)
+                                                RtlStringCbCopyA(
+                                                    slN->procName,
+                                                    sizeof(slN->procName),
+                                                    loadingProcess);
+                                            slN->msg = (char*)
+                                                ExAllocatePool2(
+                                                    POOL_FLAG_NON_PAGED,
+                                                    slLen, 'msg');
+                                            if (slN->msg) {
+                                                RtlCopyMemory(slN->msg,
+                                                    slMsg, slLen);
+                                                slN->bufSize = (ULONG)slLen;
+                                                if (!CallbackObjects::
+                                                    GetNotifQueue()->
+                                                    Enqueue(slN)) {
+                                                    ExFreePool(slN->msg);
+                                                    ExFreePool(slN);
+                                                }
+                                            } else {
+                                                ExFreePool(slN);
+                                            }
+                                        }
+                                    }
+                                    break;  // one match per image load
                                 }
                             }
 

@@ -96,6 +96,150 @@ static BOOLEAN IsLdapPort(UINT16 port) {
 static BOOLEAN IsSystemProcess(UINT64 pid) { return pid == 0 || pid == 4; }
 
 // ---------------------------------------------------------------------------
+// Interactive C2 / beaconing session detector.
+//
+// When operators use proxying tooling (Cobalt Strike, Sliver, Mythic, etc.)
+// with sleep~0 or near-zero check-in intervals, they create an interactive
+// session that produces a distinctive traffic pattern: one process making
+// dozens-to-hundreds of connections per minute to a single IP:port on
+// standard web ports (80, 443, 8080, 8443) that blend with normal traffic.
+//
+// Normal applications (browsers, updaters) also talk to the same IPs
+// repeatedly, so we allowlist known high-talkers by process name and use
+// a conservative threshold: 30 connections from the same (PID, remoteIP,
+// remotePort) tuple within 60 seconds.  A browser opening 30 connections
+// to the same CDN endpoint in a minute is possible but rare; a sleep-0
+// Beacon easily exceeds 100/min.
+//
+// Design: fixed-size hash table keyed on (PID, remoteIP, remotePort).
+// Hash collisions silently overwrite the oldest entry (acceptable —
+// we only need to catch sustained high-rate sessions, not every burst).
+// ---------------------------------------------------------------------------
+
+#define C2_TRACK_MAX        128
+#define C2_ALERT_THRESHOLD   30       // connections to same (pid,ip,port) in window
+#define C2_WINDOW_MS         60000LL  // 60-second rolling window
+
+typedef struct _C2_TRACK_ENTRY {
+    UINT64   Pid;
+    UINT32   RemoteAddr;
+    UINT16   RemotePort;
+    LONG     Count;
+    LONGLONG WindowStart;   // KeQueryInterruptTime() 100ns ticks
+    BOOLEAN  Alerted;
+    BOOLEAN  Used;
+} C2_TRACK_ENTRY;
+
+static KSPIN_LOCK     g_C2Lock;
+static C2_TRACK_ENTRY g_C2Slots[C2_TRACK_MAX];
+static LONG           g_C2InitDone = 0;
+
+static VOID C2TrackInit()
+{
+    if (InterlockedCompareExchange(&g_C2InitDone, 1, 0) == 0) {
+        RtlZeroMemory(g_C2Slots, sizeof(g_C2Slots));
+        KeInitializeSpinLock(&g_C2Lock);
+    }
+}
+
+// Ports where interactive C2 hides in plain sight.
+static BOOLEAN IsC2BlendPort(UINT16 port) {
+    return port == 80  || port == 443  || port == 8080 ||
+           port == 8443 || port == 8888 || port == 8000 ||
+           port == 8001 || port == 9090 || port == 53;
+}
+
+// Processes that legitimately sustain high connection rates to a single host.
+static BOOLEAN IsC2AllowedProcess(UINT64 pid) {
+    if (IsSystemProcess(pid)) return TRUE;
+
+    PEPROCESS proc = nullptr;
+    if (!NT_SUCCESS(PsLookupProcessByProcessId(
+            (HANDLE)(ULONG_PTR)pid, &proc)))
+        return FALSE;
+
+    char* name = PsGetProcessImageFileName(proc);
+    ObDereferenceObject(proc);
+    if (!name) return FALSE;
+
+    static const char* kAllowed[] = {
+        "chrome.exe",    "msedge.exe",    "firefox.exe",
+        "iexplore.exe",  "opera.exe",     "brave.exe",
+        "vivaldi.exe",
+        "svchost.exe",                       // Windows Update, BITS
+        "MsMpEng.exe",                       // Defender
+        "NortonEDR.exe",                     // ourselves
+        "OneDrive.exe",  "Teams.exe",
+        "Outlook.exe",   "WINWORD.EXE",
+        "slack.exe",     "Discord.exe",
+        "spotify.exe",   "steam.exe",
+        "SearchHost.exe",                    // Windows Search
+        nullptr
+    };
+    for (int i = 0; kAllowed[i]; i++) {
+        // Case-sensitive is fine — PsGetProcessImageFileName returns
+        // the original casing from the PE header.
+        if (strcmp(name, kAllowed[i]) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+// Simple hash to distribute (pid, ip, port) across the table.
+static UINT32 C2SlotHash(UINT64 pid, UINT32 addr, UINT16 port) {
+    UINT64 h = pid ^ ((UINT64)addr << 16) ^ port;
+    h = (h ^ (h >> 17)) * 0xbf58476d1ce4e5b9ULL;
+    h = (h ^ (h >> 31)) * 0x94d049bb133111ebULL;
+    return (UINT32)(h % C2_TRACK_MAX);
+}
+
+// Track a connection and return TRUE if threshold crossed (first alert only).
+static BOOLEAN C2CheckAndCount(UINT64 pid, UINT32 remoteAddr, UINT16 remotePort)
+{
+    LONGLONG now = (LONGLONG)KeQueryInterruptTime();
+    LONGLONG windowTicks = C2_WINDOW_MS * 10000LL;
+
+    UINT32 slot = C2SlotHash(pid, remoteAddr, remotePort);
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_C2Lock, &irql);
+
+    C2_TRACK_ENTRY* e = &g_C2Slots[slot];
+
+    // Check if this slot already tracks the same (pid, ip, port)
+    if (e->Used &&
+        e->Pid == pid &&
+        e->RemoteAddr == remoteAddr &&
+        e->RemotePort == remotePort)
+    {
+        // Same tuple — check window
+        if ((now - e->WindowStart) > windowTicks) {
+            // Window expired — reset
+            e->WindowStart = now;
+            e->Count       = 1;
+            e->Alerted     = FALSE;
+            KeReleaseSpinLock(&g_C2Lock, irql);
+            return FALSE;
+        }
+        e->Count++;
+        BOOLEAN alert = (!e->Alerted && e->Count >= C2_ALERT_THRESHOLD);
+        if (alert) e->Alerted = TRUE;
+        KeReleaseSpinLock(&g_C2Lock, irql);
+        return alert;
+    }
+
+    // Different tuple or empty — overwrite (hash collision eviction)
+    e->Pid         = pid;
+    e->RemoteAddr  = remoteAddr;
+    e->RemotePort  = remotePort;
+    e->Count       = 1;
+    e->WindowStart = now;
+    e->Alerted     = FALSE;
+    e->Used        = TRUE;
+    KeReleaseSpinLock(&g_C2Lock, irql);
+    return FALSE;
+}
+
+// ---------------------------------------------------------------------------
 // Configurable blocked-port list (written from user-mode via IOCTL).
 // ---------------------------------------------------------------------------
 static KSPIN_LOCK g_WfpBlocklistLock;
@@ -310,6 +454,66 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
         }
     }
 
+    // -----------------------------------------------------------------
+    // Interactive C2 / beaconing session detection.
+    //
+    // When operators proxy through standard web ports with sleep~0 or
+    // near-zero check-in intervals, a single process makes an abnormal
+    // number of connections to the same (IP, port) within a short window.
+    // Normal apps rarely exceed 10 connections/min to a single endpoint;
+    // interactive C2 easily hits 100+/min.
+    //
+    // Threshold: 30 connections from (PID, remoteIP, remotePort) within
+    // 60 seconds on blend ports (80, 443, 8080, 8443, 8888, 8000, 9090,
+    // 53). Browsers and known high-talkers are allowlisted.
+    // -----------------------------------------------------------------
+    if (IsC2BlendPort(remotePort) && !IsSystemProcess(pid) && queue) {
+        if (!IsC2AllowedProcess(pid) && C2CheckAndCount(pid, remoteAddress, remotePort)) {
+            // Resolve process name for the alert
+            PEPROCESS c2Proc = nullptr;
+            char c2ProcName[16] = "<unknown>";
+            if (NT_SUCCESS(PsLookupProcessByProcessId(
+                    (HANDLE)(ULONG_PTR)pid, &c2Proc))) {
+                char* n = PsGetProcessImageFileName(c2Proc);
+                if (n) RtlCopyMemory(c2ProcName, n, 15);
+                ObDereferenceObject(c2Proc);
+            }
+
+            char c2Msg[300] = {};
+            RtlStringCchPrintfA(c2Msg, sizeof(c2Msg),
+                "Interactive C2 session: pid=%llu (%s) made >=%d connections "
+                "to %u.%u.%u.%u:%u within 60s — possible sleep~0 beacon / "
+                "SOCKS proxy (Cobalt Strike, Sliver, Mythic)",
+                pid, c2ProcName, C2_ALERT_THRESHOLD,
+                FORMAT_ADDR(remoteAddress), remotePort);
+
+            PKERNEL_STRUCTURED_NOTIFICATION c2Notif =
+                (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED,
+                    sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'c2nt');
+            if (c2Notif) {
+                RtlZeroMemory(c2Notif, sizeof(*c2Notif));
+                SET_WARNING(*c2Notif);
+                SET_NETWORK_CHECK(*c2Notif);
+                c2Notif->pid            = (HANDLE)(ULONG_PTR)pid;
+                c2Notif->scoopedAddress = (ULONG64)(ULONG_PTR)remoteAddress;
+                c2Notif->isPath         = FALSE;
+                RtlCopyMemory(c2Notif->procName, c2ProcName, 15);
+                SIZE_T c2Len = strlen(c2Msg) + 1;
+                c2Notif->msg = (char*)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED, c2Len, 'c2mg');
+                c2Notif->bufSize = (ULONG)c2Len;
+                if (c2Notif->msg) {
+                    RtlCopyMemory(c2Notif->msg, c2Msg, c2Len);
+                    if (!queue->Enqueue(c2Notif)) {
+                        ExFreePool(c2Notif->msg);
+                        ExFreePool(c2Notif);
+                    }
+                } else { ExFreePool(c2Notif); }
+            }
+        }
+    }
+
     // Skip enqueueing routine Info-level connections to avoid queue saturation.
     // Always surface blocked and suspicious connections.
     if (!blocked && !suspicious) {
@@ -463,6 +667,7 @@ NTSTATUS WdfTcpipUtils::InitWfp() {
 
     KeInitializeSpinLock(&g_WfpBlocklistLock);
     KerbTrackInit();
+    C2TrackInit();
 
     NTSTATUS status = FwpmEngineOpen0(NULL, RPC_C_AUTHN_WINNT, NULL, NULL, &EngineHandle);
     if (!NT_SUCCESS(status)) goto failure;
