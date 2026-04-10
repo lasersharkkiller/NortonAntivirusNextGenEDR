@@ -63,6 +63,7 @@ ULONG SyscallsUtils::NtCreateNamedPipeFileId = 0;      // Resolve dynamically
 ULONG SyscallsUtils::NtOpenThreadId = 0;               // Resolve dynamically
 ULONG SyscallsUtils::NtFlushInstructionCacheId = 0;    // Resolve dynamically
 ULONG SyscallsUtils::NtCreateFileId = 0;              // Resolve dynamically — physical memory / raw device access detection
+ULONG SyscallsUtils::NtAssignProcessToJobObjectId = 0; // Resolve dynamically — job object kill attack detection
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -687,6 +688,11 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		// ObjectAttributes = arg3 = R8
 		NtCreateFileHandler((PVOID)trapFrame->R8);
 	}
+	else if (NtAssignProcessToJobObjectId != 0 && id == NtAssignProcessToJobObjectId) {
+		// NtAssignProcessToJobObject(JobHandle, ProcessHandle)
+		// ProcessHandle = arg2 = RDX
+		NtAssignProcessToJobObjectHandler((HANDLE)trapFrame->Rdx);
+	}
 
 	return TRUE;
 }
@@ -1137,6 +1143,10 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtCreateFile;
 	RtlInitUnicodeString(&usNtCreateFile, L"NtCreateFile");
 	NtCreateFileId = getSSNByName(ssdtTable, &usNtCreateFile, exportsMap);
+
+	UNICODE_STRING usNtAssignJob;
+	RtlInitUnicodeString(&usNtAssignJob, L"NtAssignProcessToJobObject");
+	NtAssignProcessToJobObjectId = getSSNByName(ssdtTable, &usNtAssignJob, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -2049,6 +2059,62 @@ VOID SyscallsUtils::NtCreateFileHandler(PVOID ObjectAttributes)
 			break;
 		}
 	} __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// NtAssignProcessToJobObject — detect job object kill attacks.
+//
+// Attack: attacker creates a job object, assigns the EDR service (or any
+// sensitive process) to it, then sets JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+// Closing the job handle terminates the victim process.
+//
+// NtAssignProcessToJobObject(JobHandle, ProcessHandle)
+// ProcessHandle = arg2 (RDX on x64)
+//
+// We resolve the ProcessHandle to a PEPROCESS and check if it targets the
+// EDR service or a sensitive OS process.  ObRegisterCallbacks already strips
+// PROCESS_SET_QUOTA from handles to our service, but this provides defense-
+// in-depth and alerting for any sensitive process assignment.
+VOID SyscallsUtils::NtAssignProcessToJobObjectHandler(HANDLE ProcessHandle)
+{
+	if (!ProcessHandle) return;
+
+	PEPROCESS targetProc = nullptr;
+	NTSTATUS s = ObReferenceObjectByHandle(
+		ProcessHandle, 0, *PsProcessType, UserMode, (PVOID*)&targetProc, nullptr);
+	if (!NT_SUCCESS(s) || !targetProc) return;
+
+	PEPROCESS callerProc = IoGetCurrentProcess();
+	BOOLEAN isEdrService = FALSE;
+	BOOLEAN isSensitive = FALSE;
+
+	// Check if target is our EDR service
+	ULONG targetPid = HandleToUlong(PsGetProcessId(targetProc));
+	ULONG svcPid = (ULONG)InterlockedCompareExchange(
+		&ObjectUtils::g_ServicePid, 0, 0);
+	if (svcPid != 0 && targetPid == svcPid)
+		isEdrService = TRUE;
+
+	if (!isEdrService)
+		isSensitive = ObjectUtils::IsSensitiveProcess(targetProc);
+
+	if (isEdrService || isSensitive) {
+		char* callerName = PsGetProcessImageFileName(callerProc);
+		char* targetName = PsGetProcessImageFileName(targetProc);
+
+		char msg[256];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"Job object attack: '%s' assigning '%s' (pid=%lu) to a job object "
+			"— potential KILL_ON_JOB_CLOSE / process limit attack%s",
+			callerName ? callerName : "?",
+			targetName ? targetName : "?",
+			targetPid,
+			isEdrService ? " targeting NortonEDR service" : "");
+
+		EmitSyscallNotif(0, msg, callerProc, nullptr,
+			isEdrService /* CRITICAL if targeting EDR, WARNING for other sensitive */);
+	}
+
+	ObDereferenceObject(targetProc);
 }
 
 // NtCreateSection — flag SEC_IMAGE (module stomping) and executable file-backed sections.

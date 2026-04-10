@@ -14,6 +14,7 @@
 #include <wdf.h>
 
 PDEVICE_OBJECT DeviceObject = NULL;
+PDEVICE_OBJECT g_DeviceObject = nullptr;  // exposed for IoAllocateWorkItem (phantom DLL, inject timer)
 
 SyscallsUtils* g_syscallsUtils;
 CallbackObjects* g_callbackObjects;
@@ -269,6 +270,17 @@ NTSTATUS DriverIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 			ObjectUtils::RegisterServicePid(svcPid);
 			status = STATUS_SUCCESS;
 		}
+		else if (stack->Parameters.DeviceIoControl.IoControlCode == NORTONAV_HOOKDLL_CONFIRM) {
+
+			if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(UINT32)) {
+				status = STATUS_INVALID_PARAMETER;
+				__leave;
+			}
+
+			UINT32 confirmPid = *(UINT32*)Irp->AssociatedIrp.SystemBuffer;
+			DllInjector::ConfirmInjection(confirmPid);
+			status = STATUS_SUCCESS;
+		}
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 		DbgPrint("[!] Exception occurred in DriverIoControl\n");
@@ -390,6 +402,8 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 		return status;
 	}
 
+	g_DeviceObject = DeviceObject;
+
 	status = IoCreateSymbolicLink(&symLink, &devName);
 	if (!NT_SUCCESS(status))
 	{
@@ -429,6 +443,30 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	NTSTATUS fsStatus = FsFilter::Init(DriverObject, g_hashQueue);
 	if (!NT_SUCCESS(fsStatus)) {
 		DbgPrint("[-] FsFilter::Init failed: 0x%x — filesystem monitoring disabled\n", fsStatus);
+	}
+
+	// Periodic HookDll injection-confirmation timeout check (every 5s).
+	// DPC fires at DISPATCH_LEVEL → queues a work item to PASSIVE_LEVEL.
+	{
+		static KTIMER       s_InjectTimer;
+		static KDPC         s_InjectDpc;
+		static PIO_WORKITEM s_InjectWorkItem;
+
+		s_InjectWorkItem = IoAllocateWorkItem(DeviceObject);
+		if (s_InjectWorkItem) {
+			KeInitializeTimer(&s_InjectTimer);
+			KeInitializeDpc(&s_InjectDpc,
+				[](PKDPC, PVOID Ctx, PVOID, PVOID) {
+					if (Ctx) IoQueueWorkItem((PIO_WORKITEM)Ctx,
+						[](PDEVICE_OBJECT, PVOID) { DllInjector::CheckPendingTimeouts(); },
+						DelayedWorkQueue, nullptr);
+				}, s_InjectWorkItem);
+
+			LARGE_INTEGER due;
+			due.QuadPart = -50000000LL;  // 5 seconds initial delay
+			KeSetTimerEx(&s_InjectTimer, due, 5000 /*5s period*/, &s_InjectDpc);
+			DbgPrint("[+] HookDll injection confirmation timer started\n");
+		}
 	}
 
 	DbgPrint("[+] Driver loaded\n");

@@ -165,12 +165,15 @@ OB_PREOP_CALLBACK_STATUS ObjectUtils::ProcessPreCallback(
         HandleToUlong(PsGetProcessId(targetProc)) == svcPid)
     {
         // Strip all useful attack rights from the service process handle.
+        // PROCESS_SET_QUOTA is required by NtAssignProcessToJobObject —
+        // stripping it prevents job-object kill (KILL_ON_JOB_CLOSE) attacks.
         const ACCESS_MASK kProtectMask =
             PROCESS_TERMINATE       |
             PROCESS_VM_WRITE        |
             PROCESS_VM_OPERATION    |
             PROCESS_SUSPEND_RESUME  |
-            PROCESS_SET_INFORMATION;
+            PROCESS_SET_INFORMATION |
+            PROCESS_SET_QUOTA;
 
         toStrip = original & kProtectMask;
         if (toStrip) {

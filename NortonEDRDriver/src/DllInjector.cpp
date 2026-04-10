@@ -57,6 +57,21 @@ static ULONG      g_InjectedPids[MAX_INJECTED_PIDS] = {};
 static LONG       g_InjectedCount = 0;
 static KSPIN_LOCK g_PidLock;
 
+// ---------------------------------------------------------------------------
+// Injection confirmation tracking — detects failed/blocked/raced APC injection.
+// HookDll must send NORTONAV_HOOKDLL_CONFIRM within 5 seconds of APC queue.
+// ---------------------------------------------------------------------------
+#define MAX_PENDING_INJECT 512
+
+struct PendingInject {
+    ULONG pid;
+    LARGE_INTEGER queuedTime;
+    BOOLEAN used;
+};
+
+static PendingInject g_PendingInjects[MAX_PENDING_INJECT] = {};
+static KSPIN_LOCK    g_PendingLock;
+
 // Returns TRUE if pid was already in the set; adds it and returns FALSE otherwise.
 static BOOLEAN MarkInjected(ULONG pid) {
     KIRQL irql;
@@ -146,6 +161,7 @@ static VOID NTAPI ApcRundownRoutine(PRKAPC Apc) {
 
 VOID DllInjector::Initialize() {
     KeInitializeSpinLock(&g_PidLock);
+    KeInitializeSpinLock(&g_PendingLock);
 }
 
 VOID DllInjector::SetConfig(
@@ -224,5 +240,87 @@ VOID DllInjector::TryInject(PEPROCESS process, PUNICODE_STRING fullImageName) {
         ExFreePoolWithTag(ctx, 'apci');
     } else {
         DbgPrint("[+] DllInjector: APC queued pid=%lu pathBuf=%p\n", pid, pathBuf);
+
+        // Record pending injection for confirmation tracking
+        KIRQL irql;
+        KeAcquireSpinLock(&g_PendingLock, &irql);
+        for (int i = 0; i < MAX_PENDING_INJECT; i++) {
+            if (!g_PendingInjects[i].used) {
+                g_PendingInjects[i].pid  = pid;
+                KeQuerySystemTimePrecise(&g_PendingInjects[i].queuedTime);
+                g_PendingInjects[i].used = TRUE;
+                break;
+            }
+        }
+        KeReleaseSpinLock(&g_PendingLock, irql);
     }
+}
+
+// ---------------------------------------------------------------------------
+// ConfirmInjection — called from IOCTL handler when HookDll reports success.
+// ---------------------------------------------------------------------------
+VOID DllInjector::ConfirmInjection(ULONG pid) {
+    KIRQL irql;
+    KeAcquireSpinLock(&g_PendingLock, &irql);
+    for (int i = 0; i < MAX_PENDING_INJECT; i++) {
+        if (g_PendingInjects[i].used && g_PendingInjects[i].pid == pid) {
+            g_PendingInjects[i].used = FALSE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_PendingLock, irql);
+    DbgPrint("[+] DllInjector: HookDll confirmed for pid=%lu\n", pid);
+}
+
+// ---------------------------------------------------------------------------
+// CheckPendingTimeouts — called periodically from a timer work item.
+// Emits WARNING for any injection that hasn't been confirmed within 5 seconds.
+// ---------------------------------------------------------------------------
+VOID DllInjector::CheckPendingTimeouts() {
+    LARGE_INTEGER now;
+    KeQuerySystemTimePrecise(&now);
+
+    const LONGLONG kTimeoutTicks = 5LL * 10000000LL;  // 5 seconds in 100ns units
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_PendingLock, &irql);
+    for (int i = 0; i < MAX_PENDING_INJECT; i++) {
+        if (!g_PendingInjects[i].used) continue;
+        if ((now.QuadPart - g_PendingInjects[i].queuedTime.QuadPart) < kTimeoutTicks)
+            continue;
+
+        ULONG pid = g_PendingInjects[i].pid;
+        g_PendingInjects[i].used = FALSE;
+        KeReleaseSpinLock(&g_PendingLock, irql);
+
+        char msg[200];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "HookDll injection timeout: pid=%lu did not confirm within 5s "
+            "— process may be unmonitored (APC race, mitigation policy block, or injection failure)",
+            pid);
+
+        PKERNEL_STRUCTURED_NOTIFICATION notif =
+            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+        if (notif) {
+            RtlZeroMemory(notif, sizeof(*notif));
+            SET_WARNING(*notif);
+            SET_IMAGE_LOAD_PATH_CHECK(*notif);
+            notif->pid    = (HANDLE)(ULONG_PTR)pid;
+            notif->isPath = FALSE;
+            SIZE_T msgLen = strlen(msg) + 1;
+            notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+            if (notif->msg) {
+                RtlCopyMemory(notif->msg, msg, msgLen);
+                notif->bufSize = (ULONG)msgLen;
+                if (!CallbackObjects::GetNotifQueue()->Enqueue(notif)) {
+                    ExFreePool(notif->msg); ExFreePool(notif);
+                }
+            } else { ExFreePool(notif); }
+        }
+
+        // Re-acquire and continue scanning
+        KeAcquireSpinLock(&g_PendingLock, &irql);
+    }
+    KeReleaseSpinLock(&g_PendingLock, irql);
 }

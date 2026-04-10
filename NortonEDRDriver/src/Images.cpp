@@ -37,6 +37,53 @@ static BOOLEAN NtdllSeenBefore(ULONG pid) {
 }
 
 // ---------------------------------------------------------------------------
+// Image hash verification — anti-phantom-DLL defense (Fast and Furious)
+//
+// SHA256 critical DLLs at ImageLoadNotifyRoutine time, then re-verify 200ms
+// later via a deferred work item.  A mismatch means the mapped image was
+// replaced between callback and execution (phantom DLL / process hollowing).
+// ---------------------------------------------------------------------------
+#define MAX_IMAGE_HASHES 512
+
+struct ImageHashEntry {
+    ULONG  pid;
+    PVOID  imageBase;
+    SIZE_T imageSize;
+    BYTE   hash[SHA256_BLOCK_SIZE];   // 32 bytes
+    BOOLEAN used;
+};
+
+static ImageHashEntry g_ImageHashes[MAX_IMAGE_HASHES] = {};
+static KSPIN_LOCK     g_ImageHashLock;
+
+// Work item context for deferred re-verification
+struct HashVerifyCtx {
+    PIO_WORKITEM workItem;
+    ULONG        pid;
+    PVOID        imageBase;
+    SIZE_T       imageSize;
+    BYTE         originalHash[SHA256_BLOCK_SIZE];
+};
+
+// DLLs worth hashing — high-value targets for phantom DLL / unhooking attacks.
+static BOOLEAN ShouldHashImage(PUNICODE_STRING fullImageName) {
+    if (!fullImageName || !fullImageName->Buffer) return FALSE;
+    static const WCHAR* kHashTargets[] = {
+        L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll",
+        L"amsi.dll", L"clr.dll", L"clrjit.dll", nullptr
+    };
+    for (int i = 0; kHashTargets[i]; i++) {
+        if (UnicodeStringContains(fullImageName, kHashTargets[i]))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// Forward declarations for deferred hash verification
+static VOID QueueHashVerification(ULONG pid, PVOID imageBase, SIZE_T imageSize, BYTE* hash);
+static VOID HashVerifyWorker(PDEVICE_OBJECT DevObj, PVOID Context);
+
+// ---------------------------------------------------------------------------
 // Argument-spoofing discrepancy detection (Adam Chester / Cobalt Strike "argue")
 //
 // At CreateProcessNotifyEx time the kernel gives us CreateInfo->CommandLine —
@@ -188,6 +235,128 @@ VOID ImageUtils::CheckCmdLineDiscrepancy(ULONG pid, PEPROCESS proc)
 	} else {
 		ExFreePool(n);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phantom DLL deferred re-verification — fires 200ms after image load to
+// detect post-callback content replacement (enSilo "Fast and Furious" attack).
+// ---------------------------------------------------------------------------
+
+static VOID HashVerifyWorker(PDEVICE_OBJECT DevObj, PVOID Context) {
+    UNREFERENCED_PARAMETER(DevObj);
+    HashVerifyCtx* ctx = (HashVerifyCtx*)Context;
+    if (!ctx) return;
+
+    // Small delay to let the attacker's swap happen (if any)
+    LARGE_INTEGER delay;
+    delay.QuadPart = -200 * 10000LL;  // 200ms relative
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+
+    // Re-attach to the process and re-hash
+    PEPROCESS process = nullptr;
+    NTSTATUS s = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)ctx->pid, &process);
+    if (!NT_SUCCESS(s) || !process) goto cleanup;
+
+    {
+        KAPC_STATE apcState;
+        KeStackAttachProcess(process, &apcState);
+
+        BYTE rehash[SHA256_BLOCK_SIZE] = {};
+        BOOLEAN hashOk = FALSE;
+        __try {
+            SHA256_CTX sha;
+            SHA256Init(&sha);
+            SIZE_T remaining = ctx->imageSize;
+            BYTE* ptr = (BYTE*)ctx->imageBase;
+            while (remaining > 0) {
+                SIZE_T chunk = min(remaining, (SIZE_T)4096);
+                if (!MmIsAddressValid(ptr)) break;
+                SHA256Update(&sha, ptr, chunk);
+                ptr += chunk;
+                remaining -= chunk;
+            }
+            SHA256Final(rehash, &sha);
+            hashOk = TRUE;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Process may have exited or memory unmapped
+        }
+
+        KeUnstackDetachProcess(&apcState);
+
+        if (hashOk &&
+            RtlCompareMemory(ctx->originalHash, rehash, SHA256_BLOCK_SIZE) != SHA256_BLOCK_SIZE)
+        {
+            // MISMATCH — phantom DLL detected!
+            char msg[256];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "Phantom DLL: mapped image at %p (pid=%lu) content modified after "
+                "ImageLoadNotifyRoutine — race condition exploit detected",
+                ctx->imageBase, ctx->pid);
+
+            PKERNEL_STRUCTURED_NOTIFICATION notif =
+                (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+            if (notif) {
+                RtlZeroMemory(notif, sizeof(*notif));
+                SET_CRITICAL(*notif);
+                SET_IMAGE_LOAD_PATH_CHECK(*notif);
+                notif->pid    = (HANDLE)(ULONG_PTR)ctx->pid;
+                notif->isPath = FALSE;
+                char* procName = PsGetProcessImageFileName(process);
+                if (procName) RtlStringCbCopyA(notif->procName, sizeof(notif->procName), procName);
+                SIZE_T msgLen = strlen(msg) + 1;
+                notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+                if (notif->msg) {
+                    RtlCopyMemory(notif->msg, msg, msgLen);
+                    notif->bufSize = (ULONG)msgLen;
+                    if (!CallbackObjects::GetNotifQueue()->Enqueue(notif)) {
+                        ExFreePool(notif->msg); ExFreePool(notif);
+                    }
+                } else { ExFreePool(notif); }
+            }
+        }
+
+        ObDereferenceObject(process);
+    }
+
+    // Remove entry from hash table
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&g_ImageHashLock, &irql);
+        for (int i = 0; i < MAX_IMAGE_HASHES; i++) {
+            if (g_ImageHashes[i].used &&
+                g_ImageHashes[i].pid == ctx->pid &&
+                g_ImageHashes[i].imageBase == ctx->imageBase) {
+                g_ImageHashes[i].used = FALSE;
+                break;
+            }
+        }
+        KeReleaseSpinLock(&g_ImageHashLock, irql);
+    }
+
+cleanup:
+    IoFreeWorkItem(ctx->workItem);
+    ExFreePoolWithTag(ctx, 'hvwi');
+}
+
+static VOID QueueHashVerification(ULONG pid, PVOID imageBase, SIZE_T imageSize, BYTE* hash) {
+    extern PDEVICE_OBJECT g_DeviceObject;
+    if (!g_DeviceObject) return;
+
+    PIO_WORKITEM workItem = IoAllocateWorkItem(g_DeviceObject);
+    if (!workItem) return;
+
+    HashVerifyCtx* ctx = (HashVerifyCtx*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(HashVerifyCtx), 'hvwi');
+    if (!ctx) { IoFreeWorkItem(workItem); return; }
+
+    ctx->workItem  = workItem;
+    ctx->pid       = pid;
+    ctx->imageBase = imageBase;
+    ctx->imageSize = imageSize;
+    RtlCopyMemory(ctx->originalHash, hash, SHA256_BLOCK_SIZE);
+
+    IoQueueWorkItem(workItem, HashVerifyWorker, DelayedWorkQueue, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -707,6 +876,51 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
             DbgPrint("[-] Exception in ImageLoadNotifyRoutine\n");
         }
 
+        // --- Phantom DLL detection: hash critical images for deferred re-verification ---
+        if (ImageInfo->ImageBase && ImageInfo->ImageSize > 0 &&
+            ShouldHashImage(FullImageName))
+        {
+            BYTE digest[SHA256_BLOCK_SIZE] = {};
+            BOOLEAN hashed = FALSE;
+            __try {
+                SHA256_CTX hashCtx;
+                SHA256Init(&hashCtx);
+                SIZE_T remaining = ImageInfo->ImageSize;
+                BYTE* ptr = (BYTE*)ImageInfo->ImageBase;
+                while (remaining > 0) {
+                    SIZE_T chunk = min(remaining, (SIZE_T)4096);
+                    if (!MmIsAddressValid(ptr)) break;
+                    SHA256Update(&hashCtx, ptr, chunk);
+                    ptr += chunk;
+                    remaining -= chunk;
+                }
+                SHA256Final(digest, &hashCtx);
+                hashed = TRUE;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+            if (hashed) {
+                KIRQL hashIrql;
+                KeAcquireSpinLock(&g_ImageHashLock, &hashIrql);
+                for (int hi = 0; hi < MAX_IMAGE_HASHES; hi++) {
+                    if (!g_ImageHashes[hi].used) {
+                        g_ImageHashes[hi].pid       = HandleToUlong(ProcessId);
+                        g_ImageHashes[hi].imageBase = ImageInfo->ImageBase;
+                        g_ImageHashes[hi].imageSize = ImageInfo->ImageSize;
+                        RtlCopyMemory(g_ImageHashes[hi].hash, digest, SHA256_BLOCK_SIZE);
+                        g_ImageHashes[hi].used      = TRUE;
+                        break;
+                    }
+                }
+                KeReleaseSpinLock(&g_ImageHashLock, hashIrql);
+
+                QueueHashVerification(
+                    HandleToUlong(ProcessId),
+                    ImageInfo->ImageBase,
+                    ImageInfo->ImageSize,
+                    digest);
+            }
+        }
+
         // Queue HookDll APC while still attached — allocates path buffer in target process.
         DllInjector::TryInject(targetProcess, FullImageName);
 
@@ -742,6 +956,7 @@ VOID ImageUtils::setImageNotificationCallback() {
 
     KeInitializeSpinLock(&g_NtdllPidLock);
     KeInitializeSpinLock(&g_CmdLineRecLock);
+    KeInitializeSpinLock(&g_ImageHashLock);
 
     // Prefer Ex (subsystem-aware, Win10 1709+).
     UNICODE_STRING usEx;

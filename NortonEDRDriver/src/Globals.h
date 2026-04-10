@@ -56,6 +56,14 @@
 // opened to that PID (self-protection, like CrowdStrike's CSAgent protection).
 #define NORTONAV_REGISTER_SERVICE_PID CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// Input: UINT32 PID — HookDll confirms successful load + hook installation.
+// Absence of confirmation within 5s triggers a WARNING alert.
+#define NORTONAV_HOOKDLL_CONFIRM CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Global device object — needed by IoAllocateWorkItem for deferred hash verification
+// and injection timeout checking.
+extern PDEVICE_OBJECT g_DeviceObject;
+
 // Payload sent from user mode to configure DllInjector.
 // LoadLibraryWAddress is the VA of LoadLibraryW in the NortonEDR process;
 // it is valid in all processes because system DLLs are mapped at the same VA
@@ -746,6 +754,7 @@ class SyscallsUtils {
 	static ULONG NtOpenThreadId;              // Variable — thread hijack / context scrape detection
 	static ULONG NtFlushInstructionCacheId;   // Variable — post-injection cache flush detection
 	static ULONG NtCreateFileId;             // Variable — physical memory / raw device access detection (IOMMU bypass)
+	static ULONG NtAssignProcessToJobObjectId; // Variable — job object assignment attack detection
 
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
@@ -999,6 +1008,9 @@ public:
 	static VOID NtCreateFileHandler(
 		PVOID ObjectAttributes
 	);
+
+	// Job object assignment attack detection (KILL_ON_JOB_CLOSE)
+	static VOID NtAssignProcessToJobObjectHandler(HANDLE ProcessHandle);
 
 	// Named pipe C2 / lateral movement detection
 	static VOID NtCreateNamedPipeFileHandler(
@@ -1279,6 +1291,10 @@ public:
     static VOID SetConfig(PVOID loadLibraryW, ULONG ownerPid, PCWSTR path, ULONG byteLen);
     // Must be called at PASSIVE_LEVEL while attached to `process` via KeStackAttachProcess.
     static VOID TryInject(PEPROCESS process, PUNICODE_STRING fullImageName);
+    // APC execution confirmation — called from IOCTL when HookDll reports successful load.
+    static VOID ConfirmInjection(ULONG pid);
+    // Periodic check for HookDll injections that never confirmed (5s timeout).
+    static VOID CheckPendingTimeouts();
 };
 
 class ImageUtils {

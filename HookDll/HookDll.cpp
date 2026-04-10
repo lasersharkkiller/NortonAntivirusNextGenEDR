@@ -1589,6 +1589,20 @@ void InstallHooks() {
     InstallAllInlineHooks(); // prologue patches first — catches GetProcAddress callers
     PatchAllModules(false);  // IAT patches catch load-time importers
 
+    // Confirm successful injection to kernel driver — enables injection timeout detection.
+    // NORTONAV_HOOKDLL_CONFIRM = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+    {
+        HANDLE hDev = CreateFileA("\\\\.\\NortonEDR",
+            GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hDev != INVALID_HANDLE_VALUE) {
+            DWORD pid = g_selfPid;
+            DWORD returned = 0;
+            DeviceIoControl(hDev, 0x00222018,
+                &pid, sizeof(pid), nullptr, 0, &returned, nullptr);
+            CloseHandle(hDev);
+        }
+    }
+
     // Start the hook-integrity watch thread.
     // WatchThreadProc is inside HookDll so IsAddressInKnownModule() returns true
     // for its start address — Hook_CreateThread won't fire a false alarm.
