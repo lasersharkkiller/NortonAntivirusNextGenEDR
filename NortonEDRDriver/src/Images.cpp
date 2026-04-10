@@ -134,56 +134,61 @@ VOID ImageUtils::InitSecondaryNtdllTracker() {
 // fire — the call originates in ring 0 and never traverses the SSDT.
 //
 // This scanner runs every 5 seconds (piggybacked on the injection-confirmation
-// timer) and walks the user-mode APC queue of every thread in processes that
-// have a secondary ntdll mapping.  If any queued APC's NormalRoutine points
-// into that secondary ntdll, we've caught a kernel-originated APC injection
-// using a privately resolved LdrLoadDll — the exact pattern that bypasses
-// our syscall-level detection.
+// timer) and walks the user-mode APC queue of EVERY user-mode thread across
+// ALL processes.  For each queued APC with a non-NULL NormalRoutine it checks:
+//
+//   1. Skip our own HookDll APCs (DllInjector::IsOurApc)
+//   2. NormalRoutine in secondary ntdll → CRITICAL
+//      (kernel driver resolved LdrLoadDll from a privately mapped ntdll copy)
+//   3. NormalRoutine in private executable VAD → CRITICAL
+//      (kernel driver allocated RWX, wrote shellcode, queued APC to it)
+//
+// Performance: most threads have an empty user-mode APC queue (Flink==ListHead),
+// so the fast-path is a single pointer comparison per thread.  The VAD walk
+// only runs when a suspicious NormalRoutine is found.
 //
 // Limitation: APCs that fire and are dequeued between scan intervals will be
 // missed.  This is a best-effort probabilistic detection complementing the
-// syscall hooks; the secondary ntdll mapping alert itself (from
-// ImageLoadNotifyRoutine) always fires regardless.
+// syscall hooks.
 // ---------------------------------------------------------------------------
-VOID ImageUtils::ScanApcQueuesForSecondaryNtdll() {
+VOID ImageUtils::ScanApcQueues() {
     KERNEL_STRUCTURES_OFFSET* offsets = OffsetsMgt::GetOffsets();
     if (!offsets) return;
 
-    // Collect unique PIDs that have secondary ntdll entries.
-    ULONG pidsToScan[MAX_SECONDARY_NTDLL];
-    int pidCount = 0;
+    __try {
+        PEPROCESS currentProcess = PsInitialSystemProcess;
+        PLIST_ENTRY procListHead = (PLIST_ENTRY)(
+            (PUCHAR)currentProcess + offsets->ActiveProcessLinks);
+        PLIST_ENTRY procEntry = procListHead->Flink;
+        int procCount = 0;
 
-    KIRQL irql;
-    KeAcquireSpinLock(&g_SecNtdllLock, &irql);
-    for (int i = 0; i < MAX_SECONDARY_NTDLL; i++) {
-        if (!g_SecNtdll[i].used) continue;
-        ULONG pid = g_SecNtdll[i].pid;
-        BOOLEAN dup = FALSE;
-        for (int j = 0; j < pidCount; j++) {
-            if (pidsToScan[j] == pid) { dup = TRUE; break; }
-        }
-        if (!dup && pidCount < MAX_SECONDARY_NTDLL)
-            pidsToScan[pidCount++] = pid;
-    }
-    KeReleaseSpinLock(&g_SecNtdllLock, irql);
+        do {
+            if (!MmIsAddressValid(procEntry)) break;
 
-    if (pidCount == 0) return;
+            currentProcess = (PEPROCESS)(
+                (PUCHAR)procEntry - offsets->ActiveProcessLinks);
+            if (!currentProcess || !MmIsAddressValid(currentProcess)) break;
 
-    for (int p = 0; p < pidCount; p++) {
-        PEPROCESS process = nullptr;
-        NTSTATUS status = PsLookupProcessByProcessId(
-            (HANDLE)(ULONG_PTR)pidsToScan[p], &process);
-        if (!NT_SUCCESS(status) || !process) continue;
+            ULONG pid = HandleToUlong(PsGetProcessId(currentProcess));
 
-        __try {
+            // Skip Idle (0) and System (4) — no user-mode APCs
+            if (pid <= 4 || ++procCount > 4096) {
+                procEntry = procEntry->Flink;
+                continue;
+            }
+
             PLIST_ENTRY threadListHead = (PLIST_ENTRY)(
-                (PUCHAR)process + offsets->ThreadListHead);
+                (PUCHAR)currentProcess + offsets->ThreadListHead);
 
             if (!MmIsAddressValid(threadListHead) ||
                 !MmIsAddressValid(threadListHead->Flink)) {
-                ObDereferenceObject(process);
+                procEntry = procEntry->Flink;
                 continue;
             }
+
+            // VAD root — only resolved when needed for shellcode check
+            RTL_AVL_TREE* vadRoot = (RTL_AVL_TREE*)(
+                (PUCHAR)currentProcess + offsets->VadRoot);
 
             PLIST_ENTRY threadEntry = threadListHead->Flink;
             int threadCount = 0;
@@ -193,13 +198,12 @@ VOID ImageUtils::ScanApcQueuesForSecondaryNtdll() {
 
                 PETHREAD eThread = (PETHREAD)(
                     (PUCHAR)threadEntry - offsets->ThreadListEntry);
-
                 if (!MmIsAddressValid(eThread)) {
                     threadEntry = threadEntry->Flink;
                     continue;
                 }
 
-                // User-mode APC list head = KTHREAD + ApcState + ApcListHead[UserMode]
+                // User-mode APC list head
                 PLIST_ENTRY userApcListHead = (PLIST_ENTRY)(
                     (PUCHAR)eThread +
                     KTHREAD_APCSTATE_OFFSET +
@@ -211,15 +215,19 @@ VOID ImageUtils::ScanApcQueuesForSecondaryNtdll() {
                     continue;
                 }
 
+                // Fast-path: skip empty APC queues (vast majority of threads)
+                if (userApcListHead->Flink == userApcListHead) {
+                    threadEntry = threadEntry->Flink;
+                    continue;
+                }
+
                 PLIST_ENTRY apcEntry = userApcListHead->Flink;
                 int apcCount = 0;
 
                 while (apcEntry != userApcListHead && apcCount++ < 64) {
                     if (!MmIsAddressValid(apcEntry)) break;
 
-                    // KAPC base = list entry address - ApcListEntry offset
                     PUCHAR kapcBase = (PUCHAR)apcEntry - KAPC_APCLISTENTRY_OFFSET;
-
                     if (!MmIsAddressValid(kapcBase) ||
                         !MmIsAddressValid(kapcBase + KAPC_NORMALROUTINE_OFFSET)) {
                         apcEntry = apcEntry->Flink;
@@ -228,23 +236,44 @@ VOID ImageUtils::ScanApcQueuesForSecondaryNtdll() {
 
                     PVOID normalRoutine = *(PVOID*)(kapcBase + KAPC_NORMALROUTINE_OFFSET);
 
-                    if (normalRoutine &&
-                        IsAddressInSecondaryNtdll(pidsToScan[p], (ULONG64)normalRoutine))
-                    {
-                        // CRITICAL: kernel-originated APC targeting secondary ntdll
-                        char msg[350];
-                        char* procName = PsGetProcessImageFileName(process);
-                        HANDLE tid = PsGetThreadId(eThread);
+                    // Skip NULL NormalRoutine (special kernel APCs / I/O completion)
+                    if (!normalRoutine) {
+                        apcEntry = apcEntry->Flink;
+                        continue;
+                    }
 
+                    // Skip our own HookDll injection APCs
+                    if (DllInjector::IsOurApc(normalRoutine, pid)) {
+                        apcEntry = apcEntry->Flink;
+                        continue;
+                    }
+
+                    char* procName = PsGetProcessImageFileName(currentProcess);
+                    HANDLE tid = PsGetThreadId(eThread);
+                    const char* reason = nullptr;
+
+                    // Check 1: NormalRoutine in secondary ntdll mapping
+                    if (IsAddressInSecondaryNtdll(pid, (ULONG64)normalRoutine)) {
+                        reason = "NormalRoutine points into secondary ntdll — "
+                                 "kernel driver injection via privately resolved LdrLoadDll";
+                    }
+                    // Check 2: NormalRoutine in private executable VAD (shellcode)
+                    else if (MmIsAddressValid(vadRoot) &&
+                             VadUtils::IsAddressInPrivateExecVad(
+                                 (PRTL_BALANCED_NODE)vadRoot, (ULONG64)normalRoutine)) {
+                        reason = "NormalRoutine points into private executable memory — "
+                                 "kernel driver APC injection via shellcode in allocated RWX";
+                    }
+
+                    if (reason) {
+                        char msg[450];
                         RtlStringCbPrintfA(msg, sizeof(msg),
-                            "KeInsertQueueApc bypass detected: user-mode APC with "
-                            "NormalRoutine 0x%llX points into secondary ntdll mapping "
-                            "in '%s' (pid=%lu tid=%lu) — kernel driver injection via "
-                            "privately resolved LdrLoadDll (syscall hook bypass)",
+                            "KeInsertQueueApc bypass: user-mode APC "
+                            "(NormalRoutine=0x%llX) in '%s' (pid=%lu tid=%lu) — %s",
                             (ULONG64)normalRoutine,
                             procName ? procName : "?",
-                            pidsToScan[p],
-                            HandleToUlong(tid));
+                            pid, HandleToUlong(tid),
+                            reason);
 
                         PKERNEL_STRUCTURED_NOTIFICATION notif =
                             (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
@@ -255,10 +284,11 @@ VOID ImageUtils::ScanApcQueuesForSecondaryNtdll() {
                             SET_CRITICAL(*notif);
                             SET_SYSCALL_CHECK(*notif);
                             notif->scoopedAddress = (ULONG64)normalRoutine;
-                            notif->pid = (HANDLE)(ULONG_PTR)pidsToScan[p];
+                            notif->pid = (HANDLE)(ULONG_PTR)pid;
                             notif->isPath = FALSE;
                             if (procName)
-                                RtlStringCbCopyA(notif->procName, sizeof(notif->procName), procName);
+                                RtlStringCbCopyA(notif->procName,
+                                    sizeof(notif->procName), procName);
 
                             SIZE_T msgLen = strlen(msg) + 1;
                             notif->msg = (char*)ExAllocatePool2(
@@ -273,12 +303,11 @@ VOID ImageUtils::ScanApcQueuesForSecondaryNtdll() {
                             } else { ExFreePool(notif); }
                         }
 
-                        InjectionTaintTracker::MarkTainted(
-                            (HANDLE)(ULONG_PTR)pidsToScan[p]);
+                        InjectionTaintTracker::MarkTainted((HANDLE)(ULONG_PTR)pid);
 
                         DbgPrint("[!] APC queue scan: KeInsertQueueApc bypass — "
-                                 "NormalRoutine=%p in secondary ntdll, pid=%lu tid=%lu\n",
-                                 normalRoutine, pidsToScan[p], HandleToUlong(tid));
+                                 "NormalRoutine=%p pid=%lu tid=%lu\n",
+                                 normalRoutine, pid, HandleToUlong(tid));
                     }
 
                     apcEntry = apcEntry->Flink;
@@ -286,12 +315,12 @@ VOID ImageUtils::ScanApcQueuesForSecondaryNtdll() {
 
                 threadEntry = threadEntry->Flink;
             }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            DbgPrint("[-] APC queue scan: exception for pid=%lu\n", pidsToScan[p]);
-        }
 
-        ObDereferenceObject(process);
+            procEntry = procEntry->Flink;
+        } while (procEntry != procListHead);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] APC queue scan: exception during process walk\n");
     }
 }
 

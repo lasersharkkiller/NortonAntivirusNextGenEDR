@@ -324,3 +324,25 @@ VOID DllInjector::CheckPendingTimeouts() {
     }
     KeReleaseSpinLock(&g_PendingLock, irql);
 }
+
+// ---------------------------------------------------------------------------
+// IsOurApc — used by the periodic APC queue scanner to distinguish our own
+// HookDll injection APCs from malicious ones.
+// Returns TRUE if normalRoutine matches our configured LoadLibraryW address
+// AND the PID is one we previously injected into.
+// ---------------------------------------------------------------------------
+BOOLEAN DllInjector::IsOurApc(PVOID normalRoutine, ULONG pid) {
+    if (!g_ConfigSet) return FALSE;
+    if (normalRoutine != g_LoadLibraryW) return FALSE;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&g_PidLock, &irql);
+    for (LONG i = 0; i < g_InjectedCount; i++) {
+        if (g_InjectedPids[i] == pid) {
+            KeReleaseSpinLock(&g_PidLock, irql);
+            return TRUE;
+        }
+    }
+    KeReleaseSpinLock(&g_PidLock, irql);
+    return FALSE;
+}

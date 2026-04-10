@@ -472,7 +472,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 					if (Ctx) IoQueueWorkItem((PIO_WORKITEM)Ctx,
 						[](PDEVICE_OBJECT, PVOID) {
 							DllInjector::CheckPendingTimeouts();
-							ImageUtils::ScanApcQueuesForSecondaryNtdll();
+							ImageUtils::ScanApcQueues();
 						},
 						DelayedWorkQueue, nullptr);
 				}, s_InjectWorkItem);

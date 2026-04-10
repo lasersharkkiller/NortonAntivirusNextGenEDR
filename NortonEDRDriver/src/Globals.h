@@ -1331,6 +1331,10 @@ public:
     static VOID ConfirmInjection(ULONG pid);
     // Periodic check for HookDll injections that never confirmed (5s timeout).
     static VOID CheckPendingTimeouts();
+    // Returns TRUE if a NormalRoutine address matches our configured LoadLibraryW
+    // AND the target PID is one we injected.  Used by the APC queue scanner to
+    // exclude our own queued APCs from detection.
+    static BOOLEAN IsOurApc(PVOID normalRoutine, ULONG pid);
 };
 
 class ImageUtils {
@@ -1382,10 +1386,12 @@ public:
 	static VOID RemoveSecondaryNtdll(ULONG pid);
 
 	// Periodic APC queue scanner — KeInsertQueueApc blind spot mitigation.
-	// Walks user-mode APC queues of threads in processes that have secondary
-	// ntdll mappings, detecting kernel-originated APC injection that bypasses
-	// our NtQueueApcThread/Ex syscall hooks entirely.
-	static VOID ScanApcQueuesForSecondaryNtdll();
+	// Walks user-mode APC queues of ALL user processes, detecting kernel-
+	// originated APC injection that bypasses our NtQueueApcThread/Ex syscall
+	// hooks.  Checks: (1) NormalRoutine in secondary ntdll mapping,
+	// (2) NormalRoutine in private executable VAD (shellcode in allocated RWX).
+	// Our own HookDll APCs are excluded via DllInjector::IsOurApc().
+	static VOID ScanApcQueues();
 };
 
 class ThreadUtils : public ProcessUtils {
