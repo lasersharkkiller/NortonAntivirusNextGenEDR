@@ -54,5 +54,15 @@ typedef struct _KERNEL_STRUCTURES_OFFSETS {
 #define MM_EXECUTE_GUARD_PAGE  0xE 
 #define MM_EXECUTE_NOACCESS    0xF 
 
+// KTHREAD APC queue offsets — stable across Win10 19041 – Win11 22632 (x64).
+// Used by the periodic APC queue scanner to detect KeInsertQueueApc bypass.
+#define KTHREAD_APCSTATE_OFFSET       0x098  // KAPC_STATE embedded in KTHREAD
+#define KAPCSTATE_USERLIST_OFFSET     0x010  // ApcListHead[UserMode] within KAPC_STATE
+// Combined: user-mode APC list head = KTHREAD + 0x0A8
+
+// KAPC structure offsets (x64)
+#define KAPC_APCLISTENTRY_OFFSET      0x010  // LIST_ENTRY linking into APC list
+#define KAPC_NORMALROUTINE_OFFSET     0x030  // user-mode routine pointer (LdrLoadDll target)
+
 // Others
-#define PROCESS_TERMINATE 0x0001 
+#define PROCESS_TERMINATE 0x0001

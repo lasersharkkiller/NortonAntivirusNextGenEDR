@@ -1380,6 +1380,12 @@ public:
 	static VOID InitSecondaryNtdllTracker();
 	static BOOLEAN IsAddressInSecondaryNtdll(ULONG pid, ULONG64 address);
 	static VOID RemoveSecondaryNtdll(ULONG pid);
+
+	// Periodic APC queue scanner — KeInsertQueueApc blind spot mitigation.
+	// Walks user-mode APC queues of threads in processes that have secondary
+	// ntdll mappings, detecting kernel-originated APC injection that bypasses
+	// our NtQueueApcThread/Ex syscall hooks entirely.
+	static VOID ScanApcQueuesForSecondaryNtdll();
 };
 
 class ThreadUtils : public ProcessUtils {

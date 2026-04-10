@@ -470,14 +470,17 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 			KeInitializeDpc(&s_InjectDpc,
 				[](PKDPC, PVOID Ctx, PVOID, PVOID) {
 					if (Ctx) IoQueueWorkItem((PIO_WORKITEM)Ctx,
-						[](PDEVICE_OBJECT, PVOID) { DllInjector::CheckPendingTimeouts(); },
+						[](PDEVICE_OBJECT, PVOID) {
+							DllInjector::CheckPendingTimeouts();
+							ImageUtils::ScanApcQueuesForSecondaryNtdll();
+						},
 						DelayedWorkQueue, nullptr);
 				}, s_InjectWorkItem);
 
 			LARGE_INTEGER due;
 			due.QuadPart = -50000000LL;  // 5 seconds initial delay
 			KeSetTimerEx(&s_InjectTimer, due, 5000 /*5s period*/, &s_InjectDpc);
-			DbgPrint("[+] HookDll injection confirmation timer started\n");
+			DbgPrint("[+] Periodic timer started (injection confirmation + APC queue scan)\n");
 		}
 	}
 
