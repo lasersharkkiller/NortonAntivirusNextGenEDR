@@ -789,7 +789,9 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				if (parentName != NULL &&
 					(strcmp(parentName, "wmiprvse.exe") == 0 ||
 					 strcmp(parentName, "wsmprovhost.exe") == 0 ||
-					 strcmp(parentName, "winrshost.exe") == 0)) {
+					 strcmp(parentName, "winrshost.exe") == 0 ||
+					 strcmp(parentName, "dllhost.exe") == 0 ||
+					 strcmp(parentName, "mmc.exe") == 0)) {
 
 					if (CreateInfo->ImageFileName != NULL &&
 						(UnicodeStringContains(CreateInfo->ImageFileName, L"cmd.exe") ||
@@ -804,7 +806,7 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 								POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
 
 						if (kernelNotif) {
-							char* msg = "Lateral Movement: Remote exec host spawned shell process";
+							char* msg = "Lateral Movement: Remote exec host (WMI/WinRM/DCOM) spawned shell process";
 
 							SET_CRITICAL(*kernelNotif);
 							SET_CALLING_PROC_PID_CHECK(*kernelNotif);
@@ -956,6 +958,78 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 			}
 		}
 
+		// --- Tunneling / proxy tool detection ---
+		// Attackers deploy tunneling tools on compromised hosts to proxy C2 traffic,
+		// pivot laterally, or relay attack tools (Impacket, CrackMapExec) without
+		// placing binaries on the target. Detect the tunnel endpoints.
+		{
+			static const WCHAR* kTunnelingTools[] = {
+				L"chisel.exe",         // HTTP/SOCKS tunnel
+				L"ligolo-agent.exe",   // Ligolo-ng agent
+				L"ligolo-proxy.exe",   // Ligolo-ng proxy
+				L"frpc.exe",           // Fast Reverse Proxy client
+				L"frps.exe",           // Fast Reverse Proxy server
+				L"gost.exe",           // GO Simple Tunnel
+				L"plink.exe",          // PuTTY CLI — SSH tunnels
+				L"socat.exe",          // Socket relay
+				L"ncat.exe",           // Nmap netcat variant
+				L"iox.exe",            // Port forwarding / SOCKS proxy
+				L"earthworm.exe",      // EarthWorm tunnel (APT tool)
+				L"ew.exe",             // EarthWorm short name
+				L"ngrok.exe",          // Reverse tunnel to public endpoint
+				L"rathole.exe",        // Rust reverse proxy
+				L"bore.exe",           // Minimal tunnel
+				L"revsocks.exe",       // Reverse SOCKS5 proxy
+				L"rsocx.exe",          // Rust SOCKS proxy
+				nullptr
+			};
+
+			if (CreateInfo->ImageFileName && CreateInfo->ImageFileName->Buffer) {
+				for (int i = 0; kTunnelingTools[i]; i++) {
+					if (!UnicodeStringContains(CreateInfo->ImageFileName, kTunnelingTools[i]))
+						continue;
+
+					char narrowPath[256] = {};
+					USHORT copyChars = min(
+						(USHORT)(CreateInfo->ImageFileName->Length / sizeof(WCHAR)),
+						(USHORT)(sizeof(narrowPath) - 1));
+					for (USHORT j = 0; j < copyChars; j++) {
+						WCHAR wc = CreateInfo->ImageFileName->Buffer[j];
+						narrowPath[j] = (wc < 128) ? (char)wc : '?';
+					}
+
+					char* tunnelProc = PsGetProcessImageFileName(Process);
+					char msg[320];
+					RtlStringCbPrintfA(msg, sizeof(msg),
+						"Tunneling tool: '%s' launched from '%s' "
+						"(network pivot / C2 relay)",
+						tunnelProc ? tunnelProc : "?", narrowPath);
+
+					PKERNEL_STRUCTURED_NOTIFICATION n =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+					if (n) {
+						RtlZeroMemory(n, sizeof(*n));
+						SET_CRITICAL(*n);
+						SET_CALLING_PROC_PID_CHECK(*n);
+						n->isPath = FALSE;
+						n->pid    = PsGetProcessId(Process);
+						if (tunnelProc) RtlCopyMemory(n->procName, tunnelProc, 14);
+						SIZE_T msgLen = strlen(msg) + 1;
+						n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+						if (n->msg) {
+							RtlCopyMemory(n->msg, msg, msgLen);
+							n->bufSize = (ULONG)msgLen;
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+								ExFreePool(n->msg); ExFreePool(n);
+							}
+						} else { ExFreePool(n); }
+					}
+					break;
+				}
+			}
+		}
+
 		// -----------------------------------------------------------------------
 		// Mitigation policy check — detect policies that block our HookDll injection
 		// or prevent trampoline installation, leaving the process unwatched.
@@ -1064,6 +1138,12 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"-windowstyle hidden",     "PowerShell hidden window -- stealth execution",     FALSE },
 				{ L"-w hidden",               "PowerShell -w hidden abbreviation",                 FALSE },
 				{ L"[system.reflection",      "Reflection Assembly load -- in-memory .NET",        FALSE },
+				// --- Proxied lateral movement / tunneling patterns ---
+				{ L"interface portproxy",     "netsh portproxy -- local port forwarding pivot",     TRUE  },
+				{ L"> \\\\127.0.0.1\\",        "smbexec: UNC output redirection to localhost",      TRUE  },
+				{ L"\\\\c$\\__output",         "smbexec: C$ admin share __output file pattern",     TRUE  },
+				{ L"> \\\\localhost\\",         "smbexec: UNC output redirection variant",           TRUE  },
+				{ L"connectaddress=",         "netsh portproxy connectaddress -- pivot forwarding", TRUE  },
 				{ nullptr, nullptr, FALSE }
 			};
 

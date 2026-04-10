@@ -386,6 +386,12 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	// Take SSDT baseline snapshot and run full hook scan
 	HookDetector::Init(g_hashQueue);
 
+	// CI.dll code integrity baseline — SHA256 hash of the executable section
+	HookDetector::TakeCiBaseline();
+
+	// EPROCESS protection level baseline — snapshot PPL levels for lsass, csrss, etc.
+	HookDetector::TakeEprocessProtBaseline();
+
 	SsdtUtils ssdtUtils;
 	PVOID moduleBase = ssdtUtils.GetKernelBaseAddress();
 	if (moduleBase) {

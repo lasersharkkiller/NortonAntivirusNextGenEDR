@@ -1,4 +1,5 @@
 #include "Globals.h"
+#include "sha256utils.h"
 
 // ---------------------------------------------------------------------------
 // Static member definitions
@@ -15,6 +16,85 @@ BOOLEAN              HookDetector::s_CbSnapshotTaken   = FALSE;
 PsCallbackSnapshot   HookDetector::s_ProcNotifyCbSnap   = {};
 PsCallbackSnapshot   HookDetector::s_ThreadNotifyCbSnap = {};
 PsCallbackSnapshot   HookDetector::s_ImageNotifyCbSnap  = {};
+
+// ---------------------------------------------------------------------------
+// CI.dll code integrity — SHA256 baseline of CI.dll's executable sections.
+// Detects patching of g_CiOptions or function-level hooks (BYOVD bypass).
+// ---------------------------------------------------------------------------
+
+static PVOID   s_CiTextBase     = nullptr;
+static SIZE_T  s_CiTextSize     = 0;
+static BYTE    s_CiTextHash[SHA256_BLOCK_SIZE] = {};
+static BOOLEAN s_CiBaselineValid = FALSE;
+
+// Walk PsLoadedModuleList to find a kernel module by name.
+static PVOID FindKernelModuleBase(const WCHAR* name, PULONG outSize) {
+    PLIST_ENTRY head = PsLoadedModuleList;
+    if (!head || !MmIsAddressValid(head)) return nullptr;
+
+    SIZE_T nameLen = 0;
+    while (name[nameLen]) nameLen++;
+
+    PLIST_ENTRY entry = head->Flink;
+    __try {
+        while (entry != head && MmIsAddressValid(entry)) {
+            PLDR_DATA_TABLE_ENTRY mod =
+                CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+            if (mod->BaseDllName.Buffer && mod->BaseDllName.Length > 0 &&
+                mod->BaseDllName.Length / sizeof(WCHAR) == nameLen) {
+                BOOLEAN match = TRUE;
+                for (SIZE_T i = 0; i < nameLen; i++) {
+                    WCHAR a = mod->BaseDllName.Buffer[i];
+                    WCHAR b = name[i];
+                    if (a >= L'A' && a <= L'Z') a += 32;
+                    if (b >= L'A' && b <= L'Z') b += 32;
+                    if (a != b) { match = FALSE; break; }
+                }
+                if (match) {
+                    if (outSize) *outSize = (ULONG)(ULONG_PTR)mod->SizeOfImage;
+                    return mod->DllBase;
+                }
+            }
+            entry = entry->Flink;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// EPROCESS protection level monitoring — snapshot and periodic verification.
+// Detects BYOVD zeroing of EPROCESS.Protection on PPL processes (lsass, csrss).
+// ---------------------------------------------------------------------------
+
+#define MAX_PROT_WATCH 8
+
+struct ProtWatchEntry {
+    ULONG   pid;
+    UCHAR   initialLevel;
+    char    name[16];
+    BOOLEAN active;
+};
+
+static ProtWatchEntry g_ProtWatch[MAX_PROT_WATCH] = {};
+
+static const char* kProtWatchNames[] = {
+    "lsass.exe",
+    "csrss.exe",
+    "smss.exe",
+    "wininit.exe",
+    "services.exe",
+    nullptr
+};
+
+static BOOLEAN IsProtWatchTarget(const char* name) {
+    char lower[16] = {};
+    for (int i = 0; i < 15 && name[i]; i++)
+        lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i];
+    for (int i = 0; kProtWatchNames[i]; i++)
+        if (strcmp(lower, kProtWatchNames[i]) == 0) return TRUE;
+    return FALSE;
+}
 
 // ---------------------------------------------------------------------------
 // Private helper: classify the first bytes of a function as a hook type.
@@ -832,6 +912,258 @@ VOID HookDetector::CheckObCallbackIntegrity(BufferQueue* bufQueue)
 }
 
 // ---------------------------------------------------------------------------
+// TakeCiBaseline — snapshot CI.dll's executable code section at init time.
+// ---------------------------------------------------------------------------
+
+VOID HookDetector::TakeCiBaseline() {
+    ULONG modSize = 0;
+    PVOID ciBase = FindKernelModuleBase(L"CI.dll", &modSize);
+    if (!ciBase || !modSize) {
+        DbgPrint("[-] HookDetector: CI.dll not found in loaded module list\n");
+        return;
+    }
+
+    __try {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)ciBase;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((PUCHAR)ciBase + dos->e_lfanew);
+        if (!MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+        // Find the first executable section (typically .text or PAGE)
+        PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+        for (USHORT i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+            if (!MmIsAddressValid(&sec[i])) break;
+            if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+                s_CiTextBase = (PVOID)((PUCHAR)ciBase + sec[i].VirtualAddress);
+                s_CiTextSize = sec[i].Misc.VirtualSize;
+                break;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+
+    if (!s_CiTextBase || !s_CiTextSize) {
+        DbgPrint("[-] HookDetector: CI.dll executable section not found\n");
+        return;
+    }
+
+    // SHA256 hash the executable section
+    __try {
+        SHA256_CTX ctx;
+        SHA256Init(&ctx);
+        SIZE_T remaining = s_CiTextSize;
+        BYTE* ptr = (BYTE*)s_CiTextBase;
+        while (remaining > 0) {
+            SIZE_T chunk = min(remaining, (SIZE_T)4096);
+            if (!MmIsAddressValid(ptr)) break;
+            SHA256Update(&ctx, ptr, chunk);
+            ptr += chunk;
+            remaining -= chunk;
+        }
+        SHA256Final(s_CiTextHash, &ctx);
+        s_CiBaselineValid = TRUE;
+        DbgPrint("[+] HookDetector: CI.dll baseline captured (%p, %llu bytes)\n",
+            s_CiTextBase, (ULONG64)s_CiTextSize);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] HookDetector: exception hashing CI.dll\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CheckCiIntegrity — re-hash CI.dll code section and compare to baseline.
+// A mismatch means g_CiOptions was patched or a function was inline-hooked,
+// both of which are BYOVD attack signatures to disable driver signing.
+// ---------------------------------------------------------------------------
+
+VOID HookDetector::CheckCiIntegrity(BufferQueue* bufQueue) {
+    if (!s_CiBaselineValid || !s_CiTextBase || !s_CiTextSize || !bufQueue)
+        return;
+
+    BYTE rehash[SHA256_BLOCK_SIZE] = {};
+    BOOLEAN hashed = FALSE;
+
+    __try {
+        SHA256_CTX ctx;
+        SHA256Init(&ctx);
+        SIZE_T remaining = s_CiTextSize;
+        BYTE* ptr = (BYTE*)s_CiTextBase;
+        while (remaining > 0) {
+            SIZE_T chunk = min(remaining, (SIZE_T)4096);
+            if (!MmIsAddressValid(ptr)) break;
+            SHA256Update(&ctx, ptr, chunk);
+            ptr += chunk;
+            remaining -= chunk;
+        }
+        SHA256Final(rehash, &ctx);
+        hashed = TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (!hashed) return;
+
+    if (RtlCompareMemory(s_CiTextHash, rehash, SHA256_BLOCK_SIZE)
+        != SHA256_BLOCK_SIZE)
+    {
+        DbgPrint("[!] HookDetector: CI.dll code section MODIFIED!\n");
+
+        const char* msg =
+            "ANTI-TAMPER: CI.dll code section modified — "
+            "g_CiOptions patch or inline hook (BYOVD driver signing bypass)";
+        SIZE_T msgLen = strlen(msg) + 1;
+
+        PKERNEL_STRUCTURED_NOTIFICATION notif =
+            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED,
+                sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'cint');
+        if (notif) {
+            RtlZeroMemory(notif, sizeof(*notif));
+            SET_CRITICAL(*notif);
+            SET_CI_INTEGRITY_CHECK(*notif);
+            notif->scoopedAddress = (ULONG64)s_CiTextBase;
+            RtlCopyMemory(notif->procName, "NortonEDR", 9);
+            notif->msg = (char*)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, msgLen, 'cimg');
+            notif->bufSize = (ULONG)msgLen;
+            if (notif->msg) {
+                RtlCopyMemory(notif->msg, msg, msgLen);
+                if (!bufQueue->Enqueue(notif)) {
+                    ExFreePool(notif->msg);
+                    ExFreePool(notif);
+                }
+            } else {
+                ExFreePool(notif);
+            }
+        }
+
+        // Update baseline so we don't spam on every scan cycle
+        RtlCopyMemory(s_CiTextHash, rehash, SHA256_BLOCK_SIZE);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TakeEprocessProtBaseline — snapshot protection levels of sensitive OS
+// processes (lsass, csrss, etc.) for periodic downgrade detection.
+// Must be called at PASSIVE_LEVEL.
+// ---------------------------------------------------------------------------
+
+VOID HookDetector::TakeEprocessProtBaseline() {
+    ULONG bufSize = 0;
+    ZwQuerySystemInformation(5, nullptr, 0, &bufSize);
+    if (!bufSize) return;
+    bufSize += 4096; // headroom for race
+
+    PVOID buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, bufSize, 'eprt');
+    if (!buffer) return;
+
+    if (!NT_SUCCESS(ZwQuerySystemInformation(5, buffer, bufSize, nullptr))) {
+        ExFreePool(buffer);
+        return;
+    }
+
+    ULONG watchIdx = 0;
+    PSYSTEM_PROCESS_INFORMATION p = (PSYSTEM_PROCESS_INFORMATION)buffer;
+    while (watchIdx < MAX_PROT_WATCH) {
+        if (p->UniqueProcessId != 0) {
+            PEPROCESS proc = nullptr;
+            if (NT_SUCCESS(PsLookupProcessByProcessId(
+                    p->UniqueProcessId, &proc))) {
+                char* name = PsGetProcessImageFileName(proc);
+                if (name && IsProtWatchTarget(name)) {
+                    PPS_PROTECTION prot = PsGetProcessProtection(proc);
+                    g_ProtWatch[watchIdx].pid = HandleToUlong(p->UniqueProcessId);
+                    g_ProtWatch[watchIdx].initialLevel =
+                        prot ? prot->Level : 0;
+                    char lower[16] = {};
+                    for (int i = 0; i < 15 && name[i]; i++)
+                        lower[i] = (name[i] >= 'A' && name[i] <= 'Z')
+                            ? name[i] + 32 : name[i];
+                    RtlCopyMemory(g_ProtWatch[watchIdx].name, lower, 16);
+                    g_ProtWatch[watchIdx].active = TRUE;
+                    watchIdx++;
+                    DbgPrint("[+] HookDetector: EPROCESS prot snap — %s pid=%lu level=0x%02X\n",
+                        lower, HandleToUlong(p->UniqueProcessId),
+                        prot ? prot->Level : 0);
+                }
+                ObDereferenceObject(proc);
+            }
+        }
+        if (!p->NextEntryOffset) break;
+        p = (PSYSTEM_PROCESS_INFORMATION)((PUCHAR)p + p->NextEntryOffset);
+    }
+
+    ExFreePool(buffer);
+    DbgPrint("[+] HookDetector: EPROCESS protection baseline — %lu processes\n",
+        watchIdx);
+}
+
+// ---------------------------------------------------------------------------
+// CheckEprocessProtection — verify PPL levels haven't been downgraded.
+// A decrease in PS_PROTECTION.Level means a BYOVD driver zeroed the field.
+// ---------------------------------------------------------------------------
+
+VOID HookDetector::CheckEprocessProtection(BufferQueue* bufQueue) {
+    if (!bufQueue) return;
+
+    for (int i = 0; i < MAX_PROT_WATCH; i++) {
+        if (!g_ProtWatch[i].active) continue;
+
+        PEPROCESS proc = nullptr;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId(
+                (HANDLE)(ULONG_PTR)g_ProtWatch[i].pid, &proc))) {
+            g_ProtWatch[i].active = FALSE; // process exited
+            continue;
+        }
+
+        PPS_PROTECTION prot = PsGetProcessProtection(proc);
+        UCHAR currentLevel = prot ? prot->Level : 0;
+        ObDereferenceObject(proc);
+
+        // Only alert on decrease — if the initial level was 0, the process
+        // was never PPL-protected (e.g. RunAsPPL not enabled for lsass).
+        if (g_ProtWatch[i].initialLevel > 0 &&
+            currentLevel < g_ProtWatch[i].initialLevel)
+        {
+            char msg[200];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "ANTI-TAMPER: %s (pid=%lu) protection downgraded 0x%02X->0x%02X — "
+                "BYOVD PPL-strip (EPROCESS.Protection zeroed)",
+                g_ProtWatch[i].name, g_ProtWatch[i].pid,
+                g_ProtWatch[i].initialLevel, currentLevel);
+
+            SIZE_T msgLen = strlen(msg) + 1;
+            PKERNEL_STRUCTURED_NOTIFICATION notif =
+                (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED,
+                    sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'epnt');
+            if (notif) {
+                RtlZeroMemory(notif, sizeof(*notif));
+                SET_CRITICAL(*notif);
+                SET_EPROCESS_PROT_CHECK(*notif);
+                notif->pid = (HANDLE)(ULONG_PTR)g_ProtWatch[i].pid;
+                RtlCopyMemory(notif->procName, g_ProtWatch[i].name, 15);
+                notif->msg = (char*)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED, msgLen, 'epmg');
+                notif->bufSize = (ULONG)msgLen;
+                if (notif->msg) {
+                    RtlCopyMemory(notif->msg, msg, msgLen);
+                    if (!bufQueue->Enqueue(notif)) {
+                        ExFreePool(notif->msg);
+                        ExFreePool(notif);
+                    }
+                } else {
+                    ExFreePool(notif);
+                }
+            }
+
+            // Update snapshot so we only fire once per downgrade
+            g_ProtWatch[i].initialLevel = currentLevel;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RunAllHookChecks — run all detection routines in sequence.
 // Call after driver init is complete (and periodically from AntiTamper).
 // ---------------------------------------------------------------------------
@@ -850,6 +1182,8 @@ VOID HookDetector::RunAllHookChecks(
     CheckAltSyscallHandlerIntegrity(bufQueue);
     CheckObCallbackIntegrity(bufQueue);
     CheckPsCallbackIntegrity(bufQueue);
+    CheckCiIntegrity(bufQueue);
+    CheckEprocessProtection(bufQueue);
 
     DbgPrint("[*] HookDetector results — SSDT=%lu Inline=%lu EAT=%lu ETW=%d\n",
         ssdt, inl, eat, (int)etw);

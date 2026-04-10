@@ -813,6 +813,120 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                     }
                                 }
 
+                            // -------------------------------------------------------
+                            // CLR injection detection (Cobalt Strike execute-assembly)
+                            //
+                            // clr.dll / clrjit.dll / coreclr.dll loading into a
+                            // process whose PE header lacks a COM descriptor
+                            // (IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR, index 14) means
+                            // the host is a native executable hosting the CLR at
+                            // runtime — the hallmark of Cobalt Strike execute-assembly,
+                            // Covenant GruntStager, and similar in-memory .NET
+                            // assembly injection techniques.
+                            //
+                            // Check: parse PEB->ImageBaseAddress PE headers for the
+                            // COM descriptor directory. Handle both PE32 and PE32+
+                            // (WOW64 and native 64-bit processes).
+                            // -------------------------------------------------------
+                            BOOLEAN isClrLoad =
+                                IsLolDriverName(charBuffer, cbLen, "clr.dll") ||
+                                IsLolDriverName(charBuffer, cbLen, "clrjit.dll") ||
+                                IsLolDriverName(charBuffer, cbLen, "coreclr.dll");
+
+                            if (isClrLoad) {
+                                BOOLEAN isDotNet = FALSE;
+                                __try {
+                                    PPEB peb = (PPEB)PsGetProcessPeb(targetProcess);
+                                    if (peb && MmIsAddressValid(peb)) {
+                                        PVOID imgBase = peb->ImageBaseAddress;
+                                        if (imgBase && MmIsAddressValid(imgBase)) {
+                                            PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)imgBase;
+                                            if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
+                                                dos->e_lfanew > 0 && dos->e_lfanew < 0x1000) {
+                                                PIMAGE_NT_HEADERS ntHdr = (PIMAGE_NT_HEADERS)
+                                                    ((BYTE*)imgBase + dos->e_lfanew);
+                                                if (MmIsAddressValid(ntHdr) &&
+                                                    ntHdr->Signature == IMAGE_NT_SIGNATURE) {
+                                                    WORD magic = ntHdr->OptionalHeader.Magic;
+                                                    if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+                                                        PIMAGE_NT_HEADERS64 nt64 = (PIMAGE_NT_HEADERS64)ntHdr;
+                                                        if (nt64->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR &&
+                                                            nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress != 0)
+                                                            isDotNet = TRUE;
+                                                    } else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+                                                        PIMAGE_NT_HEADERS32 nt32 = (PIMAGE_NT_HEADERS32)ntHdr;
+                                                        if (nt32->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR &&
+                                                            nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress != 0)
+                                                            isDotNet = TRUE;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+                                if (!isDotNet) {
+                                    // Native processes that legitimately host the CLR
+                                    static const char* kLegitClrHosts[] = {
+                                        "w3wp.exe",       // IIS worker process
+                                        "mmc.exe",        // Management Console (.NET snap-ins)
+                                        "sqlservr.exe",   // SQL Server CLR integration
+                                        "iisexpress.exe", // IIS Express
+                                        "dllhost.exe",    // COM+ surrogate for .NET COM
+                                        "wmiprvse.exe",   // WMI .NET providers
+                                        nullptr
+                                    };
+
+                                    BOOLEAN isAllowedClrHost = FALSE;
+                                    if (loadingProcess) {
+                                        for (int ch = 0; kLegitClrHosts[ch]; ch++) {
+                                            if (strcmp(loadingProcess, kLegitClrHosts[ch]) == 0) {
+                                                isAllowedClrHost = TRUE;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if (!isAllowedClrHost) {
+                                        char clrMsg[200];
+                                        RtlStringCbPrintfA(clrMsg, sizeof(clrMsg),
+                                            "CLR loaded into non-.NET process '%s' — "
+                                            "possible execute-assembly / in-memory .NET injection",
+                                            loadingProcess ? loadingProcess : "?");
+                                        SIZE_T clrLen = strlen(clrMsg) + 1;
+
+                                        PKERNEL_STRUCTURED_NOTIFICATION clrNotif =
+                                            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                                                POOL_FLAG_NON_PAGED,
+                                                sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+                                        if (clrNotif) {
+                                            RtlZeroMemory(clrNotif, sizeof(*clrNotif));
+                                            SET_CRITICAL(*clrNotif);
+                                            SET_IMAGE_LOAD_PATH_CHECK(*clrNotif);
+                                            SET_CALLING_PROC_PID_CHECK(*clrNotif);
+                                            clrNotif->pid = PsGetProcessId(targetProcess);
+                                            clrNotif->isPath = FALSE;
+                                            if (loadingProcess)
+                                                RtlStringCbCopyA(clrNotif->procName,
+                                                                 sizeof(clrNotif->procName),
+                                                                 loadingProcess);
+                                            clrNotif->msg = (char*)ExAllocatePool2(
+                                                POOL_FLAG_NON_PAGED, clrLen, 'msg');
+                                            if (clrNotif->msg) {
+                                                RtlCopyMemory(clrNotif->msg, clrMsg, clrLen);
+                                                clrNotif->bufSize = (ULONG)clrLen;
+                                                if (!CallbackObjects::GetNotifQueue()->Enqueue(clrNotif)) {
+                                                    ExFreePool(clrNotif->msg);
+                                                    ExFreePool(clrNotif);
+                                                }
+                                            } else {
+                                                ExFreePool(clrNotif);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             // ntdll double-load detection: second ntdll.dll image load
                             // into the same process is an extremely rare event in clean
                             // populations (0.04% over 27M processes/month) and is the
@@ -918,6 +1032,54 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                     ImageInfo->ImageBase,
                     ImageInfo->ImageSize,
                     digest);
+            }
+        }
+
+        // --- Signature level sanity check for critical system DLLs ---
+        // Windows 10 1709+ populates ImageSignatureLevel in IMAGE_INFO.Properties
+        // (bits 12-15). Microsoft-signed system DLLs (ntdll, kernel32, kernelbase,
+        // amsi, clr, clrjit) should have level >= SE_SIGNING_LEVEL_MICROSOFT (8).
+        // A level of 1-7 means CI checked and found the image below Microsoft-signed
+        // threshold — CI.dll was bypassed or the image catalog was tampered with.
+        // Level 0 (UNCHECKED) is ambiguous (could be old OS) so we skip it.
+        if (ShouldHashImage(FullImageName)) {
+            ULONG sigLevel = (ImageInfo->Properties >> 12) & 0xF;
+            if (sigLevel >= 1 && sigLevel <= 7) {
+                char sigMsg[200];
+                RtlStringCbPrintfA(sigMsg, sizeof(sigMsg),
+                    "Critical DLL signature level below Microsoft-signed "
+                    "(level=%lu) — CI bypass or catalog tampering detected",
+                    sigLevel);
+                SIZE_T sigLen = strlen(sigMsg) + 1;
+
+                PKERNEL_STRUCTURED_NOTIFICATION sigNotif =
+                    (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED,
+                        sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+                if (sigNotif) {
+                    RtlZeroMemory(sigNotif, sizeof(*sigNotif));
+                    SET_CRITICAL(*sigNotif);
+                    SET_IMAGE_LOAD_PATH_CHECK(*sigNotif);
+                    SET_CI_INTEGRITY_CHECK(*sigNotif);
+                    sigNotif->pid = PsGetProcessId(targetProcess);
+                    sigNotif->isPath = FALSE;
+                    char* procName = PsGetProcessImageFileName(targetProcess);
+                    if (procName)
+                        RtlStringCbCopyA(sigNotif->procName,
+                                         sizeof(sigNotif->procName), procName);
+                    sigNotif->msg = (char*)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED, sigLen, 'msg');
+                    if (sigNotif->msg) {
+                        RtlCopyMemory(sigNotif->msg, sigMsg, sigLen);
+                        sigNotif->bufSize = (ULONG)sigLen;
+                        if (!CallbackObjects::GetNotifQueue()->Enqueue(sigNotif)) {
+                            ExFreePool(sigNotif->msg);
+                            ExFreePool(sigNotif);
+                        }
+                    } else {
+                        ExFreePool(sigNotif);
+                    }
+                }
             }
         }
 

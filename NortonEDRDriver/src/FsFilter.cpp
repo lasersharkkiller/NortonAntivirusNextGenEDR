@@ -497,6 +497,45 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
             }
         }
 
+        // ---- CatRoot / catalog store write detection ----
+        // Signature catalog hijacking: an attacker with admin drops a .cat file
+        // into CatRoot/CatRoot2 that vouches for their malicious DLL hash.
+        // CI.dll then genuinely assigns a high signature level to unsigned code.
+        // Only CryptSvc (svchost.exe) and TrustedInstaller should write here.
+        {
+            static const PCWSTR kCatRootPaths[] = {
+                L"\\catroot\\",
+                L"\\catroot2\\",
+            };
+
+            ACCESS_MASK desiredAccess =
+                Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            BOOLEAN isWriteAccess = (desiredAccess &
+                (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE |
+                 FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)) != 0;
+
+            if (isWriteAccess) {
+                for (SIZE_T i = 0; i < ARRAYSIZE(kCatRootPaths); i++) {
+                    if (WcsContainsLower(&nameInfo->Name, kCatRootPaths[i])) {
+                        // Allow CryptSvc (svchost.exe) and TrustedInstaller
+                        // PsGetProcessImageFileName truncates to 15 chars
+                        if (procName &&
+                            (strcmp(procName, "svchost.exe") == 0 ||
+                             strcmp(procName, "TrustedInsta") == 0))
+                            break;
+
+                        char msg[200];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: CatRoot catalog store write by '%s' (pid=%llu) — "
+                            "possible signature catalog injection / CI bypass",
+                            procName ? procName : "?", (ULONG64)(ULONG_PTR)pid);
+                        EnqueueFsAlert(pid, procName, msg, TRUE);
+                        break;
+                    }
+                }
+            }
+        }
+
         // ---- NTFS Alternate Data Stream (ADS) detection ----
         // nameInfo->Stream is non-empty for named streams, e.g. ":hidden:$DATA".
         // Exact-match against known-benign streams; flag everything else.

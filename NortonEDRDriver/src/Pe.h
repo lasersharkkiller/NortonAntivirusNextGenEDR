@@ -138,3 +138,7 @@ typedef struct _IMAGE_SECTION_HEADER
     WORD NumberOfLinenumbers;
     ULONG Characteristics;
 } IMAGE_SECTION_HEADER, * PIMAGE_SECTION_HEADER;
+
+#ifndef IMAGE_SCN_MEM_EXECUTE
+#define IMAGE_SCN_MEM_EXECUTE 0x20000000
+#endif

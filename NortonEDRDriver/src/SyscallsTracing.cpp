@@ -2854,10 +2854,59 @@ VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes)
 	}
 
 	if (!isSystemPipe) {
-		char msg[128];
-		RtlStringCbPrintfA(msg, sizeof(msg),
-			"NtCreateNamedPipeFile: non-system process creating named pipe — possible C2 transport");
-		EmitSyscallNotif(0, msg, caller, nullptr, FALSE); // WARNING
+		// Check for known C2 framework named pipe patterns — escalate to CRITICAL
+		static const WCHAR* kC2PipePatterns[] = {
+			L"msagent_",       // Cobalt Strike default SMB beacon
+			L"MSSE-",          // Cobalt Strike MSSE-*-server
+			L"postex_",        // Cobalt Strike post-exploitation
+			L"postex_ssh_",    // Cobalt Strike SSH
+			L"status_",        // Cobalt Strike status pipe variant
+			L"mojo.5688.8052", // Cobalt Strike named pipe stager
+			L"win_svc",        // Cobalt Strike service pipe
+			L"ntsvcs_",        // Cobalt Strike masquerading as ntsvcs
+			L"scerpc_",        // Cobalt Strike masquerading as scerpc
+			L"meterpreter",    // Metasploit Meterpreter
+			L"PSEXESVC",       // PsExec service pipe
+			L"RemCom",         // RemCom (open-source PsExec)
+			L"csexec",         // CsExec lateral movement
+			L"winsvc_",        // Generic malware service pipe
+			nullptr
+		};
+
+		BOOLEAN isC2Pipe = FALSE;
+		for (int i = 0; kC2PipePatterns[i]; i++) {
+			// Case-insensitive substring match within the pipe name
+			UNICODE_STRING pattern;
+			RtlInitUnicodeString(&pattern, kC2PipePatterns[i]);
+			if (pipeName->Length >= pattern.Length) {
+				// Slide window over pipe name looking for substring
+				USHORT maxOff = (pipeName->Length - pattern.Length) / sizeof(WCHAR);
+				for (USHORT off = 0; off <= maxOff; off++) {
+					UNICODE_STRING slice;
+					slice.Buffer = pipeName->Buffer + off;
+					slice.Length = pattern.Length;
+					slice.MaximumLength = pattern.Length;
+					if (RtlEqualUnicodeString(&slice, &pattern, TRUE)) {
+						isC2Pipe = TRUE;
+						break;
+					}
+				}
+			}
+			if (isC2Pipe) break;
+		}
+
+		if (isC2Pipe) {
+			char msg[196];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtCreateNamedPipeFile: C2 framework pipe pattern detected "
+				"(Cobalt Strike / Metasploit / PsExec)");
+			EmitSyscallNotif(0, msg, caller, nullptr, TRUE); // CRITICAL
+		} else {
+			char msg[128];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtCreateNamedPipeFile: non-system process creating named pipe");
+			EmitSyscallNotif(0, msg, caller, nullptr, FALSE); // WARNING
+		}
 	}
 }
 

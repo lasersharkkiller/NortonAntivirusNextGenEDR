@@ -1561,6 +1561,16 @@ public:
     // Fires CRITICAL alert if any are missing.  Added to RunAllHookChecks().
     static VOID     CheckPsCallbackIntegrity(BufferQueue* bufQueue);
 
+    // CI.dll code integrity — SHA256 baseline of executable section, periodic re-hash.
+    // Detects g_CiOptions patching and inline hooks installed by BYOVD drivers.
+    static VOID     TakeCiBaseline();
+    static VOID     CheckCiIntegrity(BufferQueue* bufQueue);
+
+    // EPROCESS protection level monitoring — snapshot PPL levels for sensitive processes,
+    // alert on downgrade (BYOVD driver zeroing EPROCESS.Protection field).
+    static VOID     TakeEprocessProtBaseline();
+    static VOID     CheckEprocessProtection(BufferQueue* bufQueue);
+
     static VOID RunAllHookChecks(
         PFUNCTION_MAP exportsMap,
         PVOID         moduleBase,
