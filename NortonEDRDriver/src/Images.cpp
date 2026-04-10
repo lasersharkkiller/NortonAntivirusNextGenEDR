@@ -403,6 +403,16 @@ static const char* kLolDriverNames[] = {
     "memdrv.sys",         // Generic memory access driver
     "asmmap64.sys",       // ASMedia — arbitrary physical memory map
     "inpoutx64.sys",      // InpOut — direct port I/O / physical memory
+
+    // RegPhantom rootkit IOCs (Nextron Systems threat analysis, March 2026)
+    // CmRegisterCallback-as-C2-channel + reflective kernel PE loader,
+    // signed with valid Chinese certificates (Guangzhou Xuanfeng, Autel).
+    "mapdriver.sys",
+    "mydriver.sys",
+    "testdriver.sys",
+    "fsfilter.sys",       // NOT our own NortonEDR driver — this is the rootkit's filename
+    "devdriver.sys",
+    "0629.sys",
     nullptr
 };
 
@@ -437,6 +447,256 @@ static BOOLEAN IsNtdllPath(const char* buf, SIZE_T len) {
         if ((tail[i] | 0x20) != kSuffix[i]) return FALSE;
     }
     return TRUE;
+}
+
+// ---------------------------------------------------------------------------
+// Suspicious Authenticode certificate signer detection for kernel drivers.
+//
+// Opens the driver file, reads the PE security directory (WIN_CERTIFICATE),
+// and searches the raw certificate bytes for known-bad organizations and
+// adversary-nation country codes.
+// ---------------------------------------------------------------------------
+
+// Known-bad certificate organizations used to sign malicious kernel drivers.
+// Substring match in raw certificate DER bytes (the org name is stored as
+// PrintableString/UTF8String, so ASCII substrings work).
+static const char* kMaliciousSignerOrgs[] = {
+    // RegPhantom rootkit (Nextron Systems, March 2026)
+    "Guangzhou Xuanfeng",
+    "Autel Intelligent Technology",
+    // FiveSys rootkit (Bitdefender, 2021)
+    "Hainan YouHu",
+    // Netfilter rootkit (Microsoft, 2021)
+    "Ningbo Gaoxinqu zhidian",
+    "Beijing JoinHope Image Technology",
+    // Chinese APT / rootkit signing certs (various threat intel)
+    "Zhuhai liancheng Technology",
+    "Shanghai Yulian Software",
+    "Beijing Kate Zhanhong Technology",
+    "Shenzhen Luyoudashi Technology",
+    // FakeCert / stolen Chinese certs used by multiple ransomware groups
+    "Beijing Chunbai Technology",
+    nullptr
+};
+
+// Adversary-nation 2-letter country codes (ISO 3166-1 alpha-2).
+// DER encoding: OID 2.5.4.6 (countryName) = 55 04 06, then PrintableString
+// tag 13, length 02, followed by the 2 ASCII bytes.
+static const UCHAR kOidCountryPrefix[] = { 0x55, 0x04, 0x06, 0x13, 0x02 };
+
+static const struct {
+    UCHAR  code[2];
+    const char* label;
+} kAdversaryCountries[] = {
+    { { 'C', 'N' }, "China (CN)"        },
+    { { 'R', 'U' }, "Russia (RU)"       },
+    { { 'I', 'R' }, "Iran (IR)"         },
+    { { 'K', 'P' }, "North Korea (KP)"  },
+    { { 'B', 'Y' }, "Belarus (BY)"      },
+};
+
+// Legitimate vendors from adversary nations whose kernel drivers are expected.
+// Searched as substrings in the same certificate blob.
+static const char* kTrustedAdversaryNationSigners[] = {
+    "Realtek Semiconductor",
+    "Realtek",               // some certs use short form
+    "MediaTek",
+    "Lenovo",
+    "Huawei",
+    "Tencent Technology",
+    "Qihoo 360",
+    "Beijing Kingsoft",
+    "Kaspersky",
+    "Doctor Web",
+    "Dahua Technology",
+    "Hangzhou Hikvision",
+    "Yandex",
+    "TP-LINK",
+    "Tenda Technology",
+    "ZTE Corporation",
+    "DJI Technology",
+    nullptr
+};
+
+// Case-insensitive substring search in a byte buffer.
+static BOOLEAN CertBlobContains(const UCHAR* blob, SIZE_T blobLen,
+                                const char* needle)
+{
+    SIZE_T needleLen = 0;
+    while (needle[needleLen]) needleLen++;
+    if (blobLen < needleLen) return FALSE;
+
+    for (SIZE_T i = 0; i <= blobLen - needleLen; i++) {
+        BOOLEAN match = TRUE;
+        for (SIZE_T j = 0; j < needleLen; j++) {
+            UCHAR a = blob[i + j];
+            UCHAR b = (UCHAR)needle[j];
+            // case-insensitive for ASCII letters
+            if ((a | 0x20) != (b | 0x20)) { match = FALSE; break; }
+        }
+        if (match) return TRUE;
+    }
+    return FALSE;
+}
+
+static VOID EmitSignerAlert(const char* alertMsg, BOOLEAN isCritical)
+{
+    SIZE_T msgLen = strlen(alertMsg) + 1;
+    PKERNEL_STRUCTURED_NOTIFICATION notif =
+        (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'sgn');
+    if (!notif) return;
+    RtlZeroMemory(notif, sizeof(*notif));
+    if (isCritical) { SET_CRITICAL(*notif); }
+    else            { SET_WARNING(*notif);  }
+    SET_SUSPECT_SIGNER_CHECK(*notif);
+    notif->pid    = PsGetProcessId(PsGetCurrentProcess());
+    notif->isPath = FALSE;
+    notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'sgmg');
+    notif->bufSize = (ULONG)msgLen;
+    if (notif->msg) {
+        RtlCopyMemory(notif->msg, alertMsg, msgLen);
+        if (!CallbackObjects::GetNotifQueue()->Enqueue(notif)) {
+            ExFreePool(notif->msg);
+            ExFreePool(notif);
+        }
+    } else {
+        ExFreePool(notif);
+    }
+}
+
+static VOID CheckDriverCertificateSigner(PUNICODE_STRING imagePath)
+{
+    if (!imagePath || !imagePath->Buffer || imagePath->Length == 0)
+        return;
+
+    // Open the driver file on disk
+    HANDLE fileHandle = NULL;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+    InitializeObjectAttributes(&oa, imagePath,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    NTSTATUS status = ZwOpenFile(&fileHandle,
+        FILE_READ_DATA | SYNCHRONIZE, &oa, &iosb,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE);
+    if (!NT_SUCCESS(status)) return;
+
+    // Read DOS header
+    IMAGE_DOS_HEADER dosHdr = {};
+    LARGE_INTEGER offset = {};
+    offset.QuadPart = 0;
+    status = ZwReadFile(fileHandle, NULL, NULL, NULL, &iosb,
+        &dosHdr, sizeof(dosHdr), &offset, NULL);
+    if (!NT_SUCCESS(status) || dosHdr.e_magic != IMAGE_DOS_SIGNATURE) {
+        ZwClose(fileHandle);
+        return;
+    }
+
+    // Read NT headers (use 64-bit; DataDirectory offset is the same for our purpose)
+    IMAGE_NT_HEADERS64 ntHdr = {};
+    offset.QuadPart = dosHdr.e_lfanew;
+    status = ZwReadFile(fileHandle, NULL, NULL, NULL, &iosb,
+        &ntHdr, sizeof(ntHdr), &offset, NULL);
+    if (!NT_SUCCESS(status) || ntHdr.Signature != IMAGE_NT_SIGNATURE) {
+        ZwClose(fileHandle);
+        return;
+    }
+
+    // Security directory (IMAGE_DIRECTORY_ENTRY_SECURITY = index 4)
+    // Note: VirtualAddress here is a FILE offset, not an RVA.
+    IMAGE_DATA_DIRECTORY secDir =
+        ntHdr.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+    if (secDir.VirtualAddress == 0 || secDir.Size == 0 || secDir.Size > 128 * 1024) {
+        ZwClose(fileHandle);
+        return;  // no embedded certificate or unreasonably large
+    }
+
+    UCHAR* certBlob = (UCHAR*)ExAllocatePool2(
+        POOL_FLAG_PAGED, secDir.Size, 'cert');
+    if (!certBlob) { ZwClose(fileHandle); return; }
+
+    offset.QuadPart = secDir.VirtualAddress;
+    status = ZwReadFile(fileHandle, NULL, NULL, NULL, &iosb,
+        certBlob, secDir.Size, &offset, NULL);
+    ZwClose(fileHandle);
+
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(certBlob, 'cert');
+        return;
+    }
+
+    SIZE_T blobLen = (SIZE_T)secDir.Size;
+
+    // --- Tier 1: known-bad signer organizations (CRITICAL) ---
+    for (int i = 0; kMaliciousSignerOrgs[i]; i++) {
+        if (CertBlobContains(certBlob, blobLen, kMaliciousSignerOrgs[i])) {
+            // Narrow the image path for the alert message
+            char pathNarrow[100] = {};
+            USHORT chars = imagePath->Length / sizeof(WCHAR);
+            if (chars > 99) chars = 99;
+            for (USHORT c = 0; c < chars; c++)
+                pathNarrow[c] = (imagePath->Buffer[c] < 128)
+                                ? (char)imagePath->Buffer[c] : '?';
+
+            char msg[300];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "MALICIOUS SIGNER: kernel driver '%s' signed by known-bad org '%s' "
+                "(rootkit/APT certificate)",
+                pathNarrow, kMaliciousSignerOrgs[i]);
+            EmitSignerAlert(msg, TRUE);
+
+            ExFreePoolWithTag(certBlob, 'cert');
+            return;  // already CRITICAL, no need for Tier 2 check
+        }
+    }
+
+    // --- Tier 2: adversary-nation country code (WARNING unless trusted) ---
+    for (SIZE_T i = 0; i + sizeof(kOidCountryPrefix) + 2 <= blobLen; i++) {
+        if (RtlCompareMemory(certBlob + i, kOidCountryPrefix,
+                             sizeof(kOidCountryPrefix)) != sizeof(kOidCountryPrefix))
+            continue;
+
+        UCHAR cc[2] = { certBlob[i + 5], certBlob[i + 6] };
+
+        for (int ci = 0; ci < ARRAYSIZE(kAdversaryCountries); ci++) {
+            if (cc[0] != kAdversaryCountries[ci].code[0] ||
+                cc[1] != kAdversaryCountries[ci].code[1])
+                continue;
+
+            // Check if the signer is in the trusted whitelist
+            BOOLEAN trusted = FALSE;
+            for (int ti = 0; kTrustedAdversaryNationSigners[ti]; ti++) {
+                if (CertBlobContains(certBlob, blobLen,
+                                     kTrustedAdversaryNationSigners[ti])) {
+                    trusted = TRUE;
+                    break;
+                }
+            }
+            if (trusted) break;
+
+            // Not in whitelist — emit WARNING
+            char pathNarrow[100] = {};
+            USHORT chars = imagePath->Length / sizeof(WCHAR);
+            if (chars > 99) chars = 99;
+            for (USHORT c = 0; c < chars; c++)
+                pathNarrow[c] = (imagePath->Buffer[c] < 128)
+                                ? (char)imagePath->Buffer[c] : '?';
+
+            char msg[300];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "SUSPECT SIGNER: kernel driver '%s' signed with %s certificate "
+                "not in trusted vendor whitelist",
+                pathNarrow, kAdversaryCountries[ci].label);
+            EmitSignerAlert(msg, FALSE);
+
+            ExFreePoolWithTag(certBlob, 'cert');
+            return;
+        }
+    }
+
+    ExFreePoolWithTag(certBlob, 'cert');
 }
 
 VOID ImageUtils::ImageLoadNotifyRoutine(
@@ -509,6 +769,22 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
             }
             ExFreePool(charBuf);
         }
+        // ---------------------------------------------------------------
+        // Suspicious Authenticode signer detection for kernel drivers.
+        //
+        // Opens the driver file on disk, reads the PE security directory
+        // (Authenticode signature), and searches the raw certificate blob
+        // for:
+        //   Tier 1 (CRITICAL) — known-bad organizations used by rootkits
+        //     and APT groups (RegPhantom, FiveSys, Netfilter, etc.)
+        //   Tier 2 (WARNING) — adversary-nation country codes (CN/RU/IR/KP)
+        //     NOT in a trusted-signer whitelist.
+        //
+        // The country code is extracted by matching the DER-encoded OID
+        // 2.5.4.6 (countryName): bytes 55 04 06 13 02 XX XX.
+        // ---------------------------------------------------------------
+        CheckDriverCertificateSigner(FullImageName);
+
         // Kernel image — no further per-process analysis needed.
         return;
     }

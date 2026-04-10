@@ -54,6 +54,29 @@ static const WCHAR* kPersistencePaths[] = {
     // WMI event subscriptions write to this hive path.
     L"\\Microsoft\\WBEM",
 
+    // --- T1547.002: Authentication Package persistence ---
+    // Adversaries add custom DLLs to be loaded by LSA at boot.
+    L"\\Control\\Lsa\\Authentication Packages",
+
+    // --- T1547.005: Security Support Provider persistence ---
+    // SSP DLLs loaded into lsass.exe at boot; Mimikatz mimilib.dll abuses this.
+    L"\\Control\\Lsa\\Security Packages",
+
+    // --- T1547.008: LSASS Driver persistence ---
+    L"\\Control\\Lsa\\Notification Packages",
+
+    // --- T1547.010: Port Monitor persistence ---
+    // Adversaries register a malicious DLL as a port monitor loaded by spoolsv.exe.
+    L"\\Control\\Print\\Monitors",
+
+    // --- T1547.012: Print Processor persistence ---
+    // Malicious print processor DLLs loaded by the print spooler service.
+    L"\\Control\\Print\\Environments",
+
+    // --- T1547.015: Active Setup persistence ---
+    // Per-user execution at logon via StubPath value.
+    L"\\Active Setup\\Installed Components",
+
     nullptr
 };
 
@@ -69,6 +92,12 @@ static const BOOLEAN kPersistenceCritical[] = {
     TRUE,  TRUE,                       // SecureBoot / EFI — Critical
     FALSE,                             // Scheduled tasks — Warning
     FALSE,                             // WMI — Warning
+    TRUE,                              // LSA Authentication Packages — Critical
+    TRUE,                              // LSA Security Packages (SSP) — Critical
+    TRUE,                              // LSA Notification Packages — Critical
+    TRUE,                              // Print Monitors — Critical
+    TRUE,                              // Print Processors — Critical
+    TRUE,                              // Active Setup — Critical
 };
 
 BOOLEAN RegistryUtils::isRegistryPersistenceBehavior(

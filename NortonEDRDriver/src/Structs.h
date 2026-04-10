@@ -68,6 +68,8 @@
 #define SET_DKOM_CHECK(notification)            ((notification).DkomCheck            = 1)
 #define SET_DSE_BYPASS_CHECK(notification)      ((notification).DseBypassCheck       = 1)
 #define SET_UNSIGNED_MODULE_CHECK(notification) ((notification).UnsignedModuleCheck  = 1)
+#define SET_CM_CALLBACK_CHECK(notification)    ((notification).CmCallbackCheck      = 1)
+#define SET_SUSPECT_SIGNER_CHECK(notification) ((notification).SuspectSignerCheck   = 1)
 
 typedef unsigned short WORD;
 typedef unsigned char BYTE;
@@ -743,7 +745,9 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
             unsigned char DkomCheck          : 1;
             unsigned char DseBypassCheck     : 1;
             unsigned char UnsignedModuleCheck: 1;
-            unsigned char Reserved4          : 5;
+            unsigned char CmCallbackCheck    : 1;
+            unsigned char SuspectSignerCheck : 1;
+            unsigned char Reserved4          : 3;
         };
         unsigned char method4;
     };

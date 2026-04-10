@@ -381,6 +381,11 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	// are registered (inside setupNotificationsGlobal() above).
 	HookDetector::TakePsCallbackSnapshot();
 
+	// Snapshot CmpCallBackVector[] immediately after CmRegisterCallbackEx
+	// (called from setupNotificationsGlobal → setRegistryNotificationCallback).
+	// Detects RegPhantom-style rogue CmCallback registration and callback hijacking.
+	HookDetector::TakeCmCallbackSnapshot();
+
 	EtwProvider::Init();
 
 	// Take SSDT baseline snapshot and run full hook scan

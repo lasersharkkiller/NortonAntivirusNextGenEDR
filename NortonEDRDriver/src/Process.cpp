@@ -1030,6 +1030,117 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 			}
 		}
 
+		// --- T1219: Remote access tool / IDE tunneling detection ---
+		// Adversaries deploy legitimate remote access software (AnyDesk, TeamViewer,
+		// ScreenConnect, etc.) and VS Code tunnels for persistent C2 and interactive
+		// control. Chaos, Akira, DeadLock ransomware all use this pattern.
+		{
+			static const struct {
+				const WCHAR* name;
+				const char*  desc;
+				BOOLEAN      critical;
+			} kRemoteAccessTools[] = {
+				// --- T1219.002: Remote desktop software ---
+				{ L"anydesk.exe",        "AnyDesk remote access tool (Chaos/Akira/DeadLock ransomware)", TRUE  },
+				{ L"teamviewer.exe",     "TeamViewer remote access tool",                               FALSE },
+				{ L"screenconnect.exe",  "ScreenConnect/ConnectWise remote access",                     TRUE  },
+				{ L"connectwisecontrol", "ConnectWise Control remote access",                           TRUE  },
+				{ L"splashtop.exe",      "Splashtop Streamer remote access",                           FALSE },
+				{ L"rustdesk.exe",       "RustDesk remote access tool (Akira ransomware)",              TRUE  },
+				{ L"mobaxterm.exe",      "MobaXterm remote access (Akira ransomware)",                  FALSE },
+				{ L"optitune.exe",       "OptiTune RMM (Chaos ransomware)",                            FALSE },
+				{ L"syncrosetup.exe",    "Syncro RMM tool (Chaos ransomware)",                         FALSE },
+				{ L"remcos.exe",         "Remcos RAT -- known malware",                                TRUE  },
+				{ L"remoteutilities",    "Remote Utilities -- dual-use RAT",                           FALSE },
+				{ L"action1_agent.exe",  "Action1 RMM (ransomware abuse)",                             FALSE },
+				{ L"meshagent.exe",      "MeshCentral agent (ransomware/APT use)",                     FALSE },
+				{ L"cloudflared.exe",    "Cloudflare Tunnel (Akira C2 relay)",                         TRUE  },
+				{ nullptr, nullptr, FALSE }
+			};
+
+			if (CreateInfo->ImageFileName && CreateInfo->ImageFileName->Buffer) {
+				for (int i = 0; kRemoteAccessTools[i].name; i++) {
+					if (!UnicodeStringContains(CreateInfo->ImageFileName, kRemoteAccessTools[i].name))
+						continue;
+
+					// TeamViewer/Splashtop from Program Files are likely IT-managed — skip
+					if (!kRemoteAccessTools[i].critical &&
+						(UnicodeStringContains(CreateInfo->ImageFileName, L"\\Program Files\\") ||
+						 UnicodeStringContains(CreateInfo->ImageFileName, L"\\Program Files (x86)\\")))
+						continue;
+
+					char* ratProc = PsGetProcessImageFileName(Process);
+					char msg[320];
+					RtlStringCbPrintfA(msg, sizeof(msg),
+						"Remote access tool: %s",
+						kRemoteAccessTools[i].desc);
+
+					PKERNEL_STRUCTURED_NOTIFICATION n =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+					if (n) {
+						RtlZeroMemory(n, sizeof(*n));
+						if (kRemoteAccessTools[i].critical) { SET_CRITICAL(*n); }
+						else { SET_WARNING(*n); }
+						SET_CALLING_PROC_PID_CHECK(*n);
+						n->isPath = FALSE;
+						n->pid    = PsGetProcessId(Process);
+						if (ratProc) RtlCopyMemory(n->procName, ratProc, 14);
+						SIZE_T msgLen = strlen(msg) + 1;
+						n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+						if (n->msg) {
+							RtlCopyMemory(n->msg, msg, msgLen);
+							n->bufSize = (ULONG)msgLen;
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+								ExFreePool(n->msg); ExFreePool(n);
+							}
+						} else { ExFreePool(n); }
+					}
+					break;
+				}
+			}
+
+			// --- T1219.001: VS Code IDE tunnel detection ---
+			// Adversaries execute "code.exe tunnel" to create a reverse tunnel through
+			// Microsoft Azure, providing browser-based shell access to the compromised host.
+			if (CreateInfo->CommandLine && CreateInfo->CommandLine->Buffer &&
+				CreateInfo->CommandLine->Length > 0)
+			{
+				PCUNICODE_STRING cmdLine = CreateInfo->CommandLine;
+				if (CmdContains(cmdLine, L"code.exe tunnel") ||
+					CmdContains(cmdLine, L"code tunnel") ||
+					CmdContains(cmdLine, L"code-insiders.exe tunnel"))
+				{
+					char* vsProc = PsGetProcessImageFileName(Process);
+					char msg[256];
+					RtlStringCbPrintfA(msg, sizeof(msg),
+						"VS Code IDE tunnel: 'code.exe tunnel' detected -- "
+						"reverse tunnel via Azure relay (T1219.001)");
+
+					PKERNEL_STRUCTURED_NOTIFICATION n =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+					if (n) {
+						RtlZeroMemory(n, sizeof(*n));
+						SET_CRITICAL(*n);
+						SET_CALLING_PROC_PID_CHECK(*n);
+						n->isPath = FALSE;
+						n->pid    = PsGetProcessId(Process);
+						if (vsProc) RtlCopyMemory(n->procName, vsProc, 14);
+						SIZE_T msgLen = strlen(msg) + 1;
+						n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+						if (n->msg) {
+							RtlCopyMemory(n->msg, msg, msgLen);
+							n->bufSize = (ULONG)msgLen;
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+								ExFreePool(n->msg); ExFreePool(n);
+							}
+						} else { ExFreePool(n); }
+					}
+				}
+			}
+		}
+
 		// -----------------------------------------------------------------------
 		// Mitigation policy check — detect policies that block our HookDll injection
 		// or prevent trampoline installation, leaving the process unwatched.
@@ -1144,6 +1255,28 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"\\\\c$\\__output",         "smbexec: C$ admin share __output file pattern",     TRUE  },
 				{ L"> \\\\localhost\\",         "smbexec: UNC output redirection variant",           TRUE  },
 				{ L"connectaddress=",         "netsh portproxy connectaddress -- pivot forwarding", TRUE  },
+				// --- T1562: Defense impairment patterns ---
+				{ L"systemsettingsadminflows", "SystemSettingsAdminFlows Defender disable (Deadlock ransomware)", TRUE },
+				{ L"wevtutil.exe cl",          "wevtutil event log clearing (Mimic ransomware)",   TRUE  },
+				{ L"wevtutil cl ",             "wevtutil event log clearing (short form)",          TRUE  },
+				{ L"vssadmin delete shadows",  "VSS shadow deletion -- ransomware pre-encryption", TRUE  },
+				{ L"vssadmin.exe delete shadows", "VSS shadow deletion -- ransomware (full path)", TRUE  },
+				{ L"shadowcopy delete",        "wmic shadowcopy delete -- ransomware VSS wipe",    TRUE  },
+				{ L"add-mppreference",         "Add-MpPreference -- Defender config tampering",    TRUE  },
+				{ L"-exclusionpath",           "Defender ExclusionPath abuse (Chihuahua Stealer)",  TRUE  },
+				{ L"-exclusionprocess",        "Defender ExclusionProcess abuse",                   TRUE  },
+				{ L"-exclusionextension",      "Defender ExclusionExtension abuse",                 TRUE  },
+				{ L"set-mppreference",         "Set-MpPreference -- Defender config tampering",     TRUE  },
+				{ L"disablerealtimemonitoring", "Disable-RealtimeMonitoring via PowerShell",        TRUE  },
+				{ L"advfirewall set",          "netsh advfirewall -- firewall disable (Medusa)",    TRUE  },
+				{ L"firewall set opmode disable", "netsh firewall opmode disable (legacy)",         TRUE  },
+				{ L"sc stop windefend",        "Stop Windows Defender service",                     TRUE  },
+				{ L"sc delete windefend",      "Delete Windows Defender service",                   TRUE  },
+				{ L"sc config windefend start=disabled", "Disable Defender autostart",              TRUE  },
+				{ L"sc stop sense",            "Stop Defender ATP sensor service",                  TRUE  },
+				{ L"sc config eventlog start=disabled", "Disable Windows Event Log service",        TRUE  },
+				{ L"bcdedit /set safeboot",    "bcdedit safeboot -- EDR bypass via Safe Mode",      TRUE  },
+				{ L"bcdedit.exe /set {default} recoveryenabled no", "Disable recovery (ransomware)", TRUE },
 				{ nullptr, nullptr, FALSE }
 			};
 

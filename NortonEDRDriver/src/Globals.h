@@ -1509,6 +1509,20 @@ struct PsCallbackSnapshot {
     BOOLEAN valid;       // FALSE if LEA scan failed — check is skipped
 };
 
+// Snapshot of CmpCallBackVector[] — the EX_CALLBACK array backing CmRegisterCallback.
+// Mirrors the PsNotify approach: locate via LEA scan of CmRegisterCallbackEx,
+// snapshot all registered function pointers at init, detect additions/removals/hijacks.
+// RegPhantom rootkit hijacks CmRegisterCallback entries as a C2 channel.
+#define CM_CALLBACK_SNAPSHOT_MAX 64
+
+struct CmCallbackSnapshot {
+    PVOID  arrayBase;                               // base of CmpCallBackVector[]
+    PVOID  callbacks[CM_CALLBACK_SNAPSHOT_MAX];      // known-good function pointers
+    ULONG  count;                                    // entries populated
+    PVOID  ourCallback;                              // our RegistryUtils::RegOpNotifyCallback
+    BOOLEAN valid;                                   // FALSE if LEA scan failed
+};
+
 class HookDetector {
 
     static PSSDT_BASELINE_ENTRY ssdtBaseline;
@@ -1527,6 +1541,9 @@ class HookDetector {
     static PsCallbackSnapshot   s_ProcNotifyCbSnap;
     static PsCallbackSnapshot   s_ThreadNotifyCbSnap;
     static PsCallbackSnapshot   s_ImageNotifyCbSnap;
+
+    // CmpCallBackVector snapshot — CmRegisterCallback integrity (RegPhantom defense).
+    static CmCallbackSnapshot   s_CmCbSnap;
 
     static UCHAR DetectInlineHookType(PVOID functionAddress);
     static PVOID ResolveHookTarget(PVOID functionAddress, UCHAR hookType);
@@ -1560,6 +1577,11 @@ public:
     // Verify our process/thread/image callbacks are still present in the internal arrays.
     // Fires CRITICAL alert if any are missing.  Added to RunAllHookChecks().
     static VOID     CheckPsCallbackIntegrity(BufferQueue* bufQueue);
+
+    // CmRegisterCallback (CmpCallBackVector) integrity — snapshot at init,
+    // detect foreign registrations and callback hijacking (RegPhantom C2 channel).
+    static VOID     TakeCmCallbackSnapshot();
+    static VOID     CheckCmCallbackIntegrity(BufferQueue* bufQueue);
 
     // CI.dll code integrity — SHA256 baseline of executable section, periodic re-hash.
     // Detects g_CiOptions patching and inline hooks installed by BYOVD drivers.

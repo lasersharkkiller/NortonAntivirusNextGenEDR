@@ -17,6 +17,8 @@ PsCallbackSnapshot   HookDetector::s_ProcNotifyCbSnap   = {};
 PsCallbackSnapshot   HookDetector::s_ThreadNotifyCbSnap = {};
 PsCallbackSnapshot   HookDetector::s_ImageNotifyCbSnap  = {};
 
+CmCallbackSnapshot   HookDetector::s_CmCbSnap           = {};
+
 // ---------------------------------------------------------------------------
 // CI.dll code integrity — SHA256 baseline of CI.dll's executable sections.
 // Detects patching of g_CiOptions or function-level hooks (BYOVD bypass).
@@ -912,6 +914,219 @@ VOID HookDetector::CheckObCallbackIntegrity(BufferQueue* bufQueue)
 }
 
 // ---------------------------------------------------------------------------
+// CmRegisterCallback (CmpCallBackVector) integrity verification.
+//
+// CmpCallBackVector is an array of EX_CALLBACK slots — the same mechanism
+// used by PspCreateProcessNotifyRoutine[].  We locate it by scanning
+// CmRegisterCallbackEx for LEA [RIP+disp32] instructions, then validate
+// by finding our own RegistryUtils::RegOpNotifyCallback in the slots.
+//
+// RegPhantom rootkit registers a rogue CmRegisterCallback as a covert C2
+// channel and can hijack existing callback function pointers.  This check
+// detects both attacks.
+// ---------------------------------------------------------------------------
+
+// Locate CmpCallBackVector by scanning CmRegisterCallbackEx for LEA instructions.
+// Unlike PsNotify where we know our callback pointer, for CmCallbacks we scan
+// CmRegisterCallbackEx (or CmUnRegisterCallback) which references CmpCallBackVector.
+static PVOID FindCmCallbackArrayBase(PVOID cmRegFn, PVOID ourCallback)
+{
+    if (!cmRegFn || !MmIsAddressValid(cmRegFn)) return nullptr;
+
+    PUCHAR p = (PUCHAR)cmRegFn;
+    __try {
+        // Scan a wider range for CmRegisterCallbackEx — it may reference
+        // CmpCallBackVector deeper in the function than PsSet* functions.
+        for (ULONG i = 0; i < 0x400 - 7; i++) {
+            // REX.W prefix (0x48 or 0x4C) + LEA opcode (0x8D) + ModRM
+            if ((p[i] != 0x48 && p[i] != 0x4C) || p[i+1] != 0x8D)
+                continue;
+            BOOLEAN validModRM = FALSE;
+            for (ULONG b = 0; b < ARRAYSIZE(g_LeaSecondBytes); b++)
+                if (p[i+2] == g_LeaSecondBytes[b]) { validModRM = TRUE; break; }
+            if (!validModRM) continue;
+
+            LONG disp = *(LONG*)(p + i + 3);
+            PVOID candidate = (PVOID)(p + i + 7 + disp);
+            if (!MmIsAddressValid(candidate)) continue;
+
+            // Validate: walk EX_CALLBACK slots looking for our callback
+            PUCHAR arr = (PUCHAR)candidate;
+            for (ULONG slot = 0; slot < CM_CALLBACK_SNAPSHOT_MAX; slot++) {
+                PVOID* slotPtr = (PVOID*)(arr + slot * 8);
+                if (!MmIsAddressValid(slotPtr)) break;
+                PVOID fn = ExCallbackGetFunction(*slotPtr);
+                if (fn == ourCallback) return candidate;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    return nullptr;
+}
+
+// TakeCmCallbackSnapshot — called once after CmRegisterCallbackEx succeeds.
+// Records every callback function pointer in CmpCallBackVector[].
+
+VOID HookDetector::TakeCmCallbackSnapshot()
+{
+    RtlZeroMemory(&s_CmCbSnap, sizeof(s_CmCbSnap));
+    s_CmCbSnap.ourCallback = (PVOID)RegistryUtils::RegOpNotifyCallback;
+    s_CmCbSnap.valid       = FALSE;
+
+    // Resolve CmRegisterCallbackEx to scan for CmpCallBackVector
+    UNICODE_STRING uName;
+    RtlInitUnicodeString(&uName, L"CmRegisterCallbackEx");
+    PVOID cmRegFn = MmGetSystemRoutineAddress(&uName);
+    if (!cmRegFn) {
+        // Fallback: try CmUnRegisterCallback — it also references the array
+        RtlInitUnicodeString(&uName, L"CmUnRegisterCallback");
+        cmRegFn = MmGetSystemRoutineAddress(&uName);
+    }
+
+    if (!cmRegFn) {
+        DbgPrint("[-] HookDetector: CmRegisterCallbackEx not found\n");
+        return;
+    }
+
+    PVOID arr = FindCmCallbackArrayBase(cmRegFn, s_CmCbSnap.ourCallback);
+    if (!arr) {
+        DbgPrint("[-] HookDetector: CmpCallBackVector LEA scan failed\n");
+        return;
+    }
+
+    s_CmCbSnap.arrayBase = arr;
+    s_CmCbSnap.valid     = TRUE;
+
+    // Snapshot all currently-registered callback function pointers
+    __try {
+        PUCHAR base = (PUCHAR)arr;
+        for (ULONG slot = 0; slot < CM_CALLBACK_SNAPSHOT_MAX; slot++) {
+            PVOID* slotPtr = (PVOID*)(base + slot * 8);
+            if (!MmIsAddressValid(slotPtr)) break;
+            PVOID fn = ExCallbackGetFunction(*slotPtr);
+            if (fn) {
+                s_CmCbSnap.callbacks[s_CmCbSnap.count++] = fn;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    DbgPrint("[+] HookDetector: CmCallback snapshot — %lu entries, array at %p\n",
+        s_CmCbSnap.count, arr);
+}
+
+// Emit alert helper for CmCallback integrity issues.
+static VOID EmitCmCallbackAlert(BufferQueue* bufQueue, const char* msg,
+                                PVOID addr, BOOLEAN isCritical)
+{
+    SIZE_T msgLen = strlen(msg) + 1;
+    PKERNEL_STRUCTURED_NOTIFICATION notif =
+        (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'cmcb');
+    if (!notif) return;
+    RtlZeroMemory(notif, sizeof(*notif));
+    if (isCritical) { SET_CRITICAL(*notif); }
+    else            { SET_WARNING(*notif);  }
+    SET_CM_CALLBACK_CHECK(*notif);
+    notif->scoopedAddress = (ULONG64)addr;
+    RtlCopyMemory(notif->procName, "NortonEDR", 9);
+    notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'cmmg');
+    notif->bufSize = (ULONG)msgLen;
+    if (notif->msg) {
+        RtlCopyMemory(notif->msg, msg, msgLen);
+        if (!bufQueue->Enqueue(notif)) {
+            ExFreePool(notif->msg);
+            ExFreePool(notif);
+        }
+    } else {
+        ExFreePool(notif);
+    }
+}
+
+// CheckCmCallbackIntegrity — periodic verification of CmpCallBackVector[].
+//
+// Three checks:
+//   1. OUR callback must still be present (unlink detection)
+//   2. No NEW callbacks registered after init (rogue callback / RegPhantom C2)
+//   3. No EXISTING callback function pointers changed (hijack detection)
+
+VOID HookDetector::CheckCmCallbackIntegrity(BufferQueue* bufQueue)
+{
+    if (!bufQueue || !s_CmCbSnap.valid || !s_CmCbSnap.arrayBase)
+        return;
+
+    // Collect current live callback function pointers
+    PVOID current[CM_CALLBACK_SNAPSHOT_MAX] = {};
+    ULONG currentCount = 0;
+
+    __try {
+        PUCHAR base = (PUCHAR)s_CmCbSnap.arrayBase;
+        for (ULONG slot = 0; slot < CM_CALLBACK_SNAPSHOT_MAX; slot++) {
+            PVOID* slotPtr = (PVOID*)(base + slot * 8);
+            if (!MmIsAddressValid(slotPtr)) break;
+            PVOID fn = ExCallbackGetFunction(*slotPtr);
+            if (fn) current[currentCount++] = fn;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] HookDetector: exception reading CmpCallBackVector\n");
+        return;
+    }
+
+    // --- Check 1: our callback must still be present ---
+    BOOLEAN ourFound = FALSE;
+    for (ULONG i = 0; i < currentCount; i++) {
+        if (current[i] == s_CmCbSnap.ourCallback) { ourFound = TRUE; break; }
+    }
+
+    if (!ourFound) {
+        char msg[200];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "ANTI-TAMPER: CmRegisterCallback unlinked from CmpCallBackVector "
+            "-- EDR registry monitoring silenced (RegPhantom/rootkit attack)");
+        EmitCmCallbackAlert(bufQueue, msg, s_CmCbSnap.ourCallback, TRUE);
+    }
+
+    // --- Check 2: detect new (foreign) callbacks not in snapshot ---
+    for (ULONG i = 0; i < currentCount; i++) {
+        BOOLEAN known = FALSE;
+        for (ULONG j = 0; j < s_CmCbSnap.count; j++) {
+            if (current[i] == s_CmCbSnap.callbacks[j]) { known = TRUE; break; }
+        }
+        if (!known) {
+            char msg[220];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "ROGUE CmCallback: unknown registry callback at %p registered after "
+                "EDR init -- possible RegPhantom C2 channel or rootkit hook",
+                current[i]);
+            EmitCmCallbackAlert(bufQueue, msg, current[i], TRUE);
+        }
+    }
+
+    // --- Check 3: detect removed/replaced callbacks (hijack) ---
+    for (ULONG i = 0; i < s_CmCbSnap.count; i++) {
+        BOOLEAN stillPresent = FALSE;
+        for (ULONG j = 0; j < currentCount; j++) {
+            if (s_CmCbSnap.callbacks[i] == current[j]) { stillPresent = TRUE; break; }
+        }
+        if (!stillPresent && s_CmCbSnap.callbacks[i] != s_CmCbSnap.ourCallback) {
+            // A callback from our snapshot disappeared — possible hijack where the
+            // function pointer was swapped (RegPhantom XOR-encoded pointer technique)
+            char msg[220];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "CmCallback HIJACK: init-time callback %p no longer in CmpCallBackVector "
+                "-- function pointer may have been replaced (RegPhantom technique)",
+                s_CmCbSnap.callbacks[i]);
+            EmitCmCallbackAlert(bufQueue, msg, s_CmCbSnap.callbacks[i], TRUE);
+        }
+    }
+
+    DbgPrint("[+] HookDetector: CmCallback check done — live=%lu snapshot=%lu our=%s\n",
+        currentCount, s_CmCbSnap.count, ourFound ? "present" : "MISSING");
+}
+
+// ---------------------------------------------------------------------------
 // TakeCiBaseline — snapshot CI.dll's executable code section at init time.
 // ---------------------------------------------------------------------------
 
@@ -1182,6 +1397,7 @@ VOID HookDetector::RunAllHookChecks(
     CheckAltSyscallHandlerIntegrity(bufQueue);
     CheckObCallbackIntegrity(bufQueue);
     CheckPsCallbackIntegrity(bufQueue);
+    CheckCmCallbackIntegrity(bufQueue);
     CheckCiIntegrity(bufQueue);
     CheckEprocessProtection(bufQueue);
 

@@ -589,6 +589,123 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
             }
         }
 
+        // ---- T1036.002: Right-to-Left Override (RTLO) character in filename ----
+        // Ferocious Kitten and others use Unicode U+202E to make .exe look like .pdf.
+        // Scan FinalComponent for the RTLO character.
+        if (nameInfo->FinalComponent.Length > 0 && nameInfo->FinalComponent.Buffer) {
+            USHORT charCount = nameInfo->FinalComponent.Length / sizeof(WCHAR);
+            for (USHORT ri = 0; ri < charCount; ri++) {
+                if (nameInfo->FinalComponent.Buffer[ri] == L'\x202E') {
+                    char nameBuf[64] = {};
+                    ANSI_STRING ansiName;
+                    if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiName, &nameInfo->FinalComponent, TRUE))) {
+                        SIZE_T n = ansiName.Length < sizeof(nameBuf) - 1 ? ansiName.Length : sizeof(nameBuf) - 1;
+                        RtlCopyMemory(nameBuf, ansiName.Buffer, n);
+                        RtlFreeAnsiString(&ansiName);
+                    }
+                    char msg[224];
+                    RtlStringCchPrintfA(msg, sizeof(msg),
+                        "FS: Right-to-Left Override (RTLO) in filename -- masquerading as benign extension "
+                        "(T1036.002) file=%s pid=%llu",
+                        nameBuf[0] ? nameBuf : "?", (ULONG64)(ULONG_PTR)pid);
+                    EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                    break;
+                }
+            }
+        }
+
+        // ---- T1036.007: Double file extension detection ----
+        // Adversaries name files like "invoice.pdf.exe" to hide the real extension.
+        // Check if the name (minus the real extension) still contains a known doc/media extension.
+        if (nameInfo->FinalComponent.Length > 0 && nameInfo->Extension.Length > 0) {
+            static const WCHAR* kDecoyExts[] = {
+                L".pdf", L".doc", L".docx", L".xls", L".xlsx", L".ppt",
+                L".jpg", L".png", L".mp4", L".txt", L".rtf", nullptr
+            };
+            static const WCHAR* kExecExts2[] = {
+                L".exe", L".scr", L".bat", L".cmd", L".com", L".pif",
+                L".vbs", L".js", L".wsf", L".hta", L".msi", nullptr
+            };
+            // Check if real extension is executable
+            BOOLEAN realIsExec = FALSE;
+            for (int ei = 0; kExecExts2[ei]; ei++) {
+                if (ExtMatch(&nameInfo->Extension, kExecExts2[ei])) {
+                    realIsExec = TRUE; break;
+                }
+            }
+            if (realIsExec) {
+                // Check if the stem (before real extension) contains a decoy extension
+                USHORT stemChars = (nameInfo->FinalComponent.Length - nameInfo->Extension.Length) / sizeof(WCHAR);
+                if (stemChars > 4) {  // need room for ".pdf" etc.
+                    for (int di = 0; kDecoyExts[di]; di++) {
+                        SIZE_T dLen = wcslen(kDecoyExts[di]);
+                        for (USHORT si = 0; si + dLen <= stemChars; si++) {
+                            BOOLEAN match = TRUE;
+                            for (SIZE_T ci = 0; ci < dLen; ci++) {
+                                WCHAR sc = nameInfo->FinalComponent.Buffer[si + ci];
+                                if (sc >= L'A' && sc <= L'Z') sc += 32;
+                                if (sc != kDecoyExts[di][ci]) { match = FALSE; break; }
+                            }
+                            if (match) {
+                                char fnameBuf[96] = {};
+                                ANSI_STRING ansiN;
+                                if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiN, &nameInfo->FinalComponent, TRUE))) {
+                                    SIZE_T n2 = ansiN.Length < sizeof(fnameBuf) - 1 ? ansiN.Length : sizeof(fnameBuf) - 1;
+                                    RtlCopyMemory(fnameBuf, ansiN.Buffer, n2);
+                                    RtlFreeAnsiString(&ansiN);
+                                }
+                                char msg[224];
+                                RtlStringCchPrintfA(msg, sizeof(msg),
+                                    "FS: Double file extension -- masquerading (T1036.007) file=%s pid=%llu",
+                                    fnameBuf[0] ? fnameBuf : "?", (ULONG64)(ULONG_PTR)pid);
+                                EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                                goto done_double_ext;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        done_double_ext:;
+
+        // ---- T1547.009: Startup folder write monitoring ----
+        // AdaptixC2, CABINETRAT, and various malware drop files in Startup for persistence.
+        {
+            static const PCWSTR kStartupPaths[] = {
+                L"\\start menu\\programs\\startup\\",
+                L"\\programs\\startup\\",
+                nullptr
+            };
+            ULONG createDisposition2 = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
+            if (createDisposition2 == FILE_CREATE || createDisposition2 == FILE_OVERWRITE_IF ||
+                createDisposition2 == FILE_SUPERSEDE)
+            {
+                for (SIZE_T si = 0; kStartupPaths[si]; si++) {
+                    if (WcsContainsLower(&nameInfo->Name, kStartupPaths[si])) {
+                        // Exclude explorer.exe (normal shortcut management)
+                        if (procName && strcmp(procName, "explorer.exe") == 0) break;
+
+                        char fBuf[96] = {};
+                        ANSI_STRING ansiFC;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiFC, &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiFC.Length < sizeof(fBuf) - 1 ? ansiFC.Length : sizeof(fBuf) - 1;
+                            RtlCopyMemory(fBuf, ansiFC.Buffer, n);
+                            RtlFreeAnsiString(&ansiFC);
+                        }
+                        char msg[224];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: File created in Startup folder -- persistence (T1547.009) "
+                            "file=%s by=%s pid=%llu",
+                            fBuf[0] ? fBuf : "?",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid);
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                        break;
+                    }
+                }
+            }
+        }
+
         // ---- Executable drop in suspicious directory ----
         BOOLEAN isExec = FALSE;
         for (SIZE_T i = 0; i < ARRAYSIZE(kExecExts); i++) {
