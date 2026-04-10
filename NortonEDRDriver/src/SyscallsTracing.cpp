@@ -187,66 +187,77 @@ VOID SyscallsUtils::NtVersionPreCheck() {
 
 			NtQueueApcThreadExId = 0x0165;
 			NtSetContextThreadId = 0x018b;
+			NtContinueEx = 0x00C4;
 
 		};
 		case 19042: {
 
 			NtQueueApcThreadExId = 0x0165;
 			NtSetContextThreadId = 0x018b;
+			NtContinueEx = 0x00C4;
 
 		};
 		case 19043: {
 
 			NtQueueApcThreadExId = 0x0165;
 			NtSetContextThreadId = 0x018b;
+			NtContinueEx = 0x00C4;
 
 		};
 		case 19044: {
 
 			NtQueueApcThreadExId = 0x0166;
 			NtSetContextThreadId = 0x018d;
+			NtContinueEx = 0x00C4;
 
 		};
 		case 19045: {
 
 			NtQueueApcThreadExId = 0x0166;
 			NtSetContextThreadId = 0x018d;
+			NtContinueEx = 0x00C4;
 
 		};
 		case 20348: {
 
 			NtQueueApcThreadExId = 0x016b;
 			NtSetContextThreadId = 0x0193;
+			NtContinueEx = 0x00C4;
 
 		};
 		case 22000: {
 
 			NtQueueApcThreadExId = 0x016d;
 			NtSetContextThreadId = 0x0195;
+			NtContinueEx = 0x00C4;
 
 		};
 		case 22621: {
 
 			NtQueueApcThreadExId = 0x0170;
 			NtSetContextThreadId = 0x0198;
+			NtContinueEx = 0x00C4;
 
 		};
 		case 22631: {
 
 			NtQueueApcThreadExId = 0x0170;
 			NtSetContextThreadId = 0x0198;
+			NtContinueEx = 0x00C4;
 
 		};
 		case 25000: {
 
 			NtQueueApcThreadExId = 0x0171;
 			NtSetContextThreadId = 0x0199;
+			NtContinueEx = 0x00C4;
 
 		};
 		case 26000: {
 
 			NtQueueApcThreadExId = 0x0172;
 			NtSetContextThreadId = 0x019a;
+			NtContinueEx = 0x00C4;
 
 		};
 		default: {
@@ -275,6 +286,7 @@ static const char* IdToName(ULONG id) {
 	if (id == NtDebugActiveProcessId) return "NtDebugActiveProcess";
 	if (id == NtResumeThreadId) return "NtResumeThread";
 	if (id == NtContinueId) return "NtContinue";
+	if (NtContinueEx != 0 && id == NtContinueEx) return "NtContinueEx";
 	if (id == NtCreateThreadExId) return "NtCreateThreadEx";
 	if (id == NtOpenThreadId) return "NtOpenThread";
 	return "Unknown";
@@ -299,7 +311,8 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		 id == 0x0054                   || id == 0x0045                  || id == NtQueueApcThreadExId  ||
 		 id == NtSetContextThreadId     || id == NtOpenProcessId         || id == NtMapViewOfSectionId  ||
 		 id == NtDuplicateObjectId      || id == NtDebugActiveProcessId  || id == NtResumeThreadId      ||
-		 id == NtContinueId             || id == NtCreateThreadExId      || id == NtOpenThreadId);
+		 id == NtContinueId             || id == NtCreateThreadExId      || id == NtOpenThreadId        ||
+		 (NtContinueEx != 0 && id == NtContinueEx));
 
 	if (isAttackRelevant) {
 		// CET shadow stack check — catches Type 2 indirect syscalls on CET-capable hardware
@@ -385,6 +398,12 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		NtContinueHandler(
 			(PCONTEXT)trapFrame->Rcx,
 			(BOOLEAN)trapFrame->Rdx
+		);
+	}
+	else if (NtContinueEx != 0 && id == NtContinueEx) {	// NtContinueEx — same PCONTEXT arg1
+		NtContinueHandler(
+			(PCONTEXT)trapFrame->Rcx,
+			FALSE
 		);
 	}
 	else if (id == 0x0050) {			// NtProtectVirtualMemory | Win 10 -> Win11 24H2
@@ -1700,17 +1719,45 @@ VOID SyscallsUtils::NtQueueApcThreadExHandler(
 	ObDereferenceObject(targetThread);
 }
 
-// NtContinue — flag execution redirected into private executable memory.
+// NtContinue — flag execution redirected into private executable memory,
+// and detect hardware breakpoint installation via CONTEXT_DEBUG_REGISTERS.
 // Typical attack: process hollowing / shellcode loader sets context then
-// calls NtContinue to jump into injected code.
+// calls NtContinue to jump into injected code.  Also: malware deliberately
+// triggers an exception, then uses NtContinue to restore context with DR0-DR3
+// set — bypassing NtSetContextThread monitoring entirely.
 VOID SyscallsUtils::NtContinueHandler(
 	PCONTEXT Context,
 	BOOLEAN TestAlert
 ) {
 	if (!Context || !MmIsAddressValid(Context)) return;
 
-	ULONG64 rip = Context->Rip;
-	// Only inspect user-mode addresses
+	ULONG64 rip = 0;
+	ULONG   ctxFlags = 0;
+	ULONG64 dr0 = 0, dr1 = 0, dr2 = 0, dr3 = 0;
+
+	__try {
+		rip      = Context->Rip;
+		ctxFlags = Context->ContextFlags;
+		if (ctxFlags & CONTEXT_DEBUG_REGISTERS) {
+			dr0 = Context->Dr0; dr1 = Context->Dr1;
+			dr2 = Context->Dr2; dr3 = Context->Dr3;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return; }
+
+	// DR register manipulation via NtContinue — same technique as NtSetContextThread
+	// but avoids that syscall entirely by using exception → NtContinue path.
+	if ((ctxFlags & CONTEXT_DEBUG_REGISTERS) && (dr0 || dr1 || dr2 || dr3)) {
+		char msg[256];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtContinue: CONTEXT_DEBUG_REGISTERS Dr0=0x%llX Dr1=0x%llX "
+			"Dr2=0x%llX Dr3=0x%llX — hardware BP bypass via exception+NtContinue path",
+			(unsigned long long)dr0, (unsigned long long)dr1,
+			(unsigned long long)dr2, (unsigned long long)dr3);
+		EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, FALSE);
+	}
+
+	// Only inspect user-mode addresses for shellcode redirect
 	if (!rip || rip >= 0x00007FFFFFFFFFFF) return;
 
 	// Skip protected processes — their pages aren't queryable this way

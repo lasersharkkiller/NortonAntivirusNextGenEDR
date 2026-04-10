@@ -1643,6 +1643,12 @@ public:
     static VOID     TakeCiBaseline();
     static VOID     CheckCiIntegrity(BufferQueue* bufQueue);
 
+    // SeCiCallbacks integrity — resolve SeValidateImageHeader/SeValidateImageData
+    // from ntoskrnl, scan for indirect call targets, verify they point into CI.dll.
+    // Detects callback table overwrite that redirects CI validation to attacker stub.
+    static VOID     TakeSeCiCallbackBaseline();
+    static VOID     CheckSeCiCallbackIntegrity(BufferQueue* bufQueue);
+
     // EPROCESS protection level monitoring — snapshot PPL levels for sensitive processes,
     // alert on downgrade (BYOVD driver zeroing EPROCESS.Protection field).
     static VOID     TakeEprocessProtBaseline();

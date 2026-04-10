@@ -288,15 +288,26 @@ static VOID CheckDkomHiding()
 }
 
 // ---------------------------------------------------------------------------
-// CheckDseIntegrity — read g_CiEnabled from ci.dll's export table.
+// CheckDseIntegrity — read g_CiEnabled AND g_CiOptions from ci.dll exports.
 //
-// g_CiEnabled is a DWORD in ci.dll that CI reads on each load decision.
-// Patching it to 0 disables driver signature enforcement for the remainder of
-// the boot session.  We read it from the live in-memory PE export table.
+// g_CiEnabled (DWORD): high-level on/off for CI.  0 = DSE fully disabled.
+// g_CiOptions (DWORD): policy bitmask controlling enforcement behaviour:
+//   Bit 0 (0x01) = CODEINTEGRITY_OPTION_ENABLED   — image hash enforcement
+//   Bit 1 (0x02) = CODEINTEGRITY_OPTION_TESTSIGN   — allow test-signed drivers
+//   Bit 3 (0x08) = CODEINTEGRITY_OPTION_UMCI        — user-mode CI (WDAC)
 //
-// Expected value: non-zero (typically 6 in normal production mode).
-// Suspicious:     0 → DSE fully disabled.
+// g_CiOptions lives in CI.dll's .data section — NOT covered by our .text
+// SHA256 baseline.  A BYOVD driver can clear bit 0 (or set the entire value
+// to 0) to disable STATUS_INVALID_IMAGE_HASH without touching any code page.
+//
+// Expected g_CiEnabled: non-zero (typically 6).
+// Expected g_CiOptions: bit 0 set (0x01 minimum), bit 1 clear (no test sign).
+// Suspicious:  g_CiEnabled == 0, or g_CiOptions bit 0 cleared, or bit 1 set.
 // ---------------------------------------------------------------------------
+
+// Expected initial value captured at first check — allows detecting runtime changes.
+static volatile LONG s_CiOptionsBaseline   = -1;   // -1 = not yet captured
+static volatile LONG s_CiOptionsBaselineSet = 0;
 
 static VOID CheckDseIntegrity()
 {
@@ -314,7 +325,6 @@ static VOID CheckDseIntegrity()
             if (ldte->BaseDllName.Buffer &&
                 ldte->BaseDllName.Length >= 6 * 2 /* "ci.dll" = 6 chars */ ) {
 
-                // Case-insensitive match on the short name
                 WCHAR lower[16] = {};
                 USHORT copyLen = min(ldte->BaseDllName.Length / sizeof(WCHAR), 15u);
                 for (USHORT i = 0; i < copyLen; i++) {
@@ -336,7 +346,7 @@ static VOID CheckDseIntegrity()
             return;
         }
 
-        // --- Walk PE export table ---
+        // --- Walk PE export table to resolve both globals ---
         PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)ciBase;
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
 
@@ -357,34 +367,86 @@ static VOID CheckDseIntegrity()
         PULONG  funcs    = (PULONG) ((ULONG_PTR)ciBase + expDir->AddressOfFunctions);
 
         PULONG gCiEnabled = nullptr;
+        PULONG gCiOptions = nullptr;
         for (ULONG i = 0; i < expDir->NumberOfNames; i++) {
             const char* name = (const char*)((ULONG_PTR)ciBase + names[i]);
             if (!MmIsAddressValid((PVOID)name)) continue;
             if (strcmp(name, "g_CiEnabled") == 0) {
                 USHORT ord = ordinals[i];
                 gCiEnabled = (PULONG)((ULONG_PTR)ciBase + funcs[ord]);
-                break;
+            } else if (strcmp(name, "g_CiOptions") == 0) {
+                USHORT ord = ordinals[i];
+                gCiOptions = (PULONG)((ULONG_PTR)ciBase + funcs[ord]);
             }
+            if (gCiEnabled && gCiOptions) break;
         }
 
-        if (!gCiEnabled || !MmIsAddressValid(gCiEnabled)) {
+        // --- Check g_CiEnabled ---
+        if (gCiEnabled && MmIsAddressValid(gCiEnabled)) {
+            ULONG ciVal = *gCiEnabled;
+            DbgPrint("[+] AntiTamper: g_CiEnabled = %lu\n", ciVal);
+
+            if (ciVal == 0) {
+                char msg[160];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "DSE BYPASS: g_CiEnabled in ci.dll = 0 — "
+                    "driver signature enforcement disabled, unsigned kernel code may be loaded");
+                EmitKernelCheckAlert(msg, SetDseBit);
+            }
+        } else {
             DbgPrint("[-] DSE check: g_CiEnabled not found in ci.dll exports\n");
-            return;
         }
 
-        ULONG ciVal = *gCiEnabled;
-        DbgPrint("[+] AntiTamper: g_CiEnabled = %lu\n", ciVal);
+        // --- Check g_CiOptions ---
+        if (gCiOptions && MmIsAddressValid(gCiOptions)) {
+            ULONG opts = *gCiOptions;
+            DbgPrint("[+] AntiTamper: g_CiOptions = 0x%lX\n", opts);
 
-        if (ciVal == 0) {
-            char msg[160];
-            RtlStringCbPrintfA(msg, sizeof(msg),
-                "DSE BYPASS: g_CiEnabled in ci.dll = 0 — "
-                "driver signature enforcement disabled, unsigned kernel code may be loaded");
-            EmitKernelCheckAlert(msg, SetDseBit);
+            // Capture baseline on first run
+            if (!InterlockedCompareExchange(&s_CiOptionsBaselineSet, 1, 0)) {
+                InterlockedExchange(&s_CiOptionsBaseline, (LONG)opts);
+                DbgPrint("[+] AntiTamper: g_CiOptions baseline captured: 0x%lX\n", opts);
+            }
+
+            // Check 1: enforcement bit (bit 0) cleared — STATUS_INVALID_IMAGE_HASH bypassed
+            if (!(opts & 0x01)) {
+                char msg[200];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "DSE BYPASS: g_CiOptions = 0x%lX — CODEINTEGRITY_OPTION_ENABLED (bit 0) "
+                    "cleared; STATUS_INVALID_IMAGE_HASH bypassed, unsigned images will load",
+                    opts);
+                EmitKernelCheckAlert(msg, SetDseBit);
+            }
+
+            // Check 2: test-signing bit (bit 1) set at runtime — not expected in production
+            if ((opts & 0x02) && s_CiOptionsBaseline != -1 &&
+                !((ULONG)s_CiOptionsBaseline & 0x02)) {
+                char msg[200];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "DSE BYPASS: g_CiOptions = 0x%lX — CODEINTEGRITY_OPTION_TESTSIGN (bit 1) "
+                    "set at runtime (was 0x%lX at boot); test-signed drivers now accepted",
+                    opts, (ULONG)s_CiOptionsBaseline);
+                EmitKernelCheckAlert(msg, SetDseBit);
+            }
+
+            // Check 3: value changed from baseline — any runtime modification is suspicious
+            if (s_CiOptionsBaseline != -1 && opts != (ULONG)s_CiOptionsBaseline) {
+                // Only alert if we haven't already fired one of the specific checks above
+                if ((opts & 0x01) && !((opts & 0x02) && !((ULONG)s_CiOptionsBaseline & 0x02))) {
+                    char msg[200];
+                    RtlStringCbPrintfA(msg, sizeof(msg),
+                        "DSE TAMPER: g_CiOptions changed from 0x%lX to 0x%lX — "
+                        "runtime CI policy modification (possible BYOVD attack)",
+                        (ULONG)s_CiOptionsBaseline, opts);
+                    EmitKernelCheckAlert(msg, SetDseBit);
+                }
+            }
+        } else {
+            DbgPrint("[-] DSE check: g_CiOptions not found in ci.dll exports\n");
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrint("[-] DSE check: exception reading ci.dll export\n");
+        DbgPrint("[-] DSE check: exception reading ci.dll exports\n");
     }
 }
 

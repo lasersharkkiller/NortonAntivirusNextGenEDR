@@ -1258,6 +1258,214 @@ VOID HookDetector::CheckCiIntegrity(BufferQueue* bufQueue) {
 }
 
 // ---------------------------------------------------------------------------
+// SeCiCallbacks integrity — detect callback table overwrite in ntoskrnl.
+//
+// When CI.dll initialises, it registers validation callbacks into ntoskrnl's
+// SeCiCallbacks table.  ntoskrnl functions like SeValidateImageHeader dispatch
+// through this table via indirect calls (call [rip+disp32]).
+//
+// An attacker (BYOVD, rootkit) can overwrite these function pointers to
+// redirect CI validation to a stub that always returns STATUS_SUCCESS —
+// bypassing STATUS_INVALID_IMAGE_HASH without modifying CI.dll itself.
+//
+// Detection: resolve SeValidateImageHeader (exported by ntoskrnl), scan its
+// prologue for FF 15 xx xx xx xx (call [rip+disp32]) instructions, compute
+// the indirect target (= SeCiCallbacks entry), read the stored function
+// pointer, and verify it falls within CI.dll's image range.
+//
+// Baseline: snapshot the callback addresses at init.  Periodically re-read
+// and compare — any change = callback table tampered.
+// ---------------------------------------------------------------------------
+
+#define MAX_SECI_CALLBACKS 8
+
+struct SeCiCallbackEntry {
+    PVOID* tableSlot;      // address of the function pointer in ntoskrnl
+    PVOID  expectedTarget; // CI.dll function address captured at baseline
+    BOOLEAN used;
+};
+
+static SeCiCallbackEntry s_SeCiEntries[MAX_SECI_CALLBACKS] = {};
+static ULONG             s_SeCiEntryCount = 0;
+static PVOID             s_CiImageBase    = nullptr;
+static ULONG             s_CiImageSize    = 0;
+static BOOLEAN           s_SeCiBaselineValid = FALSE;
+
+// Scan the first scanLen bytes of a function for FF 15 (call [rip+disp32])
+// instructions whose indirect target falls in kernel address space.
+// Records each discovered callback slot into s_SeCiEntries.
+static VOID ScanForIndirectCalls(PUCHAR funcBase, SIZE_T scanLen)
+{
+    for (SIZE_T off = 0; off + 6 <= scanLen; off++) {
+        if (funcBase[off] != 0xFF || funcBase[off + 1] != 0x15)
+            continue;
+
+        // RIP-relative disp32 — target = &funcBase[off+6] + (signed)disp32
+        LONG disp32 = *(LONG*)(&funcBase[off + 2]);
+        PVOID* slot = (PVOID*)((PUCHAR)&funcBase[off + 6] + disp32);
+
+        if (!MmIsAddressValid(slot)) continue;
+
+        // The slot should point into kernel space (CI.dll is a kernel module)
+        PVOID target = *slot;
+        if (!target || (ULONG_PTR)target < 0xFFFF800000000000ULL)
+            continue;
+
+        if (s_SeCiEntryCount < MAX_SECI_CALLBACKS) {
+            s_SeCiEntries[s_SeCiEntryCount].tableSlot     = slot;
+            s_SeCiEntries[s_SeCiEntryCount].expectedTarget = target;
+            s_SeCiEntries[s_SeCiEntryCount].used           = TRUE;
+            s_SeCiEntryCount++;
+        }
+
+        off += 5; // skip past this instruction
+    }
+}
+
+VOID HookDetector::TakeSeCiCallbackBaseline()
+{
+    // Get CI.dll image range
+    ULONG ciSize = 0;
+    PVOID ciBase = FindKernelModuleBase(L"CI.dll", &ciSize);
+    if (!ciBase || !ciSize) {
+        DbgPrint("[-] SeCiCallback: CI.dll not found\n");
+        return;
+    }
+    s_CiImageBase = ciBase;
+    s_CiImageSize = ciSize;
+
+    // Resolve SeValidateImageHeader and SeValidateImageData from ntoskrnl
+    static const WCHAR* kFuncNames[] = {
+        L"SeValidateImageHeader",
+        L"SeValidateImageData",
+        nullptr
+    };
+
+    __try {
+        for (int i = 0; kFuncNames[i]; i++) {
+            UNICODE_STRING uName;
+            RtlInitUnicodeString(&uName, kFuncNames[i]);
+            PVOID func = MmGetSystemRoutineAddress(&uName);
+            if (!func || !MmIsAddressValid(func)) continue;
+
+            // Scan first 128 bytes for indirect call targets
+            ScanForIndirectCalls((PUCHAR)func, 128);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] SeCiCallback: exception during baseline scan\n");
+        return;
+    }
+
+    if (s_SeCiEntryCount > 0) {
+        s_SeCiBaselineValid = TRUE;
+        DbgPrint("[+] SeCiCallback: baseline captured — %lu callback slots tracked\n",
+            s_SeCiEntryCount);
+        for (ULONG i = 0; i < s_SeCiEntryCount; i++) {
+            DbgPrint("    slot[%lu]: %p → %p %s\n", i,
+                s_SeCiEntries[i].tableSlot,
+                s_SeCiEntries[i].expectedTarget,
+                ((ULONG_PTR)s_SeCiEntries[i].expectedTarget >= (ULONG_PTR)ciBase &&
+                 (ULONG_PTR)s_SeCiEntries[i].expectedTarget < (ULONG_PTR)ciBase + ciSize)
+                    ? "(in CI.dll)" : "(OUTSIDE CI.dll!)");
+        }
+    } else {
+        DbgPrint("[-] SeCiCallback: no indirect call targets found in Se*Validate* stubs\n");
+    }
+}
+
+VOID HookDetector::CheckSeCiCallbackIntegrity(BufferQueue* bufQueue)
+{
+    if (!s_SeCiBaselineValid || !bufQueue || !s_CiImageBase) return;
+
+    __try {
+        for (ULONG i = 0; i < s_SeCiEntryCount; i++) {
+            if (!s_SeCiEntries[i].used) continue;
+            if (!MmIsAddressValid(s_SeCiEntries[i].tableSlot)) continue;
+
+            PVOID current = *(s_SeCiEntries[i].tableSlot);
+
+            // Check 1: callback changed from baseline
+            if (current != s_SeCiEntries[i].expectedTarget) {
+                char msg[300];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "ANTI-TAMPER: SeCiCallbacks[%lu] at %p changed from %p to %p — "
+                    "CI validation callback redirected (STATUS_INVALID_IMAGE_HASH bypass)",
+                    i, s_SeCiEntries[i].tableSlot,
+                    s_SeCiEntries[i].expectedTarget, current);
+
+                SIZE_T msgLen = strlen(msg) + 1;
+                PKERNEL_STRUCTURED_NOTIFICATION notif =
+                    (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED,
+                        sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'seci');
+                if (notif) {
+                    RtlZeroMemory(notif, sizeof(*notif));
+                    SET_CRITICAL(*notif);
+                    SET_CI_INTEGRITY_CHECK(*notif);
+                    notif->scoopedAddress = (ULONG64)current;
+                    notif->isPath = FALSE;
+                    RtlCopyMemory(notif->procName, "NortonEDR", 9);
+                    notif->msg = (char*)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED, msgLen, 'scim');
+                    if (notif->msg) {
+                        RtlCopyMemory(notif->msg, msg, msgLen);
+                        notif->bufSize = (ULONG)msgLen;
+                        if (!bufQueue->Enqueue(notif)) {
+                            ExFreePool(notif->msg);
+                            ExFreePool(notif);
+                        }
+                    } else { ExFreePool(notif); }
+                }
+
+                // Update baseline to avoid re-alerting
+                s_SeCiEntries[i].expectedTarget = current;
+            }
+
+            // Check 2: callback points outside CI.dll image range
+            if (current &&
+                ((ULONG_PTR)current < (ULONG_PTR)s_CiImageBase ||
+                 (ULONG_PTR)current >= (ULONG_PTR)s_CiImageBase + s_CiImageSize))
+            {
+                char msg[300];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "ANTI-TAMPER: SeCiCallbacks[%lu] target %p is OUTSIDE CI.dll "
+                    "(%p–%p) — callback hijacked to attacker code",
+                    i, current, s_CiImageBase,
+                    (PVOID)((ULONG_PTR)s_CiImageBase + s_CiImageSize));
+
+                SIZE_T msgLen = strlen(msg) + 1;
+                PKERNEL_STRUCTURED_NOTIFICATION notif =
+                    (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED,
+                        sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'seci');
+                if (notif) {
+                    RtlZeroMemory(notif, sizeof(*notif));
+                    SET_CRITICAL(*notif);
+                    SET_CI_INTEGRITY_CHECK(*notif);
+                    notif->scoopedAddress = (ULONG64)current;
+                    notif->isPath = FALSE;
+                    RtlCopyMemory(notif->procName, "NortonEDR", 9);
+                    notif->msg = (char*)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED, msgLen, 'scim');
+                    if (notif->msg) {
+                        RtlCopyMemory(notif->msg, msg, msgLen);
+                        notif->bufSize = (ULONG)msgLen;
+                        if (!bufQueue->Enqueue(notif)) {
+                            ExFreePool(notif->msg);
+                            ExFreePool(notif);
+                        }
+                    } else { ExFreePool(notif); }
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] SeCiCallback: exception during integrity check\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TakeEprocessProtBaseline — snapshot protection levels of sensitive OS
 // processes (lsass, csrss, etc.) for periodic downgrade detection.
 // Must be called at PASSIVE_LEVEL.
@@ -1399,6 +1607,7 @@ VOID HookDetector::RunAllHookChecks(
     CheckPsCallbackIntegrity(bufQueue);
     CheckCmCallbackIntegrity(bufQueue);
     CheckCiIntegrity(bufQueue);
+    CheckSeCiCallbackIntegrity(bufQueue);
     CheckEprocessProtection(bufQueue);
 
     DbgPrint("[*] HookDetector results — SSDT=%lu Inline=%lu EAT=%lu ETW=%d\n",

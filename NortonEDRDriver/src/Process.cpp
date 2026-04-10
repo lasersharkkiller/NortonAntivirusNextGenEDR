@@ -1382,6 +1382,10 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"sc config eventlog start=disabled", "Disable Windows Event Log service",        TRUE  },
 				{ L"bcdedit /set safeboot",    "bcdedit safeboot -- EDR bypass via Safe Mode",      TRUE  },
 				{ L"bcdedit.exe /set {default} recoveryenabled no", "Disable recovery (ransomware)", TRUE },
+				{ L"bcdedit /set testsigning",  "bcdedit testsigning -- DSE bypass allows unsigned drivers", TRUE },
+				{ L"bcdedit /set nointegritychecks", "bcdedit nointegritychecks -- CI bypass disables image hash validation", TRUE },
+				{ L"bcdedit /set loadoptions DISABLE_INTEGRITY_CHECKS", "bcdedit DISABLE_INTEGRITY_CHECKS -- CI bypass via boot options", TRUE },
+				{ L"bcdedit /set loadoptions DDISABLE_INTEGRITY_CHECKS", "bcdedit DDISABLE_INTEGRITY_CHECKS -- CI bypass (double-D variant)", TRUE },
 				{ nullptr, nullptr, FALSE }
 			};
 

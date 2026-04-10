@@ -395,6 +395,10 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	// CI.dll code integrity baseline — SHA256 hash of the executable section
 	HookDetector::TakeCiBaseline();
 
+	// SeCiCallbacks baseline — snapshot CI validation callback pointers in ntoskrnl.
+	// Detects callback table overwrite that redirects SeValidateImageHeader to attacker stub.
+	HookDetector::TakeSeCiCallbackBaseline();
+
 	// EPROCESS protection level baseline — snapshot PPL levels for lsass, csrss, etc.
 	HookDetector::TakeEprocessProtBaseline();
 
