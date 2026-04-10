@@ -73,9 +73,14 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
 
     union {
         struct {
-            unsigned char NetworkCheck  : 1;
-            unsigned char FsFilterCheck : 1;
-            unsigned char Reserved3     : 6;
+            unsigned char NetworkCheck          : 1;
+            unsigned char FsFilterCheck         : 1;
+            unsigned char TokenCheck            : 1;
+            unsigned char PnpCheck              : 1;
+            unsigned char ObCallbackCheck       : 1;
+            unsigned char PsNotifyCallbackCheck : 1;
+            unsigned char CiIntegrityCheck      : 1;
+            unsigned char EprocessProtCheck     : 1;
         };
         unsigned char method3;
     };
@@ -95,6 +100,18 @@ typedef struct _KERNEL_STRUCTURED_NOTIFICATION {
             unsigned char Reserved : 5; // Align
         };
         unsigned char Level;
+    };
+
+    union {
+        struct {
+            unsigned char DkomCheck          : 1;
+            unsigned char DseBypassCheck     : 1;
+            unsigned char UnsignedModuleCheck: 1;
+            unsigned char CmCallbackCheck    : 1;
+            unsigned char SuspectSignerCheck : 1;
+            unsigned char Reserved4          : 3;
+        };
+        unsigned char method4;
     };
 
     char* msg;

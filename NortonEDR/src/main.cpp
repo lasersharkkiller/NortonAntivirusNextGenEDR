@@ -28,6 +28,10 @@
 
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "wintrust.lib")
+
+#include <wintrust.h>
+#include <softpub.h>
 
 using namespace ftxui;
 using namespace std;
@@ -2542,6 +2546,106 @@ int yr_callback_function_byte_stream(
 
 UINT lastNotifiedStackSpoofPid = 0;
 
+// ---------------------------------------------------------------------------
+// WinVerifyTrust revocation check for driver certificates.
+//
+// Called from the notification handler when the kernel reports a suspect signer
+// or expired certificate.  Extracts the NT-namespace driver path from the alert
+// message, converts to a Win32 path, and calls WinVerifyTrust with online
+// revocation checking (OCSP + CRL).
+//
+// Returns: "REVOKED", "EXPIRED", "UNTRUSTED", "VALID", or "ERROR: <reason>".
+// ---------------------------------------------------------------------------
+
+static std::string VerifyDriverSignatureRevocation(const std::string& ntPath)
+{
+    std::string win32Path = QueryDosDevicePath(ntPath);
+    if (win32Path.empty()) return "ERROR: path conversion failed";
+
+    std::wstring wPath(win32Path.begin(), win32Path.end());
+
+    WINTRUST_FILE_INFO fileInfo = {};
+    fileInfo.cbStruct = sizeof(fileInfo);
+    fileInfo.pcwszFilePath = wPath.c_str();
+    fileInfo.hFile = NULL;
+    fileInfo.pgKnownSubject = NULL;
+
+    GUID actionGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+    WINTRUST_DATA wtd = {};
+    wtd.cbStruct            = sizeof(wtd);
+    wtd.pPolicyCallbackData = NULL;
+    wtd.pSIPClientData      = NULL;
+    wtd.dwUIChoice          = WTD_UI_NONE;
+    // Enable online revocation checking (CRL + OCSP)
+    wtd.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
+    wtd.dwUnionChoice       = WTD_CHOICE_FILE;
+    wtd.pFile               = &fileInfo;
+    wtd.dwStateAction       = WTD_STATEACTION_VERIFY;
+    wtd.hWVTStateData       = NULL;
+    wtd.pwszURLReference    = NULL;
+    // Revocation + lifetime checking
+    wtd.dwProvFlags         = WTD_REVOCATION_CHECK_CHAIN |
+                              WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+    // First try with cached CRLs (fast, no network)
+    LONG status = WinVerifyTrust(NULL, &actionGuid, &wtd);
+
+    if (status == CERT_E_REVOKED)
+        return "REVOKED";
+    if (status == CERT_E_EXPIRED)
+        return "EXPIRED";
+
+    // If cache-only didn't find revocation info, retry with network access
+    if (status != ERROR_SUCCESS) {
+        wtd.dwProvFlags = WTD_REVOCATION_CHECK_CHAIN;
+        // Close previous state
+        wtd.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(NULL, &actionGuid, &wtd);
+
+        // Re-verify with network
+        wtd.dwStateAction = WTD_STATEACTION_VERIFY;
+        wtd.hWVTStateData = NULL;
+        status = WinVerifyTrust(NULL, &actionGuid, &wtd);
+    }
+
+    // Close state
+    WINTRUST_DATA wtdClose = wtd;
+    wtdClose.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, &actionGuid, &wtdClose);
+
+    switch (status) {
+    case ERROR_SUCCESS:
+        return "VALID";
+    case TRUST_E_NOSIGNATURE:
+        return "UNSIGNED";
+    case CERT_E_REVOKED:
+        return "REVOKED";
+    case CERT_E_EXPIRED:
+        return "EXPIRED";
+    case CERT_E_UNTRUSTEDROOT:
+    case TRUST_E_EXPLICIT_DISTRUST:
+        return "UNTRUSTED";
+    case CERT_E_CHAINING:
+        return "CHAIN_ERROR";
+    default:
+        return "UNTRUSTED (0x" + std::to_string(status) + ")";
+    }
+}
+
+// Extract the NT-namespace path from a kernel alert message.
+// Our kernel alerts format paths as: "... kernel driver '\Device\...\foo.sys' ..."
+static std::string ExtractDriverPathFromAlert(const char* msg)
+{
+    if (!msg) return "";
+    const char* start = strchr(msg, '\'');
+    if (!start) return "";
+    start++;  // skip the opening quote
+    const char* end = strchr(start, '\'');
+    if (!end || end <= start) return "";
+    return std::string(start, end - start);
+}
+
 int Notify(PKERNEL_STRUCTURED_NOTIFICATION notif, char* msg) {
 
     time_t now = time(0);
@@ -2624,6 +2728,85 @@ int Notify(PKERNEL_STRUCTURED_NOTIFICATION notif, char* msg) {
     }
     else if (notif->FsFilterCheck) {
         method = "Method: Filesystem Activity Monitor";
+    }
+    else if (notif->TokenCheck) {
+        method = "Method: Token / Logon Session Monitor";
+    }
+    else if (notif->PnpCheck) {
+        method = "Method: PnP Device Monitor";
+    }
+    else if (notif->ObCallbackCheck) {
+        method = "Method: ObCallback Integrity Check";
+    }
+    else if (notif->PsNotifyCallbackCheck) {
+        method = "Method: PsNotify Callback Integrity";
+    }
+    else if (notif->CiIntegrityCheck) {
+        method = "Method: CI.dll Code Integrity Check";
+    }
+    else if (notif->EprocessProtCheck) {
+        method = "Method: EPROCESS Protection Monitor";
+    }
+    else if (notif->DkomCheck) {
+        method = "Method: DKOM Process Hiding Detection";
+    }
+    else if (notif->DseBypassCheck) {
+        method = "Method: DSE Bypass Detection";
+    }
+    else if (notif->UnsignedModuleCheck) {
+        method = "Method: Unsigned Kernel Module Detection";
+    }
+    else if (notif->CmCallbackCheck) {
+        method = "Method: CmCallback Integrity Check";
+    }
+    else if (notif->SuspectSignerCheck) {
+        method = "Method: Driver Certificate Signer Analysis";
+    }
+
+    // --- Usermode WinVerifyTrust revocation check ---
+    // When the kernel flags a suspect/expired/unsigned driver cert, extract the
+    // driver path from the alert and verify via WinVerifyTrust with CRL/OCSP.
+    // If the cert is revoked, escalate to CRITICAL regardless of kernel severity.
+    if (notif->SuspectSignerCheck || notif->UnsignedModuleCheck) {
+        std::string drvPath = ExtractDriverPathFromAlert(msg);
+        if (!drvPath.empty()) {
+            std::string revStatus = VerifyDriverSignatureRevocation(drvPath);
+            std::string revDetail = " [WinVerifyTrust: " + revStatus + "]";
+
+            // Append revocation status to the message for UI display
+            SIZE_T origLen = strlen(msg);
+            SIZE_T extraLen = revDetail.size();
+            if (origLen + extraLen < 1024) {
+                // msg points into the IOCTL buffer — safe to append within 1MB buffer
+                memcpy(msg + origLen, revDetail.c_str(), extraLen + 1);
+            }
+
+            if (revStatus == "REVOKED" || revStatus == "UNTRUSTED") {
+                // Escalate: override to CRITICAL and append escalation note
+                notif->Critical = 1;
+                notif->Warning  = 0;
+
+                std::string escalation =
+                    " ** REVOKED/UNTRUSTED certificate detected by WinVerifyTrust — "
+                    "this driver was signed with a certificate that has been explicitly "
+                    "revoked or distrusted. High-confidence malicious driver.";
+                SIZE_T curLen = strlen(msg);
+                SIZE_T escLen = escalation.size();
+                if (curLen + escLen < 1024) {
+                    memcpy(msg + curLen, escalation.c_str(), escLen + 1);
+                }
+
+                PushUiDetectionEvent(
+                    "[!!] REVOKED CERT: " + drvPath,
+                    "Driver signed with revoked/untrusted certificate.\n"
+                    "WinVerifyTrust result: " + revStatus + "\n"
+                    "Kernel alert: " + std::string(msg),
+                    "Method: Certificate Revocation Check (WinVerifyTrust)",
+                    pid,
+                    DetectionSeverity::Critical
+                );
+            }
+        }
     }
 
     if (notif->Critical) {

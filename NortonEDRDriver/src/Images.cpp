@@ -696,6 +696,93 @@ static VOID CheckDriverCertificateSigner(PUNICODE_STRING imagePath)
         }
     }
 
+    // --- Tier 3: certificate expiry date check ---
+    //
+    // X.509 validity dates are encoded as either:
+    //   UTCTime (tag 0x17):        YYMMDDHHMMSSZ   (13 bytes, year < 50 → 20YY, ≥ 50 → 19YY)
+    //   GeneralizedTime (tag 0x18): YYYYMMDDHHMMSSZ (15 bytes)
+    //
+    // X.509 certificates contain a SEQUENCE { notBefore, notAfter } in the
+    // TBSCertificate.validity field.  In a PKCS#7 SignedData blob there may be
+    // multiple certificates (signing cert + intermediates + root).  We scan for
+    // ALL time fields and track the latest notAfter — that's the signing cert's
+    // expiry (intermediates/roots typically expire later, but we want the leaf).
+    //
+    // We actually want the EARLIEST notAfter across all certs in the chain,
+    // because the chain is only as valid as its weakest link — but in practice
+    // the leaf cert always has the shortest lifetime, so we track the latest
+    // notBefore-companion notAfter pair by looking at sequential time pairs.
+    {
+        USHORT latestNotAfterYear = 9999;  // we want the minimum notAfter year
+        BOOLEAN foundAny = FALSE;
+
+        for (SIZE_T i = 0; i + 2 < blobLen; i++) {
+            USHORT year = 0;
+            SIZE_T fieldLen = 0;
+
+            if (certBlob[i] == 0x17 && certBlob[i + 1] == 13) {
+                // UTCTime: YYMMDDHHMMSSZ
+                if (i + 2 + 13 > blobLen) continue;
+                UCHAR y0 = certBlob[i + 2] - '0';
+                UCHAR y1 = certBlob[i + 3] - '0';
+                if (y0 > 9 || y1 > 9) continue;
+                USHORT yy = y0 * 10 + y1;
+                year = (yy < 50) ? (2000 + yy) : (1900 + yy);
+                fieldLen = 13;
+            } else if (certBlob[i] == 0x18 && certBlob[i + 1] == 15) {
+                // GeneralizedTime: YYYYMMDDHHMMSSZ
+                if (i + 2 + 15 > blobLen) continue;
+                UCHAR y0 = certBlob[i + 2] - '0';
+                UCHAR y1 = certBlob[i + 3] - '0';
+                UCHAR y2 = certBlob[i + 4] - '0';
+                UCHAR y3 = certBlob[i + 5] - '0';
+                if (y0 > 9 || y1 > 9 || y2 > 9 || y3 > 9) continue;
+                year = y0 * 1000 + y1 * 100 + y2 * 10 + y3;
+                fieldLen = 15;
+            } else {
+                continue;
+            }
+
+            if (year < 1990 || year > 2100) continue;  // sanity
+
+            // Time fields in X.509 validity come in pairs: notBefore, notAfter.
+            // We're interested in notAfter — the second of each pair.
+            // Simple heuristic: track every time field, and the minimum year
+            // that's plausibly a notAfter (> 2000) gives us the leaf cert expiry.
+            // Skip obvious notBefore values (very early years).
+            if (year >= 2005) {
+                if (year < latestNotAfterYear) {
+                    latestNotAfterYear = year;
+                    foundAny = TRUE;
+                }
+            }
+
+            // Advance past this time field to avoid re-scanning
+            i += 1 + fieldLen;
+        }
+
+        if (foundAny && latestNotAfterYear < 2019) {
+            char pathNarrow[100] = {};
+            USHORT chars = imagePath->Length / sizeof(WCHAR);
+            if (chars > 99) chars = 99;
+            for (USHORT c = 0; c < chars; c++)
+                pathNarrow[c] = (imagePath->Buffer[c] < 128)
+                                ? (char)imagePath->Buffer[c] : '?';
+
+            BOOLEAN isCritical = (latestNotAfterYear < 2015);
+            char msg[300];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "%s: kernel driver '%s' signing certificate expired in %hu "
+                "-- %s",
+                isCritical ? "EXPIRED CERT" : "STALE CERT",
+                pathNarrow, latestNotAfterYear,
+                isCritical
+                    ? "pre-2015 cross-signing era cert, high likelihood of abuse"
+                    : "cert expired 7+ years ago, legitimate vendors would have re-signed");
+            EmitSignerAlert(msg, isCritical);
+        }
+    }
+
     ExFreePoolWithTag(certBlob, 'cert');
 }
 
