@@ -11,6 +11,7 @@
 
 // Process information classes
 #define PROCESS_PROTECTION_LEVEL_CLASS  0x3Du   // ProcessProtectionLevel (61)
+#define PROCESS_MITIGATION_POLICY_CLASS 0x34u   // ProcessMitigationPolicy (52) — SetProcessMitigationPolicy
 
 PSSDT_TABLE SyscallsUtils::ssdtTable = nullptr;
 PFUNCTION_MAP SyscallsUtils::exportsMap = nullptr;
@@ -2641,22 +2642,25 @@ VOID SyscallsUtils::NtQuerySystemInformationHandler(ULONG SystemInformationClass
 	EmitSyscallNotif(0, msg, proc, nullptr, critical);
 }
 
-// NtSetInformationProcess — detect PPL stripping attacks (Gabriel Landau / PPLdump).
+// NtSetInformationProcess — detect PPL stripping and ProcessMitigationPolicy changes.
 //
-// Attackers call NtSetInformationProcess(ProcessProtectionLevel=0x3D, ..., Level=0) to strip
-// PPL from an unrelated process, silencing its EDR callbacks. This handler fires on any
-// user-mode (non-PPL) caller attempting to modify ProcessProtectionLevel on any process.
+// 1. ProcessProtectionLevel (0x3D): Attackers call with Level=0 to strip PPL from a
+//    process, silencing its EDR callbacks.  (Gabriel Landau / PPLdump technique)
+//
+// 2. ProcessMitigationPolicy (0x34): SetProcessMitigationPolicy passes through here.
+//    Detecting ProcessSignaturePolicy being set at runtime is an evasion indicator —
+//    malware (Cobalt Strike fork-and-run, Adam Chester blockdlls) applies
+//    BLOCK_NON_MICROSOFT_BINARIES to its sacrificial process to prevent EDR DLL injection.
+//    By the time user code can call this, our APC has already loaded HookDll, but we
+//    still want telemetry showing the evasion attempt.
 VOID SyscallsUtils::NtSetInformationProcessHandler(
 	HANDLE ProcessHandle,
 	ULONG  ProcessInformationClass,
 	PVOID  ProcessInformation,
 	ULONG  ProcessInformationLength)
 {
-	UNREFERENCED_PARAMETER(ProcessInformation);
-	UNREFERENCED_PARAMETER(ProcessInformationLength);
-
-	// Only care about ProcessProtectionLevel (class 0x3D = 61)
-	if (ProcessInformationClass != PROCESS_PROTECTION_LEVEL_CLASS)
+	if (ProcessInformationClass != PROCESS_PROTECTION_LEVEL_CLASS &&
+		ProcessInformationClass != PROCESS_MITIGATION_POLICY_CLASS)
 		return;
 
 	PEPROCESS caller = IoGetCurrentProcess();
@@ -2685,23 +2689,72 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 		if (NT_SUCCESS(st)) ownedRef = TRUE;
 	}
 
-	char msg[128];
-	if (target) {
-		char targetName[15] = {};
-		PUCHAR imgName = PsGetProcessImageFileName(target);
-		if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
+	char msg[256];
 
-		RtlStringCbPrintfA(msg, sizeof(msg),
-			"ANTI-TAMPER: PPL-strip attempt via NtSetInformationProcess"
-			"(ProcessProtectionLevel) on '%s' — Gabriel Landau / PPLdump technique",
-			targetName);
-	} else {
-		RtlStringCbPrintfA(msg, sizeof(msg),
-			"ANTI-TAMPER: PPL-strip attempt via NtSetInformationProcess"
-			"(ProcessProtectionLevel) — target handle unresolvable");
+	if (ProcessInformationClass == PROCESS_PROTECTION_LEVEL_CLASS) {
+		// PPL-strip detection
+		if (target) {
+			char targetName[15] = {};
+			PUCHAR imgName = PsGetProcessImageFileName(target);
+			if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
+
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"ANTI-TAMPER: PPL-strip attempt via NtSetInformationProcess"
+				"(ProcessProtectionLevel) on '%s' — Gabriel Landau / PPLdump technique",
+				targetName);
+		} else {
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"ANTI-TAMPER: PPL-strip attempt via NtSetInformationProcess"
+				"(ProcessProtectionLevel) — target handle unresolvable");
+		}
+		EmitSyscallNotif(0, msg, caller, target, TRUE /* critical */);
 	}
+	else if (ProcessInformationClass == PROCESS_MITIGATION_POLICY_CLASS) {
+		// ProcessMitigationPolicy — detect SignaturePolicy / DynamicCodePolicy changes.
+		// PROCESS_MITIGATION_POLICY_INFORMATION layout:
+		//   DWORD[0] = PROCESS_MITIGATION_POLICY enum (Policy type)
+		//   DWORD[1] = Policy flags (MicrosoftSignedOnly, ProhibitDynamicCode, etc.)
+		//
+		// Policy enum values of interest:
+		//   2 = ProcessDynamicCodePolicy  (ACG — blocks RWX, prevents hook trampolines)
+		//   8 = ProcessSignaturePolicy    (blockdlls — blocks non-MS DLL loads)
+		ULONG policyType = 0;
+		ULONG policyFlags = 0;
+		if (ProcessInformation && MmIsAddressValid(ProcessInformation) &&
+			ProcessInformationLength >= 8) {
+			__try {
+				policyType  = ((ULONG*)ProcessInformation)[0];
+				policyFlags = ((ULONG*)ProcessInformation)[1];
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+		}
 
-	EmitSyscallNotif(0, msg, caller, target, TRUE /* critical */);
+		BOOLEAN isSigPolicy = (policyType == 8 && (policyFlags & 0x1)); // MicrosoftSignedOnly
+		BOOLEAN isDynPolicy = (policyType == 2 && (policyFlags & 0x1)); // ProhibitDynamicCode
+
+		if (isSigPolicy || isDynPolicy) {
+			char targetName[15] = {};
+			if (target) {
+				PUCHAR imgName = PsGetProcessImageFileName(target);
+				if (imgName) RtlCopyMemory(targetName, imgName,
+					min(strlen((char*)imgName), 14u));
+			}
+
+			if (isSigPolicy) {
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"SetProcessMitigationPolicy(ProcessSignaturePolicy:MicrosoftSignedOnly) "
+					"on '%s'%s — blockdlls evasion (Cobalt Strike fork-and-run / Adam Chester)",
+					targetName[0] ? targetName : "?",
+					(target != caller) ? " (cross-process)" : "");
+			} else {
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"SetProcessMitigationPolicy(ProcessDynamicCodePolicy:ProhibitDynamicCode) "
+					"on '%s'%s — ACG evasion prevents RWX hook trampolines",
+					targetName[0] ? targetName : "?",
+					(target != caller) ? " (cross-process)" : "");
+			}
+			EmitSyscallNotif(0, msg, caller, target, FALSE /* warning */);
+		}
+	}
 
 	if (ownedRef && target) ObDereferenceObject(target);
 }

