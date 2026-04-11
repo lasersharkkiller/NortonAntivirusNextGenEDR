@@ -1,18 +1,22 @@
 ;
 ; NortonEDRDriver.inf
 ;
+; Minifilter driver INF for Norton EDR kernel-mode file system filter.
+; Registered in the FSFilter Anti-Virus load order group at altitude 320021.
+;
 
 [Version]
 Signature   = "$WINDOWS NT$"
-Class       = System ; TODO: specify appropriate Class
-ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318} ; TODO: specify appropriate ClassGuid
+Class       = "AntiVirus"
+ClassGuid   = {b1d1a169-c54f-4379-81db-bee7d88d7454}
 Provider    = %ManufacturerName%
 CatalogFile = NortonEDRDriver.cat
-DriverVer   = ; TODO: set DriverVer in stampinf property pages
+DriverVer   =
 PnpLockdown = 1
 
 [DestinationDirs]
-DefaultDestDir = 13
+DefaultDestDir   = 12   ; %windir%\system32\drivers
+NortonEDR.CopyFiles = 12
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
@@ -24,39 +28,58 @@ NortonEDRDriver.sys = 1,,
 ; Install Section
 ;*****************************************
 
-[Manufacturer]
-%ManufacturerName% = Standard,NT$ARCH$.10.0...16299 ; %13% support introduced in build 16299
+[DefaultInstall.NT$ARCH$]
+OptionDesc = %NortonEDRDriver.SVCDESC%
+CopyFiles  = NortonEDR.CopyFiles
 
-[Standard.NT$ARCH$.10.0...16299]
-%NortonEDRDriver.DeviceDesc% = NortonEDRDriver_Device, Root\NortonEDRDriver ; TODO: edit hw-id
+[DefaultInstall.NT$ARCH$.Services]
+AddService = %ServiceName%,,NortonEDR_Service_Inst
 
-[NortonEDRDriver_Device.NT]
-CopyFiles = File_Copy
+[DefaultUninstall.NT$ARCH$]
+LegacyUninstall = 1
 
-[File_Copy]
+[DefaultUninstall.NT$ARCH$.Services]
+DelService = %ServiceName%,0x200   ; SPSVCINST_STOPSERVICE
+
+;*****************************************
+; Service installation
+;*****************************************
+
+[NortonEDR_Service_Inst]
+DisplayName    = %NortonEDRDriver.SVCDESC%
+Description    = %NortonEDRDriver.SVCDESC%
+ServiceType    = 2                          ; SERVICE_FILE_SYSTEM_DRIVER
+StartType      = 3                          ; SERVICE_DEMAND_START
+ErrorControl   = 1                          ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\NortonEDRDriver.sys
+LoadOrderGroup = "FSFilter Anti-Virus"
+Dependencies   = FltMgr
+AddReg         = NortonEDR.AddReg
+
+;*****************************************
+; Minifilter instance registration
+;*****************************************
+
+[NortonEDR.AddReg]
+HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Instances\"%DefaultInstance%,"Altitude",0x00000000,%Altitude%
+HKR,"Instances\"%DefaultInstance%,"Flags",0x00010001,0x0
+
+;*****************************************
+; Copy files
+;*****************************************
+
+[NortonEDR.CopyFiles]
 NortonEDRDriver.sys
 
-;-------------- Service installation
-[NortonEDRDriver_Device.NT.Services]
-AddService = NortonEDRDriver,%SPSVCINST_ASSOCSERVICE%, NortonEDRDriver_Service_Inst
-
-; -------------- NortonEDRDriver driver install sections
-[NortonEDRDriver_Service_Inst]
-DisplayName    = %NortonEDRDriver.SVCDESC%
-ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
-StartType      = 3               ; SERVICE_DEMAND_START
-ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
-ServiceBinary  = %13%\NortonEDRDriver.sys
-
-[NortonEDRDriver_Device.NT.Wdf]
-KmdfService = NortonEDRDriver, NortonEDRDriver_wdfsect
-
-[NortonEDRDriver_wdfsect]
-KmdfLibraryVersion = $KMDFVERSION$
+;*****************************************
+; String definitions
+;*****************************************
 
 [Strings]
-SPSVCINST_ASSOCSERVICE = 0x00000002
-ManufacturerName = "<Your manufacturer name>" ;TODO: Replace with your manufacturer name
-DiskName = "NortonEDRDriver Installation Disk"
-NortonEDRDriver.DeviceDesc = "NortonEDRDriver Device"
-NortonEDRDriver.SVCDESC = "NortonEDRDriver Service"
+ManufacturerName         = "Norton"
+ServiceName              = "NortonEDRDriver"
+DiskName                 = "NortonEDRDriver Installation Disk"
+NortonEDRDriver.SVCDESC  = "Norton EDR Filesystem Minifilter"
+DefaultInstance          = "NortonEDRDrvInstance"
+Altitude                 = "320021"
