@@ -100,6 +100,138 @@ static const BOOLEAN kPersistenceCritical[] = {
     TRUE,                              // Active Setup — Critical
 };
 
+// ---------------------------------------------------------------------------
+// Defense evasion registry paths — T1562 (Impair Defenses)
+// These are value writes that disable security controls.  Separate from
+// persistence because they need caller-aware filtering (Windows Update and
+// Group Policy legitimately touch some of these keys).
+// ---------------------------------------------------------------------------
+
+struct DefenseEvasionEntry {
+    const WCHAR* keySubstr;    // key path substring to match
+    const WCHAR* valueName;    // specific value name (NULL = any value write)
+    const char*  description;  // human-readable alert text
+    BOOLEAN      isCritical;   // TRUE = Critical, FALSE = Warning
+};
+
+static const DefenseEvasionEntry kDefenseEvasionPaths[] = {
+    // --- T1562.001: Disable Windows Defender ---
+    { L"\\Windows Defender\\",               L"DisableAntiSpyware",
+      "Defender disabled: DisableAntiSpyware",                          TRUE  },
+    { L"\\Windows Defender\\Real-Time Protection", L"DisableRealtimeMonitoring",
+      "Defender RTP disabled: DisableRealtimeMonitoring",               TRUE  },
+    { L"\\Windows Defender\\Real-Time Protection", L"DisableBehaviorMonitoring",
+      "Defender behavior monitoring disabled",                          TRUE  },
+    { L"\\Windows Defender\\Real-Time Protection", L"DisableOnAccessProtection",
+      "Defender on-access protection disabled",                         TRUE  },
+    { L"\\Windows Defender\\Real-Time Protection", L"DisableScanOnRealtimeEnable",
+      "Defender scan-on-RTP-enable disabled",                           TRUE  },
+    { L"\\Windows Defender\\SpyNet",         L"SpyNetReporting",
+      "Defender cloud reporting (SpyNet) modified",                     FALSE },
+    { L"\\Windows Defender\\SpyNet",         L"SubmitSamplesConsent",
+      "Defender sample submission modified",                            FALSE },
+    { L"\\Windows Defender\\",               L"DisableAntiVirus",
+      "Defender AV disabled: DisableAntiVirus",                         TRUE  },
+    { L"\\Windows Defender\\Features",       L"TamperProtection",
+      "Defender Tamper Protection modified",                            TRUE  },
+
+    // --- T1562.004: Disable Windows Firewall ---
+    { L"\\FirewallPolicy\\StandardProfile",  L"EnableFirewall",
+      "Firewall disabled: StandardProfile",                             TRUE  },
+    { L"\\FirewallPolicy\\DomainProfile",    L"EnableFirewall",
+      "Firewall disabled: DomainProfile",                               TRUE  },
+    { L"\\FirewallPolicy\\PublicProfile",    L"EnableFirewall",
+      "Firewall disabled: PublicProfile",                               TRUE  },
+
+    // --- T1548.002: UAC Bypass / Disable ---
+    { L"\\Policies\\System",                 L"EnableLUA",
+      "UAC disabled: EnableLUA set to 0",                               TRUE  },
+    { L"\\Policies\\System",                 L"ConsentPromptBehaviorAdmin",
+      "UAC prompt behavior modified (potential bypass)",                 FALSE },
+    { L"\\Policies\\System",                 L"LocalAccountTokenFilterPolicy",
+      "Remote UAC filtering disabled — enables pass-the-hash",          TRUE  },
+
+    // --- T1562.002: Disable Event Logging ---
+    { L"\\EventLog\\Security",              L"MaxSize",
+      "Security event log MaxSize modified — log tampering",            TRUE  },
+    { L"\\EventLog\\System",                L"MaxSize",
+      "System event log MaxSize modified — log tampering",              FALSE },
+    { L"\\EventLog\\Application",           L"MaxSize",
+      "Application event log MaxSize modified — log tampering",         FALSE },
+    // Sysmon, PowerShell, and other diagnostic logs are under this path
+    { L"\\Microsoft\\Windows\\EventLog",    NULL,
+      "Diagnostic event log configuration modified",                    FALSE },
+
+    // --- T1562.003: Disable PowerShell Logging ---
+    { L"\\PowerShell\\ScriptBlockLogging",  L"EnableScriptBlockLogging",
+      "PowerShell ScriptBlock logging disabled",                        TRUE  },
+    { L"\\PowerShell\\ModuleLogging",       L"EnableModuleLogging",
+      "PowerShell Module logging disabled",                             TRUE  },
+    { L"\\PowerShell\\Transcription",       L"EnableTranscripting",
+      "PowerShell transcription logging disabled",                      TRUE  },
+
+    // --- T1112: Credential access via registry ---
+    // Storing cleartext passwords in WDigest (Mimikatz UseLogonCredential)
+    { L"\\Control\\SecurityProviders\\WDigest", L"UseLogonCredential",
+      "WDigest cleartext credential caching enabled (Mimikatz technique)", TRUE },
+
+    // --- T1112: LSA protection downgrade ---
+    { L"\\Control\\Lsa",                    L"RunAsPPL",
+      "LSA RunAsPPL protection modified — credential guard downgrade",  TRUE  },
+
+    // --- Misc defense evasion ---
+    // AMSI provider unregistration (COM CLSID nuke)
+    { L"\\AMSI\\Providers",                 NULL,
+      "AMSI provider registry modification — potential AMSI bypass",    TRUE  },
+
+    { nullptr, nullptr, nullptr, FALSE }
+};
+
+// Trusted processes that legitimately modify security-related registry values.
+// PsGetProcessImageFileName returns at most 14 chars (EPROCESS.ImageFileName).
+static BOOLEAN IsDefenseEvasionTrustedCaller() {
+    char* name = PsGetProcessImageFileName(IoGetCurrentProcess());
+    if (!name) return FALSE;
+    return (strcmp(name, "services.exe")  == 0 ||
+            strcmp(name, "svchost.exe")   == 0 ||
+            strcmp(name, "TrustedInsta")  == 0 ||
+            strcmp(name, "msiexec.exe")   == 0 ||
+            strcmp(name, "tiworker.exe")  == 0 ||
+            strcmp(name, "MsMpEng.exe")   == 0 ||
+            strcmp(name, "SecurityHeal")  == 0 ||
+            strcmp(name, "MpCmdRun.exe")  == 0);
+}
+
+// Check if a SetValueKey operation matches a defense evasion pattern.
+// Returns the matched entry or NULL.
+static const DefenseEvasionEntry* MatchDefenseEvasion(
+    PCUNICODE_STRING regPath,
+    PREG_SET_VALUE_KEY_INFORMATION setValInfo)
+{
+    for (int i = 0; kDefenseEvasionPaths[i].keySubstr; i++) {
+        if (!UnicodeStringContains((PUNICODE_STRING)regPath,
+                                   kDefenseEvasionPaths[i].keySubstr))
+            continue;
+
+        // If entry requires a specific value name, check it
+        if (kDefenseEvasionPaths[i].valueName) {
+            if (!setValInfo || !setValInfo->ValueName ||
+                !setValInfo->ValueName->Buffer ||
+                setValInfo->ValueName->Length == 0 ||
+                !MmIsAddressValid(setValInfo->ValueName->Buffer))
+                continue;
+
+            UNICODE_STRING target;
+            RtlInitUnicodeString(&target, kDefenseEvasionPaths[i].valueName);
+            if (!RtlEqualUnicodeString(setValInfo->ValueName, &target, TRUE))
+                continue;
+        }
+
+        return &kDefenseEvasionPaths[i];
+    }
+    return nullptr;
+}
+
 BOOLEAN RegistryUtils::isRegistryPersistenceBehavior(
 	PUNICODE_STRING regPath
 ) {
@@ -176,6 +308,105 @@ NTSTATUS RegistryUtils::RegOpNotifyCallback(
 
 				BOOLEAN isCritical = PersistencePathIsCritical((PUNICODE_STRING)regPath);
 
+				// ---- Service config hijacking: value-name + caller awareness ----
+				// For RegNtPreSetValueKey on service keys, detect modification of
+				// high-risk values (ImagePath, ServiceDll, FailureCommand) by
+				// non-service-manager processes.  Suppresses noisy generic alerts
+				// for routine service value writes from trusted callers.
+				BOOLEAN isServicePath = UnicodeStringContains(
+					(PUNICODE_STRING)regPath, L"\\Services\\");
+				BOOLEAN isServiceHijack = FALSE;
+				char hijackDetail[350] = {};
+
+				if (isServicePath && regNotifyClass == RegNtPreSetValueKey) {
+					PREG_SET_VALUE_KEY_INFORMATION setValInfo =
+						(PREG_SET_VALUE_KEY_INFORMATION)Arg2;
+
+					BOOLEAN highRiskValue = FALSE;
+					if (setValInfo && setValInfo->ValueName &&
+						setValInfo->ValueName->Buffer &&
+						setValInfo->ValueName->Length > 0 &&
+						MmIsAddressValid(setValInfo->ValueName->Buffer))
+					{
+						// T1543.003 — service binary/DLL path & failure recovery
+						static const WCHAR* kHijackVals[] = {
+							L"ImagePath",       // service binary
+							L"ServiceDll",      // svchost-hosted service DLL
+							L"FailureCommand",  // failure recovery command exec
+							nullptr
+						};
+						for (int v = 0; kHijackVals[v]; v++) {
+							UNICODE_STRING target;
+							RtlInitUnicodeString(&target, kHijackVals[v]);
+							if (RtlEqualUnicodeString(
+									setValInfo->ValueName, &target, TRUE)) {
+								highRiskValue = TRUE;
+								break;
+							}
+						}
+					}
+
+					if (highRiskValue) {
+						char* procName =
+							PsGetProcessImageFileName(IoGetCurrentProcess());
+						// Legitimate writers: services.exe (SCM), TrustedInstaller,
+						// svchost.exe (self-config), msiexec.exe (Windows Installer)
+						BOOLEAN trusted = procName && (
+							strcmp(procName, "services.exe") == 0 ||
+							strcmp(procName, "TrustedInsta") == 0 ||
+							strcmp(procName, "svchost.exe")  == 0 ||
+							strcmp(procName, "msiexec.exe")  == 0);
+
+						if (!trusted) {
+							isServiceHijack = TRUE;
+							isCritical = TRUE;
+
+							// Narrow the value name
+							char valNarrow[40] = {};
+							USHORT vc =
+								setValInfo->ValueName->Length / sizeof(WCHAR);
+							if (vc > 39) vc = 39;
+							for (USHORT ci = 0; ci < vc; ci++)
+								valNarrow[ci] =
+									(setValInfo->ValueName->Buffer[ci] < 128)
+									? (char)setValInfo->ValueName->Buffer[ci]
+									: '?';
+
+							// Extract new value data (REG_SZ / REG_EXPAND_SZ)
+							char newPath[100] = {};
+							if (setValInfo->Data && setValInfo->DataSize > 0 &&
+								MmIsAddressValid(setValInfo->Data) &&
+								(setValInfo->Type == REG_SZ ||
+								 setValInfo->Type == REG_EXPAND_SZ))
+							{
+								__try {
+									WCHAR* wd = (WCHAR*)setValInfo->Data;
+									ULONG nc =
+										setValInfo->DataSize / sizeof(WCHAR);
+									if (nc > 99) nc = 99;
+									for (ULONG ci = 0;
+										 ci < nc && wd[ci]; ci++)
+										newPath[ci] = (wd[ci] < 128)
+											? (char)wd[ci] : '?';
+								} __except (EXCEPTION_EXECUTE_HANDLER) {}
+							}
+
+							RtlStringCbPrintfA(hijackDetail,
+								sizeof(hijackDetail),
+								"Service config hijack: %s modified %s "
+								"-> \"%s\" (non-service-manager writer "
+								"-- MITRE T1543.003)",
+								procName ? procName : "unknown",
+								valNarrow,
+								newPath[0] ? newPath : "<binary data>");
+						}
+					}
+
+					// Suppress noisy generic alerts for routine service
+					// value writes — only fire on confirmed hijacking
+					if (!isServiceHijack) goto skip_persistence_alert;
+				}
+
 				// Build a descriptive message that includes the key path (first 120 chars).
 				char pathNarrow[121] = {};
 				if (regPath->Buffer && regPath->Length > 0) {
@@ -186,11 +417,16 @@ NTSTATUS RegistryUtils::RegOpNotifyCallback(
 						                 ? (char)regPath->Buffer[ci] : '?';
 				}
 
-				char alertMsg[200];
-				RtlStringCbPrintfA(alertMsg, sizeof(alertMsg),
-					"%s Registry persistence/boot key write: %s",
-					isCritical ? "CRITICAL" : "Warning",
-					pathNarrow);
+				char alertMsg[350];
+				if (isServiceHijack) {
+					RtlStringCbPrintfA(alertMsg, sizeof(alertMsg),
+						"%s", hijackDetail);
+				} else {
+					RtlStringCbPrintfA(alertMsg, sizeof(alertMsg),
+						"%s Registry persistence/boot key write: %s",
+						isCritical ? "CRITICAL" : "Warning",
+						pathNarrow);
+				}
 				SIZE_T alertLen = strlen(alertMsg) + 1;
 
 				PKERNEL_STRUCTURED_NOTIFICATION kernelNotif =
@@ -224,8 +460,137 @@ NTSTATUS RegistryUtils::RegOpNotifyCallback(
 					}
 				}
 			}
+skip_persistence_alert:
+
+			// ---- Defense evasion detection (T1562) ----
+			// Only fires on RegNtPreSetValueKey — key creation alone is not
+			// defense evasion (the values do the damage, not the keys).
+			if (regNotifyClass == RegNtPreSetValueKey) {
+				PREG_SET_VALUE_KEY_INFORMATION setValInfo =
+					(PREG_SET_VALUE_KEY_INFORMATION)Arg2;
+
+				const DefenseEvasionEntry* match =
+					MatchDefenseEvasion(regPath, setValInfo);
+
+				if (match && !IsDefenseEvasionTrustedCaller()) {
+					char* procName =
+						PsGetProcessImageFileName(IoGetCurrentProcess());
+
+					char evasionMsg[300];
+					RtlStringCbPrintfA(evasionMsg, sizeof(evasionMsg),
+						"Defense evasion (T1562): %s by %s",
+						match->description,
+						procName ? procName : "unknown");
+					SIZE_T evasionLen = strlen(evasionMsg) + 1;
+
+					PKERNEL_STRUCTURED_NOTIFICATION eNotif =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED,
+							sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+					if (eNotif) {
+						RtlZeroMemory(eNotif, sizeof(*eNotif));
+						if (match->isCritical) { SET_CRITICAL(*eNotif); }
+						else                   { SET_WARNING(*eNotif);  }
+						SET_SYSCALL_CHECK(*eNotif);
+						eNotif->bufSize = (ULONG)evasionLen;
+						eNotif->isPath  = FALSE;
+						eNotif->pid     = PsGetProcessId(IoGetCurrentProcess());
+						eNotif->msg     = (char*)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, evasionLen, 'msg');
+						if (procName)
+							RtlCopyMemory(eNotif->procName, procName, 14);
+						if (eNotif->msg) {
+							RtlCopyMemory(eNotif->msg, evasionMsg, evasionLen);
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(eNotif)) {
+								ExFreePool(eNotif->msg);
+								ExFreePool(eNotif);
+							}
+						} else {
+							ExFreePool(eNotif);
+						}
+					}
+				}
+			}
 		}
 		break;
+
+	// ---- Value deletion monitoring ----
+	// Attackers use `reg delete` to remove security-related values.
+	// E.g., deleting DisableAntiSpyware after GPO enforcement,
+	// or removing RunAsPPL to downgrade LSA protection.
+	// REG_DELETE_VALUE_KEY_INFORMATION has Object + ValueName.
+	case RegNtPreDeleteValueKey:
+	{
+		PREG_DELETE_VALUE_KEY_INFORMATION delInfo =
+			(PREG_DELETE_VALUE_KEY_INFORMATION)Arg2;
+		if (!delInfo || !delInfo->Object || !MmIsAddressValid(delInfo->Object))
+			break;
+
+		status = CmCallbackGetKeyObjectIDEx(
+			&cookie, delInfo->Object, NULL, &regPath, 0);
+		if (!NT_SUCCESS(status) || !regPath || !regPath->Length ||
+			!MmIsAddressValid(regPath->Buffer))
+			break;
+
+		// Check if this deletion targets a security-sensitive key+value
+		// by matching against defense evasion paths that have a valueName.
+		if (!delInfo->ValueName || !delInfo->ValueName->Buffer ||
+			delInfo->ValueName->Length == 0 ||
+			!MmIsAddressValid(delInfo->ValueName->Buffer))
+			break;
+
+		for (int i = 0; kDefenseEvasionPaths[i].keySubstr; i++) {
+			if (!kDefenseEvasionPaths[i].valueName) continue;
+			if (!UnicodeStringContains((PUNICODE_STRING)regPath,
+			                           kDefenseEvasionPaths[i].keySubstr))
+				continue;
+
+			UNICODE_STRING target;
+			RtlInitUnicodeString(&target, kDefenseEvasionPaths[i].valueName);
+			if (!RtlEqualUnicodeString(delInfo->ValueName, &target, TRUE))
+				continue;
+
+			if (IsDefenseEvasionTrustedCaller()) break;
+
+			char* procName =
+				PsGetProcessImageFileName(IoGetCurrentProcess());
+
+			char delMsg[300];
+			RtlStringCbPrintfA(delMsg, sizeof(delMsg),
+				"Defense evasion (T1562): %s DELETED by %s",
+				kDefenseEvasionPaths[i].description,
+				procName ? procName : "unknown");
+			SIZE_T delLen = strlen(delMsg) + 1;
+
+			PKERNEL_STRUCTURED_NOTIFICATION dNotif =
+				(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED,
+					sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+			if (dNotif) {
+				RtlZeroMemory(dNotif, sizeof(*dNotif));
+				SET_CRITICAL(*dNotif);
+				SET_SYSCALL_CHECK(*dNotif);
+				dNotif->bufSize = (ULONG)delLen;
+				dNotif->isPath  = FALSE;
+				dNotif->pid     = PsGetProcessId(IoGetCurrentProcess());
+				dNotif->msg     = (char*)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, delLen, 'msg');
+				if (procName)
+					RtlCopyMemory(dNotif->procName, procName, 14);
+				if (dNotif->msg) {
+					RtlCopyMemory(dNotif->msg, delMsg, delLen);
+					if (!CallbackObjects::GetNotifQueue()->Enqueue(dNotif)) {
+						ExFreePool(dNotif->msg);
+						ExFreePool(dNotif);
+					}
+				} else {
+					ExFreePool(dNotif);
+				}
+			}
+			break;  // matched — one alert per deletion
+		}
+		break;
+	}
 
 	default:
 		break;
