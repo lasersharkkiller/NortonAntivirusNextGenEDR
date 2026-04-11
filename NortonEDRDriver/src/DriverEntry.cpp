@@ -435,6 +435,10 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	// EPROCESS protection level baseline — snapshot PPL levels for lsass, csrss, etc.
 	HookDetector::TakeEprocessProtBaseline();
 
+	// Initialize Skeleton Key detection lock (lsass auth DLL baselines are
+	// populated lazily from ImageLoadNotifyRoutine as auth DLLs load into lsass).
+	HookDetector::InitLsassAuthLock();
+
 	// Callback prologue baseline — snapshot first 16 bytes of each registered
 	// callback function (Ob/Ps/Cm/IOCTL).  Detects inline hooks patched by BYOVD
 	// onto our callback entry points to silently neuter the EDR.

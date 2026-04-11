@@ -1656,6 +1656,137 @@ VOID HookDetector::CheckEprocessProtection(BufferQueue* bufQueue) {
 }
 
 // ---------------------------------------------------------------------------
+// Skeleton Key detection — periodic re-hash of lsass authentication DLLs.
+//
+// Mimikatz misc::skeleton patches msv1_0.dll (MsvpPasswordValidate) and
+// kerberos.dll code in the lsass process to accept a master password.
+// The phantom DLL hash only covers 200ms post-load; Skeleton Key patches
+// happen hours later via mimidrv IOCTL.  We keep a permanent baseline hash
+// of each auth DLL's mapped image and re-verify every 30 seconds.
+// ---------------------------------------------------------------------------
+
+#define MAX_LSASS_AUTH_DLLS 8
+
+struct LsassAuthDllEntry {
+    ULONG   lsassPid;
+    PVOID   imageBase;
+    SIZE_T  imageSize;
+    BYTE    baselineHash[SHA256_BLOCK_SIZE];
+    char    dllName[32];
+    BOOLEAN active;
+};
+
+static LsassAuthDllEntry g_LsassAuthDlls[MAX_LSASS_AUTH_DLLS] = {};
+static KSPIN_LOCK        g_LsassAuthLock;
+static BOOLEAN           g_LsassAuthInitialized = FALSE;
+
+// Called from Images.cpp ImageLoadNotifyRoutine when an auth DLL loads into lsass.
+VOID HookDetector::RecordLsassAuthDll(ULONG pid, PVOID imageBase, SIZE_T imageSize,
+                                       const BYTE* hash, const char* name) {
+    KIRQL irql;
+    KeAcquireSpinLock(&g_LsassAuthLock, &irql);
+    for (int i = 0; i < MAX_LSASS_AUTH_DLLS; i++) {
+        if (!g_LsassAuthDlls[i].active) {
+            g_LsassAuthDlls[i].lsassPid = pid;
+            g_LsassAuthDlls[i].imageBase = imageBase;
+            g_LsassAuthDlls[i].imageSize = imageSize;
+            RtlCopyMemory(g_LsassAuthDlls[i].baselineHash, hash, SHA256_BLOCK_SIZE);
+            RtlStringCbCopyA(g_LsassAuthDlls[i].dllName,
+                sizeof(g_LsassAuthDlls[i].dllName), name);
+            g_LsassAuthDlls[i].active = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_LsassAuthLock, irql);
+}
+
+// Periodic check — called from RunAllHookChecks every 30 seconds.
+// Re-attaches to lsass and re-hashes each auth DLL, comparing to baseline.
+VOID HookDetector::CheckLsassAuthDllIntegrity(BufferQueue* bufQueue) {
+    if (!bufQueue) return;
+
+    for (int i = 0; i < MAX_LSASS_AUTH_DLLS; i++) {
+        if (!g_LsassAuthDlls[i].active) continue;
+
+        PEPROCESS proc = nullptr;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId(
+                (HANDLE)(ULONG_PTR)g_LsassAuthDlls[i].lsassPid, &proc))) {
+            g_LsassAuthDlls[i].active = FALSE; // lsass exited — shouldn't happen
+            continue;
+        }
+
+        BYTE rehash[SHA256_BLOCK_SIZE] = {};
+        BOOLEAN hashed = FALSE;
+
+        KAPC_STATE apcState;
+        KeStackAttachProcess(proc, &apcState);
+        __try {
+            SHA256_CTX ctx;
+            SHA256Init(&ctx);
+            SIZE_T remaining = g_LsassAuthDlls[i].imageSize;
+            BYTE* ptr = (BYTE*)g_LsassAuthDlls[i].imageBase;
+            while (remaining > 0) {
+                SIZE_T chunk = min(remaining, (SIZE_T)4096);
+                if (!MmIsAddressValid(ptr)) break;
+                SHA256Update(&ctx, ptr, chunk);
+                ptr += chunk;
+                remaining -= chunk;
+            }
+            SHA256Final(rehash, &ctx);
+            hashed = TRUE;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        KeUnstackDetachProcess(&apcState);
+        ObDereferenceObject(proc);
+
+        if (!hashed) continue;
+
+        if (RtlCompareMemory(g_LsassAuthDlls[i].baselineHash,
+                rehash, SHA256_BLOCK_SIZE) != SHA256_BLOCK_SIZE) {
+            // MISMATCH — Skeleton Key or code patch detected!
+            char msg[256];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "SKELETON KEY: %s code modified in lsass (pid=%lu) — "
+                "Mimikatz misc::skeleton authentication backdoor detected",
+                g_LsassAuthDlls[i].dllName, g_LsassAuthDlls[i].lsassPid);
+
+            SIZE_T msgLen = strlen(msg) + 1;
+            PKERNEL_STRUCTURED_NOTIFICATION notif =
+                (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED,
+                    sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'skel');
+            if (notif) {
+                RtlZeroMemory(notif, sizeof(*notif));
+                SET_CRITICAL(*notif);
+                SET_IMAGE_LOAD_PATH_CHECK(*notif);
+                notif->pid = (HANDLE)(ULONG_PTR)g_LsassAuthDlls[i].lsassPid;
+                RtlStringCbCopyA(notif->procName, sizeof(notif->procName), "lsass.exe");
+                notif->msg = (char*)ExAllocatePool2(
+                    POOL_FLAG_NON_PAGED, msgLen, 'skmg');
+                notif->bufSize = (ULONG)msgLen;
+                if (notif->msg) {
+                    RtlCopyMemory(notif->msg, msg, msgLen);
+                    if (!bufQueue->Enqueue(notif)) {
+                        ExFreePool(notif->msg);
+                        ExFreePool(notif);
+                    }
+                } else {
+                    ExFreePool(notif);
+                }
+            }
+
+            // Update baseline so we fire once per modification
+            RtlCopyMemory(g_LsassAuthDlls[i].baselineHash,
+                rehash, SHA256_BLOCK_SIZE);
+        }
+    }
+}
+
+void HookDetector::InitLsassAuthLock() {
+    KeInitializeSpinLock(&g_LsassAuthLock);
+    g_LsassAuthInitialized = TRUE;
+}
+
+// ---------------------------------------------------------------------------
 // MajorFunction dispatch table integrity — detect BYOVD patching of our
 // IRP_MJ_DEVICE_CONTROL handler.  An attacker with kernel write can redirect
 // or NOP our IOCTL dispatcher, silencing all user-kernel communication.
@@ -1903,6 +2034,7 @@ VOID HookDetector::RunAllHookChecks(
     CheckCiIntegrity(bufQueue);
     CheckSeCiCallbackIntegrity(bufQueue);
     CheckEprocessProtection(bufQueue);
+    CheckLsassAuthDllIntegrity(bufQueue);
     CheckMajorFunctionIntegrity(bufQueue);
     CheckCallbackPrologueIntegrity(bufQueue);
 

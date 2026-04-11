@@ -500,6 +500,11 @@ static CriticalFuncGuard g_etwGuards[] = {
     { "ntdll.dll",  "NtTraceEvent",      nullptr, {}, false },
     { "amsi.dll",   "AmsiScanBuffer",    nullptr, {}, false },
     { "amsi.dll",   "AmsiOpenSession",   nullptr, {}, false },
+    // Mimikatz crypto::capi / crypto::cng patches these to force-export
+    // non-exportable private keys (CRYPT_EXPORTABLE flag bypass).
+    { "ncrypt.dll", "NCryptOpenStorageProvider", nullptr, {}, false },
+    { "ncrypt.dll", "NCryptExportKey",           nullptr, {}, false },
+    { "ncrypt.dll", "NCryptFreeObject",          nullptr, {}, false },
     { nullptr, nullptr, nullptr, {}, false }
 };
 

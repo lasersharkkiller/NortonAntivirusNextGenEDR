@@ -354,11 +354,16 @@ struct HashVerifyCtx {
 };
 
 // DLLs worth hashing — high-value targets for phantom DLL / unhooking attacks.
+// Includes lsass authentication DLLs for Skeleton Key (misc::skeleton) detection.
 static BOOLEAN ShouldHashImage(PUNICODE_STRING fullImageName) {
     if (!fullImageName || !fullImageName->Buffer) return FALSE;
     static const WCHAR* kHashTargets[] = {
         L"ntdll.dll", L"kernel32.dll", L"kernelbase.dll",
-        L"amsi.dll", L"clr.dll", L"clrjit.dll", nullptr
+        L"amsi.dll", L"clr.dll", L"clrjit.dll",
+        // lsass authentication DLLs — Skeleton Key patches these in-memory
+        L"msv1_0.dll", L"lsasrv.dll", L"wdigest.dll", L"kerberos.dll",
+        L"tspkg.dll", L"ncrypt.dll",
+        nullptr
     };
     for (int i = 0; kHashTargets[i]; i++) {
         if (UnicodeStringContains(fullImageName, kHashTargets[i]))
@@ -1457,6 +1462,9 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                     { "netapi32.dll", 12, "Domain replication attack (I_NetServerAuthenticate2)",   TRUE  },
                                     { "comsvcs.dll",  12, "LOLBin MiniDump export — rundll32 comsvcs.dll,MiniDump lsass dump", TRUE },
                                     { "system.identitymodel.dll", 26, "Kerberos S4U delegation abuse (Rubeus/S4U2Self/S4U2Proxy)", TRUE },
+                                    { "mimilib.dll",  11, "Mimikatz SSP DLL — credential logging/Skeleton Key helper",  TRUE  },
+                                    { "mimidrv.dll",  11, "Mimikatz driver companion DLL",                              TRUE  },
+                                    { "dpapi.dll",    9,  "DPAPI master key / credential blob decryption (Mimikatz dpapi module)", TRUE },
                                     { nullptr, 0, nullptr, FALSE }
                                 };
 
@@ -1936,6 +1944,51 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                     ImageInfo->ImageBase,
                     ImageInfo->ImageSize,
                     digest);
+
+                // --- Skeleton Key: record permanent baseline for auth DLLs in lsass ---
+                // If this DLL is an authentication DLL loading into lsass.exe,
+                // record it for periodic re-verification (every 30s) to detect
+                // Mimikatz misc::skeleton code patching hours after boot.
+                static const WCHAR* kAuthDlls[] = {
+                    L"msv1_0.dll", L"kerberos.dll", L"lsasrv.dll",
+                    L"wdigest.dll", L"tspkg.dll", L"ncrypt.dll", nullptr
+                };
+                BOOLEAN isAuthDll = FALSE;
+                const char* authName = nullptr;
+                for (int ai = 0; kAuthDlls[ai]; ai++) {
+                    if (UnicodeStringContains(FullImageName, kAuthDlls[ai])) {
+                        isAuthDll = TRUE;
+                        // Narrow the name for logging
+                        static const char* kAuthNarrow[] = {
+                            "msv1_0.dll", "kerberos.dll", "lsasrv.dll",
+                            "wdigest.dll", "tspkg.dll", "ncrypt.dll"
+                        };
+                        authName = kAuthNarrow[ai];
+                        break;
+                    }
+                }
+                if (isAuthDll && ProcessId != NULL) {
+                    PEPROCESS targetProc = nullptr;
+                    if (NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &targetProc))) {
+                        char* procName = PsGetProcessImageFileName(targetProc);
+                        if (procName) {
+                            char lower[16] = {};
+                            for (int li = 0; li < 15 && procName[li]; li++)
+                                lower[li] = (procName[li] >= 'A' && procName[li] <= 'Z')
+                                    ? procName[li] + 32 : procName[li];
+                            if (strcmp(lower, "lsass.exe") == 0) {
+                                HookDetector::RecordLsassAuthDll(
+                                    HandleToUlong(ProcessId),
+                                    ImageInfo->ImageBase,
+                                    ImageInfo->ImageSize,
+                                    digest, authName);
+                                DbgPrint("[+] Skeleton Key baseline: %s in lsass pid=%lu\n",
+                                    authName, HandleToUlong(ProcessId));
+                            }
+                        }
+                        ObDereferenceObject(targetProc);
+                    }
+                }
             }
         }
 

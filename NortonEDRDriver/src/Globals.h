@@ -1654,6 +1654,13 @@ public:
     static VOID     TakeEprocessProtBaseline();
     static VOID     CheckEprocessProtection(BufferQueue* bufQueue);
 
+    // Skeleton Key detection — periodic re-hash of lsass auth DLLs (msv1_0.dll,
+    // kerberos.dll, etc.).  Detects Mimikatz misc::skeleton code patching.
+    static VOID     InitLsassAuthLock();
+    static VOID     RecordLsassAuthDll(ULONG pid, PVOID imageBase, SIZE_T imageSize,
+                                        const BYTE* hash, const char* name);
+    static VOID     CheckLsassAuthDllIntegrity(BufferQueue* bufQueue);
+
     // MajorFunction dispatch table integrity — baseline IRP_MJ_DEVICE_CONTROL at init,
     // detect BYOVD patching that redirects or NOPs our IOCTL handler.
     static VOID     TakeMajorFunctionBaseline(PDRIVER_OBJECT drvObj);
