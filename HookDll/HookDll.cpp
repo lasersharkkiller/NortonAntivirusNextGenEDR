@@ -475,11 +475,130 @@ static void VerifyHooks() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ETW / AMSI critical function integrity monitoring (XPN "Hiding Your .NET")
+//
+// Attackers patch ntdll!EtwEventWrite or amsi!AmsiScanBuffer prologues with
+// a `ret` (0xC3) to blind ETW telemetry or AMSI scanning.  The prerequisite
+// VirtualProtect on image memory is caught by the kernel driver, but we add
+// a user-mode integrity check here as defense-in-depth.
+//
+// On first call, we snapshot the first 16 bytes of each function.
+// On each subsequent check, we compare and alert + restore if tampered.
+// ---------------------------------------------------------------------------
+struct CriticalFuncGuard {
+    const char* modName;
+    const char* funcName;
+    BYTE* addr;            // resolved address
+    BYTE  baseline[16];    // original prologue bytes
+    bool  valid;           // baseline captured
+};
+
+static CriticalFuncGuard g_etwGuards[] = {
+    { "ntdll.dll",  "EtwEventWrite",     nullptr, {}, false },
+    { "ntdll.dll",  "EtwEventWriteFull", nullptr, {}, false },
+    { "ntdll.dll",  "NtTraceEvent",      nullptr, {}, false },
+    { "amsi.dll",   "AmsiScanBuffer",    nullptr, {}, false },
+    { "amsi.dll",   "AmsiOpenSession",   nullptr, {}, false },
+    { nullptr, nullptr, nullptr, {}, false }
+};
+
+static void InitCriticalFuncGuards() {
+    for (int i = 0; g_etwGuards[i].modName; i++) {
+        HMODULE hMod = GetModuleHandleA(g_etwGuards[i].modName);
+        if (!hMod) continue;
+        BYTE* fn = (BYTE*)GetProcAddress(hMod, g_etwGuards[i].funcName);
+        if (!fn) continue;
+
+        g_etwGuards[i].addr = fn;
+        __try {
+            memcpy(g_etwGuards[i].baseline, fn, 16);
+            g_etwGuards[i].valid = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+}
+
+static void VerifyCriticalFuncIntegrity() {
+    for (int i = 0; g_etwGuards[i].modName; i++) {
+        CriticalFuncGuard& g = g_etwGuards[i];
+        if (!g.valid || !g.addr) continue;
+
+        // amsi.dll may not be loaded yet — re-resolve on each check
+        if (!g.valid && !g.addr) {
+            HMODULE hMod = GetModuleHandleA(g.modName);
+            if (!hMod) continue;
+            BYTE* fn = (BYTE*)GetProcAddress(hMod, g.funcName);
+            if (!fn) continue;
+            g.addr = fn;
+            __try {
+                memcpy(g.baseline, fn, 16);
+                g.valid = true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        }
+
+        bool tampered = false;
+        BYTE current[16] = {};
+        __try {
+            memcpy(current, g.addr, 16);
+            tampered = (memcmp(current, g.baseline, 16) != 0);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+
+        if (!tampered) continue;
+
+        // Identify the specific patch pattern for better alerting
+        const char* pattern = "unknown modification";
+        if (current[0] == 0xC3)
+            pattern = "ret (0xC3) — XPN ETW/AMSI blind technique";
+        else if (current[0] == 0xB8 && current[5] == 0xC3)
+            pattern = "mov eax,imm + ret — forced clean return";
+        else if (current[0] == 0x33 && current[1] == 0xC0 && current[2] == 0xC3)
+            pattern = "xor eax,eax + ret — forced S_OK return";
+        else if (current[0] == 0x48 && current[1] == 0x31 && current[2] == 0xC0 && current[3] == 0xC3)
+            pattern = "xor rax,rax + ret — forced zero return (x64)";
+
+        char det[256];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "%s!%s prologue patched: %s — "
+            "original %02X%02X%02X%02X now %02X%02X%02X%02X",
+            g.modName, g.funcName, pattern,
+            g.baseline[0], g.baseline[1], g.baseline[2], g.baseline[3],
+            current[0], current[1], current[2], current[3]);
+        SendHookEvent("Critical", "EtwAmsiIntegrity", 0, det);
+
+        // Restore the original prologue to re-enable ETW/AMSI
+        DWORD old = 0;
+        if (g_vpOriginal &&
+            g_vpOriginal(g.addr, 16, PAGE_EXECUTE_READWRITE, &old)) {
+            memcpy(g.addr, g.baseline, 16);
+            g_vpOriginal(g.addr, 16, old, &old);
+        }
+    }
+}
+
+// Check for amsi.dll loads that happened after our initial scan
+static void RefreshAmsiGuards() {
+    for (int i = 0; g_etwGuards[i].modName; i++) {
+        if (g_etwGuards[i].valid) continue;
+        HMODULE hMod = GetModuleHandleA(g_etwGuards[i].modName);
+        if (!hMod) continue;
+        BYTE* fn = (BYTE*)GetProcAddress(hMod, g_etwGuards[i].funcName);
+        if (!fn) continue;
+        g_etwGuards[i].addr = fn;
+        __try {
+            memcpy(g_etwGuards[i].baseline, fn, 16);
+            g_etwGuards[i].valid = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+}
+
 static DWORD WINAPI WatchThreadProc(LPVOID) {
     // WaitForSingleObject with 2000 ms timeout: fires VerifyHooks on each expiry,
     // exits cleanly when g_watchStop is signalled from RemoveHooks().
-    while (WaitForSingleObject(g_watchStop, 2000) == WAIT_TIMEOUT)
+    while (WaitForSingleObject(g_watchStop, 2000) == WAIT_TIMEOUT) {
         VerifyHooks();
+        RefreshAmsiGuards();
+        VerifyCriticalFuncIntegrity();
+    }
     return 0;
 }
 
@@ -1602,6 +1721,10 @@ void InstallHooks() {
             CloseHandle(hDev);
         }
     }
+
+    // Snapshot ETW/AMSI critical function prologues before the watch thread starts.
+    // These baselines are checked every 2s to detect XPN-style patching.
+    InitCriticalFuncGuards();
 
     // Start the hook-integrity watch thread.
     // WatchThreadProc is inside HookDll so IsAddressInKnownModule() returns true
