@@ -751,6 +751,7 @@ class SyscallsUtils {
 	static ULONG NtSetInformationThreadId;    // Variable — token impersonation detection
 	static ULONG NtTraceControlId;            // Variable — ETW manipulation detection
 	static ULONG NtCreateNamedPipeFileId;     // Variable — named pipe C2 detection
+	static ULONG NtCreateMailslotFileId;      // Variable — mailslot C2 / lateral movement detection
 	static ULONG NtOpenThreadId;              // Variable — thread hijack / context scrape detection
 	static ULONG NtFlushInstructionCacheId;   // Variable — post-injection cache flush detection
 	static ULONG NtCreateFileId;             // Variable — physical memory / raw device access detection (IOMMU bypass)
@@ -1017,6 +1018,11 @@ public:
 		PVOID ObjectAttributes
 	);
 
+	// Mailslot C2 / lateral movement / domain enumeration detection
+	static VOID NtCreateMailslotFileHandler(
+		PVOID ObjectAttributes
+	);
+
 	// Thread hijack / context scrape detection
 	static VOID NtOpenThreadHandler(
 		HANDLE      ThreadHandle,
@@ -1225,6 +1231,16 @@ public:
         PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
 
     static NTSTATUS FLTAPI FilterUnloadCallback(FLT_FILTER_UNLOAD_FLAGS Flags);
+
+    // InstanceSetup — accept attachment to npfs (Named Pipe FS) and msfs (Mailslot FS)
+    // in addition to normal NTFS volumes.
+    static NTSTATUS FLTAPI InstanceSetupCallback(
+        PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_SETUP_FLAGS Flags,
+        DEVICE_TYPE VolumeDeviceType, FLT_FILESYSTEM_TYPE VolumeFilesystemType);
+
+    // Named Pipe FS (npfs.sys) monitoring — pipe connect / impersonation detection
+    static FLT_PREOP_CALLBACK_STATUS FLTAPI PreCreateNpfs(
+        PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
 
     // Herpaderping: track FILE_OBJECTs used to back active SEC_IMAGE sections.
     // Called from NtCreateSectionHandler when SEC_IMAGE + file handle are both present.

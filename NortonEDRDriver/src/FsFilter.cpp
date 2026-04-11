@@ -394,7 +394,8 @@ static FLT_REGISTRATION g_FltRegistration = {
     nullptr,                        // ContextRegistration
     g_FsCallbacks,
     FsFilter::FilterUnloadCallback,
-    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
+    FsFilter::InstanceSetupCallback,  // InstanceSetupCallback — accept npfs/msfs volumes
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
 };
 
 // ---------------------------------------------------------------------------
@@ -457,9 +458,66 @@ NTSTATUS FLTAPI FsFilter::FilterUnloadCallback(FLT_FILTER_UNLOAD_FLAGS Flags) {
 }
 
 // ---------------------------------------------------------------------------
-// IRP_MJ_CREATE — credential access + executable drop detection
+// InstanceSetup — accept attachment to Named Pipe FS (npfs) and Mailslot FS
+// (msfs) volumes in addition to regular file system volumes.
+// The Filter Manager calls this for every volume it discovers; returning
+// STATUS_SUCCESS means "attach here", STATUS_FLT_DO_NOT_ATTACH means "skip".
 // ---------------------------------------------------------------------------
-FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
+NTSTATUS FLTAPI FsFilter::InstanceSetupCallback(
+    PCFLT_RELATED_OBJECTS      FltObjects,
+    FLT_INSTANCE_SETUP_FLAGS   Flags,
+    DEVICE_TYPE                VolumeDeviceType,
+    FLT_FILESYSTEM_TYPE        VolumeFilesystemType
+) {
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(Flags);
+    UNREFERENCED_PARAMETER(VolumeDeviceType);
+
+    // Attach to: NTFS, npfs (Named Pipe File System), msfs (Mailslot File System)
+    switch (VolumeFilesystemType) {
+    case FLT_FSTYPE_NTFS:
+    case FLT_FSTYPE_NPFS:   // Named Pipe File System
+    case FLT_FSTYPE_MSFS:   // Mailslot File System
+        return STATUS_SUCCESS;
+    default:
+        // Still attach to other FS types (FAT, ReFS, etc.) for broad coverage
+        return STATUS_SUCCESS;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Named Pipe FS pre-create callback — monitors pipe open/connect operations.
+//
+// When a process opens a named pipe (IRP_MJ_CREATE on npfs volume), this
+// detects pipe impersonation attacks and suspicious pipe access patterns:
+//   - FILE_CREATE_PIPE_INSTANCE: creating a rogue instance to intercept clients
+//   - Pipe opens with WRITE_DAC/WRITE_OWNER: DACL manipulation on pipes
+//   - Access to known sensitive pipes from unexpected processes
+// ---------------------------------------------------------------------------
+static const PCWSTR kSensitivePipes[] = {
+    L"lsarpc",            // LSA RPC — credential theft
+    L"samr",              // SAM Remote Protocol — user enumeration
+    L"svcctl",            // Service Control Manager — remote service creation
+    L"atsvc",             // Task Scheduler — remote task creation
+    L"epmapper",          // RPC Endpoint Mapper
+    L"eventlog",          // Event Log — log manipulation
+    L"winreg",            // Remote Registry
+    L"srvsvc",            // Server Service — share enumeration
+    L"wkssvc",            // Workstation Service
+    L"spoolss",           // Print Spooler — PrintNightmare
+};
+
+// Known C2 pipe name patterns (substring match) — same set as the syscall hook
+// but checked here on the open/connect side for processes that didn't create the pipe.
+static const PCWSTR kC2PipePatternsFs[] = {
+    L"msagent_",       L"MSSE-",          L"postex_",
+    L"postex_ssh_",    L"status_",        L"mojo.5688.8052",
+    L"win_svc",        L"ntsvcs_",        L"scerpc_",
+    L"meterpreter",    L"PSEXESVC",       L"RemCom",
+    L"csexec",         L"winsvc_",
+};
+
+FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreateNpfs(
     PFLT_CALLBACK_DATA         Data,
     PCFLT_RELATED_OBJECTS      FltObjects,
     PVOID*                     CompletionContext
@@ -468,6 +526,144 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
     UNREFERENCED_PARAMETER(CompletionContext);
 
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    PEPROCESS process  = IoThreadToProcess(Data->Thread);
+    HANDLE    pid      = PsGetProcessId(process);
+    char*     procName = PsGetProcessImageFileName(process);
+
+    // Skip system processes
+    if ((ULONG_PTR)pid <= 4) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (procName) {
+        char lower[16] = {};
+        for (int i = 0; i < 15 && procName[i]; i++)
+            lower[i] = (procName[i] >= 'A' && procName[i] <= 'Z') ? procName[i] + 32 : procName[i];
+        if (strcmp(lower, "system") == 0 || strcmp(lower, "svchost.exe") == 0 ||
+            strcmp(lower, "services.exe") == 0 || strcmp(lower, "lsass.exe") == 0 ||
+            strcmp(lower, "wininit.exe") == 0 || strcmp(lower, "csrss.exe") == 0)
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    PFLT_FILE_NAME_INFORMATION nameInfo = nullptr;
+    NTSTATUS status = FltGetFileNameInformation(
+        Data,
+        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+        &nameInfo);
+    if (!NT_SUCCESS(status) || !nameInfo) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    __try {
+        if (!NT_SUCCESS(FltParseFileNameInformation(nameInfo))) __leave;
+
+        // ---- C2 framework pipe pattern on connect side ----
+        for (SIZE_T i = 0; i < ARRAYSIZE(kC2PipePatternsFs); i++) {
+            if (WcsContainsLower(&nameInfo->FinalComponent, kC2PipePatternsFs[i])) {
+                char msg[224];
+                RtlStringCchPrintfA(msg, sizeof(msg),
+                    "FS-NPFS: Process '%s' (pid=%llu) connecting to C2-pattern pipe "
+                    "(Cobalt Strike / Metasploit / PsExec)",
+                    procName ? procName : "?", (ULONG64)(ULONG_PTR)pid);
+                EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                __leave;
+            }
+        }
+
+        // ---- Sensitive pipe access from non-SMB-server processes ----
+        // RPC pipes like lsarpc, samr, svcctl are normally opened by svchost/lsass.
+        // A random user process opening them may indicate lateral movement tools
+        // (Impacket, CrackMapExec, etc.) running locally.
+        for (SIZE_T i = 0; i < ARRAYSIZE(kSensitivePipes); i++) {
+            if (WcsContainsLower(&nameInfo->FinalComponent, kSensitivePipes[i])) {
+                char pipeBuf[64] = {};
+                ANSI_STRING ansiPipe;
+                if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiPipe, &nameInfo->FinalComponent, TRUE))) {
+                    SIZE_T n = ansiPipe.Length < sizeof(pipeBuf) - 1 ? ansiPipe.Length : sizeof(pipeBuf) - 1;
+                    RtlCopyMemory(pipeBuf, ansiPipe.Buffer, n);
+                    RtlFreeAnsiString(&ansiPipe);
+                }
+                char msg[224];
+                RtlStringCchPrintfA(msg, sizeof(msg),
+                    "FS-NPFS: Sensitive RPC pipe access — pipe=%s by '%s' (pid=%llu) "
+                    "— possible lateral movement / credential access",
+                    pipeBuf[0] ? pipeBuf : "?",
+                    procName ? procName : "?",
+                    (ULONG64)(ULONG_PTR)pid);
+                EnqueueFsAlert(pid, procName, msg, FALSE);  // WARNING
+                __leave;
+            }
+        }
+
+        // ---- Pipe impersonation: FILE_CREATE_PIPE_INSTANCE from non-service process ----
+        // Creating a new instance of an existing pipe allows intercepting clients that
+        // connect to it — classic impersonation attack (e.g. potato privilege escalation).
+        ACCESS_MASK desiredAccess =
+            Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+        ULONG createOptions = Data->Iopb->Parameters.Create.Options & 0x00FFFFFF;
+
+        if (createOptions & FILE_CREATE_PIPE_INSTANCE) {
+            char pipeBuf[64] = {};
+            ANSI_STRING ansiPipe;
+            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiPipe, &nameInfo->FinalComponent, TRUE))) {
+                SIZE_T n = ansiPipe.Length < sizeof(pipeBuf) - 1 ? ansiPipe.Length : sizeof(pipeBuf) - 1;
+                RtlCopyMemory(pipeBuf, ansiPipe.Buffer, n);
+                RtlFreeAnsiString(&ansiPipe);
+            }
+            char msg[224];
+            RtlStringCchPrintfA(msg, sizeof(msg),
+                "FS-NPFS: Pipe instance creation (impersonation risk) — pipe=%s "
+                "by '%s' (pid=%llu) — possible potato / pipe impersonation attack",
+                pipeBuf[0] ? pipeBuf : "?",
+                procName ? procName : "?",
+                (ULONG64)(ULONG_PTR)pid);
+            EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+        }
+
+        // ---- DACL manipulation on pipes ----
+        if (desiredAccess & (WRITE_DAC | WRITE_OWNER)) {
+            char pipeBuf[64] = {};
+            ANSI_STRING ansiPipe;
+            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiPipe, &nameInfo->FinalComponent, TRUE))) {
+                SIZE_T n = ansiPipe.Length < sizeof(pipeBuf) - 1 ? ansiPipe.Length : sizeof(pipeBuf) - 1;
+                RtlCopyMemory(pipeBuf, ansiPipe.Buffer, n);
+                RtlFreeAnsiString(&ansiPipe);
+            }
+            char msg[224];
+            RtlStringCchPrintfA(msg, sizeof(msg),
+                "FS-NPFS: DACL/owner modification on pipe=%s by '%s' (pid=%llu)",
+                pipeBuf[0] ? pipeBuf : "?",
+                procName ? procName : "?",
+                (ULONG64)(ULONG_PTR)pid);
+            EnqueueFsAlert(pid, procName, msg, FALSE);  // WARNING
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    FltReleaseFileNameInformation(nameInfo);
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+// ---------------------------------------------------------------------------
+// IRP_MJ_CREATE — credential access + executable drop detection
+// ---------------------------------------------------------------------------
+FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
+    PFLT_CALLBACK_DATA         Data,
+    PCFLT_RELATED_OBJECTS      FltObjects,
+    PVOID*                     CompletionContext
+) {
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    // Route to specialised handler when attached to Named Pipe File System (npfs.sys)
+    if (FltObjects && FltObjects->FileObject) {
+        FLT_FILESYSTEM_TYPE fsType = FLT_FSTYPE_UNKNOWN;
+        NTSTATUS volStatus = FltGetFileSystemType(FltObjects->Instance, &fsType);
+        if (NT_SUCCESS(volStatus)) {
+            if (fsType == FLT_FSTYPE_NPFS)
+                return FsFilter::PreCreateNpfs(Data, FltObjects, CompletionContext);
+            // msfs (mailslot) creates are also caught here — the syscall hook already
+            // covers creation; on the open side there's little to flag beyond what
+            // the pipe handler does, so we skip for now.
+        }
+    }
 
     PFLT_FILE_NAME_INFORMATION nameInfo = nullptr;
     NTSTATUS status = FltGetFileNameInformation(
@@ -499,6 +695,54 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
                     pathBuf[0] ? pathBuf : "?", (ULONG64)(ULONG_PTR)pid);
                 EnqueueFsAlert(pid, procName, msg, FALSE);
                 __leave;
+            }
+        }
+
+        // ---- NTFS metadata stream direct access (anti-forensics / ACL bypass) ----
+        // Tools like RawCopy, Invoke-NinjaCopy, and forensic utilities directly open
+        // NTFS metadata files ($MFT, $UsnJrnl, $LogFile, $Boot) to:
+        //   - Dump SAM/SYSTEM hives bypassing file-level ACLs ($MFT raw read)
+        //   - Tamper with or read the USN change journal ($UsnJrnl) for anti-forensics
+        //   - Wipe transaction logs ($LogFile) to cover tracks
+        //   - Read/modify boot sector ($Boot) for bootkits
+        // Only NTFS driver (System) should access these directly.
+        {
+            static const PCWSTR kNtfsMetaStreams[] = {
+                L"$mft",
+                L"$mftmirr",
+                L"$logfile",
+                L"$boot",
+                L"$bitmap",
+                L"$secure",
+                L"$upcase",
+                L"$extend\\$usnjrnl",
+                L"$extend\\$objid",
+                L"$extend\\$reparse",
+                L"$extend\\$quota",
+            };
+
+            for (SIZE_T i = 0; i < ARRAYSIZE(kNtfsMetaStreams); i++) {
+                if (WcsContainsLower(&nameInfo->Name, kNtfsMetaStreams[i])) {
+                    // Only System (PID 4) should access these
+                    if ((ULONG_PTR)pid <= 4) break;
+
+                    char metaBuf[64] = {};
+                    ANSI_STRING ansiMeta;
+                    if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiMeta, &nameInfo->FinalComponent, TRUE))) {
+                        SIZE_T n = ansiMeta.Length < sizeof(metaBuf) - 1 ? ansiMeta.Length : sizeof(metaBuf) - 1;
+                        RtlCopyMemory(metaBuf, ansiMeta.Buffer, n);
+                        RtlFreeAnsiString(&ansiMeta);
+                    }
+                    char msg[224];
+                    RtlStringCchPrintfA(msg, sizeof(msg),
+                        "FS: Direct NTFS metadata access — %s by '%s' (pid=%llu) "
+                        "— possible raw disk read / anti-forensics",
+                        metaBuf[0] ? metaBuf : "?",
+                        procName ? procName : "?",
+                        (ULONG64)(ULONG_PTR)pid);
+                    EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                    break;
+                }
             }
         }
 

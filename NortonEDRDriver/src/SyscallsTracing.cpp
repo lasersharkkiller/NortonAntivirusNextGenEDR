@@ -61,6 +61,7 @@ ULONG SyscallsUtils::NtDebugActiveProcessId = 0;       // Resolve dynamically
 ULONG SyscallsUtils::NtSetInformationThreadId = 0;     // Resolve dynamically
 ULONG SyscallsUtils::NtTraceControlId = 0;             // Resolve dynamically
 ULONG SyscallsUtils::NtCreateNamedPipeFileId = 0;      // Resolve dynamically
+ULONG SyscallsUtils::NtCreateMailslotFileId = 0;       // Resolve dynamically
 ULONG SyscallsUtils::NtOpenThreadId = 0;               // Resolve dynamically
 ULONG SyscallsUtils::NtFlushInstructionCacheId = 0;    // Resolve dynamically
 ULONG SyscallsUtils::NtCreateFileId = 0;              // Resolve dynamically — physical memory / raw device access detection
@@ -685,6 +686,12 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		PVOID objAttr = (PVOID)trapFrame->Rdx;
 		NtCreateNamedPipeFileHandler(objAttr);
 	}
+	else if (NtCreateMailslotFileId != 0 && id == NtCreateMailslotFileId) {
+		// NtCreateMailslotFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, CreateOptions, MailslotQuota, MaximumMessageSize, ReadTimeout)
+		// ObjectAttributes = arg3 = R8
+		PVOID objAttr = (PVOID)trapFrame->R8;
+		NtCreateMailslotFileHandler(objAttr);
+	}
 	else if (NtOpenThreadId != 0 && id == NtOpenThreadId) {
 		// NtOpenThread(ThreadHandle*, DesiredAccess, ObjectAttributes, ClientId)
 		// RCX=handle ptr, RDX=access, R8=ObjAttr, R9=ClientId
@@ -1154,6 +1161,10 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtCreateNamedPipeFile;
 	RtlInitUnicodeString(&usNtCreateNamedPipeFile, L"NtCreateNamedPipeFile");
 	NtCreateNamedPipeFileId = getSSNByName(ssdtTable, &usNtCreateNamedPipeFile, exportsMap);
+
+	UNICODE_STRING usNtCreateMailslotFile;
+	RtlInitUnicodeString(&usNtCreateMailslotFile, L"NtCreateMailslotFile");
+	NtCreateMailslotFileId = getSSNByName(ssdtTable, &usNtCreateMailslotFile, exportsMap);
 
 	UNICODE_STRING usNtOpenThread;
 	RtlInitUnicodeString(&usNtOpenThread, L"NtOpenThread");
@@ -3124,6 +3135,125 @@ VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes)
 			char msg[128];
 			RtlStringCbPrintfA(msg, sizeof(msg),
 				"NtCreateNamedPipeFile: non-system process creating named pipe");
+			EmitSyscallNotif(0, msg, caller, nullptr, FALSE); // WARNING
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// NtCreateMailslotFile — detect mailslot-based C2, lateral movement, and
+// domain enumeration.
+//
+// Mailslots (\Device\Mailslot\*) provide one-to-many broadcast IPC.
+// Legitimate usage is narrow: NETLOGON (\Mailslot\NET\GETDC*),
+// browser service (\Mailslot\BROWSE), and DFS referrals.
+// Any other mailslot creation from a non-system process is suspicious —
+// malware uses them for covert C2 channels and lateral movement signalling.
+// ---------------------------------------------------------------------------
+VOID SyscallsUtils::NtCreateMailslotFileHandler(PVOID ObjectAttributes)
+{
+	// Well-known system mailslots — creation by system services is expected
+	static const WCHAR* kSystemMailslots[] = {
+		L"\\Device\\Mailslot\\NET\\GETDC",       // NETLOGON domain controller locator
+		L"\\Device\\Mailslot\\NET\\NETLOGON",     // NETLOGON additional queries
+		L"\\Device\\Mailslot\\BROWSE",            // Computer Browser service
+		L"\\Device\\Mailslot\\53cb31a0-70c5-11d1", // DFS referral service
+		L"\\Device\\Mailslot\\HydraLs\\",         // Terminal Services licensing
+		L"\\Device\\Mailslot\\Resp\\",            // Browser election response
+		nullptr
+	};
+
+	// System processes that legitimately create mailslots
+	static const char* kSystemProcs[] = {
+		"services.exe", "svchost.exe", "lsass.exe",
+		"wininit.exe", "csrss.exe", "system", nullptr
+	};
+
+	PEPROCESS caller = IoGetCurrentProcess();
+
+	// Skip kernel/PPL callers
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	char* name = PsGetProcessImageFileName(caller);
+	if (!name) return;
+	char lower[16] = {};
+	for (int i = 0; i < 15 && name[i]; i++)
+		lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i];
+
+	for (int i = 0; kSystemProcs[i]; i++) {
+		if (strcmp(lower, kSystemProcs[i]) == 0) return;
+	}
+
+	// Extract mailslot name from ObjectAttributes
+	if (!ObjectAttributes || !MmIsAddressValid(ObjectAttributes)) return;
+
+	OBJECT_ATTRIBUTES* objAttr = (OBJECT_ATTRIBUTES*)ObjectAttributes;
+	if (!objAttr->ObjectName || !MmIsAddressValid(objAttr->ObjectName)) return;
+
+	UNICODE_STRING* slotName = (UNICODE_STRING*)objAttr->ObjectName;
+	if (!slotName->Length || !MmIsAddressValid(slotName->Buffer)) return;
+
+	// Check against system mailslot list (prefix match — e.g. GETDC* variants)
+	BOOLEAN isSystemSlot = FALSE;
+	for (int i = 0; kSystemMailslots[i]; i++) {
+		UNICODE_STRING sysSlot;
+		RtlInitUnicodeString(&sysSlot, kSystemMailslots[i]);
+		// Prefix match: system slot name is a prefix of the actual name
+		if (slotName->Length >= sysSlot.Length) {
+			UNICODE_STRING prefix;
+			prefix.Buffer = slotName->Buffer;
+			prefix.Length = sysSlot.Length;
+			prefix.MaximumLength = sysSlot.Length;
+			if (RtlEqualUnicodeString(&prefix, &sysSlot, TRUE)) {
+				isSystemSlot = TRUE;
+				break;
+			}
+		}
+	}
+
+	if (!isSystemSlot) {
+		// Check for especially suspicious patterns — escalate to CRITICAL
+		static const WCHAR* kSusPatterns[] = {
+			L"cobaltstrike",     // Obvious but some samples use it
+			L"beacon",           // Generic beacon signalling
+			L"meterpreter",      // Metasploit
+			L"c2channel",        // Generic C2
+			L"exfil",            // Data exfiltration
+			nullptr
+		};
+
+		BOOLEAN isSuspicious = FALSE;
+		for (int i = 0; kSusPatterns[i]; i++) {
+			UNICODE_STRING pattern;
+			RtlInitUnicodeString(&pattern, kSusPatterns[i]);
+			if (slotName->Length >= pattern.Length) {
+				USHORT maxOff = (slotName->Length - pattern.Length) / sizeof(WCHAR);
+				for (USHORT off = 0; off <= maxOff; off++) {
+					UNICODE_STRING slice;
+					slice.Buffer = slotName->Buffer + off;
+					slice.Length = pattern.Length;
+					slice.MaximumLength = pattern.Length;
+					if (RtlEqualUnicodeString(&slice, &pattern, TRUE)) {
+						isSuspicious = TRUE;
+						break;
+					}
+				}
+			}
+			if (isSuspicious) break;
+		}
+
+		if (isSuspicious) {
+			char msg[196];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtCreateMailslotFile: suspicious mailslot pattern detected "
+				"— possible C2 channel by '%s'", lower);
+			EmitSyscallNotif(0, msg, caller, nullptr, TRUE); // CRITICAL
+		} else {
+			char msg[160];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtCreateMailslotFile: non-system process '%s' creating mailslot "
+				"— possible covert IPC / lateral movement", lower);
 			EmitSyscallNotif(0, msg, caller, nullptr, FALSE); // WARNING
 		}
 	}
