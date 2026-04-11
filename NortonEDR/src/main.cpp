@@ -3495,13 +3495,13 @@ bool InstallNortonEDRDriver(
         drvName.c_str(),
         drvName.c_str(),
         SERVICE_ALL_ACCESS,
-        SERVICE_KERNEL_DRIVER,
+        SERVICE_FILE_SYSTEM_DRIVER,
         SERVICE_DEMAND_START,
         SERVICE_ERROR_NORMAL,
         drvPath.c_str(),
+        L"FSFilter Anti-Virus",     // LoadOrderGroup — must match INF and altitude range
         NULL,
-        NULL,
-        NULL,
+        L"FltMgr\0",               // Dependencies — Filter Manager must load first
         NULL,
         NULL
     );
@@ -3539,7 +3539,7 @@ bool InstallNortonEDRDriver(
             RegCloseKey(hk);
         }
         if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, instKey, 0, nullptr, 0, KEY_WRITE, nullptr, &hk, nullptr) == ERROR_SUCCESS) {
-            const wchar_t* altitude = L"265000";
+            const wchar_t* altitude = L"320021";
             RegSetValueExW(hk, L"Altitude", 0, REG_SZ,
                            (const BYTE*)altitude, (DWORD)((wcslen(altitude) + 1) * sizeof(wchar_t)));
             DWORD flags = 0;

@@ -1,10 +1,11 @@
 #include "Globals.h"
 
 // ---------------------------------------------------------------------------
-// Minifilter altitude — FSFilter Activity Monitor range (260000–269999)
-// Must match the value written to the registry by the user-mode installer.
+// Minifilter altitude — FSFilter Anti-Virus range (320000–329999)
+// Must match the value written to the registry by the user-mode installer
+// and the INF [Instance.DefaultInstance] section.
 // ---------------------------------------------------------------------------
-#define NORTONAV_FS_ALTITUDE L"265000"
+#define NORTONAV_FS_ALTITUDE L"320021"
 
 // ---------------------------------------------------------------------------
 // Globals
