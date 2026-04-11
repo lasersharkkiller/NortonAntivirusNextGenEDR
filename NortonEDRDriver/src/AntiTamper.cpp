@@ -392,6 +392,13 @@ static VOID CheckDseIntegrity()
                     "DSE BYPASS: g_CiEnabled in ci.dll = 0 — "
                     "driver signature enforcement disabled, unsigned kernel code may be loaded");
                 EmitKernelCheckAlert(msg, SetDseBit);
+
+                // Auto-restore: re-enable CI to block further unsigned loads.
+                // Typical production value is 6 (ENABLED | KERNEL_DEBUGGER_ENABLED).
+                // We restore to 6 as a safe default that enables enforcement.
+                *gCiEnabled = 6;
+                DbgPrint("[!] AntiTamper: g_CiEnabled RESTORED to 6 "
+                    "(was 0 — DSEFix/BYOVD bypass neutralized)\n");
             }
         } else {
             DbgPrint("[-] DSE check: g_CiEnabled not found in ci.dll exports\n");
@@ -408,6 +415,8 @@ static VOID CheckDseIntegrity()
                 DbgPrint("[+] AntiTamper: g_CiOptions baseline captured: 0x%lX\n", opts);
             }
 
+            BOOLEAN tampered = FALSE;
+
             // Check 1: enforcement bit (bit 0) cleared — STATUS_INVALID_IMAGE_HASH bypassed
             if (!(opts & 0x01)) {
                 char msg[200];
@@ -416,6 +425,7 @@ static VOID CheckDseIntegrity()
                     "cleared; STATUS_INVALID_IMAGE_HASH bypassed, unsigned images will load",
                     opts);
                 EmitKernelCheckAlert(msg, SetDseBit);
+                tampered = TRUE;
             }
 
             // Check 2: test-signing bit (bit 1) set at runtime — not expected in production
@@ -427,19 +437,42 @@ static VOID CheckDseIntegrity()
                     "set at runtime (was 0x%lX at boot); test-signed drivers now accepted",
                     opts, (ULONG)s_CiOptionsBaseline);
                 EmitKernelCheckAlert(msg, SetDseBit);
+                tampered = TRUE;
             }
 
-            // Check 3: value changed from baseline — any runtime modification is suspicious
-            if (s_CiOptionsBaseline != -1 && opts != (ULONG)s_CiOptionsBaseline) {
-                // Only alert if we haven't already fired one of the specific checks above
-                if ((opts & 0x01) && !((opts & 0x02) && !((ULONG)s_CiOptionsBaseline & 0x02))) {
-                    char msg[200];
-                    RtlStringCbPrintfA(msg, sizeof(msg),
-                        "DSE TAMPER: g_CiOptions changed from 0x%lX to 0x%lX — "
-                        "runtime CI policy modification (possible BYOVD attack)",
-                        (ULONG)s_CiOptionsBaseline, opts);
-                    EmitKernelCheckAlert(msg, SetDseBit);
-                }
+            // Check 3: UMCI/WDAC bit (bit 3) cleared at runtime — user-mode CI disabled
+            if (s_CiOptionsBaseline != -1 &&
+                ((ULONG)s_CiOptionsBaseline & 0x08) && !(opts & 0x08)) {
+                char msg[200];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "DSE BYPASS: g_CiOptions = 0x%lX — CODEINTEGRITY_OPTION_UMCI (bit 3) "
+                    "cleared at runtime (was 0x%lX); WDAC user-mode CI enforcement disabled",
+                    opts, (ULONG)s_CiOptionsBaseline);
+                EmitKernelCheckAlert(msg, SetDseBit);
+                tampered = TRUE;
+            }
+
+            // Check 4: value changed from baseline — any runtime modification is suspicious
+            if (!tampered && s_CiOptionsBaseline != -1 &&
+                opts != (ULONG)s_CiOptionsBaseline) {
+                char msg[200];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "DSE TAMPER: g_CiOptions changed from 0x%lX to 0x%lX — "
+                    "runtime CI policy modification (possible BYOVD attack)",
+                    (ULONG)s_CiOptionsBaseline, opts);
+                EmitKernelCheckAlert(msg, SetDseBit);
+                tampered = TRUE;
+            }
+
+            // Auto-restore: write the baseline value back to g_CiOptions.
+            // This actively counteracts the BYOVD bypass — the attacker can
+            // re-patch, but we re-check every 30s, creating a restoration loop
+            // that buys time for incident response and blocks unsigned loads.
+            if (tampered && s_CiOptionsBaseline != -1) {
+                ULONG restored = (ULONG)s_CiOptionsBaseline;
+                *gCiOptions = restored;
+                DbgPrint("[!] AntiTamper: g_CiOptions RESTORED to baseline 0x%lX "
+                    "(was 0x%lX — BYOVD bypass neutralized)\n", restored, opts);
             }
         } else {
             DbgPrint("[-] DSE check: g_CiOptions not found in ci.dll exports\n");
