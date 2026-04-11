@@ -92,6 +92,32 @@ static const PCWSTR kDropPaths[] = {
 };
 
 // ---------------------------------------------------------------------------
+// Protected binary directories — write-open of existing executables here is
+// suspicious (DLL hijack, binary replacement, trojanizing signed binaries).
+// ---------------------------------------------------------------------------
+static const PCWSTR kProtectedBinPaths[] = {
+    L"\\windows\\system32\\",
+    L"\\windows\\syswow64\\",
+    L"\\program files\\",
+    L"\\program files (x86)\\",
+    L"\\windows\\winsxs\\",
+    L"\\windows\\microsoft.net\\",
+};
+
+// Processes allowed to write to protected binary paths
+static const char* kBinWriteAllowedProcs[] = {
+    "TrustedInsta",     // TrustedInstaller (15-char PsGetProcessImageFileName truncation)
+    "msiexec.exe",      // Windows Installer
+    "svchost.exe",      // Windows Update / CBS
+    "poqexec.exe",      // Servicing stack
+    "DismHost.exe",     // DISM servicing
+    "tiworker.exe",     // Windows Update worker
+    "MsMpEng.exe",      // Defender
+    "NortonEDR.exe",    // Our own user-mode service
+    nullptr
+};
+
+// ---------------------------------------------------------------------------
 // Volume Shadow Copy paths (lowercase) — ransomware deletes VSS before encrypting
 // ---------------------------------------------------------------------------
 static const PCWSTR kVssPaths[] = {
@@ -452,6 +478,223 @@ NTSTATUS FsFilter::Init(PDRIVER_OBJECT DriverObject, NotifQueue* queue) {
     }
 
     DbgPrint("[+] Filesystem minifilter registered (altitude %ws)\n", NORTONAV_FS_ALTITUDE);
+
+    // -----------------------------------------------------------------------
+    // Altitude squatting / sandwiching detection.
+    //
+    // After we register, enumerate all loaded minifilters and check:
+    //   1) Any OTHER filter at our exact altitude → altitude squatting
+    //   2) Any filter at altitude (ours+1 .. ours+10) → sandwiching attack
+    //      (an attacker positions a filter just above ours to intercept/hide I/O)
+    //
+    // FltEnumerateFilterInformation returns FILTER_AGGREGATE_STANDARD_INFORMATION
+    // which includes the filter name and instance altitude strings.
+    // -----------------------------------------------------------------------
+    {
+        ULONG bytesNeeded = 0;
+        ULONG ourAltitude = 320021;
+        ULONG idx = 0;
+        NTSTATUS enumSt;
+
+        // Stack buffer for most minifilter info structs (~512 bytes typical)
+        UCHAR infoBuf[1024];
+
+        while (TRUE) {
+            enumSt = FltEnumerateFilterInformation(
+                idx, FilterAggregateStandardInformation,
+                infoBuf, sizeof(infoBuf), &bytesNeeded);
+
+            if (enumSt == STATUS_NO_MORE_ENTRIES) break;
+
+            if (!NT_SUCCESS(enumSt)) {
+                idx++;
+                continue;
+            }
+
+            PFILTER_AGGREGATE_STANDARD_INFORMATION info =
+                (PFILTER_AGGREGATE_STANDARD_INFORMATION)infoBuf;
+
+            // Only process entries that have the MiniFilter field
+            if (info->Flags & FLTFL_ASI_IS_MINIFILTER) {
+                // The structure layout differs between Type1 and Type2;
+                // both have FilterNameBufferOffset/Length and Altitude fields
+                // in the FILTER_AGGREGATE_STANDARD_INFORMATION_MINIFILTER structure.
+                // On Win10+, Type == 2 is guaranteed.
+
+                UNICODE_STRING altStr = { 0 };
+                UNICODE_STRING nameStr = { 0 };
+
+                if (info->Type.MiniFilter.FilterNameLength > 0 &&
+                    info->Type.MiniFilter.FilterNameBufferOffset > 0)
+                {
+                    nameStr.Buffer = (PWCH)((PUCHAR)info +
+                        info->Type.MiniFilter.FilterNameBufferOffset);
+                    nameStr.Length = info->Type.MiniFilter.FilterNameLength;
+                    nameStr.MaximumLength = nameStr.Length;
+                }
+
+                // Parse altitude from the FrameID + altitude fields
+                // The altitude is stored in the instance info, but for the
+                // aggregate filter info we need to check the frame altitude.
+                // More reliable: compare the filter name to our own.
+                // If this IS our filter, skip it.
+                UNICODE_STRING ourName = RTL_CONSTANT_STRING(L"NortonEDRDriver");
+                if (nameStr.Length > 0 &&
+                    RtlEqualUnicodeString(&nameStr, &ourName, TRUE))
+                {
+                    idx++;
+                    continue;
+                }
+
+                // To get the actual altitude, enumerate instances of this filter.
+                // Use FltEnumerateInstances via the filter name, but that requires
+                // an PFLT_FILTER handle. Instead, use the simpler approach:
+                // enumerate all filter instances on the system and check altitudes.
+                // For efficiency, we do the instance walk outside this loop.
+            }
+
+            idx++;
+        }
+
+        // Walk all filter instances on every volume to check altitude proximity.
+        // FltEnumerateInstances(NULL, NULL, ...) returns all instances system-wide
+        // when both Volume and Filter are NULL (undocumented but works Win8+).
+        // Safer approach: use FltEnumerateInstanceInformationByFilter on each filter.
+        //
+        // Simpler: enumerate instances globally via FltEnumerateInstances with
+        // our own filter handle and Volume=NULL → only our instances; then check
+        // for foreign instances near our altitude per-volume via
+        // FltEnumerateInstanceInformationByVolume.
+        //
+        // Most practical approach: for each volume our filter is attached to,
+        // walk every instance and check altitude proximity.
+
+        PFLT_VOLUME* volList = nullptr;
+        ULONG volCount = 0;
+        enumSt = FltEnumerateVolumes(g_FilterHandle, nullptr, 0, &volCount);
+        if (enumSt == STATUS_BUFFER_TOO_SMALL && volCount > 0) {
+            SIZE_T volListSize = volCount * sizeof(PFLT_VOLUME);
+            volList = (PFLT_VOLUME*)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, volListSize, 'fvol');
+            if (volList) {
+                enumSt = FltEnumerateVolumes(
+                    g_FilterHandle, volList, volCount, &volCount);
+            }
+        }
+
+        if (NT_SUCCESS(enumSt) && volList) {
+            for (ULONG vi = 0; vi < volCount; vi++) {
+                ULONG instIdx = 0;
+                UCHAR instBuf[512];
+                ULONG instNeeded = 0;
+
+                while (TRUE) {
+                    NTSTATUS instSt = FltEnumerateInstanceInformationByVolume(
+                        volList[vi], instIdx,
+                        InstanceAggregateStandardInformation,
+                        instBuf, sizeof(instBuf), &instNeeded);
+
+                    if (instSt == STATUS_NO_MORE_ENTRIES) break;
+                    if (!NT_SUCCESS(instSt)) { instIdx++; continue; }
+
+                    PINSTANCE_AGGREGATE_STANDARD_INFORMATION instInfo =
+                        (PINSTANCE_AGGREGATE_STANDARD_INFORMATION)instBuf;
+
+                    if (instInfo->Flags & FLTFL_IASI_IS_MINIFILTER) {
+                        UNICODE_STRING instAlt = { 0 };
+                        UNICODE_STRING instName = { 0 };
+
+                        if (instInfo->Type.MiniFilter.FilterNameLength > 0 &&
+                            instInfo->Type.MiniFilter.FilterNameBufferOffset > 0)
+                        {
+                            instName.Buffer = (PWCH)((PUCHAR)instInfo +
+                                instInfo->Type.MiniFilter.FilterNameBufferOffset);
+                            instName.Length = instInfo->Type.MiniFilter.FilterNameLength;
+                            instName.MaximumLength = instName.Length;
+                        }
+
+                        if (instInfo->Type.MiniFilter.AltitudeLength > 0 &&
+                            instInfo->Type.MiniFilter.AltitudeBufferOffset > 0)
+                        {
+                            instAlt.Buffer = (PWCH)((PUCHAR)instInfo +
+                                instInfo->Type.MiniFilter.AltitudeBufferOffset);
+                            instAlt.Length = instInfo->Type.MiniFilter.AltitudeLength;
+                            instAlt.MaximumLength = instAlt.Length;
+                        }
+
+                        // Skip our own instances
+                        UNICODE_STRING ourName2 = RTL_CONSTANT_STRING(L"NortonEDRDriver");
+                        if (instName.Length > 0 &&
+                            RtlEqualUnicodeString(&instName, &ourName2, TRUE))
+                        {
+                            instIdx++;
+                            continue;
+                        }
+
+                        // Parse the altitude string to a numeric value
+                        if (instAlt.Length > 0 && instAlt.Buffer) {
+                            ULONG foreignAlt = 0;
+                            // Manual parse — altitude is a decimal numeric string
+                            for (USHORT ci = 0; ci < instAlt.Length / sizeof(WCHAR); ci++) {
+                                WCHAR c = instAlt.Buffer[ci];
+                                if (c >= L'0' && c <= L'9')
+                                    foreignAlt = foreignAlt * 10 + (c - L'0');
+                                else if (c == L'.') break; // fractional part (rare)
+                            }
+
+                            // Check 1: exact altitude collision (squatting)
+                            if (foreignAlt == ourAltitude) {
+                                char nameBuf[64] = {};
+                                ANSI_STRING ansiN;
+                                if (instName.Length > 0 &&
+                                    NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiN, &instName, TRUE)))
+                                {
+                                    SIZE_T n = ansiN.Length < sizeof(nameBuf) - 1 ? ansiN.Length : sizeof(nameBuf) - 1;
+                                    RtlCopyMemory(nameBuf, ansiN.Buffer, n);
+                                    RtlFreeAnsiString(&ansiN);
+                                }
+                                char msg[256];
+                                RtlStringCchPrintfA(msg, sizeof(msg),
+                                    "ALTITUDE SQUATTING: filter '%s' registered at our exact "
+                                    "altitude %lu — EDR minifilter may be displaced!",
+                                    nameBuf[0] ? nameBuf : "?", ourAltitude);
+                                EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+                                DbgPrint("[!] %s\n", msg);
+                            }
+                            // Check 2: sandwiching — foreign filter just above us
+                            // (altitude ours+1 .. ours+10)
+                            else if (foreignAlt > ourAltitude &&
+                                     foreignAlt <= ourAltitude + 10)
+                            {
+                                char nameBuf[64] = {};
+                                ANSI_STRING ansiN;
+                                if (instName.Length > 0 &&
+                                    NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiN, &instName, TRUE)))
+                                {
+                                    SIZE_T n = ansiN.Length < sizeof(nameBuf) - 1 ? ansiN.Length : sizeof(nameBuf) - 1;
+                                    RtlCopyMemory(nameBuf, ansiN.Buffer, n);
+                                    RtlFreeAnsiString(&ansiN);
+                                }
+                                char msg[256];
+                                RtlStringCchPrintfA(msg, sizeof(msg),
+                                    "ALTITUDE SANDWICH: filter '%s' at altitude %lu is positioned "
+                                    "just above us (%lu) — may intercept/hide I/O before EDR sees it",
+                                    nameBuf[0] ? nameBuf : "?", foreignAlt, ourAltitude);
+                                EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+                                DbgPrint("[!] %s\n", msg);
+                            }
+                        }
+                    }
+
+                    instIdx++;
+                }
+
+                FltObjectDereference(volList[vi]);
+            }
+            ExFreePool(volList);
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -953,8 +1196,15 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
                 nullptr
             };
             ULONG createDisposition2 = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
-            if (createDisposition2 == FILE_CREATE || createDisposition2 == FILE_OVERWRITE_IF ||
-                createDisposition2 == FILE_SUPERSEDE)
+            ACCESS_MASK daStartup = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            // Trigger on new file creation OR write-open of existing file (overwrite attack)
+            BOOLEAN isStartupWrite =
+                (createDisposition2 == FILE_CREATE || createDisposition2 == FILE_OVERWRITE_IF ||
+                 createDisposition2 == FILE_SUPERSEDE) ||
+                ((createDisposition2 == FILE_OPEN || createDisposition2 == FILE_OPEN_IF) &&
+                 (daStartup & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0);
+
+            if (isStartupWrite)
             {
                 for (SIZE_T si = 0; kStartupPaths[si]; si++) {
                     if (WcsContainsLower(&nameInfo->Name, kStartupPaths[si])) {
@@ -968,10 +1218,14 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
                             RtlCopyMemory(fBuf, ansiFC.Buffer, n);
                             RtlFreeAnsiString(&ansiFC);
                         }
+                        const char* verb = (createDisposition2 == FILE_OPEN ||
+                                            createDisposition2 == FILE_OPEN_IF)
+                                           ? "overwritten" : "created";
                         char msg[224];
                         RtlStringCchPrintfA(msg, sizeof(msg),
-                            "FS: File created in Startup folder -- persistence (T1547.009) "
+                            "FS: File %s in Startup folder -- persistence (T1547.009) "
                             "file=%s by=%s pid=%llu",
+                            verb,
                             fBuf[0] ? fBuf : "?",
                             procName ? procName : "?",
                             (ULONG64)(ULONG_PTR)pid);
@@ -1006,6 +1260,66 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
                             pathBuf[0] ? pathBuf : "?", (ULONG64)(ULONG_PTR)pid);
                         EnqueueFsAlert(pid, procName, msg, FALSE);
                         break;
+                    }
+                }
+            }
+
+            // ---- Existing binary overwrite detection (T1574 / T1036.005) ----
+            // Malware opens an EXISTING executable with write access to:
+            //   - Replace a signed binary with a trojanized version (binary planting)
+            //   - Hijack a DLL loaded by a legitimate process (DLL search-order hijack)
+            //   - Patch an executable in-place to inject shellcode
+            // The disposition is FILE_OPEN (not CREATE/OVERWRITE) because the file
+            // already exists — this is the gap that pure "new file" detection misses.
+            //
+            // We flag write-access opens to executables in protected paths (System32,
+            // Program Files, WinSxS, etc.) from non-servicing processes.
+            if (createDisposition == FILE_OPEN || createDisposition == FILE_OPEN_IF ||
+                createDisposition == FILE_OVERWRITE || createDisposition == FILE_OVERWRITE_IF)
+            {
+                ACCESS_MASK daBin = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+                BOOLEAN wantWrite = (daBin & (FILE_WRITE_DATA | FILE_APPEND_DATA |
+                                              FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES)) != 0;
+                if (wantWrite) {
+                    // Only flag writes in protected binary directories
+                    BOOLEAN inProtectedDir = FALSE;
+                    for (SIZE_T i = 0; i < ARRAYSIZE(kProtectedBinPaths); i++) {
+                        if (WcsContainsLower(&nameInfo->Name, kProtectedBinPaths[i])) {
+                            inProtectedDir = TRUE;
+                            break;
+                        }
+                    }
+
+                    if (inProtectedDir) {
+                        // Check allowlist — servicing processes legitimately update binaries
+                        BOOLEAN isAllowed = FALSE;
+                        if ((ULONG_PTR)pid <= 4) isAllowed = TRUE;
+                        if (!isAllowed && procName) {
+                            for (int ai = 0; kBinWriteAllowedProcs[ai]; ai++) {
+                                if (strcmp(procName, kBinWriteAllowedProcs[ai]) == 0) {
+                                    isAllowed = TRUE;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!isAllowed) {
+                            char binBuf[96] = {};
+                            ANSI_STRING ansiB;
+                            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiB, &nameInfo->FinalComponent, TRUE))) {
+                                SIZE_T n = ansiB.Length < sizeof(binBuf) - 1 ? ansiB.Length : sizeof(binBuf) - 1;
+                                RtlCopyMemory(binBuf, ansiB.Buffer, n);
+                                RtlFreeAnsiString(&ansiB);
+                            }
+                            char msg[256];
+                            RtlStringCchPrintfA(msg, sizeof(msg),
+                                "FS: Write-open to existing binary — %s by '%s' (pid=%llu) "
+                                "— possible DLL hijack / binary replacement / trojanizing (T1574)",
+                                binBuf[0] ? binBuf : "?",
+                                procName ? procName : "?",
+                                (ULONG64)(ULONG_PTR)pid);
+                            EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                        }
                     }
                 }
             }

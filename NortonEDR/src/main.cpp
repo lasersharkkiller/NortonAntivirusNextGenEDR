@@ -252,6 +252,11 @@ static std::atomic<bool> g_rdpStop(false);
 static EVT_HANDLE        g_bitsSubscription = nullptr;
 static std::atomic<bool> g_bitsStop(false);
 
+// ---------------------------------------------------------------------------
+// Minifilter altitude registry audit
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_altitudeAuditStop(false);
+
 struct TraceRuntimeConfig {
     std::vector<std::string> targetProcessNamesLower;
     bool includeChildren = false;
@@ -5362,6 +5367,189 @@ static void BitsSubscriberThread() {
     g_bitsSubscription = nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// AltitudeAuditThread — periodic registry scan for minifilter altitude theft.
+//
+// Every 30 seconds, this thread:
+//   1) Verifies our own altitude registry key hasn't been tampered with
+//   2) Scans all other services for altitude squatting (same altitude as ours)
+//   3) Checks for suspicious near-altitude registrations (sandwiching)
+//
+// Attackers may:
+//   - Overwrite our altitude key to a value where no EDR listens
+//   - Register their own driver at our altitude so we fail to attach on reboot
+//   - Plant a filter just above us to intercept I/O before we see it
+// ---------------------------------------------------------------------------
+void AltitudeAuditThread()
+{
+    const wchar_t* kExpectedAltitude = L"320021";
+    const ULONG    kOurAltNum        = 320021;
+    const ULONG    kSandwichRange    = 10;  // alert if foreign filter within +10
+
+    std::cout << "[AltitudeAudit] Minifilter altitude integrity monitor active\n";
+
+    while (!g_altitudeAuditStop.load()) {
+        // --- Check 1: Verify our own altitude key ---
+        {
+            HKEY hk = nullptr;
+            // The installer writes: Services\NortonEDRDriver\Instances\NortonEDRDrvInstance
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                    L"SYSTEM\\CurrentControlSet\\Services\\NortonEDRDriver\\Instances\\NortonEDRDrvInstance",
+                    0, KEY_READ, &hk) == ERROR_SUCCESS)
+            {
+                wchar_t altBuf[64] = {};
+                DWORD   altSize = sizeof(altBuf);
+                DWORD   altType = 0;
+                if (RegQueryValueExW(hk, L"Altitude", nullptr, &altType,
+                        (LPBYTE)altBuf, &altSize) == ERROR_SUCCESS)
+                {
+                    if (altType != REG_SZ || wcscmp(altBuf, kExpectedAltitude) != 0) {
+                        std::string tampered = "Altitude registry key TAMPERED: expected '320021', found '";
+                        char narrowBuf[64] = {};
+                        WideCharToMultiByte(CP_UTF8, 0, altBuf, -1, narrowBuf, sizeof(narrowBuf), nullptr, nullptr);
+                        tampered += narrowBuf;
+                        tampered += "' — attacker may have redirected our minifilter to a dead altitude";
+
+                        PushUiDetectionEvent(
+                            "Minifilter altitude registry tampered",
+                            tampered,
+                            "altitude_tamper",
+                            0,
+                            DetectionSeverity::Critical
+                        );
+                    }
+                }
+                else {
+                    // Altitude value missing entirely
+                    PushUiDetectionEvent(
+                        "Minifilter altitude registry key MISSING",
+                        "The Altitude value under NortonEDRDrvInstance has been deleted — "
+                        "minifilter will fail to attach on next boot",
+                        "altitude_tamper",
+                        0,
+                        DetectionSeverity::Critical
+                    );
+                }
+                RegCloseKey(hk);
+            }
+            else {
+                // Entire instance key missing
+                PushUiDetectionEvent(
+                    "Minifilter instance registry key MISSING",
+                    "The NortonEDRDrvInstance key has been deleted — "
+                    "minifilter will fail to attach on next boot",
+                    "altitude_tamper",
+                    0,
+                    DetectionSeverity::Critical
+                );
+            }
+        }
+
+        // --- Check 2: Scan all services for altitude squatting / sandwiching ---
+        {
+            HKEY hkServices = nullptr;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                    L"SYSTEM\\CurrentControlSet\\Services",
+                    0, KEY_ENUMERATE_SUB_KEYS, &hkServices) == ERROR_SUCCESS)
+            {
+                wchar_t svcName[256];
+                DWORD   svcIdx = 0;
+                DWORD   svcNameLen;
+
+                while (true) {
+                    svcNameLen = ARRAYSIZE(svcName);
+                    if (RegEnumKeyExW(hkServices, svcIdx++, svcName, &svcNameLen,
+                            nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                        break;
+
+                    // Skip our own service
+                    if (_wcsicmp(svcName, L"NortonEDRDriver") == 0) continue;
+
+                    // Check if this service has an Instances subkey
+                    std::wstring instPath = std::wstring(svcName) + L"\\Instances";
+                    HKEY hkInst = nullptr;
+                    if (RegOpenKeyExW(hkServices, instPath.c_str(), 0,
+                            KEY_ENUMERATE_SUB_KEYS, &hkInst) != ERROR_SUCCESS)
+                        continue;
+
+                    wchar_t instName[256];
+                    DWORD   instIdx2 = 0;
+                    DWORD   instNameLen;
+
+                    while (true) {
+                        instNameLen = ARRAYSIZE(instName);
+                        if (RegEnumKeyExW(hkInst, instIdx2++, instName, &instNameLen,
+                                nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                            break;
+
+                        HKEY hkInstance = nullptr;
+                        if (RegOpenKeyExW(hkInst, instName, 0, KEY_READ,
+                                &hkInstance) != ERROR_SUCCESS)
+                            continue;
+
+                        wchar_t altBuf[64] = {};
+                        DWORD   altSize = sizeof(altBuf);
+                        DWORD   altType = 0;
+                        if (RegQueryValueExW(hkInstance, L"Altitude", nullptr,
+                                &altType, (LPBYTE)altBuf, &altSize) == ERROR_SUCCESS &&
+                            altType == REG_SZ)
+                        {
+                            // Parse altitude to numeric
+                            ULONG foreignAlt = (ULONG)_wtol(altBuf);
+
+                            char narrowSvc[128] = {};
+                            WideCharToMultiByte(CP_UTF8, 0, svcName, -1,
+                                narrowSvc, sizeof(narrowSvc), nullptr, nullptr);
+
+                            if (foreignAlt == kOurAltNum) {
+                                std::string detail = "Service '";
+                                detail += narrowSvc;
+                                detail += "' has registered a minifilter at our exact altitude 320021 — "
+                                          "on next boot our minifilter may be displaced (altitude squatting)";
+
+                                PushUiDetectionEvent(
+                                    "Minifilter altitude SQUATTING detected",
+                                    detail,
+                                    "altitude_squat",
+                                    0,
+                                    DetectionSeverity::Critical
+                                );
+                            }
+                            else if (foreignAlt > kOurAltNum &&
+                                     foreignAlt <= kOurAltNum + kSandwichRange)
+                            {
+                                std::string detail = "Service '";
+                                detail += narrowSvc;
+                                detail += "' registered at altitude ";
+                                detail += std::to_string(foreignAlt);
+                                detail += " (ours is 320021) — positioned to intercept I/O "
+                                          "before our EDR minifilter (sandwiching attack)";
+
+                                PushUiDetectionEvent(
+                                    "Minifilter altitude SANDWICHING detected",
+                                    detail,
+                                    "altitude_sandwich",
+                                    0,
+                                    DetectionSeverity::Critical
+                                );
+                            }
+                        }
+                        RegCloseKey(hkInstance);
+                    }
+                    RegCloseKey(hkInst);
+                }
+                RegCloseKey(hkServices);
+            }
+        }
+
+        // Sleep in 500ms increments so we can respond to stop signal quickly
+        for (int s = 0; s < 60 && !g_altitudeAuditStop.load(); s++)
+            Sleep(500);
+    }
+
+    std::cout << "[AltitudeAudit] Thread stopped\n";
+}
+
 VOID ShowUI() {
 
     auto processesRenderer = Renderer([&] {
@@ -5498,6 +5686,9 @@ VOID ShowUI() {
     g_elasticStop = false;
     std::thread elasticThread(ElasticShipperThread);
 
+    g_altitudeAuditStop = false;
+    std::thread altitudeAuditThread(AltitudeAuditThread);
+
     try {
         screen.Loop(renderer);
     }
@@ -5560,6 +5751,9 @@ VOID ShowUI() {
     g_elasticStop = true;
     g_elasticCv.notify_all();
     elasticThread.join();
+
+    g_altitudeAuditStop = true;
+    altitudeAuditThread.join();
 }
 
 int main(int argc, char* argv[]) {
