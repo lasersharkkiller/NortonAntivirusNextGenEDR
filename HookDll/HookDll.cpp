@@ -1761,13 +1761,36 @@ void RemoveHooks() {
     }
 }
 
-BOOL WINAPI DllMain(HINSTANCE hInstDll, DWORD fdwReason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE hInstDll, DWORD fdwReason, LPVOID lpReserved) {
     switch (fdwReason) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hInstDll);
+
+        // Pin the DLL — bump refcount so FreeLibrary from malware cannot unload us.
+        // GetModuleHandleEx with GET_MODULE_HANDLE_EX_FLAG_PIN sets the refcount to
+        // MAXULONG, making the module permanently loaded until process exit.
+        {
+            HMODULE hPin = nullptr;
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                (LPCWSTR)DllMain,
+                &hPin);
+        }
+
         InstallHooks();
         break;
+
     case DLL_PROCESS_DETACH:
+        // lpReserved != NULL means the process is terminating — safe to clean up.
+        // lpReserved == NULL means someone called FreeLibrary — this should not
+        // happen since we pinned the DLL, but if it does, alert and refuse.
+        if (lpReserved == NULL) {
+            SendHookEvent("Critical", "DLL_PROCESS_DETACH",
+                g_selfPid,
+                "FreeLibrary called on HookDll — "
+                "EDR hook removal attempt (DLL should be pinned)");
+            return FALSE;  // reject the unload
+        }
         RemoveHooks();
         break;
     }

@@ -1587,6 +1587,76 @@ VOID HookDetector::CheckEprocessProtection(BufferQueue* bufQueue) {
 }
 
 // ---------------------------------------------------------------------------
+// MajorFunction dispatch table integrity — detect BYOVD patching of our
+// IRP_MJ_DEVICE_CONTROL handler.  An attacker with kernel write can redirect
+// or NOP our IOCTL dispatcher, silencing all user-kernel communication.
+// ---------------------------------------------------------------------------
+
+static PDRIVER_OBJECT s_DriverObj              = nullptr;
+static PVOID          s_MajorFnBaseline[IRP_MJ_MAXIMUM_FUNCTION + 1] = {};
+static BOOLEAN        s_MajorFnBaselineValid   = FALSE;
+
+VOID HookDetector::TakeMajorFunctionBaseline(PDRIVER_OBJECT drvObj)
+{
+    if (!drvObj) return;
+    s_DriverObj = drvObj;
+    for (int i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
+        s_MajorFnBaseline[i] = (PVOID)drvObj->MajorFunction[i];
+    s_MajorFnBaselineValid = TRUE;
+    DbgPrint("[+] HookDetector: MajorFunction baseline captured\n");
+}
+
+VOID HookDetector::CheckMajorFunctionIntegrity(BufferQueue* bufQueue)
+{
+    if (!s_MajorFnBaselineValid || !s_DriverObj || !bufQueue) return;
+
+    // Check the three dispatch entries we actually set
+    static const struct { int idx; const char* name; } kChecks[] = {
+        { IRP_MJ_CREATE,         "IRP_MJ_CREATE" },
+        { IRP_MJ_CLOSE,          "IRP_MJ_CLOSE" },
+        { IRP_MJ_DEVICE_CONTROL, "IRP_MJ_DEVICE_CONTROL" },
+    };
+
+    for (int c = 0; c < 3; c++) {
+        PVOID current  = (PVOID)s_DriverObj->MajorFunction[kChecks[c].idx];
+        PVOID expected = s_MajorFnBaseline[kChecks[c].idx];
+        if (current == expected) continue;
+
+        char msg[200];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "ANTI-TAMPER: NortonEDR %s handler patched %p->%p "
+            "— BYOVD dispatch table overwrite (IOCTL silencing attack)",
+            kChecks[c].name, expected, current);
+
+        PKERNEL_STRUCTURED_NOTIFICATION notif =
+            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED,
+                sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'mfnt');
+        if (notif) {
+            RtlZeroMemory(notif, sizeof(*notif));
+            SET_CRITICAL(*notif);
+            notif->pid    = 0;
+            notif->isPath = FALSE;
+            RtlCopyMemory(notif->procName, "NortonEDR", 9);
+            SIZE_T msgLen = strlen(msg) + 1;
+            notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'mfmg');
+            notif->bufSize = (ULONG)msgLen;
+            if (notif->msg) {
+                RtlCopyMemory(notif->msg, msg, msgLen);
+                if (!bufQueue->Enqueue(notif)) {
+                    ExFreePool(notif->msg); ExFreePool(notif);
+                }
+            } else { ExFreePool(notif); }
+        }
+
+        // Restore the original handler
+        InterlockedExchangePointer(
+            (PVOID*)&s_DriverObj->MajorFunction[kChecks[c].idx], expected);
+        DbgPrint("[!] HookDetector: restored %s handler\n", kChecks[c].name);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RunAllHookChecks — run all detection routines in sequence.
 // Call after driver init is complete (and periodically from AntiTamper).
 // ---------------------------------------------------------------------------
@@ -1609,6 +1679,7 @@ VOID HookDetector::RunAllHookChecks(
     CheckCiIntegrity(bufQueue);
     CheckSeCiCallbackIntegrity(bufQueue);
     CheckEprocessProtection(bufQueue);
+    CheckMajorFunctionIntegrity(bufQueue);
 
     DbgPrint("[*] HookDetector results — SSDT=%lu Inline=%lu EAT=%lu ETW=%d\n",
         ssdt, inl, eat, (int)etw);

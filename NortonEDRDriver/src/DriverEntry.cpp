@@ -12,6 +12,7 @@
 #include "Globals.h"
 #include "Deception.h"
 #include <wdf.h>
+#include <wdmsec.h>    // IoCreateDeviceSecure, SDDL_DEVOBJ_SYS_ALL_ADM_ALL
 
 PDEVICE_OBJECT DeviceObject = NULL;
 PDEVICE_OBJECT g_DeviceObject = nullptr;  // exposed for IoAllocateWorkItem (phantom DLL, inject timer)
@@ -80,8 +81,19 @@ NTSTATUS DriverCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
 KSPIN_LOCK g_spinLock;
 
+// Validate that the IOCTL caller is our registered service process.
+// Returns TRUE if service PID is registered and caller matches, or if no
+// service PID is registered yet (bootstrap: first call is REGISTER_SERVICE_PID).
+static BOOLEAN IsCallerTrustedService() {
+	ULONG svcPid = (ULONG)InterlockedCompareExchange(
+		&ObjectUtils::g_ServicePid, 0, 0);
+	if (svcPid == 0) return TRUE;  // not yet registered — bootstrap phase
+	ULONG callerPid = HandleToUlong(PsGetProcessId(IoGetCurrentProcess()));
+	return (callerPid == svcPid);
+}
+
 NTSTATUS DriverIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-		
+
 	UNREFERENCED_PARAMETER(DeviceObject);
 	PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
 	NTSTATUS status = STATUS_SUCCESS;
@@ -245,6 +257,14 @@ NTSTATUS DriverIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 		}
 		else if (stack->Parameters.DeviceIoControl.IoControlCode == END_THAT_PROCESS) {
 
+			// Only the registered NortonEDR service may terminate processes.
+			if (!IsCallerTrustedService()) {
+				DbgPrint("[!] END_THAT_PROCESS denied: caller pid=%lu is not service\n",
+					HandleToUlong(PsGetProcessId(IoGetCurrentProcess())));
+				status = STATUS_ACCESS_DENIED;
+				__leave;
+			}
+
 			if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(UINT32)) {
 				status = STATUS_INVALID_PARAMETER;
 				__leave;
@@ -260,6 +280,15 @@ NTSTATUS DriverIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 			}
 		}
 		else if (stack->Parameters.DeviceIoControl.IoControlCode == NORTONAV_REGISTER_SERVICE_PID) {
+
+			// Only allow registration if no PID is registered yet (bootstrap),
+			// or the caller is the currently registered service (re-registration).
+			if (!IsCallerTrustedService()) {
+				DbgPrint("[!] REGISTER_SERVICE_PID denied: caller pid=%lu is not service\n",
+					HandleToUlong(PsGetProcessId(IoGetCurrentProcess())));
+				status = STATUS_ACCESS_DENIED;
+				__leave;
+			}
 
 			if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(UINT32)) {
 				status = STATUS_INVALID_PARAMETER;
@@ -342,6 +371,10 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	DriverObject->MajorFunction[IRP_MJ_CLOSE] = DriverCreateClose;
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DriverIoControl;
 
+	// Snapshot the dispatch table immediately after assignment — used by the
+	// periodic integrity check to detect BYOVD patching of our IOCTL handler.
+	HookDetector::TakeMajorFunctionBaseline(DriverObject);
+
 	g_syscallsUtils = (SyscallsUtils*)ExAllocatePool2(POOL_FLAG_NON_PAGED | POOL_FLAG_RAISE_ON_FAILURE, sizeof(SyscallsUtils), 'sysc');
 	if (!g_syscallsUtils) {
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -412,7 +445,14 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\NortonEDR");
 	UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\NortonEDR");
 
-	NTSTATUS status = IoCreateDevice(DriverObject, 0, &devName, FILE_DEVICE_NETWORK, 0, FALSE, &DeviceObject);
+	// SDDL: SYSTEM (full), Administrators (full), SERVICE (read+write).
+	// Prevents unprivileged users from opening the device and sending IOCTLs
+	// like END_THAT_PROCESS or REGISTER_SERVICE_PID.
+	UNICODE_STRING sddl = RTL_CONSTANT_STRING(
+		L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;SU)");
+	NTSTATUS status = IoCreateDeviceSecure(
+		DriverObject, 0, &devName, FILE_DEVICE_UNKNOWN,
+		FILE_DEVICE_SECURE_OPEN, FALSE, &sddl, NULL, &DeviceObject);
 
 	if (!NT_SUCCESS(status)) {
 		return status;

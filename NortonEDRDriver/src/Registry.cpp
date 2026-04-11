@@ -294,6 +294,52 @@ NTSTATUS RegistryUtils::RegOpNotifyCallback(
 
 		else {
 
+			// ---- EDR self-protection: block modifications to our own service key ----
+			// Any write to Services\NortonEDR (ImagePath, Start, Type, etc.)
+			// from a non-trusted caller is blocked outright and alerted.
+			// This prevents attackers from disabling/redirecting the EDR on reboot.
+			if (UnicodeStringContains((PUNICODE_STRING)regPath, L"\\Services\\NortonEDR")) {
+				char* procName = PsGetProcessImageFileName(IoGetCurrentProcess());
+				BOOLEAN trustedSvc = procName && (
+					strcmp(procName, "services.exe") == 0 ||
+					strcmp(procName, "TrustedInsta") == 0 ||
+					strcmp(procName, "msiexec.exe")  == 0);
+				if (!trustedSvc) {
+					char selfMsg[200];
+					RtlStringCbPrintfA(selfMsg, sizeof(selfMsg),
+						"ANTI-TAMPER: NortonEDR service key modification BLOCKED "
+						"— %s attempted to modify Services\\NortonEDR",
+						procName ? procName : "unknown");
+					SIZE_T selfLen = strlen(selfMsg) + 1;
+
+					PKERNEL_STRUCTURED_NOTIFICATION sNotif =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED,
+							sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+					if (sNotif) {
+						RtlZeroMemory(sNotif, sizeof(*sNotif));
+						SET_CRITICAL(*sNotif);
+						SET_SYSCALL_CHECK(*sNotif);
+						sNotif->bufSize = (ULONG)selfLen;
+						sNotif->isPath  = FALSE;
+						sNotif->pid     = PsGetProcessId(IoGetCurrentProcess());
+						sNotif->msg     = (char*)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, selfLen, 'msg');
+						if (procName)
+							RtlCopyMemory(sNotif->procName, procName, 14);
+						if (sNotif->msg) {
+							RtlCopyMemory(sNotif->msg, selfMsg, selfLen);
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(sNotif)) {
+								ExFreePool(sNotif->msg); ExFreePool(sNotif);
+							}
+						} else {
+							ExFreePool(sNotif);
+						}
+					}
+					return STATUS_ACCESS_DENIED;  // BLOCK the write
+				}
+			}
+
 			// Honeypot check — any access to our fake credential keys is a
 			// high-confidence indicator of a credential-hunting tool.
 			// Access is ALLOWED so the attacker receives the canary data.
@@ -532,6 +578,15 @@ skip_persistence_alert:
 			!MmIsAddressValid(regPath->Buffer))
 			break;
 
+		// Self-protection: block value deletion from NortonEDR service key
+		if (UnicodeStringContains((PUNICODE_STRING)regPath, L"\\Services\\NortonEDR")) {
+			char* pn = PsGetProcessImageFileName(IoGetCurrentProcess());
+			BOOLEAN trusted = pn && (
+				strcmp(pn, "services.exe") == 0 ||
+				strcmp(pn, "TrustedInsta") == 0);
+			if (!trusted) return STATUS_ACCESS_DENIED;
+		}
+
 		// Check if this deletion targets a security-sensitive key+value
 		// by matching against defense evasion paths that have a valueName.
 		if (!delInfo->ValueName || !delInfo->ValueName->Buffer ||
@@ -592,10 +647,34 @@ skip_persistence_alert:
 		break;
 	}
 
+	// ---- Key deletion: protect our service key from being wiped ----
+	case RegNtPreDeleteKey:
+	{
+		PREG_DELETE_KEY_INFORMATION dkInfo =
+			(PREG_DELETE_KEY_INFORMATION)Arg2;
+		if (!dkInfo || !dkInfo->Object || !MmIsAddressValid(dkInfo->Object))
+			break;
+
+		status = CmCallbackGetKeyObjectIDEx(
+			&cookie, dkInfo->Object, NULL, &regPath, 0);
+		if (!NT_SUCCESS(status) || !regPath || !regPath->Length ||
+			!MmIsAddressValid(regPath->Buffer))
+			break;
+
+		if (UnicodeStringContains((PUNICODE_STRING)regPath, L"\\Services\\NortonEDR")) {
+			char* pn = PsGetProcessImageFileName(IoGetCurrentProcess());
+			BOOLEAN trusted = pn && (
+				strcmp(pn, "services.exe") == 0 ||
+				strcmp(pn, "TrustedInsta") == 0);
+			if (!trusted) return STATUS_ACCESS_DENIED;
+		}
+		break;
+	}
+
 	default:
 		break;
 	}
-	
+
 
 	return STATUS_SUCCESS;
 }

@@ -1654,6 +1654,11 @@ public:
     static VOID     TakeEprocessProtBaseline();
     static VOID     CheckEprocessProtection(BufferQueue* bufQueue);
 
+    // MajorFunction dispatch table integrity — baseline IRP_MJ_DEVICE_CONTROL at init,
+    // detect BYOVD patching that redirects or NOPs our IOCTL handler.
+    static VOID     TakeMajorFunctionBaseline(PDRIVER_OBJECT drvObj);
+    static VOID     CheckMajorFunctionIntegrity(BufferQueue* bufQueue);
+
     static VOID RunAllHookChecks(
         PFUNCTION_MAP exportsMap,
         PVOID         moduleBase,
