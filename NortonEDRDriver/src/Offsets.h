@@ -58,6 +58,7 @@ typedef struct _KERNEL_STRUCTURES_OFFSETS {
 // Used by DllInjector to temporarily clear ProcessSignaturePolicy when injecting
 // HookDll into processes with BLOCK_NON_MICROSOFT_BINARIES (Adam Chester blockdlls).
 #define EPROCESS_MITIGATION_FLAGS_OFFSET     0x9d0  // MitigationFlags (ULONG) — 4 bytes before MitigationFlags2
+#define EPROCESS_SIGNATURE_LEVEL             0x878  // SignatureLevel (UCHAR) — image signature level
 #define EPROCESS_SECTION_SIGNATURE_LEVEL     0x879  // SectionSignatureLevel (UCHAR) — min sig level for DLL loads
 #define MITIGATION_SIGNATURE_OPT_IN_BIT      23     // SignatureMitigationOptIn in MitigationFlags
 

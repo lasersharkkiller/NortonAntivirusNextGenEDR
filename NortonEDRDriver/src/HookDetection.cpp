@@ -73,7 +73,9 @@ static PVOID FindKernelModuleBase(const WCHAR* name, PULONG outSize) {
 
 struct ProtWatchEntry {
     ULONG   pid;
-    UCHAR   initialLevel;
+    UCHAR   initialLevel;        // PS_PROTECTION.Level (PPL)
+    UCHAR   initialSigLevel;     // EPROCESS.SignatureLevel
+    UCHAR   initialSectSigLevel; // EPROCESS.SectionSignatureLevel
     char    name[16];
     BOOLEAN active;
 };
@@ -805,25 +807,49 @@ VOID HookDetector::CheckPsCallbackIntegrity(BufferQueue* bufQueue)
 		PsCallbackSnapshot* snap = checks[i].snap;
 		if (!snap->valid || !snap->arrayBase || !snap->ourCallback) continue;
 
-		BOOLEAN found = FALSE;
-		PUCHAR arr    = (PUCHAR)snap->arrayBase;
+		BOOLEAN found     = FALSE;
+		BOOLEAN slotEmpty = TRUE;   // was our slot zeroed (unlink) or replaced (overwrite)?
+		PVOID   replacedWith = nullptr;
+		PUCHAR arr = (PUCHAR)snap->arrayBase;
 
 		__try {
-			for (ULONG slot = 0; slot < 64 && !found; slot++) {
+			for (ULONG slot = 0; slot < 64; slot++) {
 				PVOID* slotPtr = (PVOID*)(arr + slot * 8);
 				if (!MmIsAddressValid(slotPtr)) break;
-				PVOID fn = ExCallbackGetFunction(*slotPtr);
-				if (fn == snap->ourCallback) found = TRUE;
+				PVOID raw = *slotPtr;
+				PVOID fn  = ExCallbackGetFunction(raw);
+				if (fn == snap->ourCallback) { found = TRUE; break; }
+
+				// If we find a non-NULL slot with a function pointer that is NOT
+				// ours and not NULL, track it — one of these might be an overwrite.
+				// We can't know which slot was "ours" by index alone, but if the
+				// total live count is the same as at init time but our pointer is
+				// missing, the slot was overwritten rather than cleared.
+				if (fn && fn != snap->ourCallback) {
+					slotEmpty = FALSE;
+					replacedWith = fn;
+				}
 			}
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {}
 
 		if (!found) {
-			char msg[128];
-			RtlStringCbPrintfA(msg, sizeof(msg),
-				"ANTI-TAMPER: Ps%sNotify callback unregistered from internal array — "
-				"EDR telemetry silenced (PsRemoveCreate*NotifyRoutine or direct patch)",
-				checks[i].label);
+			char msg[220];
+			if (replacedWith && !slotEmpty) {
+				// Slot was replaced with a different function pointer —
+				// this is a callback entry overwrite (pointer swap attack).
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"ANTI-TAMPER: Ps%sNotify callback OVERWRITTEN — "
+					"function pointer replaced (was %p, possible redirect to %p) "
+					"— EX_CALLBACK_ROUTINE_BLOCK.Function swap attack",
+					checks[i].label, snap->ourCallback, replacedWith);
+			} else {
+				// Slot is empty — classic unlink (entry removed from array)
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"ANTI-TAMPER: Ps%sNotify callback UNLINKED from internal array — "
+					"EDR telemetry silenced (PsRemoveCreate*NotifyRoutine or slot zeroed)",
+					checks[i].label);
+			}
 			EmitPsCallbackAlert(bufQueue, msg, snap->ourCallback);
 		}
 	}
@@ -1495,9 +1521,14 @@ VOID HookDetector::TakeEprocessProtBaseline() {
                 char* name = PsGetProcessImageFileName(proc);
                 if (name && IsProtWatchTarget(name)) {
                     PPS_PROTECTION prot = PsGetProcessProtection(proc);
+                    PUCHAR eproc = (PUCHAR)proc;
                     g_ProtWatch[watchIdx].pid = HandleToUlong(p->UniqueProcessId);
                     g_ProtWatch[watchIdx].initialLevel =
                         prot ? prot->Level : 0;
+                    g_ProtWatch[watchIdx].initialSigLevel =
+                        *(UCHAR*)(eproc + EPROCESS_SIGNATURE_LEVEL);
+                    g_ProtWatch[watchIdx].initialSectSigLevel =
+                        *(UCHAR*)(eproc + EPROCESS_SECTION_SIGNATURE_LEVEL);
                     char lower[16] = {};
                     for (int i = 0; i < 15 && name[i]; i++)
                         lower[i] = (name[i] >= 'A' && name[i] <= 'Z')
@@ -1505,9 +1536,12 @@ VOID HookDetector::TakeEprocessProtBaseline() {
                     RtlCopyMemory(g_ProtWatch[watchIdx].name, lower, 16);
                     g_ProtWatch[watchIdx].active = TRUE;
                     watchIdx++;
-                    DbgPrint("[+] HookDetector: EPROCESS prot snap — %s pid=%lu level=0x%02X\n",
+                    DbgPrint("[+] HookDetector: EPROCESS prot snap — %s pid=%lu "
+                        "level=0x%02X sigLvl=0x%02X sectSigLvl=0x%02X\n",
                         lower, HandleToUlong(p->UniqueProcessId),
-                        prot ? prot->Level : 0);
+                        prot ? prot->Level : 0,
+                        g_ProtWatch[watchIdx - 1].initialSigLevel,
+                        g_ProtWatch[watchIdx - 1].initialSectSigLevel);
                 }
                 ObDereferenceObject(proc);
             }
@@ -1522,9 +1556,38 @@ VOID HookDetector::TakeEprocessProtBaseline() {
 }
 
 // ---------------------------------------------------------------------------
-// CheckEprocessProtection — verify PPL levels haven't been downgraded.
-// A decrease in PS_PROTECTION.Level means a BYOVD driver zeroed the field.
+// CheckEprocessProtection — verify PPL levels and signature levels haven't
+// been downgraded.  mimidrv zeroes Protection.Level (PPL strip) AND
+// SignatureLevel / SectionSignatureLevel (CI policy bypass for unsigned DLL
+// injection into lsass).  All three fields are checked.
 // ---------------------------------------------------------------------------
+
+// Helper: emit a CRITICAL EPROCESS-tamper alert.
+static VOID EmitEprocessTamperAlert(BufferQueue* bufQueue, ProtWatchEntry* entry,
+                                     const char* msg) {
+    SIZE_T msgLen = strlen(msg) + 1;
+    PKERNEL_STRUCTURED_NOTIFICATION notif =
+        (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'epnt');
+    if (!notif) return;
+    RtlZeroMemory(notif, sizeof(*notif));
+    SET_CRITICAL(*notif);
+    SET_EPROCESS_PROT_CHECK(*notif);
+    notif->pid = (HANDLE)(ULONG_PTR)entry->pid;
+    RtlCopyMemory(notif->procName, entry->name, 15);
+    notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'epmg');
+    notif->bufSize = (ULONG)msgLen;
+    if (notif->msg) {
+        RtlCopyMemory(notif->msg, msg, msgLen);
+        if (!bufQueue->Enqueue(notif)) {
+            ExFreePool(notif->msg);
+            ExFreePool(notif);
+        }
+    } else {
+        ExFreePool(notif);
+    }
+}
 
 VOID HookDetector::CheckEprocessProtection(BufferQueue* bufQueue) {
     if (!bufQueue) return;
@@ -1541,47 +1604,53 @@ VOID HookDetector::CheckEprocessProtection(BufferQueue* bufQueue) {
 
         PPS_PROTECTION prot = PsGetProcessProtection(proc);
         UCHAR currentLevel = prot ? prot->Level : 0;
+        PUCHAR eproc = (PUCHAR)proc;
+        UCHAR currentSigLevel = *(UCHAR*)(eproc + EPROCESS_SIGNATURE_LEVEL);
+        UCHAR currentSectSigLevel = *(UCHAR*)(eproc + EPROCESS_SECTION_SIGNATURE_LEVEL);
         ObDereferenceObject(proc);
 
-        // Only alert on decrease — if the initial level was 0, the process
-        // was never PPL-protected (e.g. RunAsPPL not enabled for lsass).
+        // Check 1: PS_PROTECTION.Level downgrade (PPL strip)
         if (g_ProtWatch[i].initialLevel > 0 &&
             currentLevel < g_ProtWatch[i].initialLevel)
         {
-            char msg[200];
+            char msg[256];
             RtlStringCbPrintfA(msg, sizeof(msg),
                 "ANTI-TAMPER: %s (pid=%lu) protection downgraded 0x%02X->0x%02X — "
-                "BYOVD PPL-strip (EPROCESS.Protection zeroed)",
+                "BYOVD PPL-strip (EPROCESS.Protection zeroed, mimidrv technique)",
                 g_ProtWatch[i].name, g_ProtWatch[i].pid,
                 g_ProtWatch[i].initialLevel, currentLevel);
-
-            SIZE_T msgLen = strlen(msg) + 1;
-            PKERNEL_STRUCTURED_NOTIFICATION notif =
-                (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
-                    POOL_FLAG_NON_PAGED,
-                    sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'epnt');
-            if (notif) {
-                RtlZeroMemory(notif, sizeof(*notif));
-                SET_CRITICAL(*notif);
-                SET_EPROCESS_PROT_CHECK(*notif);
-                notif->pid = (HANDLE)(ULONG_PTR)g_ProtWatch[i].pid;
-                RtlCopyMemory(notif->procName, g_ProtWatch[i].name, 15);
-                notif->msg = (char*)ExAllocatePool2(
-                    POOL_FLAG_NON_PAGED, msgLen, 'epmg');
-                notif->bufSize = (ULONG)msgLen;
-                if (notif->msg) {
-                    RtlCopyMemory(notif->msg, msg, msgLen);
-                    if (!bufQueue->Enqueue(notif)) {
-                        ExFreePool(notif->msg);
-                        ExFreePool(notif);
-                    }
-                } else {
-                    ExFreePool(notif);
-                }
-            }
-
-            // Update snapshot so we only fire once per downgrade
+            EmitEprocessTamperAlert(bufQueue, &g_ProtWatch[i], msg);
             g_ProtWatch[i].initialLevel = currentLevel;
+        }
+
+        // Check 2: SignatureLevel downgrade — mimidrv zeros this to bypass CI
+        // enforcement, allowing unsigned code to run in the target process.
+        if (g_ProtWatch[i].initialSigLevel > 0 &&
+            currentSigLevel < g_ProtWatch[i].initialSigLevel)
+        {
+            char msg[256];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "ANTI-TAMPER: %s (pid=%lu) SignatureLevel downgraded 0x%02X->0x%02X — "
+                "CI policy bypass (mimidrv / PPLmedic technique)",
+                g_ProtWatch[i].name, g_ProtWatch[i].pid,
+                g_ProtWatch[i].initialSigLevel, currentSigLevel);
+            EmitEprocessTamperAlert(bufQueue, &g_ProtWatch[i], msg);
+            g_ProtWatch[i].initialSigLevel = currentSigLevel;
+        }
+
+        // Check 3: SectionSignatureLevel downgrade — allows unsigned DLL loading
+        // into the target process (credential dumping DLL into lsass).
+        if (g_ProtWatch[i].initialSectSigLevel > 0 &&
+            currentSectSigLevel < g_ProtWatch[i].initialSectSigLevel)
+        {
+            char msg[256];
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "ANTI-TAMPER: %s (pid=%lu) SectionSignatureLevel downgraded 0x%02X->0x%02X — "
+                "unsigned DLL injection enabled (mimidrv credential dump technique)",
+                g_ProtWatch[i].name, g_ProtWatch[i].pid,
+                g_ProtWatch[i].initialSectSigLevel, currentSectSigLevel);
+            EmitEprocessTamperAlert(bufQueue, &g_ProtWatch[i], msg);
+            g_ProtWatch[i].initialSectSigLevel = currentSectSigLevel;
         }
     }
 }
@@ -1657,6 +1726,161 @@ VOID HookDetector::CheckMajorFunctionIntegrity(BufferQueue* bufQueue)
 }
 
 // ---------------------------------------------------------------------------
+// Callback prologue integrity — detect inline hooks on our own callbacks.
+//
+// A BYOVD attacker can keep all callback pointers intact but patch the first
+// bytes of our callback function body with a JMP to a NOP/RET stub.  All
+// pointer-based integrity checks pass, but the callback does nothing.
+//
+// Defense: baseline the first 16 bytes of each callback at init, re-verify
+// every 30s.  If the prologue is modified, alert and restore the original bytes.
+// ---------------------------------------------------------------------------
+
+#define CB_PROLOGUE_SIZE 16
+#define MAX_CB_PROLOGUE_ENTRIES 10
+
+struct CbPrologueEntry {
+    PVOID       address;              // function entry point
+    BYTE        baseline[CB_PROLOGUE_SIZE];  // original prologue bytes
+    const char* name;                 // human-readable label
+    BOOLEAN     active;
+};
+
+static CbPrologueEntry s_CbPrologues[MAX_CB_PROLOGUE_ENTRIES] = {};
+static ULONG            s_CbPrologueCount = 0;
+
+static VOID RecordCbPrologue(PVOID fn, const char* name) {
+    if (!fn || s_CbPrologueCount >= MAX_CB_PROLOGUE_ENTRIES) return;
+    CbPrologueEntry& e = s_CbPrologues[s_CbPrologueCount];
+    e.address = fn;
+    e.name    = name;
+    e.active  = TRUE;
+    __try {
+        RtlCopyMemory(e.baseline, fn, CB_PROLOGUE_SIZE);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        e.active = FALSE;
+        return;
+    }
+    s_CbPrologueCount++;
+}
+
+VOID HookDetector::TakeCallbackPrologueBaseline()
+{
+    s_CbPrologueCount = 0;
+
+    // Kernel callbacks — the functions registered via Ob/Ps/Cm APIs
+    RecordCbPrologue((PVOID)ObjectUtils::ProcessPreCallback,
+                     "ObProcessPreCallback");
+    RecordCbPrologue((PVOID)ObjectUtils::ThreadPreCallback,
+                     "ObThreadPreCallback");
+    RecordCbPrologue((PVOID)RegistryUtils::RegOpNotifyCallback,
+                     "CmRegOpNotifyCallback");
+
+    // Ps*Notify callbacks
+    RecordCbPrologue(ProcessUtils::s_NotifyFn,
+                     "PsProcessNotify");
+    RecordCbPrologue(ThreadUtils::s_NotifyFn,
+                     "PsThreadNotify");
+    RecordCbPrologue(ImageUtils::s_NotifyFn,
+                     "PsImageLoadNotify");
+
+    // The IOCTL dispatch handler
+    extern NTSTATUS DriverIoControl(PDEVICE_OBJECT, PIRP);
+    RecordCbPrologue((PVOID)DriverIoControl,
+                     "DriverIoControl");
+
+    DbgPrint("[+] HookDetector: callback prologue baseline captured (%lu entries)\n",
+        s_CbPrologueCount);
+}
+
+VOID HookDetector::CheckCallbackPrologueIntegrity(BufferQueue* bufQueue)
+{
+    if (!bufQueue || s_CbPrologueCount == 0) return;
+
+    for (ULONG i = 0; i < s_CbPrologueCount; i++) {
+        CbPrologueEntry& e = s_CbPrologues[i];
+        if (!e.active || !e.address) continue;
+
+        BYTE current[CB_PROLOGUE_SIZE] = {};
+        __try {
+            if (!MmIsAddressValid(e.address)) continue;
+            RtlCopyMemory(current, e.address, CB_PROLOGUE_SIZE);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+
+        if (RtlCompareMemory(current, e.baseline, CB_PROLOGUE_SIZE)
+            == CB_PROLOGUE_SIZE)
+            continue;
+
+        // Prologue modified — classify the patch type
+        const char* patchType = "unknown modification";
+        if (current[0] == 0xE9)
+            patchType = "JMP rel32 (near jump detour)";
+        else if (current[0] == 0xFF && current[1] == 0x25)
+            patchType = "JMP [rip+disp32] (indirect jump detour)";
+        else if (current[0] == 0x48 && current[1] == 0xB8 &&
+                 current[10] == 0xFF && current[11] == 0xE0)
+            patchType = "MOV RAX,imm64 + JMP RAX (long detour)";
+        else if (current[0] == 0xC3)
+            patchType = "RET (callback neutered — returns immediately)";
+        else if (current[0] == 0x33 && current[1] == 0xC0 && current[2] == 0xC3)
+            patchType = "XOR EAX,EAX + RET (forced success return)";
+        else if (current[0] == 0x48 && current[1] == 0x31 &&
+                 current[2] == 0xC0 && current[3] == 0xC3)
+            patchType = "XOR RAX,RAX + RET (forced zero return)";
+
+        char msg[280];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "ANTI-TAMPER: %s at %p inline-hooked — %s "
+            "(callback entry overwrite — BYOVD silencing attack)",
+            e.name, e.address, patchType);
+
+        PKERNEL_STRUCTURED_NOTIFICATION notif =
+            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED,
+                sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'cpnt');
+        if (notif) {
+            RtlZeroMemory(notif, sizeof(*notif));
+            SET_CRITICAL(*notif);
+            notif->pid    = 0;
+            notif->isPath = FALSE;
+            notif->scoopedAddress = (ULONG64)e.address;
+            RtlCopyMemory(notif->procName, "NortonEDR", 9);
+            SIZE_T msgLen = strlen(msg) + 1;
+            notif->msg = (char*)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, msgLen, 'cpmg');
+            notif->bufSize = (ULONG)msgLen;
+            if (notif->msg) {
+                RtlCopyMemory(notif->msg, msg, msgLen);
+                if (!bufQueue->Enqueue(notif)) {
+                    ExFreePool(notif->msg); ExFreePool(notif);
+                }
+            } else { ExFreePool(notif); }
+        }
+
+        // Restore original prologue — re-enable the callback
+        __try {
+            // Kernel code pages are read-only — we need to use CR0 WP-clear
+            // or MDL mapping.  Use MDL for safety.
+            PMDL mdl = IoAllocateMdl(e.address, CB_PROLOGUE_SIZE, FALSE, FALSE, NULL);
+            if (mdl) {
+                MmBuildMdlForNonPagedPool(mdl);
+                // Map with read-write, overriding the page protection
+                PVOID mapped = MmMapLockedPagesSpecifyCache(
+                    mdl, KernelMode, MmNonCached, NULL, FALSE, NormalPagePriority);
+                if (mapped) {
+                    RtlCopyMemory(mapped, e.baseline, CB_PROLOGUE_SIZE);
+                    MmUnmapLockedPages(mapped, mdl);
+                    DbgPrint("[!] HookDetector: restored %s prologue\n", e.name);
+                }
+                IoFreeMdl(mdl);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrint("[-] HookDetector: failed to restore %s prologue\n", e.name);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RunAllHookChecks — run all detection routines in sequence.
 // Call after driver init is complete (and periodically from AntiTamper).
 // ---------------------------------------------------------------------------
@@ -1680,6 +1904,7 @@ VOID HookDetector::RunAllHookChecks(
     CheckSeCiCallbackIntegrity(bufQueue);
     CheckEprocessProtection(bufQueue);
     CheckMajorFunctionIntegrity(bufQueue);
+    CheckCallbackPrologueIntegrity(bufQueue);
 
     DbgPrint("[*] HookDetector results — SSDT=%lu Inline=%lu EAT=%lu ETW=%d\n",
         ssdt, inl, eat, (int)etw);

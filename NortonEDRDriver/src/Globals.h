@@ -1659,6 +1659,12 @@ public:
     static VOID     TakeMajorFunctionBaseline(PDRIVER_OBJECT drvObj);
     static VOID     CheckMajorFunctionIntegrity(BufferQueue* bufQueue);
 
+    // Callback prologue integrity — baseline first 16 bytes of each registered
+    // callback function.  Detects inline hooks (JMP/RET/NOP) patched by BYOVD
+    // onto our callback entry points to silently neuter the EDR.
+    static VOID     TakeCallbackPrologueBaseline();
+    static VOID     CheckCallbackPrologueIntegrity(BufferQueue* bufQueue);
+
     static VOID RunAllHookChecks(
         PFUNCTION_MAP exportsMap,
         PVOID         moduleBase,

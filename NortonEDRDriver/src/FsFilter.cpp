@@ -390,7 +390,7 @@ static FLT_OPERATION_REGISTRATION g_FsCallbacks[] = {
 static FLT_REGISTRATION g_FltRegistration = {
     sizeof(FLT_REGISTRATION),
     FLT_REGISTRATION_VERSION,
-    0,                              // Flags
+    FLTFL_REGISTRATION_DO_NOT_SUPPORT_SERVICE_STOP, // Block fltmc unload / FltUnloadFilter
     nullptr,                        // ContextRegistration
     g_FsCallbacks,
     FsFilter::FilterUnloadCallback,
@@ -446,7 +446,12 @@ VOID FsFilter::Cleanup() {
 }
 
 NTSTATUS FLTAPI FsFilter::FilterUnloadCallback(FLT_FILTER_UNLOAD_FLAGS Flags) {
-    UNREFERENCED_PARAMETER(Flags);
+    // Only allow mandatory unloads (system shutdown / driver unload from DriverUnload).
+    // Voluntary unloads (fltmc unload, FltUnloadFilter from mimidrv/BYOVD) are blocked.
+    if (!(Flags & FLTFL_FILTER_UNLOAD_MANDATORY)) {
+        DbgPrint("[!] FsFilter: voluntary unload attempt blocked (mimidrv defense)\n");
+        return STATUS_FLT_DO_NOT_DETACH;
+    }
     FsFilter::Cleanup();
     return STATUS_SUCCESS;
 }

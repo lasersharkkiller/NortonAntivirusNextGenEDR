@@ -762,6 +762,19 @@ static const char* kLolDriverNames[] = {
     "msio64.sys",         // MICSYS MSI I/O — arbitrary phys mem / port access
     "msio32.sys",
 
+    // --- Mimikatz / credential-theft tooling ---
+    "mimidrv.sys",        // Mimikatz kernel driver — PPL strip, token theft, minifilter kill
+    "wdnmd.sys",          // Mimikatz mimidrv repack — renamed deployments
+    "fgme.sys",           // FGme exploit driver — Mimikatz PPL bypass helper
+
+    // --- Offensive toolkit kernel drivers ---
+    "dsefix.sys",         // DSEFix — patches g_CiEnabled to disable driver signing enforcement
+    "ppldump.sys",        // PPLdump — dumps PPL process memory via exploit driver
+    "pplmedic.sys",       // PPLmedic — downgrades PPL protection via WSCI exploit
+    "reddriver.sys",      // RedDriver — browser traffic interception via WFP hijack
+    "edrsilencer.sys",    // EDRSilencer — blocks EDR network telemetry via WFP rules
+    "kdu.sys",            // Kernel Driver Utility (hfiref0x) — maps unsigned drivers via BYOVD
+
     // --- RegPhantom rootkit IOCs (Nextron Systems, March 2026) ---
     "mapdriver.sys",
     "mydriver.sys",
