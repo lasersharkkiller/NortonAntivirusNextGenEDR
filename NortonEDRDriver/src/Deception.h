@@ -51,6 +51,47 @@ static const UCHAR g_CanaryNtlmHash[16] = {
 #define HONEYPOT_CRED_PATH  L"\\credentials.xml"        // in common drop paths
 
 // ---------------------------------------------------------------------------
+// Filesystem canary files — anti-ransomware tripwires
+//
+// Canary files are planted in common user directories (Documents, Desktop,
+// shared drives) with names chosen to appear at the alphabetical extremes
+// of directory listings. Ransomware enumerates directories A→Z or Z→A and
+// encrypts files sequentially — canaries are the FIRST files touched, giving
+// us an instant ransomware verdict on the very first file operation.
+//
+// Properties:
+//   - Alphabetically first ("  _AAAinsurance_records.docx") and last
+//     ("~zzz_tax_returns_2024.xlsx") in typical directories
+//   - Common document extensions (.docx, .xlsx, .pdf) — ransomware targets these
+//   - Non-zero realistic file sizes (some ransomware skips empty/tiny files)
+//   - Multiple directory depths for coverage
+//   - Any write, rename, or delete = immediate CRITICAL ransomware alert
+//   - Zero false positives: users never interact with hidden canary files
+// ---------------------------------------------------------------------------
+#define CANARY_MAX_FILES     16
+#define CANARY_FILE_SIZE     4096   // 4 KB — large enough to not be skipped
+
+// Canary filenames — leading spaces/tildes push to extremes of sort order
+static const WCHAR* g_CanaryFileNames[] = {
+    L"  _AAAinsurance_records.docx",
+    L"  _AAAmedical_claims_2024.pdf",
+    L" _AAAtax_forms_w2.xlsx",
+    L"~zzz_tax_returns_2024.xlsx",
+    L"~zzz_financial_summary.docx",
+    L"~zzz_mortgage_documents.pdf",
+};
+#define CANARY_NAME_COUNT  (sizeof(g_CanaryFileNames) / sizeof(g_CanaryFileNames[0]))
+
+// Directories to plant canaries in (relative to user profile root)
+// We use well-known folder GUIDs resolved at init time.
+static const WCHAR* g_CanarySubDirs[] = {
+    L"\\Documents",
+    L"\\Desktop",
+    L"\\Documents\\Financial",       // deep subdirectory — catches recursive enumeration
+    L"\\Documents\\Personal Records", // another deep bait directory
+};
+
+// ---------------------------------------------------------------------------
 // Deception Engine
 // ---------------------------------------------------------------------------
 class DeceptionEngine {
@@ -64,6 +105,16 @@ class DeceptionEngine {
 
     // NotifQueue for emitting deception events into the detection pipeline
     static NotifQueue* g_NotifQueue;
+
+    // Canary file tracking — full NT paths of deployed canary files
+    static UNICODE_STRING g_CanaryPaths[CANARY_MAX_FILES];
+    static ULONG          g_CanaryCount;
+
+    // Internal: deploy canary files into user profile directories
+    static NTSTATUS DeployCanaryFiles();
+    static NTSTATUS CreateSingleCanary(
+        _In_ PCWSTR directoryPath,
+        _In_ PCWSTR fileName);
 
     // Internal helpers
     static NTSTATUS CreateHoneypotRegistryKey(
@@ -100,6 +151,17 @@ public:
     static VOID HandleHoneypotFileAccess(
         _In_ PCUNICODE_STRING filePath,
         _In_ HANDLE           callerPid);
+
+    // Canary file tripwire — called from FsFilter PreCreate/PreSetInformation.
+    // Returns TRUE if the path matches a deployed canary file.
+    static BOOLEAN IsCanaryFile(_In_ PCUNICODE_STRING filePath);
+
+    // Called when a canary file is written, renamed, or deleted — immediate
+    // ransomware verdict with zero false positives.
+    static VOID HandleCanaryFileAccess(
+        _In_ PCUNICODE_STRING filePath,
+        _In_ HANDLE           callerPid,
+        _In_ const char*      operation);
 
     // Called from RegistryUtils::RegOpNotifyCallback for honeypot key access.
     static VOID HandleHoneypotRegistryAccess(

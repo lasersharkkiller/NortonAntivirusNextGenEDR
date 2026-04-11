@@ -44,10 +44,12 @@
 // ---------------------------------------------------------------------------
 // Static member definitions
 // ---------------------------------------------------------------------------
-HANDLE       DeceptionEngine::g_HoneypotSecretHandle  = nullptr;
-HANDLE       DeceptionEngine::g_HoneypotServiceHandle = nullptr;
-KSPIN_LOCK   DeceptionEngine::g_Lock;
-NotifQueue*  DeceptionEngine::g_NotifQueue            = nullptr;
+HANDLE          DeceptionEngine::g_HoneypotSecretHandle  = nullptr;
+HANDLE          DeceptionEngine::g_HoneypotServiceHandle = nullptr;
+KSPIN_LOCK      DeceptionEngine::g_Lock;
+NotifQueue*     DeceptionEngine::g_NotifQueue            = nullptr;
+UNICODE_STRING  DeceptionEngine::g_CanaryPaths[CANARY_MAX_FILES] = {};
+ULONG           DeceptionEngine::g_CanaryCount                   = 0;
 
 // ---------------------------------------------------------------------------
 // Internal: create or open a registry key and set a value
@@ -121,6 +123,219 @@ VOID DeceptionEngine::EmitDeceptionAlert(
     RtlCopyMemory(notif->msg, msg, msgLen);
 
     if (!g_NotifQueue->Enqueue(notif)) ExFreePool(notif);
+}
+
+// ---------------------------------------------------------------------------
+// Canary file deployment — create bait documents in user directories
+// ---------------------------------------------------------------------------
+
+// Create a single canary file at directoryPath\fileName with realistic content.
+// The file is created with FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM to keep
+// it out of casual Explorer views while still visible to ransomware enumeration
+// (ransomware calls FindFirstFile with no attribute filter — they see everything).
+NTSTATUS DeceptionEngine::CreateSingleCanary(
+    _In_ PCWSTR directoryPath,
+    _In_ PCWSTR fileName)
+{
+    if (g_CanaryCount >= CANARY_MAX_FILES) return STATUS_INSUFFICIENT_RESOURCES;
+
+    // Build full path: directoryPath + "\" + fileName
+    WCHAR fullPath[512];
+    NTSTATUS s = RtlStringCbPrintfW(fullPath, sizeof(fullPath),
+        L"%s\\%s", directoryPath, fileName);
+    if (!NT_SUCCESS(s)) return s;
+
+    UNICODE_STRING uniPath;
+    RtlInitUnicodeString(&uniPath, fullPath);
+
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &uniPath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
+
+    IO_STATUS_BLOCK iosb;
+    HANDLE hFile = nullptr;
+
+    s = ZwCreateFile(
+        &hFile,
+        GENERIC_WRITE | SYNCHRONIZE,
+        &oa,
+        &iosb,
+        nullptr,
+        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY,
+        FILE_SHARE_READ,
+        FILE_OPEN_IF,          // create if not exists, open if already there
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+        nullptr, 0);
+
+    if (!NT_SUCCESS(s)) {
+        // Directory may not exist — try creating it first
+        // Build the directory path
+        UNICODE_STRING dirUni;
+        RtlInitUnicodeString(&dirUni, directoryPath);
+        OBJECT_ATTRIBUTES dirOa;
+        InitializeObjectAttributes(&dirOa, &dirUni,
+            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
+
+        HANDLE hDir = nullptr;
+        IO_STATUS_BLOCK dirIosb;
+        NTSTATUS dirSt = ZwCreateFile(
+            &hDir,
+            FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            &dirOa, &dirIosb, nullptr,
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN_IF,
+            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            nullptr, 0);
+        if (NT_SUCCESS(dirSt) && hDir) ZwClose(hDir);
+
+        // Retry file creation
+        s = ZwCreateFile(
+            &hFile, GENERIC_WRITE | SYNCHRONIZE, &oa, &iosb, nullptr,
+            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY,
+            FILE_SHARE_READ, FILE_OPEN_IF,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+            nullptr, 0);
+        if (!NT_SUCCESS(s)) return s;
+    }
+
+    // Write realistic-looking content — a plausible document header followed by
+    // padding.  The content doesn't need to be a valid OOXML/PDF — it just needs
+    // to be non-zero bytes so ransomware doesn't skip it as an empty file.
+    // We use a recognizable ASCII header that also helps us identify canaries
+    // if we ever need to verify the file.
+    UCHAR canaryContent[CANARY_FILE_SIZE];
+    RtlFillMemory(canaryContent, sizeof(canaryContent), 0x20);  // spaces
+
+    // Embed a canary signature at the start (not the file extension magic —
+    // we want ransomware to treat this as a real document worth encrypting)
+    static const char kCanaryHeader[] =
+        "PERSONAL FINANCIAL RECORDS - CONFIDENTIAL\r\n"
+        "Account: 4532-XXXX-XXXX-7891\r\n"
+        "Tax ID: XXX-XX-4821\r\n"
+        "This document contains sensitive information.\r\n"
+        "\r\n"
+        "NortonEDR-Canary-v1\r\n";  // our hidden tag at the end of the header
+
+    RtlCopyMemory(canaryContent, kCanaryHeader,
+        min(sizeof(kCanaryHeader) - 1, sizeof(canaryContent)));
+
+    ZwWriteFile(hFile, nullptr, nullptr, nullptr, &iosb,
+        canaryContent, sizeof(canaryContent), nullptr, nullptr);
+    ZwClose(hFile);
+
+    // Store the full NT path for runtime matching
+    USHORT pathBytes = uniPath.Length;
+    PWCH pathBuf = (PWCH)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, pathBytes + sizeof(WCHAR), 'cnry');
+    if (pathBuf) {
+        RtlCopyMemory(pathBuf, uniPath.Buffer, pathBytes);
+        pathBuf[pathBytes / sizeof(WCHAR)] = L'\0';
+        g_CanaryPaths[g_CanaryCount].Buffer        = pathBuf;
+        g_CanaryPaths[g_CanaryCount].Length         = pathBytes;
+        g_CanaryPaths[g_CanaryCount].MaximumLength  = pathBytes + sizeof(WCHAR);
+        g_CanaryCount++;
+        DbgPrint("[NortonEDR-Deception] Canary deployed: %wZ\n", &g_CanaryPaths[g_CanaryCount - 1]);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+// Deploy canary files across user profile directories.
+// We enumerate user profiles from HKLM\SOFTWARE\Microsoft\Windows NT\
+// CurrentVersion\ProfileList and plant canaries in each user's Documents,
+// Desktop, and deep subdirectories.
+NTSTATUS DeceptionEngine::DeployCanaryFiles()
+{
+    g_CanaryCount = 0;
+
+    // Open the ProfileList key to enumerate user profile directories
+    UNICODE_STRING profileListPath;
+    RtlInitUnicodeString(&profileListPath,
+        L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList");
+
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &profileListPath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
+
+    HANDLE hProfileList = nullptr;
+    NTSTATUS s = ZwOpenKey(&hProfileList, KEY_READ, &oa);
+    if (!NT_SUCCESS(s)) {
+        DbgPrint("[NortonEDR-Deception] Cannot open ProfileList: 0x%x\n", s);
+        return s;
+    }
+
+    // Enumerate subkeys (each is a user SID)
+    ULONG index = 0;
+    UCHAR keyInfoBuf[512];
+    ULONG resultLen = 0;
+
+    while (NT_SUCCESS(ZwEnumerateKey(hProfileList, index++,
+        KeyBasicInformation, keyInfoBuf, sizeof(keyInfoBuf), &resultLen)))
+    {
+        KEY_BASIC_INFORMATION* keyInfo = (KEY_BASIC_INFORMATION*)keyInfoBuf;
+
+        // Skip short SIDs (built-in accounts like S-1-5-18, S-1-5-19, S-1-5-20)
+        if (keyInfo->NameLength < 20 * sizeof(WCHAR)) continue;
+
+        // Open this profile subkey to read ProfileImagePath
+        UNICODE_STRING subKeyName;
+        subKeyName.Buffer        = keyInfo->Name;
+        subKeyName.Length        = (USHORT)keyInfo->NameLength;
+        subKeyName.MaximumLength = (USHORT)keyInfo->NameLength;
+
+        OBJECT_ATTRIBUTES subOa;
+        InitializeObjectAttributes(&subOa, &subKeyName,
+            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, hProfileList, nullptr);
+
+        HANDLE hProfile = nullptr;
+        if (!NT_SUCCESS(ZwOpenKey(&hProfile, KEY_READ, &subOa))) continue;
+
+        // Read ProfileImagePath value (e.g., "C:\Users\JohnDoe")
+        UNICODE_STRING valName;
+        RtlInitUnicodeString(&valName, L"ProfileImagePath");
+
+        UCHAR valBuf[600];
+        ULONG valResultLen = 0;
+        NTSTATUS valSt = ZwQueryValueKey(hProfile, &valName,
+            KeyValuePartialInformation, valBuf, sizeof(valBuf), &valResultLen);
+        ZwClose(hProfile);
+
+        if (!NT_SUCCESS(valSt)) continue;
+
+        KEY_VALUE_PARTIAL_INFORMATION* valInfo = (KEY_VALUE_PARTIAL_INFORMATION*)valBuf;
+        if (valInfo->Type != REG_EXPAND_SZ && valInfo->Type != REG_SZ) continue;
+        if (valInfo->DataLength < 10) continue;
+
+        // Convert the profile path to an NT path (prefix with \??\)
+        WCHAR profilePath[260];
+        ULONG profileChars = valInfo->DataLength / sizeof(WCHAR);
+        // Remove trailing null if present
+        if (profileChars > 0 && ((WCHAR*)valInfo->Data)[profileChars - 1] == L'\0')
+            profileChars--;
+
+        s = RtlStringCbPrintfW(profilePath, sizeof(profilePath),
+            L"\\??\\%.*s", profileChars, (WCHAR*)valInfo->Data);
+        if (!NT_SUCCESS(s)) continue;
+
+        // Plant canaries in each subdirectory for each filename
+        for (ULONG di = 0; di < ARRAYSIZE(g_CanarySubDirs); di++) {
+            WCHAR targetDir[400];
+            s = RtlStringCbPrintfW(targetDir, sizeof(targetDir),
+                L"%s%s", profilePath, g_CanarySubDirs[di]);
+            if (!NT_SUCCESS(s)) continue;
+
+            for (ULONG fi = 0; fi < CANARY_NAME_COUNT; fi++) {
+                if (g_CanaryCount >= CANARY_MAX_FILES) goto done;
+                CreateSingleCanary(targetDir, g_CanaryFileNames[fi]);
+            }
+        }
+    }
+
+done:
+    ZwClose(hProfileList);
+    DbgPrint("[NortonEDR-Deception] Deployed %lu canary files across user profiles\n", g_CanaryCount);
+    return STATUS_SUCCESS;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,8 +413,14 @@ NTSTATUS DeceptionEngine::Init(_In_ NotifQueue* queue)
         REG_BINARY,
         nullptr);
 
+    // -----------------------------------------------------------------
+    // Canary files: anti-ransomware tripwires deployed in user directories
+    // -----------------------------------------------------------------
+    DeployCanaryFiles();
+
     DbgPrint("[NortonEDR-Deception] Deception engine initialized — "
-             "honeypots: LSA secret, service password, SAM user, file paths\n");
+             "honeypots: LSA secret, service password, SAM user, file paths, "
+             "%lu canary files\n", g_CanaryCount);
 
     return STATUS_SUCCESS;
 }
@@ -220,6 +441,17 @@ VOID DeceptionEngine::Cleanup()
         ZwClose(g_HoneypotServiceHandle);
         g_HoneypotServiceHandle = nullptr;
     }
+    // Clean up canary file path tracking (files are left on disk intentionally —
+    // removing them on unload would create a window where ransomware could run
+    // undetected; they are tiny and hidden, so leaving them is harmless)
+    for (ULONG i = 0; i < g_CanaryCount; i++) {
+        if (g_CanaryPaths[i].Buffer) {
+            ExFreePool(g_CanaryPaths[i].Buffer);
+            g_CanaryPaths[i].Buffer = nullptr;
+        }
+    }
+    g_CanaryCount = 0;
+
     g_NotifQueue = nullptr;
     DbgPrint("[NortonEDR-Deception] Deception engine cleaned up\n");
 }
@@ -344,6 +576,116 @@ VOID DeceptionEngine::HandleHoneypotFileAccess(
     // File open is ALLOWED — attacker sees the file and reads it.
     // For full deception, a post-operation callback could replace the content
     // with a decoy (fake SAM/NTDS) — left as a production extension point.
+}
+
+// ---------------------------------------------------------------------------
+// IsCanaryFile — called from FsFilter PreCreate / PreSetInformation
+//
+// Checks if the normalized file path matches any deployed canary file.
+// Uses case-insensitive suffix matching against the stored canary paths.
+// ---------------------------------------------------------------------------
+BOOLEAN DeceptionEngine::IsCanaryFile(_In_ PCUNICODE_STRING filePath)
+{
+    if (!filePath || !filePath->Buffer || g_CanaryCount == 0) return FALSE;
+
+    for (ULONG i = 0; i < g_CanaryCount; i++) {
+        if (g_CanaryPaths[i].Buffer == nullptr) continue;
+
+        // Case-insensitive comparison — canary paths are full NT paths,
+        // filePath from FltGetFileNameInformation is also a full NT path.
+        // Use suffix match: filePath may have volume device prefix while
+        // canary has \??\ prefix, so compare just the filename portions.
+        // However, both should normalize similarly. Try exact match first.
+        if (RtlEqualUnicodeString(filePath, &g_CanaryPaths[i], TRUE))
+            return TRUE;
+
+        // Fallback: check if filePath ends with the canary filename portion.
+        // Extract filename from canary path (after last backslash).
+        USHORT canaryChars = g_CanaryPaths[i].Length / sizeof(WCHAR);
+        USHORT nameStart = canaryChars;
+        for (USHORT j = canaryChars; j > 0; j--) {
+            if (g_CanaryPaths[i].Buffer[j - 1] == L'\\') {
+                nameStart = j;
+                break;
+            }
+        }
+        USHORT canaryNameLen = canaryChars - nameStart;
+        if (canaryNameLen == 0) continue;
+
+        USHORT fileChars = filePath->Length / sizeof(WCHAR);
+        if (fileChars < canaryNameLen) continue;
+
+        // Compare the filename portion (case-insensitive)
+        USHORT fileNameStart = fileChars;
+        for (USHORT j = fileChars; j > 0; j--) {
+            if (filePath->Buffer[j - 1] == L'\\') {
+                fileNameStart = j;
+                break;
+            }
+        }
+        USHORT fileNameLen = fileChars - fileNameStart;
+        if (fileNameLen != canaryNameLen) continue;
+
+        BOOLEAN match = TRUE;
+        for (USHORT k = 0; k < canaryNameLen; k++) {
+            WCHAR a = filePath->Buffer[fileNameStart + k];
+            WCHAR b = g_CanaryPaths[i].Buffer[nameStart + k];
+            if (a >= L'A' && a <= L'Z') a += 32;
+            if (b >= L'A' && b <= L'Z') b += 32;
+            if (a != b) { match = FALSE; break; }
+        }
+
+        // Also verify the parent directory contains one of our canary subdirs
+        // to avoid false positives from identically named files elsewhere
+        if (match) {
+            for (ULONG di = 0; di < ARRAYSIZE(g_CanarySubDirs); di++) {
+                UNICODE_STRING subDir;
+                RtlInitUnicodeString(&subDir, g_CanarySubDirs[di]);
+                ULONG sdLen = subDir.Length / sizeof(WCHAR);
+                if (fileNameStart >= sdLen) {
+                    BOOLEAN dirMatch = TRUE;
+                    for (ULONG ci = 0; ci < sdLen; ci++) {
+                        WCHAR fa = filePath->Buffer[fileNameStart - sdLen + ci];
+                        WCHAR fb = subDir.Buffer[ci];
+                        if (fa >= L'A' && fa <= L'Z') fa += 32;
+                        if (fb >= L'A' && fb <= L'Z') fb += 32;
+                        if (fa != fb) { dirMatch = FALSE; break; }
+                    }
+                    if (dirMatch) return TRUE;
+                }
+            }
+        }
+    }
+    return FALSE;
+}
+
+// ---------------------------------------------------------------------------
+// HandleCanaryFileAccess — CRITICAL ransomware alert on canary tripwire
+//
+// This fires on the very first file the ransomware touches — no need for
+// burst counting, rename-extension heuristics, or behavioral thresholds.
+// Any write/rename/delete of a canary is a confirmed ransomware indicator.
+// ---------------------------------------------------------------------------
+VOID DeceptionEngine::HandleCanaryFileAccess(
+    _In_ PCUNICODE_STRING filePath,
+    _In_ HANDLE           callerPid,
+    _In_ const char*      operation)
+{
+    ANSI_STRING ansiPath = {};
+    RtlUnicodeStringToAnsiString(&ansiPath, filePath, TRUE);
+
+    char msg[320];
+    RtlStringCbPrintfA(msg, sizeof(msg),
+        "RANSOMWARE CANARY TRIPWIRE: %s on canary file '%s' by PID=%llu — "
+        "CONFIRMED RANSOMWARE ACTIVITY — immediate response required",
+        operation,
+        ansiPath.Buffer ? ansiPath.Buffer : "(unknown)",
+        (ULONG64)(ULONG_PTR)callerPid);
+
+    if (ansiPath.Buffer) RtlFreeAnsiString(&ansiPath);
+
+    DbgPrint("[NortonEDR-Deception] *** %s ***\n", msg);
+    EmitDeceptionAlert(msg, "Method: Deception (RansomwareCanary)", (ULONG)(ULONG_PTR)callerPid);
 }
 
 // ---------------------------------------------------------------------------

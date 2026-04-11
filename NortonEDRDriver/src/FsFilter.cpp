@@ -1,4 +1,5 @@
 #include "Globals.h"
+#include "Deception.h"
 
 // ---------------------------------------------------------------------------
 // Minifilter altitude — FSFilter Anti-Virus range (320000–329999)
@@ -949,6 +950,28 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
         HANDLE    pid       = PsGetProcessId(process);
         char*     procName  = PsGetProcessImageFileName(process);
 
+        // ---- Canary file tripwire (anti-ransomware) ----
+        // Check BEFORE all other detections — canary hit = instant ransomware verdict.
+        // Any write, overwrite, or delete-open on a canary file is a confirmed attack.
+        {
+            ACCESS_MASK daCanary = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            ULONG dispCanary = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
+            BOOLEAN isCanaryWrite =
+                (daCanary & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE |
+                             FILE_WRITE_ATTRIBUTES)) != 0;
+            BOOLEAN isCanaryOverwrite =
+                (dispCanary == FILE_OVERWRITE || dispCanary == FILE_OVERWRITE_IF ||
+                 dispCanary == FILE_SUPERSEDE);
+
+            if ((isCanaryWrite || isCanaryOverwrite) &&
+                DeceptionEngine::IsCanaryFile(&nameInfo->Name))
+            {
+                const char* verb = isCanaryOverwrite ? "OVERWRITE" :
+                                   (daCanary & DELETE) ? "DELETE-OPEN" : "WRITE-OPEN";
+                DeceptionEngine::HandleCanaryFileAccess(&nameInfo->Name, pid, verb);
+            }
+        }
+
         // ---- Credential file access ----
         for (SIZE_T i = 0; i < ARRAYSIZE(kCredPaths); i++) {
             if (WcsContainsLower(&nameInfo->Name, kCredPaths[i])) {
@@ -1493,6 +1516,115 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreWrite(
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Memory dump magic-byte detection (T1003.001 — LSASS credential dump).
+    //
+    // MiniDumpWriteDump, ProcDump, comsvcs.dll MiniDump, nanodump, and custom
+    // dumpers all write a MINIDUMP_HEADER to the target file.  The header
+    // always starts at offset 0 with the signature 'MDMP' (0x504D444D).
+    //
+    // By checking the first 4 bytes of any user-mode write at file offset 0
+    // we detect ALL minidump-based credential dumpers regardless of:
+    //   - Output filename (debug.log, report.txt, etc.)
+    //   - API used (MiniDumpWriteDump, NtWriteFile, WriteFile)
+    //   - Tool (ProcDump, comsvcs.dll, custom C2 module)
+    //
+    // This is cheap: one offset check + one 4-byte comparison per write.
+    // We skip paging I/O (not user-initiated) and writes > 0 offset.
+    // -----------------------------------------------------------------------
+    {
+        // Skip paging I/O and non-cached — these are system-initiated, not user dumps
+        if (!(Data->Iopb->IrpFlags & (IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO))) {
+            LARGE_INTEGER writeOffset = Data->Iopb->Parameters.Write.ByteOffset;
+            ULONG writeLen = Data->Iopb->Parameters.Write.Length;
+
+            // Only check writes starting at offset 0 with at least 4 bytes
+            if (writeOffset.QuadPart == 0 && writeLen >= 4) {
+                // Get the write buffer — prefer the system buffer (buffered I/O),
+                // fall back to MDL, then user buffer
+                PVOID writeBuf = nullptr;
+                if (Data->Iopb->Parameters.Write.MdlAddress) {
+                    writeBuf = MmGetSystemAddressForMdlSafe(
+                        Data->Iopb->Parameters.Write.MdlAddress,
+                        NormalPagePriority | MdlMappingNoExecute);
+                }
+                if (!writeBuf) {
+                    writeBuf = Data->Iopb->Parameters.Write.WriteBuffer;
+                }
+
+                if (writeBuf && MmIsAddressValid(writeBuf)) {
+                    __try {
+                        ULONG magic = *(ULONG*)writeBuf;
+
+                        // MDMP signature: 0x504D444D ('MDMP' as little-endian DWORD)
+                        if (magic == 0x504D444D) {
+                            PEPROCESS proc = IoThreadToProcess(Data->Thread);
+                            char* pn = PsGetProcessImageFileName(proc);
+
+                            // Allow WerFault.exe (Windows Error Reporting) — legitimate crash dumps
+                            BOOLEAN isAllowed = FALSE;
+                            if (pn) {
+                                isAllowed = (strcmp(pn, "WerFault.exe") == 0 ||
+                                             strcmp(pn, "WerFaultSecu") == 0);  // 15-char truncation
+                            }
+
+                            if (!isAllowed) {
+                                char msg[224];
+                                RtlStringCbPrintfA(msg, sizeof(msg),
+                                    "FS: MINIDUMP header (MDMP) written to file by '%s' (pid=%llu) "
+                                    "— possible credential dump (T1003.001) "
+                                    "— MiniDumpWriteDump / ProcDump / comsvcs.dll",
+                                    pn ? pn : "?", (ULONG64)(ULONG_PTR)pid);
+                                EnqueueFsAlert(pid, pn, msg, TRUE);  // CRITICAL
+                            }
+                        }
+
+                        // Bonus: raw PE header being written to a file at offset 0
+                        // could indicate reflective DLL being staged to disk, or a
+                        // dropper extracting an embedded payload.  Not as critical
+                        // as a credential dump, but worth a warning.
+                        // MZ header: 0x5A4D ('MZ') at bytes [0..1]
+                        else if ((magic & 0xFFFF) == 0x5A4D && writeLen >= 64) {
+                            // Check for valid PE — the e_lfanew field at offset 0x3C
+                            // should point to a 'PE\0\0' signature.
+                            LONG peOffset = *(LONG*)((PUCHAR)writeBuf + 0x3C);
+                            if (peOffset > 0 && (ULONG)peOffset + 4 <= writeLen) {
+                                ULONG peSig = *(ULONG*)((PUCHAR)writeBuf + peOffset);
+                                if (peSig == 0x00004550) {  // 'PE\0\0'
+                                    PEPROCESS proc = IoThreadToProcess(Data->Thread);
+                                    char* pn = PsGetProcessImageFileName(proc);
+
+                                    // Allow common installers / compilers
+                                    BOOLEAN isAllowed2 = FALSE;
+                                    if ((ULONG_PTR)pid <= 4) isAllowed2 = TRUE;
+                                    if (pn) {
+                                        isAllowed2 = (strcmp(pn, "msiexec.exe") == 0 ||
+                                                      strcmp(pn, "TrustedInsta") == 0 ||
+                                                      strcmp(pn, "svchost.exe") == 0 ||
+                                                      strcmp(pn, "DismHost.exe") == 0 ||
+                                                      strcmp(pn, "tiworker.exe") == 0);
+                                    }
+
+                                    if (!isAllowed2) {
+                                        char msg[192];
+                                        RtlStringCbPrintfA(msg, sizeof(msg),
+                                            "FS: PE binary (MZ/PE) written to file by '%s' (pid=%llu) "
+                                            "— possible payload drop / reflective staging",
+                                            pn ? pn : "?", (ULONG64)(ULONG_PTR)pid);
+                                        EnqueueFsAlert(pid, pn, msg, FALSE);  // WARNING
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {
+                        // Buffer access faulted — silently ignore
+                    }
+                }
+            }
+        }
+    }
+
     UpdateWriteTracker(pid);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
@@ -1527,6 +1659,22 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetInformation(
     char*     procName = PsGetProcessImageFileName(process);
 
     __try {
+        // ---- Canary file tripwire (anti-ransomware) ----
+        // Ransomware renames files to .encrypted/.locked or deletes originals.
+        // Any rename or delete of a canary = instant confirmed ransomware.
+        if (isRename || isDelete) {
+            PFLT_FILE_NAME_INFORMATION canaryNameInfo = nullptr;
+            NTSTATUS cSt = FltGetFileNameInformation(
+                Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &canaryNameInfo);
+            if (NT_SUCCESS(cSt) && canaryNameInfo) {
+                if (DeceptionEngine::IsCanaryFile(&canaryNameInfo->Name)) {
+                    const char* verb = isDelete ? "DELETE" : "RENAME";
+                    DeceptionEngine::HandleCanaryFileAccess(&canaryNameInfo->Name, pid, verb);
+                }
+                FltReleaseFileNameInformation(canaryNameInfo);
+            }
+        }
+
         // ---- File deletion detection ----
         // Catches event log wiping (.evtx deletion), prefetch anti-forensics,
         // and ransomware deleting originals after encrypt+rename.
