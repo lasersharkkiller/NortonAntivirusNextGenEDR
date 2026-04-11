@@ -1230,6 +1230,10 @@ public:
     static FLT_PREOP_CALLBACK_STATUS FLTAPI PreNetworkQueryOpen(
         PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
 
+    // IRP_MJ_FILE_SYSTEM_CONTROL — reparse point abuse, EFS encryption abuse
+    static FLT_PREOP_CALLBACK_STATUS FLTAPI PreFsControl(
+        PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
+
     static NTSTATUS FLTAPI FilterUnloadCallback(FLT_FILTER_UNLOAD_FLAGS Flags);
 
     // InstanceSetup — accept attachment to npfs (Named Pipe FS) and msfs (Mailslot FS)

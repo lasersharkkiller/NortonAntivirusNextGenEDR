@@ -111,6 +111,31 @@ static const PCWSTR kAllowedStreams[] = {
 };
 
 // ---------------------------------------------------------------------------
+// Ransomware note filenames (lowercase, substring match).
+// Creation of these files strongly correlates with active ransomware encryption.
+// ---------------------------------------------------------------------------
+static const PCWSTR kRansomNotes[] = {
+    L"readme_locked",       L"how_to_decrypt",     L"how_to_recover",
+    L"decrypt_instruction", L"decrypt_files",      L"restore_files",
+    L"recovery_information",L"ransom_note",        L"!readme!",
+    L"_readme.txt",         L"#decrypt#",          L"#readme#",
+    L"help_decrypt",        L"your_files",         L"read_me_to_recover",
+    L"files_encrypted",     L"_recover_",          L"!how_to_unlock",
+};
+
+// ---------------------------------------------------------------------------
+// Sensitive system files that should only be accessed by specific processes.
+// ---------------------------------------------------------------------------
+static const PCWSTR kEventLogPath   = L"\\winevt\\logs\\";
+static const PCWSTR kPrefetchPath   = L"\\windows\\prefetch\\";
+static const PCWSTR kWmiRepoPath    = L"\\system32\\wbem\\repository\\";
+static const PCWSTR kPagefilePaths[] = {
+    L"\\pagefile.sys",
+    L"\\swapfile.sys",
+    L"\\hiberfil.sys",
+};
+
+// ---------------------------------------------------------------------------
 // Per-process directory enumeration tracker (mass scan = ransomware pre-scan)
 // ---------------------------------------------------------------------------
 #define FS_DIR_ENUM_WINDOW_100NS  50000000LL   // 5 seconds in 100-ns units
@@ -379,11 +404,12 @@ static VOID UpdateDirTracker(HANDLE pid) {
 // FLT_REGISTRATION
 // ---------------------------------------------------------------------------
 static FLT_OPERATION_REGISTRATION g_FsCallbacks[] = {
-    { IRP_MJ_CREATE,             0, FsFilter::PreCreate,            nullptr },
-    { IRP_MJ_WRITE,              0, FsFilter::PreWrite,             nullptr },
-    { IRP_MJ_SET_INFORMATION,    0, FsFilter::PreSetInformation,    nullptr },
-    { IRP_MJ_DIRECTORY_CONTROL,  0, FsFilter::PreDirControl,        nullptr },
-    { IRP_MJ_NETWORK_QUERY_OPEN, 0, FsFilter::PreNetworkQueryOpen,  nullptr },
+    { IRP_MJ_CREATE,              0, FsFilter::PreCreate,            nullptr },
+    { IRP_MJ_WRITE,               0, FsFilter::PreWrite,             nullptr },
+    { IRP_MJ_SET_INFORMATION,     0, FsFilter::PreSetInformation,    nullptr },
+    { IRP_MJ_DIRECTORY_CONTROL,   0, FsFilter::PreDirControl,        nullptr },
+    { IRP_MJ_FILE_SYSTEM_CONTROL, 0, FsFilter::PreFsControl,        nullptr },
+    { IRP_MJ_NETWORK_QUERY_OPEN,  0, FsFilter::PreNetworkQueryOpen,  nullptr },
     { IRP_MJ_OPERATION_END }
 };
 
@@ -983,6 +1009,120 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
                 }
             }
         }
+
+        // ---- Ransomware note file creation detection ----
+        // The presence of a ransom note file is a strong confirmation signal that
+        // encryption is actively underway. Cross-correlates with write-burst and
+        // rename-extension detections for high-confidence ransomware verdict.
+        {
+            ULONG createDisp3 = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
+            if (createDisp3 == FILE_CREATE || createDisp3 == FILE_OVERWRITE_IF ||
+                createDisp3 == FILE_SUPERSEDE || createDisp3 == FILE_OPEN_IF)
+            {
+                for (SIZE_T i = 0; i < ARRAYSIZE(kRansomNotes); i++) {
+                    if (WcsContainsLower(&nameInfo->FinalComponent, kRansomNotes[i])) {
+                        char fBuf[96] = {};
+                        ANSI_STRING ansiFC;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiFC, &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiFC.Length < sizeof(fBuf) - 1 ? ansiFC.Length : sizeof(fBuf) - 1;
+                            RtlCopyMemory(fBuf, ansiFC.Buffer, n);
+                            RtlFreeAnsiString(&ansiFC);
+                        }
+                        char msg[256];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: Ransomware note file creation — '%s' by '%s' (pid=%llu) "
+                            "— ACTIVE RANSOMWARE ENCRYPTION IN PROGRESS",
+                            fBuf[0] ? fBuf : "?",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid);
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---- Event log direct write tampering (.evtx) ----
+        // Attackers bypass wevtutil/Clear-EventLog and write directly to .evtx files
+        // to corrupt or truncate logs. Only svchost.exe (EventLog service) should write.
+        {
+            ACCESS_MASK da = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            BOOLEAN isWriteAccess2 = (da & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE |
+                                            FILE_WRITE_ATTRIBUTES)) != 0;
+
+            if (isWriteAccess2 && WcsContainsLower(&nameInfo->Name, kEventLogPath) &&
+                ExtMatch(&nameInfo->Extension, L".evtx"))
+            {
+                if (!procName || strcmp(procName, "svchost.exe") != 0) {
+                    char msg[224];
+                    RtlStringCchPrintfA(msg, sizeof(msg),
+                        "FS: Direct event log file write by '%s' (pid=%llu) "
+                        "— log tampering / evidence destruction (T1070.001)",
+                        procName ? procName : "?", (ULONG64)(ULONG_PTR)pid);
+                    EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                }
+            }
+        }
+
+        // ---- WMI repository tampering (OBJECTS.DATA) ----
+        // WMI event subscription persistence (T1546.003): malware writes to
+        // System32\wbem\Repository\OBJECTS.DATA to install permanent WMI consumers.
+        // Only WMI service (svchost.exe / WmiPrvSE.exe) should touch this.
+        {
+            ACCESS_MASK da2 = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            BOOLEAN isWriteAccess3 = (da2 & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+
+            if (isWriteAccess3 && WcsContainsLower(&nameInfo->Name, kWmiRepoPath)) {
+                // Allow WMI service processes
+                BOOLEAN isWmiProc = FALSE;
+                if (procName) {
+                    isWmiProc = (strcmp(procName, "svchost.exe") == 0 ||
+                                 strcmp(procName, "WmiPrvSE.exe") == 0 ||
+                                 strcmp(procName, "WmiApSrv.exe") == 0 ||
+                                 strcmp(procName, "mofcomp.exe") == 0);
+                }
+                if (!isWmiProc) {
+                    char fBuf[64] = {};
+                    ANSI_STRING ansiN;
+                    if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiN, &nameInfo->FinalComponent, TRUE))) {
+                        SIZE_T n = ansiN.Length < sizeof(fBuf) - 1 ? ansiN.Length : sizeof(fBuf) - 1;
+                        RtlCopyMemory(fBuf, ansiN.Buffer, n);
+                        RtlFreeAnsiString(&ansiN);
+                    }
+                    char msg[224];
+                    RtlStringCchPrintfA(msg, sizeof(msg),
+                        "FS: WMI repository write — %s by '%s' (pid=%llu) "
+                        "— possible WMI event subscription persistence (T1546.003)",
+                        fBuf[0] ? fBuf : "?",
+                        procName ? procName : "?",
+                        (ULONG64)(ULONG_PTR)pid);
+                    EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                }
+            }
+        }
+
+        // ---- Pagefile / hiberfil.sys / swapfile.sys access ----
+        // User-mode reads of pagefile.sys or hiberfil.sys enable offline credential
+        // extraction (mimikatz sekurlsa::minidump against page file contents).
+        // Only System (PID 4) and smss.exe should access these files.
+        {
+            for (SIZE_T i = 0; i < ARRAYSIZE(kPagefilePaths); i++) {
+                if (WcsContainsLower(&nameInfo->Name, kPagefilePaths[i])) {
+                    // Allow System and smss.exe
+                    if ((ULONG_PTR)pid <= 4) break;
+                    if (procName && strcmp(procName, "smss.exe") == 0) break;
+
+                    char msg[224];
+                    RtlStringCchPrintfA(msg, sizeof(msg),
+                        "FS: Pagefile/hiberfil access by '%s' (pid=%llu) "
+                        "— possible offline credential extraction / memory forensics",
+                        procName ? procName : "?",
+                        (ULONG64)(ULONG_PTR)pid);
+                    EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                    break;
+                }
+            }
+        }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 
@@ -1062,14 +1202,67 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetInformation(
                           infoClass == FileRenameInformationEx);
     BOOLEAN isHardLink = (infoClass == FileLinkInformation ||
                           infoClass == FileLinkInformationEx);
+    BOOLEAN isDelete   = (infoClass == FileDispositionInformation ||
+                          infoClass == FileDispositionInformationEx);
 
-    if (!isRename && !isHardLink) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!isRename && !isHardLink && !isDelete) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     PEPROCESS process  = IoThreadToProcess(Data->Thread);
     HANDLE    pid      = PsGetProcessId(process);
     char*     procName = PsGetProcessImageFileName(process);
 
     __try {
+        // ---- File deletion detection ----
+        // Catches event log wiping (.evtx deletion), prefetch anti-forensics,
+        // and ransomware deleting originals after encrypt+rename.
+        if (isDelete) {
+            // Only alert if DeleteFile flag is actually TRUE
+            FILE_DISPOSITION_INFORMATION* dispInfo =
+                (FILE_DISPOSITION_INFORMATION*)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+            if (!dispInfo || !dispInfo->DeleteFile) __leave;
+
+            PFLT_FILE_NAME_INFORMATION delNameInfo = nullptr;
+            NTSTATUS delSt = FltGetFileNameInformation(
+                Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &delNameInfo);
+            if (NT_SUCCESS(delSt) && delNameInfo) {
+                __try {
+                    if (!NT_SUCCESS(FltParseFileNameInformation(delNameInfo))) __leave;
+
+                    // Event log deletion — only svchost.exe (EventLog service) should do this
+                    if (WcsContainsLower(&delNameInfo->Name, kEventLogPath) &&
+                        ExtMatch(&delNameInfo->Extension, L".evtx"))
+                    {
+                        if (!procName || strcmp(procName, "svchost.exe") != 0) {
+                            char msg[224];
+                            RtlStringCchPrintfA(msg, sizeof(msg),
+                                "FS: Event log file deletion by '%s' (pid=%llu) "
+                                "— evidence destruction / anti-forensics (T1070.001)",
+                                procName ? procName : "?", (ULONG64)(ULONG_PTR)pid);
+                            EnqueueFsAlert(pid, procName, msg, TRUE);
+                        }
+                    }
+
+                    // Prefetch file deletion — anti-forensics (removes execution evidence)
+                    // Only TrustedInstaller/System should clean prefetch
+                    if (WcsContainsLower(&delNameInfo->Name, kPrefetchPath) &&
+                        ExtMatch(&delNameInfo->Extension, L".pf"))
+                    {
+                        if ((ULONG_PTR)pid > 4) {
+                            char msg[224];
+                            RtlStringCchPrintfA(msg, sizeof(msg),
+                                "FS: Prefetch file deletion by '%s' (pid=%llu) "
+                                "— anti-forensics / execution trace removal (T1070.004)",
+                                procName ? procName : "?", (ULONG64)(ULONG_PTR)pid);
+                            EnqueueFsAlert(pid, procName, msg, TRUE);
+                        }
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+                FltReleaseFileNameInformation(delNameInfo);
+            }
+            __leave;
+        }
+
         if (isHardLink) {
             // Hard link creation — ransomware uses links to encrypt a file then delete the original
             FILE_LINK_INFORMATION* linkInfo =
@@ -1171,6 +1364,140 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreDirControl(
     if ((ULONG_PTR)pid <= 4) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     UpdateDirTracker(pid);
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+// ---------------------------------------------------------------------------
+// IRP_MJ_FILE_SYSTEM_CONTROL — reparse point abuse + EFS encryption abuse.
+//
+// Reparse points (junctions, symlinks, mount points) are set via
+// FSCTL_SET_REPARSE_POINT. Attackers use them for:
+//   - Potato privilege escalation (junction redirects \??\PIPE → attacker dir)
+//   - Arbitrary file overwrite via directory junction + DLL plant
+//   - CVE-style symlink attacks to overwrite protected system files
+//
+// EFS encryption: FSCTL_SET_ENCRYPTION / FSCTL_ENCRYPTION_FSCTL_IO are used
+// by ransomware that leverages Windows built-in EFS instead of custom crypto.
+// This bypasses rename-extension heuristics entirely.
+// ---------------------------------------------------------------------------
+FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreFsControl(
+    PFLT_CALLBACK_DATA         Data,
+    PCFLT_RELATED_OBJECTS      FltObjects,
+    PVOID*                     CompletionContext
+) {
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    // Only process FSCTL (IRP_MN_USER_FS_REQUEST / IRP_MN_KERNEL_CALL)
+    if (Data->Iopb->MinorFunction != IRP_MN_USER_FS_REQUEST &&
+        Data->Iopb->MinorFunction != IRP_MN_KERNEL_CALL)
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    ULONG fsctl = Data->Iopb->Parameters.FileSystemControl.Common.FsControlCode;
+
+    // ---- Reparse point creation (junction / symlink / mount point) ----
+    if (fsctl == FSCTL_SET_REPARSE_POINT) {
+        PEPROCESS process  = IoThreadToProcess(Data->Thread);
+        HANDLE    pid      = PsGetProcessId(process);
+        char*     procName = PsGetProcessImageFileName(process);
+
+        // System/kernel PID — skip
+        if ((ULONG_PTR)pid <= 4) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+        // Allow explorer.exe (pin-to-quick-access, OneDrive placeholders)
+        // and TrustedInstaller (servicing)
+        if (procName) {
+            if (strcmp(procName, "explorer.exe") == 0 ||
+                strcmp(procName, "TrustedInsta") == 0 ||
+                strcmp(procName, "MsMpEng.exe") == 0)
+                return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+
+        // Attempt to get the target path for the alert
+        PFLT_FILE_NAME_INFORMATION nameInfo = nullptr;
+        char pathBuf[128] = {};
+        NTSTATUS st = FltGetFileNameInformation(
+            Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
+        if (NT_SUCCESS(st) && nameInfo) {
+            FltParseFileNameInformation(nameInfo);
+            ANSI_STRING ansi;
+            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, &nameInfo->Name, TRUE))) {
+                SIZE_T n = ansi.Length < sizeof(pathBuf) - 1 ? ansi.Length : sizeof(pathBuf) - 1;
+                RtlCopyMemory(pathBuf, ansi.Buffer, n);
+                RtlFreeAnsiString(&ansi);
+            }
+            FltReleaseFileNameInformation(nameInfo);
+        }
+
+        // Determine reparse tag from the buffer if accessible
+        const char* rpType = "reparse point";
+        PVOID sysBuf = Data->Iopb->Parameters.FileSystemControl.Common.SystemBuffer;
+        if (sysBuf && MmIsAddressValid(sysBuf)) {
+            REPARSE_DATA_BUFFER* rpBuf = (REPARSE_DATA_BUFFER*)sysBuf;
+            if (rpBuf->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT)
+                rpType = "junction/mount point";
+            else if (rpBuf->ReparseTag == IO_REPARSE_TAG_SYMLINK)
+                rpType = "symbolic link";
+        }
+
+        char msg[256];
+        RtlStringCchPrintfA(msg, sizeof(msg),
+            "FS: %s creation by '%s' (pid=%llu) on %s "
+            "— possible symlink/junction attack for privilege escalation",
+            rpType,
+            procName ? procName : "?",
+            (ULONG64)(ULONG_PTR)pid,
+            pathBuf[0] ? pathBuf : "?");
+        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+    }
+
+    // ---- EFS encryption abuse ----
+    // FSCTL_SET_ENCRYPTION (0x900D7) starts EFS encryption on a file/dir.
+    // FSCTL_ENCRYPTION_FSCTL_IO (0x900DB) is the EFS data write channel.
+    // Ransomware (e.g. DarkBit, some LockBit variants) uses these to leverage
+    // the OS built-in EFS as their encryption engine — no custom crypto needed.
+    else if (fsctl == FSCTL_SET_ENCRYPTION || fsctl == FSCTL_ENCRYPTION_FSCTL_IO) {
+        PEPROCESS process  = IoThreadToProcess(Data->Thread);
+        HANDLE    pid      = PsGetProcessId(process);
+        char*     procName = PsGetProcessImageFileName(process);
+
+        if ((ULONG_PTR)pid <= 4) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+        // Allow lsass.exe and svchost.exe (EFS service = lsass, CertSvc = svchost)
+        if (procName) {
+            if (strcmp(procName, "lsass.exe") == 0 ||
+                strcmp(procName, "svchost.exe") == 0)
+                return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+
+        PFLT_FILE_NAME_INFORMATION nameInfo = nullptr;
+        char pathBuf[128] = {};
+        NTSTATUS st = FltGetFileNameInformation(
+            Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
+        if (NT_SUCCESS(st) && nameInfo) {
+            FltParseFileNameInformation(nameInfo);
+            ANSI_STRING ansi;
+            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, &nameInfo->Name, TRUE))) {
+                SIZE_T n = ansi.Length < sizeof(pathBuf) - 1 ? ansi.Length : sizeof(pathBuf) - 1;
+                RtlCopyMemory(pathBuf, ansi.Buffer, n);
+                RtlFreeAnsiString(&ansi);
+            }
+            FltReleaseFileNameInformation(nameInfo);
+        }
+
+        char msg[256];
+        RtlStringCchPrintfA(msg, sizeof(msg),
+            "FS: EFS encryption %s by '%s' (pid=%llu) on %s "
+            "— possible ransomware using built-in Windows encryption",
+            (fsctl == FSCTL_SET_ENCRYPTION) ? "initiation" : "data write",
+            procName ? procName : "?",
+            (ULONG64)(ULONG_PTR)pid,
+            pathBuf[0] ? pathBuf : "?");
+        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+    }
+
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
