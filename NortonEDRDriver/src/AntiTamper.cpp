@@ -712,6 +712,9 @@ static VOID IntegrityWorkRoutine(PVOID ctx)
     // --- EPROCESS token pointer integrity (DKOM token theft detection) ---
     CheckEprocessTokenIntegrity();
 
+    // --- Minifilter integrity (instance DKOM, callback DKOM, altitude displacement) ---
+    FsFilter::ValidateMinifilterIntegrity();
+
     DbgPrint("[*] AntiTamper: periodic check complete\n");
 }
 

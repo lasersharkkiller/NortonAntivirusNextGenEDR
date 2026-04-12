@@ -1309,6 +1309,16 @@ public:
         PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_SETUP_FLAGS Flags,
         DEVICE_TYPE VolumeDeviceType, FLT_FILESYSTEM_TYPE VolumeFilesystemType);
 
+    // Instance teardown callbacks — detect FltDetachVolume and DKOM detachment
+    static NTSTATUS FLTAPI InstanceQueryTeardownCallback(
+        PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_QUERY_TEARDOWN_FLAGS Flags);
+
+    static VOID FLTAPI InstanceTeardownStartCallback(
+        PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_TEARDOWN_FLAGS Reason);
+
+    static VOID FLTAPI InstanceTeardownCompleteCallback(
+        PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE_TEARDOWN_FLAGS Reason);
+
     // Named Pipe FS (npfs.sys) monitoring — pipe connect / impersonation detection
     static FLT_PREOP_CALLBACK_STATUS FLTAPI PreCreateNpfs(
         PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
@@ -1317,6 +1327,13 @@ public:
     // Called from NtCreateSectionHandler when SEC_IMAGE + file handle are both present.
     static VOID TrackImageSectionFile(PFILE_OBJECT FileObject);
     static VOID UntrackImageSectionFile(PFILE_OBJECT FileObject);
+
+    // Periodic minifilter integrity validation — called from AntiTamper IntegrityWorkRoutine.
+    // Verifies: instance attachment, callback pointer integrity, altitude displacement.
+    static VOID ValidateMinifilterIntegrity();
+
+    // Snapshot of our PreOp callback function pointers for DKOM detection.
+    static VOID TakeCallbackSnapshot();
 
     // Pointer to CreateProcessNotifyEx callback — exposed for Ps*Notify integrity check.
     static PVOID s_NotifyFn;

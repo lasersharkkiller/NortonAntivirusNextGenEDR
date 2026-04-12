@@ -15,6 +15,36 @@ static PFLT_FILTER  g_FilterHandle = nullptr;
 static NotifQueue*  g_FsQueue      = nullptr;
 
 // ---------------------------------------------------------------------------
+// Minifilter instance snapshot — captured at Init time for DKOM detection.
+// If an attacker unlinks our instance from a volume (DKOM), the periodic
+// check will see fewer instances than the snapshot and fire an alert.
+// ---------------------------------------------------------------------------
+#define MAX_TRACKED_VOLUMES 32
+
+struct VOLUME_INSTANCE_SNAPSHOT {
+    PFLT_VOLUME Volume;           // raw pointer — only used for identity comparison
+    WCHAR       VolumeName[128];  // human-readable name for alerts
+    BOOLEAN     Valid;
+};
+
+static VOLUME_INSTANCE_SNAPSHOT g_InstanceSnapshot[MAX_TRACKED_VOLUMES] = {};
+static ULONG                    g_InstanceSnapshotCount = 0;
+static KSPIN_LOCK               g_SnapshotLock;
+
+// Callback pointer snapshot — captured at Init time for DKOM detection.
+// Stores the original PreOperation function pointers from our FLT_OPERATION_REGISTRATION.
+#define MAX_TRACKED_CALLBACKS 16
+
+struct CALLBACK_SNAPSHOT {
+    UCHAR       MajorFunction;
+    PVOID       PreOperation;
+    PVOID       PostOperation;
+};
+
+static CALLBACK_SNAPSHOT g_CallbackSnapshot[MAX_TRACKED_CALLBACKS] = {};
+static ULONG             g_CallbackSnapshotCount = 0;
+
+// ---------------------------------------------------------------------------
 // Per-process write-burst tracker (ransomware detection)
 // Counts user-mode writes per process in a sliding 5-second window.
 // ---------------------------------------------------------------------------
@@ -449,7 +479,10 @@ static FLT_REGISTRATION g_FltRegistration = {
     g_FsCallbacks,
     FsFilter::FilterUnloadCallback,
     FsFilter::InstanceSetupCallback,  // InstanceSetupCallback — accept npfs/msfs volumes
-    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
+    FsFilter::InstanceQueryTeardownCallback,
+    FsFilter::InstanceTeardownStartCallback,
+    FsFilter::InstanceTeardownCompleteCallback,
+    nullptr, nullptr, nullptr
 };
 
 // ---------------------------------------------------------------------------
@@ -696,6 +729,54 @@ NTSTATUS FsFilter::Init(PDRIVER_OBJECT DriverObject, NotifQueue* queue) {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Take snapshots for periodic integrity validation.
+    // -----------------------------------------------------------------------
+    KeInitializeSpinLock(&g_SnapshotLock);
+
+    // Snapshot 1: record which volumes we are attached to.
+    {
+        PFLT_VOLUME* snapVolList = nullptr;
+        ULONG snapVolCount = 0;
+        NTSTATUS snapSt = FltEnumerateVolumes(g_FilterHandle, nullptr, 0, &snapVolCount);
+        if (snapSt == STATUS_BUFFER_TOO_SMALL && snapVolCount > 0) {
+            SIZE_T sz = snapVolCount * sizeof(PFLT_VOLUME);
+            snapVolList = (PFLT_VOLUME*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sz, 'vsnp');
+            if (snapVolList)
+                snapSt = FltEnumerateVolumes(g_FilterHandle, snapVolList, snapVolCount, &snapVolCount);
+        }
+        if (NT_SUCCESS(snapSt) && snapVolList) {
+            g_InstanceSnapshotCount = 0;
+            for (ULONG i = 0; i < snapVolCount && g_InstanceSnapshotCount < MAX_TRACKED_VOLUMES; i++) {
+                // Check if we actually have an instance on this volume
+                PFLT_INSTANCE inst = nullptr;
+                NTSTATUS instSt = FltGetVolumeInstanceFromName(
+                    g_FilterHandle, snapVolList[i], nullptr, &inst);
+                if (NT_SUCCESS(instSt) && inst) {
+                    ULONG idx = g_InstanceSnapshotCount++;
+                    g_InstanceSnapshot[idx].Volume = snapVolList[i];
+                    g_InstanceSnapshot[idx].Valid = TRUE;
+
+                    UNICODE_STRING volStr;
+                    volStr.Buffer = g_InstanceSnapshot[idx].VolumeName;
+                    volStr.Length = 0;
+                    volStr.MaximumLength = sizeof(g_InstanceSnapshot[idx].VolumeName) - sizeof(WCHAR);
+                    ULONG retLen = 0;
+                    FltGetVolumeName(snapVolList[i], &volStr, &retLen);
+                    g_InstanceSnapshot[idx].VolumeName[volStr.Length / sizeof(WCHAR)] = L'\0';
+
+                    FltObjectDereference(inst);
+                }
+                FltObjectDereference(snapVolList[i]);
+            }
+            ExFreePool(snapVolList);
+        }
+        DbgPrint("[+] FsFilter: instance snapshot captured (%lu volumes)\n", g_InstanceSnapshotCount);
+    }
+
+    // Snapshot 2: record our PreOp/PostOp callback function pointers.
+    FsFilter::TakeCallbackSnapshot();
+
     return STATUS_SUCCESS;
 }
 
@@ -754,6 +835,324 @@ NTSTATUS FLTAPI FsFilter::InstanceSetupCallback(
         // Still attach to other FS types (FAT, ReFS, etc.) for broad coverage
         return STATUS_SUCCESS;
     }
+}
+
+// ---------------------------------------------------------------------------
+// InstanceQueryTeardownCallback — called when FltDetachVolume or fltmc detach
+// requests removal of one of our instances.  Returning STATUS_FLT_DO_NOT_DETACH
+// blocks voluntary (API-driven) detach.  Mandatory teardowns (volume dismount,
+// filter unload) bypass this callback entirely.
+// ---------------------------------------------------------------------------
+NTSTATUS FLTAPI FsFilter::InstanceQueryTeardownCallback(
+    PCFLT_RELATED_OBJECTS                FltObjects,
+    FLT_INSTANCE_QUERY_TEARDOWN_FLAGS    Flags
+) {
+    UNREFERENCED_PARAMETER(Flags);
+
+    // Build volume name for the alert
+    WCHAR volName[128] = L"<unknown>";
+    ULONG retLen = 0;
+    if (FltObjects && FltObjects->Volume) {
+        UNICODE_STRING volStr;
+        volStr.Buffer = volName;
+        volStr.Length = 0;
+        volStr.MaximumLength = sizeof(volName) - sizeof(WCHAR);
+        FltGetVolumeName(FltObjects->Volume, &volStr, &retLen);
+        volName[volStr.Length / sizeof(WCHAR)] = L'\0';
+    }
+
+    // Convert to ANSI for the alert
+    char volNameA[128] = {};
+    for (int i = 0; i < 127 && volName[i]; i++)
+        volNameA[i] = (char)volName[i];
+
+    char msg[256];
+    RtlStringCchPrintfA(msg, sizeof(msg),
+        "MINIFILTER DETACH ATTEMPT: FltDetachVolume/fltmc detach on volume '%s' "
+        "— blocked (anti-evasion)", volNameA);
+    EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+    DbgPrint("[!] %s\n", msg);
+
+    return STATUS_FLT_DO_NOT_DETACH;
+}
+
+// ---------------------------------------------------------------------------
+// InstanceTeardownStartCallback — called when a mandatory teardown begins
+// (volume dismount, filter unload).  We can't block these, but we log them
+// so the EDR service knows an instance was removed.
+// ---------------------------------------------------------------------------
+VOID FLTAPI FsFilter::InstanceTeardownStartCallback(
+    PCFLT_RELATED_OBJECTS          FltObjects,
+    FLT_INSTANCE_TEARDOWN_FLAGS    Reason
+) {
+    WCHAR volName[128] = L"<unknown>";
+    ULONG retLen = 0;
+    if (FltObjects && FltObjects->Volume) {
+        UNICODE_STRING volStr;
+        volStr.Buffer = volName;
+        volStr.Length = 0;
+        volStr.MaximumLength = sizeof(volName) - sizeof(WCHAR);
+        FltGetVolumeName(FltObjects->Volume, &volStr, &retLen);
+        volName[volStr.Length / sizeof(WCHAR)] = L'\0';
+    }
+
+    char volNameA[128] = {};
+    for (int i = 0; i < 127 && volName[i]; i++)
+        volNameA[i] = (char)volName[i];
+
+    const char* reasonStr = "unknown";
+    if (Reason & FLTFL_INSTANCE_TEARDOWN_MANUAL)
+        reasonStr = "MANUAL (FltDetachVolume)";
+    else if (Reason & FLTFL_INSTANCE_TEARDOWN_FILTER_UNLOAD)
+        reasonStr = "FILTER_UNLOAD";
+    else if (Reason & FLTFL_INSTANCE_TEARDOWN_MANDATORY_FILTER_UNLOAD)
+        reasonStr = "MANDATORY_FILTER_UNLOAD";
+    else if (Reason & FLTFL_INSTANCE_TEARDOWN_VOLUME_DISMOUNT)
+        reasonStr = "VOLUME_DISMOUNT";
+    else if (Reason & FLTFL_INSTANCE_TEARDOWN_INTERNAL_ERROR)
+        reasonStr = "INTERNAL_ERROR";
+
+    char msg[256];
+    RtlStringCchPrintfA(msg, sizeof(msg),
+        "MINIFILTER INSTANCE TEARDOWN: volume '%s' reason=%s — "
+        "instance is being forcibly detached!", volNameA, reasonStr);
+
+    // Manual teardown is always suspicious — it means someone called
+    // FltDetachVolume and our QueryTeardown was bypassed or overridden.
+    BOOLEAN critical = (Reason & FLTFL_INSTANCE_TEARDOWN_MANUAL) ? TRUE : FALSE;
+    EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, critical);
+    DbgPrint("[!] %s\n", msg);
+}
+
+// ---------------------------------------------------------------------------
+// InstanceTeardownCompleteCallback — final notification after teardown.
+// At this point, no more I/O will be delivered to this instance.
+// ---------------------------------------------------------------------------
+VOID FLTAPI FsFilter::InstanceTeardownCompleteCallback(
+    PCFLT_RELATED_OBJECTS          FltObjects,
+    FLT_INSTANCE_TEARDOWN_FLAGS    Reason
+) {
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(Reason);
+    DbgPrint("[*] FsFilter: instance teardown complete (reason 0x%x)\n", Reason);
+}
+
+// ---------------------------------------------------------------------------
+// TakeCallbackSnapshot — record the PreOp/PostOp function pointers from our
+// FLT_OPERATION_REGISTRATION array at Init time.  ValidateMinifilterIntegrity
+// compares the live values against this snapshot to detect DKOM callback
+// pointer tampering (e.g., an attacker patching our PreCreate to a NOP or
+// redirecting it to their own handler to hide I/O).
+// ---------------------------------------------------------------------------
+VOID FsFilter::TakeCallbackSnapshot() {
+    g_CallbackSnapshotCount = 0;
+    for (ULONG i = 0; g_FsCallbacks[i].MajorFunction != IRP_MJ_OPERATION_END; i++) {
+        if (g_CallbackSnapshotCount >= MAX_TRACKED_CALLBACKS) break;
+        ULONG idx = g_CallbackSnapshotCount++;
+        g_CallbackSnapshot[idx].MajorFunction = g_FsCallbacks[i].MajorFunction;
+        g_CallbackSnapshot[idx].PreOperation  = (PVOID)g_FsCallbacks[i].PreOperation;
+        g_CallbackSnapshot[idx].PostOperation = (PVOID)g_FsCallbacks[i].PostOperation;
+    }
+    DbgPrint("[+] FsFilter: callback snapshot captured (%lu entries)\n", g_CallbackSnapshotCount);
+}
+
+// ---------------------------------------------------------------------------
+// ValidateMinifilterIntegrity — periodic check called from AntiTamper.
+//
+// Verifies three things:
+//   1) Instance attachment — re-enumerate our instances and compare to the
+//      Init-time snapshot.  Missing instances = DKOM unlink or FltDetachVolume.
+//   2) Callback pointer integrity — compare live FLT_OPERATION_REGISTRATION
+//      PreOp/PostOp pointers against the Init-time snapshot.  Mismatch =
+//      attacker patched our callback table (DKOM on _FLT_FILTER→Operations).
+//   3) Altitude displacement — re-run the altitude squatting/sandwiching scan
+//      from Init to detect late-loading adversary minifilters.
+// ---------------------------------------------------------------------------
+VOID FsFilter::ValidateMinifilterIntegrity() {
+    if (!g_FilterHandle || !g_FsQueue) return;
+
+    // ---- Check 1: Instance attachment verification ----
+    {
+        for (ULONG i = 0; i < g_InstanceSnapshotCount; i++) {
+            if (!g_InstanceSnapshot[i].Valid) continue;
+
+            PFLT_INSTANCE inst = nullptr;
+            NTSTATUS st = FltGetVolumeInstanceFromName(
+                g_FilterHandle, g_InstanceSnapshot[i].Volume, nullptr, &inst);
+
+            if (!NT_SUCCESS(st) || !inst) {
+                // Our instance on this volume is gone — DKOM or forced detach
+                char volNameA[128] = {};
+                for (int c = 0; c < 127 && g_InstanceSnapshot[i].VolumeName[c]; c++)
+                    volNameA[c] = (char)g_InstanceSnapshot[i].VolumeName[c];
+
+                char msg[256];
+                RtlStringCchPrintfA(msg, sizeof(msg),
+                    "MINIFILTER DKOM: our instance on volume '%s' has been detached! "
+                    "Attacker may have unlinked our instance from the volume's instance list.",
+                    volNameA);
+                EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+                DbgPrint("[!] %s\n", msg);
+
+                // Mark as invalid so we don't spam alerts every 30 seconds
+                g_InstanceSnapshot[i].Valid = FALSE;
+            } else {
+                FltObjectDereference(inst);
+            }
+        }
+    }
+
+    // ---- Check 2: Callback pointer integrity ----
+    {
+        for (ULONG i = 0; i < g_CallbackSnapshotCount; i++) {
+            PVOID livePreOp  = (PVOID)g_FsCallbacks[i].PreOperation;
+            PVOID livePostOp = (PVOID)g_FsCallbacks[i].PostOperation;
+
+            if (livePreOp != g_CallbackSnapshot[i].PreOperation) {
+                char msg[256];
+                RtlStringCchPrintfA(msg, sizeof(msg),
+                    "MINIFILTER DKOM: PreOperation callback for IRP_MJ_%u "
+                    "was patched! Expected 0x%p, found 0x%p — callback table tampering!",
+                    (ULONG)g_CallbackSnapshot[i].MajorFunction,
+                    g_CallbackSnapshot[i].PreOperation, livePreOp);
+                EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+                DbgPrint("[!] %s\n", msg);
+            }
+
+            if (livePostOp != g_CallbackSnapshot[i].PostOperation) {
+                char msg[256];
+                RtlStringCchPrintfA(msg, sizeof(msg),
+                    "MINIFILTER DKOM: PostOperation callback for IRP_MJ_%u "
+                    "was patched! Expected 0x%p, found 0x%p — callback table tampering!",
+                    (ULONG)g_CallbackSnapshot[i].MajorFunction,
+                    g_CallbackSnapshot[i].PostOperation, livePostOp);
+                EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+                DbgPrint("[!] %s\n", msg);
+            }
+        }
+    }
+
+    // ---- Check 3: Altitude displacement (late-loading adversary filters) ----
+    {
+        ULONG ourAltitude = 320021;
+        PFLT_VOLUME* volList = nullptr;
+        ULONG volCount = 0;
+        NTSTATUS enumSt = FltEnumerateVolumes(g_FilterHandle, nullptr, 0, &volCount);
+        if (enumSt == STATUS_BUFFER_TOO_SMALL && volCount > 0) {
+            SIZE_T sz = volCount * sizeof(PFLT_VOLUME);
+            volList = (PFLT_VOLUME*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sz, 'avol');
+            if (volList)
+                enumSt = FltEnumerateVolumes(g_FilterHandle, volList, volCount, &volCount);
+        }
+
+        if (NT_SUCCESS(enumSt) && volList) {
+            for (ULONG vi = 0; vi < volCount; vi++) {
+                ULONG instIdx = 0;
+                UCHAR instBuf[512];
+                ULONG instNeeded = 0;
+
+                while (TRUE) {
+                    NTSTATUS instSt = FltEnumerateInstanceInformationByVolume(
+                        volList[vi], instIdx,
+                        InstanceAggregateStandardInformation,
+                        instBuf, sizeof(instBuf), &instNeeded);
+
+                    if (instSt == STATUS_NO_MORE_ENTRIES) break;
+                    if (!NT_SUCCESS(instSt)) { instIdx++; continue; }
+
+                    PINSTANCE_AGGREGATE_STANDARD_INFORMATION instInfo =
+                        (PINSTANCE_AGGREGATE_STANDARD_INFORMATION)instBuf;
+
+                    if (instInfo->Flags & FLTFL_IASI_IS_MINIFILTER) {
+                        UNICODE_STRING instAlt = { 0 };
+                        UNICODE_STRING instName = { 0 };
+
+                        if (instInfo->Type.MiniFilter.FilterNameLength > 0 &&
+                            instInfo->Type.MiniFilter.FilterNameBufferOffset > 0)
+                        {
+                            instName.Buffer = (PWCH)((PUCHAR)instInfo +
+                                instInfo->Type.MiniFilter.FilterNameBufferOffset);
+                            instName.Length = instInfo->Type.MiniFilter.FilterNameLength;
+                            instName.MaximumLength = instName.Length;
+                        }
+
+                        if (instInfo->Type.MiniFilter.AltitudeLength > 0 &&
+                            instInfo->Type.MiniFilter.AltitudeBufferOffset > 0)
+                        {
+                            instAlt.Buffer = (PWCH)((PUCHAR)instInfo +
+                                instInfo->Type.MiniFilter.AltitudeBufferOffset);
+                            instAlt.Length = instInfo->Type.MiniFilter.AltitudeLength;
+                            instAlt.MaximumLength = instAlt.Length;
+                        }
+
+                        // Skip our own instances
+                        UNICODE_STRING ourName = RTL_CONSTANT_STRING(L"NortonEDRDriver");
+                        if (instName.Length > 0 &&
+                            RtlEqualUnicodeString(&instName, &ourName, TRUE))
+                        {
+                            instIdx++;
+                            continue;
+                        }
+
+                        if (instAlt.Length > 0 && instAlt.Buffer) {
+                            ULONG foreignAlt = 0;
+                            for (USHORT ci = 0; ci < instAlt.Length / sizeof(WCHAR); ci++) {
+                                WCHAR c = instAlt.Buffer[ci];
+                                if (c >= L'0' && c <= L'9')
+                                    foreignAlt = foreignAlt * 10 + (c - L'0');
+                                else if (c == L'.') break;
+                            }
+
+                            // Squatting: exact altitude match
+                            if (foreignAlt == ourAltitude) {
+                                char nameBuf[64] = {};
+                                ANSI_STRING ansiN;
+                                if (instName.Length > 0 &&
+                                    NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiN, &instName, TRUE)))
+                                {
+                                    SIZE_T n = ansiN.Length < sizeof(nameBuf) - 1 ? ansiN.Length : sizeof(nameBuf) - 1;
+                                    RtlCopyMemory(nameBuf, ansiN.Buffer, n);
+                                    RtlFreeAnsiString(&ansiN);
+                                }
+                                char msg[256];
+                                RtlStringCchPrintfA(msg, sizeof(msg),
+                                    "ALTITUDE SQUATTING (periodic): filter '%s' at our exact altitude %lu!",
+                                    nameBuf[0] ? nameBuf : "?", ourAltitude);
+                                EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+                                DbgPrint("[!] %s\n", msg);
+                            }
+                            // Sandwiching: filter positioned just above us
+                            else if (foreignAlt > ourAltitude &&
+                                     foreignAlt <= ourAltitude + 10)
+                            {
+                                char nameBuf[64] = {};
+                                ANSI_STRING ansiN;
+                                if (instName.Length > 0 &&
+                                    NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiN, &instName, TRUE)))
+                                {
+                                    SIZE_T n = ansiN.Length < sizeof(nameBuf) - 1 ? ansiN.Length : sizeof(nameBuf) - 1;
+                                    RtlCopyMemory(nameBuf, ansiN.Buffer, n);
+                                    RtlFreeAnsiString(&ansiN);
+                                }
+                                char msg[256];
+                                RtlStringCchPrintfA(msg, sizeof(msg),
+                                    "ALTITUDE SANDWICH (periodic): filter '%s' at altitude %lu "
+                                    "just above us (%lu)!",
+                                    nameBuf[0] ? nameBuf : "?", foreignAlt, ourAltitude);
+                                EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+                                DbgPrint("[!] %s\n", msg);
+                            }
+                        }
+                    }
+                    instIdx++;
+                }
+                FltObjectDereference(volList[vi]);
+            }
+            ExFreePool(volList);
+        }
+    }
+
+    DbgPrint("[*] FsFilter: minifilter integrity check complete\n");
 }
 
 // ---------------------------------------------------------------------------
