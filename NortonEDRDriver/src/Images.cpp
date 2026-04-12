@@ -1717,6 +1717,163 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                             }
 
                             // -------------------------------------------------------
+                            // Mockingjay detection: RWX section in loaded DLL
+                            //
+                            // The Mockingjay technique (Ancaraini, 2023) loads a
+                            // legitimate DLL containing a Read-Write-Execute section
+                            // (e.g., msys-2.0.dll, python310.dll) via LoadLibraryA,
+                            // then copies shellcode into the existing RWX region.
+                            // No VirtualAlloc, no WriteProcessMemory — bypasses
+                            // syscall hooks and memory allocation monitors.
+                            //
+                            // Detection: parse loaded DLL's PE section headers for
+                            // IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE.  Flag
+                            // DLLs with RWX sections from non-system paths.
+                            //
+                            // Allowlist: JIT compilers (clrjit, v8, chakra), UPX-
+                            // packed installers, and images loading into system procs.
+                            // -------------------------------------------------------
+                            {
+                                // Skip kernel images and system processes
+                                BOOLEAN skipRwxCheck = FALSE;
+                                if ((ULONG_PTR)ProcessId <= 4) skipRwxCheck = TRUE;
+                                if (!skipRwxCheck && loadingProcess) {
+                                    // System processes load many DLLs with unusual sections
+                                    if (strcmp(loadingProcess, "csrss.exe") == 0 ||
+                                        strcmp(loadingProcess, "smss.exe") == 0 ||
+                                        strcmp(loadingProcess, "lsass.exe") == 0 ||
+                                        strcmp(loadingProcess, "services.exe") == 0 ||
+                                        strcmp(loadingProcess, "svchost.exe") == 0)
+                                        skipRwxCheck = TRUE;
+                                }
+
+                                // Skip DLLs from System32/SysWOW64/WinSxS — these are
+                                // OS-shipped and not attacker-controllable
+                                if (!skipRwxCheck) {
+                                    static const char* kSysDirs[] = {
+                                        "\\system32\\", "\\syswow64\\",
+                                        "\\winsxs\\", "\\assembly\\",
+                                        nullptr
+                                    };
+                                    for (int sd = 0; kSysDirs[sd]; sd++) {
+                                        for (SIZE_T k = 0; k + strlen(kSysDirs[sd]) <= cbLen; k++) {
+                                            BOOLEAN dm = TRUE;
+                                            for (SIZE_T m = 0; kSysDirs[sd][m]; m++) {
+                                                char lc = (charBuffer[k+m] | 0x20);
+                                                if (lc != kSysDirs[sd][m]) { dm = FALSE; break; }
+                                            }
+                                            if (dm) { skipRwxCheck = TRUE; break; }
+                                        }
+                                        if (skipRwxCheck) break;
+                                    }
+                                }
+
+                                // Known DLLs with legitimate RWX sections (JIT compilers,
+                                // runtimes with self-modifying code)
+                                if (!skipRwxCheck) {
+                                    static const char* kRwxAllowed[] = {
+                                        "clrjit.dll",     // .NET JIT compiler
+                                        "coreclr.dll",    // .NET Core runtime
+                                        "v8.dll",         // V8 JS engine (Chrome, Node)
+                                        "chakra.dll",     // Edge Legacy JS engine
+                                        "jscript9.dll",   // IE JS engine
+                                        "jscript.dll",    // Legacy JS engine
+                                        "vbscript.dll",   // VBScript engine
+                                        nullptr
+                                    };
+                                    for (int ra = 0; kRwxAllowed[ra]; ra++) {
+                                        if (IsLolDriverName(charBuffer, cbLen, kRwxAllowed[ra])) {
+                                            skipRwxCheck = TRUE; break;
+                                        }
+                                    }
+                                }
+
+                                if (!skipRwxCheck && ImageInfo->ImageBase &&
+                                    MmIsAddressValid(ImageInfo->ImageBase))
+                                {
+                                    __try {
+                                        PIMAGE_DOS_HEADER dllDos =
+                                            (PIMAGE_DOS_HEADER)ImageInfo->ImageBase;
+                                        if (dllDos->e_magic == IMAGE_DOS_SIGNATURE &&
+                                            dllDos->e_lfanew > 0 && dllDos->e_lfanew < 0x1000)
+                                        {
+                                            PIMAGE_NT_HEADERS dllNt = (PIMAGE_NT_HEADERS)
+                                                ((BYTE*)ImageInfo->ImageBase + dllDos->e_lfanew);
+
+                                            if (MmIsAddressValid(dllNt) &&
+                                                dllNt->Signature == IMAGE_NT_SIGNATURE)
+                                            {
+                                                WORD numSections = dllNt->FileHeader.NumberOfSections;
+                                                if (numSections > 0 && numSections <= 96) {
+                                                    // Section headers follow the optional header
+                                                    PIMAGE_SECTION_HEADER secHdr =
+                                                        (PIMAGE_SECTION_HEADER)((BYTE*)&dllNt->OptionalHeader +
+                                                            dllNt->FileHeader.SizeOfOptionalHeader);
+
+                                                    for (WORD si = 0; si < numSections; si++) {
+                                                        if (!MmIsAddressValid(&secHdr[si])) break;
+
+                                                        DWORD ch = secHdr[si].Characteristics;
+                                                        BOOLEAN isRWX =
+                                                            (ch & IMAGE_SCN_MEM_READ) &&
+                                                            (ch & IMAGE_SCN_MEM_WRITE) &&
+                                                            (ch & IMAGE_SCN_MEM_EXECUTE);
+
+                                                        if (isRWX && secHdr[si].SizeOfRawData > 0) {
+                                                            // Extract section name (8 chars max)
+                                                            char secName[9] = {};
+                                                            RtlCopyMemory(secName, secHdr[si].Name, 8);
+
+                                                            char rwxMsg[256];
+                                                            RtlStringCbPrintfA(rwxMsg, sizeof(rwxMsg),
+                                                                "Mockingjay: DLL with RWX section '%s' "
+                                                                "(size=%lu) loaded into '%s' — "
+                                                                "shellcode injection without VirtualAlloc "
+                                                                "(Ancaraini technique)",
+                                                                secName,
+                                                                secHdr[si].SizeOfRawData,
+                                                                loadingProcess ? loadingProcess : "?");
+                                                            SIZE_T rwxLen = strlen(rwxMsg) + 1;
+
+                                                            PKERNEL_STRUCTURED_NOTIFICATION rwxNotif =
+                                                                (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                                                                    POOL_FLAG_NON_PAGED,
+                                                                    sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+                                                            if (rwxNotif) {
+                                                                RtlZeroMemory(rwxNotif, sizeof(*rwxNotif));
+                                                                SET_WARNING(*rwxNotif);
+                                                                SET_IMAGE_LOAD_PATH_CHECK(*rwxNotif);
+                                                                SET_CALLING_PROC_PID_CHECK(*rwxNotif);
+                                                                rwxNotif->pid = PsGetProcessId(targetProcess);
+                                                                rwxNotif->isPath = FALSE;
+                                                                if (loadingProcess)
+                                                                    RtlStringCbCopyA(rwxNotif->procName,
+                                                                        sizeof(rwxNotif->procName),
+                                                                        loadingProcess);
+                                                                rwxNotif->msg = (char*)ExAllocatePool2(
+                                                                    POOL_FLAG_NON_PAGED, rwxLen, 'msg');
+                                                                if (rwxNotif->msg) {
+                                                                    RtlCopyMemory(rwxNotif->msg, rwxMsg, rwxLen);
+                                                                    rwxNotif->bufSize = (ULONG)rwxLen;
+                                                                    if (!CallbackObjects::GetNotifQueue()->Enqueue(rwxNotif)) {
+                                                                        ExFreePool(rwxNotif->msg);
+                                                                        ExFreePool(rwxNotif);
+                                                                    }
+                                                                } else {
+                                                                    ExFreePool(rwxNotif);
+                                                                }
+                                                            }
+                                                            break; // one alert per DLL
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                                }
+                            }
+
+                            // -------------------------------------------------------
                             // DLL sideloading detection (MITRE T1574.002)
                             //
                             // Adversaries place a malicious copy of a Windows system

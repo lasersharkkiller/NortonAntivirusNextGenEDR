@@ -1078,6 +1078,82 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
             }
         }
 
+        // ---- AppDomain hijacking via .exe.config file (Ancaraini EDR Part 3) ----
+        // Attacker drops <binary>.exe.config with appDomainManagerAssembly and
+        // privatePath pointing to a malicious DLL.  The CLR loads the attacker's
+        // assembly via AppDomainManager.InitializeNewDomain() BEFORE main() —
+        // code runs inside the signed binary's context, bypassing allowlists.
+        // Detection: .config file creation/write in protected directories.
+        {
+            // Check if filename ends with ".exe.config" (case-insensitive)
+            static const WCHAR kExeConfig[] = L".exe.config";
+            const SIZE_T kExeConfigLen = 11; // wcslen(L".exe.config")
+
+            USHORT fnChars = nameInfo->FinalComponent.Length / sizeof(WCHAR);
+            BOOLEAN isExeConfig = FALSE;
+
+            if (fnChars > (USHORT)kExeConfigLen) {
+                USHORT offset = fnChars - (USHORT)kExeConfigLen;
+                BOOLEAN match = TRUE;
+                for (SIZE_T ci = 0; ci < kExeConfigLen; ci++) {
+                    WCHAR fc = nameInfo->FinalComponent.Buffer[offset + ci];
+                    if (fc >= L'A' && fc <= L'Z') fc += 32;
+                    if (fc != kExeConfig[ci]) { match = FALSE; break; }
+                }
+                isExeConfig = match;
+            }
+
+            if (isExeConfig) {
+                // Only flag creation/write — not reads
+                ULONG createDispCfg = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
+                ACCESS_MASK daCfg = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+                BOOLEAN isWriteCfg =
+                    (createDispCfg == FILE_CREATE || createDispCfg == FILE_OVERWRITE_IF ||
+                     createDispCfg == FILE_SUPERSEDE) ||
+                    ((daCfg & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0);
+
+                if (isWriteCfg) {
+                    // Check if in a protected directory
+                    static const PCWSTR kConfigProtPaths[] = {
+                        L"\\windows\\system32\\",
+                        L"\\windows\\syswow64\\",
+                        L"\\program files\\",
+                        L"\\program files (x86)\\",
+                        L"\\windows\\microsoft.net\\",
+                        L"\\nortonedr\\",
+                    };
+
+                    for (SIZE_T i = 0; i < ARRAYSIZE(kConfigProtPaths); i++) {
+                        if (WcsContainsLower(&nameInfo->Name, kConfigProtPaths[i])) {
+                            // Allow TrustedInstaller and msiexec (legitimate .config deployment)
+                            if (procName &&
+                                (strcmp(procName, "TrustedInsta") == 0 ||
+                                 strcmp(procName, "msiexec.exe") == 0 ||
+                                 strcmp(procName, "tiworker.exe") == 0))
+                                break;
+
+                            char cfgBuf[64] = {};
+                            ANSI_STRING ansiCfg;
+                            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiCfg, &nameInfo->FinalComponent, TRUE))) {
+                                SIZE_T n = ansiCfg.Length < sizeof(cfgBuf) - 1 ? ansiCfg.Length : sizeof(cfgBuf) - 1;
+                                RtlCopyMemory(cfgBuf, ansiCfg.Buffer, n);
+                                RtlFreeAnsiString(&ansiCfg);
+                            }
+                            char msg[256];
+                            RtlStringCchPrintfA(msg, sizeof(msg),
+                                "FS: AppDomain hijack — .exe.config file write '%s' by '%s' (pid=%llu) "
+                                "— CLR will load attacker assembly before main() (Ancaraini technique)",
+                                cfgBuf[0] ? cfgBuf : "?",
+                                procName ? procName : "?",
+                                (ULONG64)(ULONG_PTR)pid);
+                            EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // ---- NTFS Alternate Data Stream (ADS) detection ----
         // nameInfo->Stream is non-empty for named streams, e.g. ":hidden:$DATA".
         // Exact-match against known-benign streams; flag everything else.

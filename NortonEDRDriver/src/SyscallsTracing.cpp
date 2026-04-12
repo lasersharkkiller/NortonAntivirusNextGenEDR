@@ -3817,12 +3817,130 @@ VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes, ULONG M
 	if (!ObjectAttributes || !MmIsAddressValid(ObjectAttributes)) return;
 
 	OBJECT_ATTRIBUTES* objAttr = (OBJECT_ATTRIBUTES*)ObjectAttributes;
-	if (!objAttr->ObjectName || !MmIsAddressValid(objAttr->ObjectName)) return;
 
-	UNICODE_STRING* pipeName = (UNICODE_STRING*)objAttr->ObjectName;
-	if (!pipeName->Length || !MmIsAddressValid(pipeName->Buffer)) return;
+	// Determine if this is an anonymous pipe (NULL/empty ObjectName).
+	// On modern Windows (Vista+), CreatePipe() internally creates pipes named
+	// \Device\NamedPipe\Win32Pipes.<PID>.<Counter> — these also count as anonymous.
+	BOOLEAN isAnonymousPipe = FALSE;
+	UNICODE_STRING* pipeName = nullptr;
 
-	// ---- Gap #2: NULL / permissive DACL detection ----
+	if (!objAttr->ObjectName || !MmIsAddressValid(objAttr->ObjectName)) {
+		isAnonymousPipe = TRUE;
+	} else {
+		pipeName = (UNICODE_STRING*)objAttr->ObjectName;
+		if (!pipeName->Length || !MmIsAddressValid(pipeName->Buffer)) {
+			isAnonymousPipe = TRUE;
+		}
+	}
+
+	// ---- Anonymous pipe abuse detection (Ancaraini technique) ----
+	// Cobalt Strike execute-assembly, powerpick, and other post-ex modules inject
+	// a reflective DLL into a sacrificial process and communicate via anonymous
+	// pipes.  Native Windows processes that RARELY use anonymous pipes becoming
+	// pipe servers/clients = strong indicator of CS sacrificial process injection.
+	// Ref: Ancaraini & Cave, WithSecure/F-Secure Labs, 2020
+	{
+		// Check for Win32Pipes.* pattern (modern anonymous pipe naming)
+		BOOLEAN isWin32Pipe = FALSE;
+		if (pipeName && pipeName->Length > 0 && MmIsAddressValid(pipeName->Buffer)) {
+			// Look for "Win32Pipes" substring (case-insensitive)
+			static const WCHAR kWin32Pipes[] = L"win32pipes";
+			SIZE_T kLen = 10; // wcslen(L"win32pipes")
+			USHORT hLen = pipeName->Length / sizeof(WCHAR);
+			if (hLen >= (USHORT)kLen) {
+				for (USHORT si = 0; si <= hLen - (USHORT)kLen; si++) {
+					BOOLEAN match = TRUE;
+					for (SIZE_T ci = 0; ci < kLen; ci++) {
+						WCHAR hc = pipeName->Buffer[si + ci];
+						if (hc >= L'A' && hc <= L'Z') hc += 32;
+						if (hc != kWin32Pipes[ci]) { match = FALSE; break; }
+					}
+					if (match) { isWin32Pipe = TRUE; break; }
+				}
+			}
+		}
+
+		if (isAnonymousPipe || isWin32Pipe) {
+			// Processes that RARELY use anonymous pipes — if they do, it's almost
+			// certainly a C2 sacrificial process with injected reflective DLL
+			static const char* kSacrificialProcs[] = {
+				"runonce.exe",     // Never uses anon pipes normally
+				"wuauclt.exe",     // Windows Update client — no anon pipes
+				"regsvcs.exe",     // .NET COM+ registration
+				"regasm.exe",      // .NET assembly registration
+				"msbuild.exe",     // Build engine — no anon pipes
+				"installutil.e",   // .NET install utility (15-char truncation)
+				"cmstp.exe",       // Connection Manager — no anon pipes
+				"presentationho",  // PresentationHost (15-char truncation)
+				"werfault.exe",    // Windows Error Reporting
+				"searchprotoco",   // SearchProtocolHost (15-char truncation)
+				"dllhost.exe",     // COM surrogate — rarely creates anon pipes
+				"gpupdate.exe",    // Group Policy update
+				"mmc.exe",         // Management Console
+				"control.exe",     // Control Panel
+				"hh.exe",          // HTML Help
+				nullptr
+			};
+
+			// Processes KNOWN to legitimately use anonymous pipes — skip these
+			static const char* kLegitAnonPipeProcs[] = {
+				"wsmprovhost.ex",  // PowerShell remoting host (15-char truncation)
+				"ngen.exe",        // .NET Native Image Generator
+				"conhost.exe",     // Console Host
+				"cmd.exe",         // Command Processor — normal pipe usage
+				"powershell.exe",  // PowerShell — normal pipe usage
+				"pwsh.exe",        // PowerShell Core
+				"chrome.exe",      // Browser multi-process
+				"msedge.exe",      // Browser multi-process
+				"firefox.exe",     // Browser multi-process
+				"code.exe",        // VS Code multi-process
+				nullptr
+			};
+
+			BOOLEAN isLegitPipeUser = isSystemProc;
+			if (!isLegitPipeUser) {
+				for (int li = 0; kLegitAnonPipeProcs[li]; li++) {
+					if (strcmp(lower, kLegitAnonPipeProcs[li]) == 0) {
+						isLegitPipeUser = TRUE; break;
+					}
+				}
+			}
+
+			if (!isLegitPipeUser) {
+				// Check if this is a known sacrificial process — CRITICAL
+				BOOLEAN isSacrificial = FALSE;
+				for (int si = 0; kSacrificialProcs[si]; si++) {
+					if (strcmp(lower, kSacrificialProcs[si]) == 0) {
+						isSacrificial = TRUE; break;
+					}
+				}
+
+				if (isSacrificial) {
+					char msg[256];
+					RtlStringCbPrintfA(msg, sizeof(msg),
+						"NtCreateNamedPipeFile: Anonymous pipe from sacrificial process '%s' "
+						"— possible Cobalt Strike execute-assembly / reflective DLL injection "
+						"(Ancaraini detection)",
+						name);
+					EmitSyscallNotif(0, msg, caller, nullptr, TRUE); // CRITICAL
+				} else if (!isAnonymousPipe) {
+					// Win32Pipes.* from a non-legit, non-sacrificial process —
+					// still worth a warning for visibility
+					char msg[224];
+					RtlStringCbPrintfA(msg, sizeof(msg),
+						"NtCreateNamedPipeFile: Anonymous pipe (Win32Pipes) by '%s' "
+						"— unusual process using anonymous pipes",
+						name);
+					EmitSyscallNotif(0, msg, caller, nullptr, FALSE); // WARNING
+				}
+			}
+
+			// If truly anonymous (no name), no further checks possible
+			if (isAnonymousPipe) return;
+		}
+	}
+
+	// ---- NULL / permissive DACL detection ----
 	// A pipe with no SecurityDescriptor or a NULL DACL allows any user to connect.
 	// This is the core setup for potato-family attacks (Sweet/Juicy/Rogue/God Potato).
 	// Check BEFORE the system-process allowlist — even system processes shouldn't do this
@@ -4086,7 +4204,52 @@ VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes, ULONG M
 		}
 	}
 
-	// ---- Gap #1: Pipe squatting detection ----
+	// ---- Cobalt Strike job pipe pattern (Ancaraini detection) ----
+	// Pre-4.2 CS modules (keylogger, screenshot, mimikatz, powerpick, netview)
+	// create pipes with names that are EXCLUSIVELY lowercase hex chars, 7-10
+	// characters long, and are NOT GUIDs (no dashes).
+	// Pattern: /\\pipe\\[0-9a-f]{7,10}/ excluding /[0-9a-f]{8}\-/
+	// Ref: Ancaraini & Cave, "Detecting Cobalt Strike Default Modules via Named
+	// Pipe Analysis" (WithSecure/F-Secure Labs, 2020)
+	{
+		USHORT pipeChars = pipeName->Length / sizeof(WCHAR);
+		USHORT lastSlash = 0;
+		for (USHORT pi = 0; pi < pipeChars; pi++) {
+			if (pipeName->Buffer[pi] == L'\\') lastSlash = pi + 1;
+		}
+
+		USHORT nameStart = lastSlash;
+		USHORT nameLen = pipeChars - nameStart;
+
+		// Check: 7-10 chars, ALL lowercase hex, NO dashes
+		if (nameLen >= 7 && nameLen <= 10) {
+			BOOLEAN allHex = TRUE;
+			for (USHORT ci = nameStart; ci < pipeChars; ci++) {
+				WCHAR ch = pipeName->Buffer[ci];
+				if (!((ch >= L'0' && ch <= L'9') ||
+					  (ch >= L'a' && ch <= L'f'))) {
+					allHex = FALSE;
+					break;
+				}
+			}
+
+			if (allHex) {
+				char pipeBuf[16] = {};
+				for (USHORT ci = 0; ci < nameLen && ci < 15; ci++) {
+					pipeBuf[ci] = (char)pipeName->Buffer[nameStart + ci];
+				}
+				char msg[256];
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"NtCreateNamedPipeFile: Cobalt Strike job pipe pattern — "
+					"pure-hex pipe '%s' (%u chars) by '%s' "
+					"(keylogger/screenshot/mimikatz/powerpick/netview)",
+					pipeBuf, (ULONG)nameLen, name);
+				EmitSyscallNotif(0, msg, caller, nullptr, TRUE); // CRITICAL
+			}
+		}
+	}
+
+	// ---- Pipe squatting detection ----
 	// Non-system process creating a pipe with a name matching a sensitive system
 	// pipe (lsarpc, svcctl, samr, etc.) — attacker creates a fake pipe to intercept
 	// RPC clients and steal credentials or gain impersonation tokens.
