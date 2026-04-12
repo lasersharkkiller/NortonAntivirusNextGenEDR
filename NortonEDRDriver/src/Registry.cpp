@@ -560,6 +560,197 @@ skip_persistence_alert:
 		}
 		break;
 
+	// ---- Minifilter altitude registry enumeration (T1518.001 / T1082) ----
+	// Attackers enumerate HKLM\SYSTEM\CCS\Services\<driver>\Instances\<inst>\Altitude
+	// to map all minifilter drivers, their altitudes, and find gaps to insert a
+	// malicious filter above/below an EDR.  Tools: fltmc, EDRSandblast, custom recon.
+	// Also catches reads of DefaultInstance values used to resolve instance names.
+	// We detect value reads on any key path containing "\Instances\" under "\Services\"
+	// where the queried value is "Altitude", "DefaultInstance", or "Flags".
+	case RegNtPreQueryValueKey:
+	{
+		PREG_QUERY_VALUE_KEY_INFORMATION qvInfo =
+			(PREG_QUERY_VALUE_KEY_INFORMATION)Arg2;
+		if (!qvInfo || !qvInfo->Object || !MmIsAddressValid(qvInfo->Object))
+			break;
+		if (!qvInfo->ValueName || !qvInfo->ValueName->Buffer ||
+			qvInfo->ValueName->Length == 0 ||
+			!MmIsAddressValid(qvInfo->ValueName->Buffer))
+			break;
+
+		// Only care about minifilter-related value names
+		static const WCHAR* kFilterValues[] = {
+			L"Altitude", L"DefaultInstance", L"Flags", nullptr
+		};
+		BOOLEAN isFilterValue = FALSE;
+		for (int i = 0; kFilterValues[i]; i++) {
+			UNICODE_STRING target;
+			RtlInitUnicodeString(&target, kFilterValues[i]);
+			if (RtlEqualUnicodeString(qvInfo->ValueName, &target, TRUE)) {
+				isFilterValue = TRUE;
+				break;
+			}
+		}
+		if (!isFilterValue) break;
+
+		status = CmCallbackGetKeyObjectIDEx(
+			&cookie, qvInfo->Object, NULL, &regPath, 0);
+		if (!NT_SUCCESS(status) || !regPath || !regPath->Length ||
+			!MmIsAddressValid(regPath->Buffer))
+			break;
+
+		// Must be under a Services\<driver>\Instances path
+		if (!UnicodeStringContains((PUNICODE_STRING)regPath, L"\\Services\\") ||
+			!UnicodeStringContains((PUNICODE_STRING)regPath, L"\\Instances"))
+			break;
+
+		// Allowlist system processes that legitimately enumerate filters
+		char* procName = PsGetProcessImageFileName(IoGetCurrentProcess());
+		if (procName) {
+			if (strcmp(procName, "services.exe") == 0 ||
+				strcmp(procName, "svchost.exe")  == 0 ||
+				strcmp(procName, "TrustedInsta") == 0 ||
+				strcmp(procName, "msiexec.exe")  == 0 ||
+				strcmp(procName, "System")       == 0 ||
+				strcmp(procName, "MsMpEng.exe")  == 0 ||
+				strcmp(procName, "lsass.exe")    == 0 ||
+				strcmp(procName, "csrss.exe")    == 0 ||
+				strcmp(procName, "smss.exe")     == 0 ||
+				strcmp(procName, "wininit.exe")  == 0 ||
+				strcmp(procName, "fltMC.exe")    == 0 ||  // fltmc itself — caught by cmdline detection
+				strcmp(procName, "NortonEDR.ex") == 0)
+				break;
+		}
+
+		// Convert path to narrow for alert
+		char pathBuf[160] = {};
+		USHORT copyLen = min(regPath->Length / sizeof(WCHAR), (USHORT)(sizeof(pathBuf) - 1));
+		for (USHORT i = 0; i < copyLen; i++) {
+			WCHAR wc = regPath->Buffer[i];
+			pathBuf[i] = (wc < 128) ? (char)wc : '?';
+		}
+
+		// Convert value name to narrow
+		char valBuf[64] = {};
+		USHORT valLen = min(qvInfo->ValueName->Length / sizeof(WCHAR), (USHORT)(sizeof(valBuf) - 1));
+		for (USHORT i = 0; i < valLen; i++) {
+			WCHAR wc = qvInfo->ValueName->Buffer[i];
+			valBuf[i] = (wc < 128) ? (char)wc : '?';
+		}
+
+		char msg[350];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"Minifilter altitude recon (T1518.001): %s queried '%s' at %s "
+			"— mapping minifilter driver altitudes for evasion/sandwiching",
+			procName ? procName : "unknown", valBuf, pathBuf);
+		SIZE_T msgLen = strlen(msg) + 1;
+
+		PKERNEL_STRUCTURED_NOTIFICATION n =
+			(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+				POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+		if (n) {
+			RtlZeroMemory(n, sizeof(*n));
+			SET_WARNING(*n);
+			SET_SYSCALL_CHECK(*n);
+			n->bufSize = (ULONG)msgLen;
+			n->isPath  = FALSE;
+			n->pid     = PsGetProcessId(IoGetCurrentProcess());
+			if (procName) RtlCopyMemory(n->procName, procName, 14);
+			n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+			if (n->msg) {
+				RtlCopyMemory(n->msg, msg, msgLen);
+				if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+					ExFreePool(n->msg); ExFreePool(n);
+				}
+			} else {
+				ExFreePool(n);
+			}
+		}
+		break;
+	}
+
+	// ---- Minifilter service key enumeration (RegNtPreEnumerateKey) ----
+	// Attackers enumerate subkeys under Services\<driver>\Instances to discover
+	// all registered minifilter instances.  This complements value read detection
+	// above — catches breadth-first registry walking tools.
+	case RegNtPreEnumerateKey:
+	{
+		PREG_ENUMERATE_KEY_INFORMATION ekInfo =
+			(PREG_ENUMERATE_KEY_INFORMATION)Arg2;
+		if (!ekInfo || !ekInfo->Object || !MmIsAddressValid(ekInfo->Object))
+			break;
+
+		status = CmCallbackGetKeyObjectIDEx(
+			&cookie, ekInfo->Object, NULL, &regPath, 0);
+		if (!NT_SUCCESS(status) || !regPath || !regPath->Length ||
+			!MmIsAddressValid(regPath->Buffer))
+			break;
+
+		// Only trigger on Instances subkey enumeration under Services
+		if (!UnicodeStringContains((PUNICODE_STRING)regPath, L"\\Services\\") ||
+			!UnicodeStringContains((PUNICODE_STRING)regPath, L"\\Instances"))
+			break;
+
+		// Same allowlist
+		char* procName = PsGetProcessImageFileName(IoGetCurrentProcess());
+		if (procName) {
+			if (strcmp(procName, "services.exe") == 0 ||
+				strcmp(procName, "svchost.exe")  == 0 ||
+				strcmp(procName, "TrustedInsta") == 0 ||
+				strcmp(procName, "msiexec.exe")  == 0 ||
+				strcmp(procName, "System")       == 0 ||
+				strcmp(procName, "MsMpEng.exe")  == 0 ||
+				strcmp(procName, "lsass.exe")    == 0 ||
+				strcmp(procName, "csrss.exe")    == 0 ||
+				strcmp(procName, "smss.exe")     == 0 ||
+				strcmp(procName, "wininit.exe")  == 0 ||
+				strcmp(procName, "fltMC.exe")    == 0 ||
+				strcmp(procName, "NortonEDR.ex") == 0)
+				break;
+		}
+
+		// Rate-limit: only alert on Index == 0 (start of enumeration) to avoid
+		// flooding with one alert per subkey when a tool walks the entire tree.
+		if (ekInfo->Index != 0) break;
+
+		char pathBuf[160] = {};
+		USHORT copyLen = min(regPath->Length / sizeof(WCHAR), (USHORT)(sizeof(pathBuf) - 1));
+		for (USHORT i = 0; i < copyLen; i++) {
+			WCHAR wc = regPath->Buffer[i];
+			pathBuf[i] = (wc < 128) ? (char)wc : '?';
+		}
+
+		char msg[300];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"Minifilter instance enum (T1518.001): %s enumerating subkeys of %s "
+			"— mapping minifilter driver instances",
+			procName ? procName : "unknown", pathBuf);
+		SIZE_T msgLen = strlen(msg) + 1;
+
+		PKERNEL_STRUCTURED_NOTIFICATION n =
+			(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+				POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+		if (n) {
+			RtlZeroMemory(n, sizeof(*n));
+			SET_WARNING(*n);
+			SET_SYSCALL_CHECK(*n);
+			n->bufSize = (ULONG)msgLen;
+			n->isPath  = FALSE;
+			n->pid     = PsGetProcessId(IoGetCurrentProcess());
+			if (procName) RtlCopyMemory(n->procName, procName, 14);
+			n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+			if (n->msg) {
+				RtlCopyMemory(n->msg, msg, msgLen);
+				if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+					ExFreePool(n->msg); ExFreePool(n);
+				}
+			} else {
+				ExFreePool(n);
+			}
+		}
+		break;
+	}
+
 	// ---- Value deletion monitoring ----
 	// Attackers use `reg delete` to remove security-related values.
 	// E.g., deleting DisableAntiSpyware after GPO enforcement,

@@ -2328,6 +2328,7 @@ VOID SyscallsUtils::NtCreateFileHandler(PVOID ObjectAttributes)
 		L"\\Device\\PhysicalMemory",
 		L"\\Device\\Rawdisk",
 		L"\\Device\\Harddisk",
+		L"\\FileSystem\\Filters\\FltMgrMsg",
 		nullptr
 	};
 	// Severity: PhysicalMemory = CRITICAL; others = WARNING unless Partition0
@@ -2335,6 +2336,7 @@ VOID SyscallsUtils::NtCreateFileHandler(PVOID ObjectAttributes)
 		TRUE,   // PhysicalMemory
 		TRUE,   // Rawdisk
 		FALSE,  // Harddisk (generic — escalate to CRITICAL if \Partition0)
+		FALSE,  // FltMgrMsg — WARNING (minifilter enumeration recon via FilterFindFirst/Next)
 	};
 
 	__try {
@@ -2359,11 +2361,15 @@ VOID SyscallsUtils::NtCreateFileHandler(PVOID ObjectAttributes)
 				pathBuf[j] = (wc < 128) ? (char)wc : '?';
 			}
 
-			char msg[256];
+			// Tailor alert message based on which path matched
+			const char* context = "physical memory / raw DMA access — IOMMU bypass indicator";
+			if (UnicodeStringContains(name, L"FltMgrMsg"))
+				context = "FltMgr communication port — minifilter enumeration recon (FilterFindFirst/FilterFindNext)";
+
+			char msg[300];
 			RtlStringCbPrintfA(msg, sizeof(msg),
-				"NtCreateFile: dangerous device path opened '%s' "
-				"(physical memory / raw DMA access — IOMMU bypass indicator)",
-				pathBuf);
+				"NtCreateFile: dangerous device path opened '%s' (%s)",
+				pathBuf, context);
 			EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, critical);
 			break;
 		}
