@@ -144,6 +144,50 @@ static IO_RATE_SLOT g_IoRateSlots[IO_RATE_TRACKER_SLOTS];
 static KSPIN_LOCK   g_IoRateLock;
 
 // ---------------------------------------------------------------------------
+// FLT_CALLBACK_DATA tampering detection — PreOp→PostOp cross-validation.
+//
+// A malicious minifilter (at any altitude between ours and the filesystem) can
+// modify members of FLT_CALLBACK_DATA between our PreOp and PostOp:
+//   - TargetFileObject swap → redirect detection to a decoy file
+//   - DesiredAccess downgrade → hide write/delete intent
+//   - CreateOptions modification → hide FILE_DELETE_ON_CLOSE / OPEN_BY_FILE_ID
+//   - FileInformationClass change → blind rename/delete detection
+//   - Write ByteOffset/Length → alter what we think was written
+//
+// PreOp snapshots key params into a pool-allocated context (sampled, every 256th
+// operation).  PostOp compares the snapshot against the live Iopb and alerts on
+// any mismatch.
+// ---------------------------------------------------------------------------
+#define PARAM_CTX_TAG       'pCtx'
+#define PARAM_CTX_MAGIC     0xC7C7C7C7
+#define PARAM_VALIDATE_RATE 256   // validate every Nth operation
+
+typedef struct _PREOP_CREATE_CTX {
+    ULONG           Magic;
+    ACCESS_MASK     DesiredAccess;
+    ULONG           CreateOptions;      // lower 24 bits of Options
+    PFILE_OBJECT    TargetFileObject;
+} PREOP_CREATE_CTX;
+
+typedef struct _PREOP_SETINFO_CTX {
+    ULONG                       Magic;
+    FILE_INFORMATION_CLASS      InfoClass;
+    PVOID                       InfoBuffer;
+    PFILE_OBJECT                TargetFileObject;
+} PREOP_SETINFO_CTX;
+
+typedef struct _PREOP_WRITE_CTX {
+    ULONG           Magic;
+    LARGE_INTEGER   ByteOffset;
+    ULONG           Length;
+    PFILE_OBJECT    TargetFileObject;
+} PREOP_WRITE_CTX;
+
+static volatile LONG g_CreateValidateCounter  = 0;
+static volatile LONG g_SetInfoValidateCounter = 0;
+static volatile LONG g_WriteValidateCounter   = 0;
+
+// ---------------------------------------------------------------------------
 // Per-IRP-type invocation counters — callback silencing detection.
 // A higher-altitude malicious filter returning FLT_PREOP_COMPLETE causes FltMgr
 // to skip all lower-altitude PreOp AND PostOp callbacks.  If our counters drop
@@ -577,8 +621,8 @@ static VOID UpdateDirTracker(HANDLE pid) {
 // ---------------------------------------------------------------------------
 static FLT_OPERATION_REGISTRATION g_FsCallbacks[] = {
     { IRP_MJ_CREATE,              0, FsFilter::PreCreate,            FsFilter::PostCreate },
-    { IRP_MJ_WRITE,               0, FsFilter::PreWrite,             nullptr },
-    { IRP_MJ_SET_INFORMATION,     0, FsFilter::PreSetInformation,    nullptr },
+    { IRP_MJ_WRITE,               0, FsFilter::PreWrite,             FsFilter::PostWrite },
+    { IRP_MJ_SET_INFORMATION,     0, FsFilter::PreSetInformation,    FsFilter::PostSetInformation },
     { IRP_MJ_DIRECTORY_CONTROL,   0, FsFilter::PreDirControl,        nullptr },
     { IRP_MJ_FILE_SYSTEM_CONTROL, 0, FsFilter::PreFsControl,        nullptr },
     { IRP_MJ_SET_EA,              0, FsFilter::PreSetEa,             nullptr },
@@ -1652,21 +1696,77 @@ FLT_POSTOP_CALLBACK_STATUS FLTAPI FsFilter::PostCreate(
     FLT_POST_OPERATION_FLAGS   Flags
 ) {
     UNREFERENCED_PARAMETER(FltObjects);
-    UNREFERENCED_PARAMETER(CompletionContext);
 
-    // Don't process at DISPATCH_LEVEL (draining)
-    if (Flags & FLTFL_POST_OPERATION_DRAINING) return FLT_POSTOP_FINISHED_PROCESSING;
+    // Free the context on all exit paths (including draining)
+    PREOP_CREATE_CTX* ctx = nullptr;
+    if (CompletionContext) {
+        ctx = (PREOP_CREATE_CTX*)CompletionContext;
+        if (ctx->Magic != PARAM_CTX_MAGIC) ctx = nullptr;  // safety check
+    }
 
-    if (!Data || !Data->Iopb) return FLT_POSTOP_FINISHED_PROCESSING;
+    if (Flags & FLTFL_POST_OPERATION_DRAINING) {
+        if (ctx) ExFreePoolWithTag(ctx, PARAM_CTX_TAG);
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
 
+    if (!Data || !Data->Iopb) {
+        if (ctx) ExFreePoolWithTag(ctx, PARAM_CTX_TAG);
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    // ---- FLT_CALLBACK_DATA tampering: cross-validate PreOp snapshot ----
+    // If any filter between our PreOp and PostOp modified the Iopb without
+    // calling FltSetCallbackDataDirty (or modified it at all), the params
+    // will diverge from our snapshot.  This catches:
+    //   - TargetFileObject swap (redirect detection to decoy file)
+    //   - DesiredAccess downgrade (hide write/delete intent)
+    //   - CreateOptions modification (hide DELETE_ON_CLOSE, OPEN_BY_FILE_ID)
+    if (ctx) {
+        BOOLEAN tampered = FALSE;
+        char detail[256] = {};
+
+        ACCESS_MASK liveAccess  = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+        ULONG       liveOptions = Data->Iopb->Parameters.Create.Options & 0x00FFFFFF;
+        PFILE_OBJECT liveFO     = Data->Iopb->TargetFileObject;
+
+        if (liveFO != ctx->TargetFileObject) {
+            tampered = TRUE;
+            RtlStringCchPrintfA(detail, sizeof(detail),
+                "TargetFileObject SWAPPED: PreOp=0x%p PostOp=0x%p "
+                "— intermediate filter redirected I/O to a different file!",
+                ctx->TargetFileObject, liveFO);
+        }
+        else if (liveAccess != ctx->DesiredAccess) {
+            tampered = TRUE;
+            RtlStringCchPrintfA(detail, sizeof(detail),
+                "DesiredAccess MODIFIED: PreOp=0x%lx PostOp=0x%lx "
+                "— intermediate filter altered access mask to hide intent!",
+                (ULONG)ctx->DesiredAccess, (ULONG)liveAccess);
+        }
+        else if (liveOptions != ctx->CreateOptions) {
+            tampered = TRUE;
+            RtlStringCchPrintfA(detail, sizeof(detail),
+                "CreateOptions MODIFIED: PreOp=0x%lx PostOp=0x%lx "
+                "— intermediate filter altered create options!",
+                ctx->CreateOptions, liveOptions);
+        }
+
+        if (tampered) {
+            PEPROCESS proc = IoThreadToProcess(Data->Thread);
+            HANDLE pid = proc ? PsGetProcessId(proc) : (HANDLE)0;
+            char msg[350];
+            RtlStringCchPrintfA(msg, sizeof(msg),
+                "FLT_CALLBACK_DATA TAMPERING (IRP_MJ_CREATE): %s", detail);
+            EnqueueFsAlert(pid, nullptr, msg, TRUE);
+            DbgPrint("[!] %s\n", msg);
+        }
+
+        ExFreePoolWithTag(ctx, PARAM_CTX_TAG);
+    }
+
+    // ---- STATUS_REPARSE abuse detection ----
     NTSTATUS createStatus = Data->IoStatus.Status;
-
-    // --- STATUS_REPARSE detection ---
     if (createStatus == STATUS_REPARSE) {
-        // The I/O manager will retry the create with the reparsed name.
-        // Check if the ORIGINAL target was in a monitored directory but
-        // the reparse tag suggests redirection.
-
         PFLT_FILE_NAME_INFORMATION nameInfo = nullptr;
         NTSTATUS st = FltGetFileNameInformation(
             Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
@@ -1674,7 +1774,6 @@ FLT_POSTOP_CALLBACK_STATUS FLTAPI FsFilter::PostCreate(
         if (NT_SUCCESS(st) && nameInfo) {
             FltParseFileNameInformation(nameInfo);
 
-            // Check if the original path was in a monitored directory
             BOOLEAN wasMonitored = FALSE;
             for (int i = 0; i < ARRAYSIZE(kMonitoredDirs); i++) {
                 if (UnicodeStringContains(&nameInfo->Name, kMonitoredDirs[i])) {
@@ -1684,15 +1783,9 @@ FLT_POSTOP_CALLBACK_STATUS FLTAPI FsFilter::PostCreate(
             }
 
             if (wasMonitored) {
-                // A reparse FROM a monitored directory is suspicious —
-                // a legitimate reparse (junction, symlink) wouldn't typically
-                // redirect away from system directories.
                 ULONG reparseTag = 0;
-                if (Data->TagData) {
-                    reparseTag = Data->TagData->FileTag;
-                }
+                if (Data->TagData) reparseTag = Data->TagData->FileTag;
 
-                // Get the process name for context
                 PEPROCESS proc = IoThreadToProcess(Data->Thread);
                 HANDLE pid = proc ? PsGetProcessId(proc) : (HANDLE)0;
 
@@ -1708,11 +1801,156 @@ FLT_POSTOP_CALLBACK_STATUS FLTAPI FsFilter::PostCreate(
                     "possible adversary minifilter redirecting I/O away from "
                     "protected directory!", pathA, reparseTag);
                 EnqueueFsAlert(pid, nullptr, msg, TRUE);
-                DbgPrint("[!] %s\n", msg);
             }
 
             FltReleaseFileNameInformation(nameInfo);
         }
+    }
+
+    return FLT_POSTOP_FINISHED_PROCESSING;
+}
+
+// ---------------------------------------------------------------------------
+// PostSetInformation — FLT_CALLBACK_DATA tampering detection for IRP_MJ_SET_INFORMATION.
+//
+// Cross-validates PreOp snapshot of FileInformationClass, InfoBuffer, and
+// TargetFileObject against the live Iopb.  Any mismatch indicates an
+// intermediate minifilter altered the operation to blind our rename/delete/
+// timestomping detection.
+// ---------------------------------------------------------------------------
+FLT_POSTOP_CALLBACK_STATUS FLTAPI FsFilter::PostSetInformation(
+    PFLT_CALLBACK_DATA         Data,
+    PCFLT_RELATED_OBJECTS      FltObjects,
+    PVOID                      CompletionContext,
+    FLT_POST_OPERATION_FLAGS   Flags
+) {
+    UNREFERENCED_PARAMETER(FltObjects);
+
+    PREOP_SETINFO_CTX* ctx = nullptr;
+    if (CompletionContext) {
+        ctx = (PREOP_SETINFO_CTX*)CompletionContext;
+        if (ctx->Magic != PARAM_CTX_MAGIC) ctx = nullptr;
+    }
+
+    if ((Flags & FLTFL_POST_OPERATION_DRAINING) || !Data || !Data->Iopb) {
+        if (ctx) ExFreePoolWithTag(ctx, PARAM_CTX_TAG);
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    if (ctx) {
+        BOOLEAN tampered = FALSE;
+        char detail[256] = {};
+
+        FILE_INFORMATION_CLASS liveClass =
+            (FILE_INFORMATION_CLASS)Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+        PVOID       liveBuf = Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+        PFILE_OBJECT liveFO = Data->Iopb->TargetFileObject;
+
+        if (liveFO != ctx->TargetFileObject) {
+            tampered = TRUE;
+            RtlStringCchPrintfA(detail, sizeof(detail),
+                "TargetFileObject SWAPPED: PreOp=0x%p PostOp=0x%p "
+                "— intermediate filter redirected SetInfo to a different file!",
+                ctx->TargetFileObject, liveFO);
+        }
+        else if (liveClass != ctx->InfoClass) {
+            tampered = TRUE;
+            RtlStringCchPrintfA(detail, sizeof(detail),
+                "FileInformationClass MODIFIED: PreOp=%u PostOp=%u "
+                "— intermediate filter changed SetInfo class to blind detection!",
+                (ULONG)ctx->InfoClass, (ULONG)liveClass);
+        }
+        else if (liveBuf != ctx->InfoBuffer) {
+            tampered = TRUE;
+            RtlStringCchPrintfA(detail, sizeof(detail),
+                "InfoBuffer SWAPPED: PreOp=0x%p PostOp=0x%p "
+                "— intermediate filter replaced SetInfo data buffer!",
+                ctx->InfoBuffer, liveBuf);
+        }
+
+        if (tampered) {
+            PEPROCESS proc = IoThreadToProcess(Data->Thread);
+            HANDLE pid = proc ? PsGetProcessId(proc) : (HANDLE)0;
+            char msg[350];
+            RtlStringCchPrintfA(msg, sizeof(msg),
+                "FLT_CALLBACK_DATA TAMPERING (IRP_MJ_SET_INFORMATION): %s", detail);
+            EnqueueFsAlert(pid, nullptr, msg, TRUE);
+            DbgPrint("[!] %s\n", msg);
+        }
+
+        ExFreePoolWithTag(ctx, PARAM_CTX_TAG);
+    }
+
+    return FLT_POSTOP_FINISHED_PROCESSING;
+}
+
+// ---------------------------------------------------------------------------
+// PostWrite — FLT_CALLBACK_DATA tampering detection for IRP_MJ_WRITE.
+//
+// Cross-validates PreOp snapshot of ByteOffset, Length, and TargetFileObject
+// against the live Iopb.  Detects intermediate filters that alter write
+// parameters to redirect writes or change what we think was written.
+// ---------------------------------------------------------------------------
+FLT_POSTOP_CALLBACK_STATUS FLTAPI FsFilter::PostWrite(
+    PFLT_CALLBACK_DATA         Data,
+    PCFLT_RELATED_OBJECTS      FltObjects,
+    PVOID                      CompletionContext,
+    FLT_POST_OPERATION_FLAGS   Flags
+) {
+    UNREFERENCED_PARAMETER(FltObjects);
+
+    PREOP_WRITE_CTX* ctx = nullptr;
+    if (CompletionContext) {
+        ctx = (PREOP_WRITE_CTX*)CompletionContext;
+        if (ctx->Magic != PARAM_CTX_MAGIC) ctx = nullptr;
+    }
+
+    if ((Flags & FLTFL_POST_OPERATION_DRAINING) || !Data || !Data->Iopb) {
+        if (ctx) ExFreePoolWithTag(ctx, PARAM_CTX_TAG);
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    if (ctx) {
+        BOOLEAN tampered = FALSE;
+        char detail[256] = {};
+
+        LARGE_INTEGER liveOffset = Data->Iopb->Parameters.Write.ByteOffset;
+        ULONG         liveLen    = Data->Iopb->Parameters.Write.Length;
+        PFILE_OBJECT  liveFO     = Data->Iopb->TargetFileObject;
+
+        if (liveFO != ctx->TargetFileObject) {
+            tampered = TRUE;
+            RtlStringCchPrintfA(detail, sizeof(detail),
+                "TargetFileObject SWAPPED: PreOp=0x%p PostOp=0x%p "
+                "— intermediate filter redirected Write to a different file!",
+                ctx->TargetFileObject, liveFO);
+        }
+        else if (liveOffset.QuadPart != ctx->ByteOffset.QuadPart) {
+            tampered = TRUE;
+            RtlStringCchPrintfA(detail, sizeof(detail),
+                "ByteOffset MODIFIED: PreOp=0x%llx PostOp=0x%llx "
+                "— intermediate filter changed write offset!",
+                ctx->ByteOffset.QuadPart, liveOffset.QuadPart);
+        }
+        else if (liveLen != ctx->Length) {
+            tampered = TRUE;
+            RtlStringCchPrintfA(detail, sizeof(detail),
+                "Length MODIFIED: PreOp=%lu PostOp=%lu "
+                "— intermediate filter changed write length!",
+                ctx->Length, liveLen);
+        }
+
+        if (tampered) {
+            PEPROCESS proc = IoThreadToProcess(Data->Thread);
+            HANDLE pid = proc ? PsGetProcessId(proc) : (HANDLE)0;
+            char msg[350];
+            RtlStringCchPrintfA(msg, sizeof(msg),
+                "FLT_CALLBACK_DATA TAMPERING (IRP_MJ_WRITE): %s", detail);
+            EnqueueFsAlert(pid, nullptr, msg, TRUE);
+            DbgPrint("[!] %s\n", msg);
+        }
+
+        ExFreePoolWithTag(ctx, PARAM_CTX_TAG);
     }
 
     return FLT_POSTOP_FINISHED_PROCESSING;
@@ -1759,6 +1997,9 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreateNpfs(
     UNREFERENCED_PARAMETER(CompletionContext);
 
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!Data->Thread) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!Data->Iopb->Parameters.Create.SecurityContext)
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     PEPROCESS process  = IoThreadToProcess(Data->Thread);
     HANDLE    pid      = PsGetProcessId(process);
@@ -1881,8 +2122,6 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
     PCFLT_RELATED_OBJECTS      FltObjects,
     PVOID*                     CompletionContext
 ) {
-    UNREFERENCED_PARAMETER(CompletionContext);
-
     InterlockedIncrement(&g_PreOpCounters[PREOP_CREATE]);
 
     // ---- Canary I/O heartbeat recognition ----
@@ -1898,18 +2137,24 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
         static const USHORT kSuffixChars = (sizeof(kCanarySuffix) / sizeof(WCHAR)) - 1;
         USHORT fnChars = FltObjects->FileObject->FileName.Length / sizeof(WCHAR);
         if (fnChars >= kSuffixChars) {
-            PWCHAR tail = FltObjects->FileObject->FileName.Buffer + (fnChars - kSuffixChars);
-            BOOLEAN match = TRUE;
-            for (USHORT ci = 0; ci < kSuffixChars && match; ci++) {
-                WCHAR c = tail[ci];
-                if (c >= L'A' && c <= L'Z') c |= 0x20;
-                WCHAR e = kCanarySuffix[ci];
-                if (e >= L'A' && e <= L'Z') e |= 0x20;
-                if (c != e) match = FALSE;
-            }
-            if (match) {
-                InterlockedIncrement(&g_CanaryHits);
-                return FLT_PREOP_SUCCESS_NO_CALLBACK;
+            // Wrap buffer access in __try/__except — a malicious higher-altitude
+            // filter could free or corrupt the FileName.Buffer pointer.
+            __try {
+                PWCHAR tail = FltObjects->FileObject->FileName.Buffer + (fnChars - kSuffixChars);
+                BOOLEAN match = TRUE;
+                for (USHORT ci = 0; ci < kSuffixChars && match; ci++) {
+                    WCHAR c = tail[ci];
+                    if (c >= L'A' && c <= L'Z') c |= 0x20;
+                    WCHAR e = kCanarySuffix[ci];
+                    if (e >= L'A' && e <= L'Z') e |= 0x20;
+                    if (c != e) match = FALSE;
+                }
+                if (match) {
+                    InterlockedIncrement(&g_CanaryHits);
+                    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Buffer was invalid — skip canary check, continue normal path
             }
         }
     }
@@ -1928,6 +2173,15 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
             // the pipe handler does, so we skip for now.
         }
     }
+
+    // ---- Bogus FLT_CALLBACK_DATA hardening ----
+    // A malicious higher-altitude minifilter can null or corrupt critical Iopb
+    // members before our PreOp fires.  Validate essential pointers early so
+    // downstream code doesn't BSOD on a poisoned IRP.
+    if (!Data->Iopb->Parameters.Create.SecurityContext)
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;  // null SecurityContext → crash guard
+    if (!Data->Thread)
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;  // null Thread → IoThreadToProcess crash guard
 
     // ---- Per-process I/O rate tracking (CPU-burn / filter-flood detection) ----
     {
@@ -2975,6 +3229,24 @@ rate_done:
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 
     FltReleaseFileNameInformation(nameInfo);
+
+    // ---- FLT_CALLBACK_DATA tampering: snapshot params for PostCreate validation ----
+    {
+        LONG cnt = InterlockedIncrement(&g_CreateValidateCounter);
+        if ((cnt & (PARAM_VALIDATE_RATE - 1)) == 0) {
+            PREOP_CREATE_CTX* ctx = (PREOP_CREATE_CTX*)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, sizeof(PREOP_CREATE_CTX), PARAM_CTX_TAG);
+            if (ctx) {
+                ctx->Magic            = PARAM_CTX_MAGIC;
+                ctx->DesiredAccess    = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+                ctx->CreateOptions    = Data->Iopb->Parameters.Create.Options & 0x00FFFFFF;
+                ctx->TargetFileObject = Data->Iopb->TargetFileObject;
+                *CompletionContext = ctx;
+                return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+            }
+        }
+    }
+
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
@@ -2988,11 +3260,12 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreWrite(
     PVOID*                     CompletionContext
 ) {
     UNREFERENCED_PARAMETER(FltObjects);
-    UNREFERENCED_PARAMETER(CompletionContext);
 
     InterlockedIncrement(&g_PreOpCounters[PREOP_WRITE]);
 
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!Data->Thread || !Data->Iopb->TargetFileObject)
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     HANDLE pid = PsGetProcessId(IoThreadToProcess(Data->Thread));
     if ((ULONG_PTR)pid <= 4) return FLT_PREOP_SUCCESS_NO_CALLBACK;  // skip System/Idle
@@ -3138,6 +3411,24 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreWrite(
     }
 
     UpdateWriteTracker(pid);
+
+    // ---- FLT_CALLBACK_DATA tampering: snapshot params for PostWrite ----
+    {
+        LONG cnt = InterlockedIncrement(&g_WriteValidateCounter);
+        if ((cnt & (PARAM_VALIDATE_RATE - 1)) == 0) {
+            PREOP_WRITE_CTX* ctx = (PREOP_WRITE_CTX*)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, sizeof(PREOP_WRITE_CTX), PARAM_CTX_TAG);
+            if (ctx) {
+                ctx->Magic            = PARAM_CTX_MAGIC;
+                ctx->ByteOffset       = Data->Iopb->Parameters.Write.ByteOffset;
+                ctx->Length            = Data->Iopb->Parameters.Write.Length;
+                ctx->TargetFileObject = Data->Iopb->TargetFileObject;
+                *CompletionContext = ctx;
+                return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+            }
+        }
+    }
+
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
@@ -3150,11 +3441,11 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetInformation(
     PVOID*                     CompletionContext
 ) {
     UNREFERENCED_PARAMETER(FltObjects);
-    UNREFERENCED_PARAMETER(CompletionContext);
 
     InterlockedIncrement(&g_PreOpCounters[PREOP_SET_INFO]);
 
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!Data->Thread) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     FILE_INFORMATION_CLASS infoClass =
         Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
@@ -3259,7 +3550,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetInformation(
             // Only alert if DeleteFile flag is actually TRUE
             FILE_DISPOSITION_INFORMATION* dispInfo =
                 (FILE_DISPOSITION_INFORMATION*)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
-            if (!dispInfo || !dispInfo->DeleteFile) __leave;
+            if (!dispInfo || !MmIsAddressValid(dispInfo) || !dispInfo->DeleteFile) __leave;
 
             PFLT_FILE_NAME_INFORMATION delNameInfo = nullptr;
             NTSTATUS delSt = FltGetFileNameInformation(
@@ -3334,7 +3625,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetInformation(
 
             UNICODE_STRING targetName;
             targetName.Buffer        = renameInfo->FileName;
-            targetName.Length        = (USHORT)renameInfo->FileNameLength;
+            targetName.Length        = (USHORT)min(renameInfo->FileNameLength, (ULONG)0xFFFE);
             targetName.MaximumLength = targetName.Length;
 
             // Extract extension: scan backwards from end for '.'
@@ -3382,6 +3673,24 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetInformation(
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 
+    // ---- FLT_CALLBACK_DATA tampering: snapshot params for PostSetInformation ----
+    {
+        LONG cnt = InterlockedIncrement(&g_SetInfoValidateCounter);
+        if ((cnt & (PARAM_VALIDATE_RATE - 1)) == 0) {
+            PREOP_SETINFO_CTX* ctx = (PREOP_SETINFO_CTX*)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, sizeof(PREOP_SETINFO_CTX), PARAM_CTX_TAG);
+            if (ctx) {
+                ctx->Magic            = PARAM_CTX_MAGIC;
+                ctx->InfoClass        = (FILE_INFORMATION_CLASS)
+                    Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+                ctx->InfoBuffer       = Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+                ctx->TargetFileObject = Data->Iopb->TargetFileObject;
+                *CompletionContext = ctx;
+                return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+            }
+        }
+    }
+
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
@@ -3401,6 +3710,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreDirControl(
     if (Data->Iopb->MinorFunction != IRP_MN_QUERY_DIRECTORY)
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!Data->Thread) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     HANDLE pid = PsGetProcessId(IoThreadToProcess(Data->Thread));
     if ((ULONG_PTR)pid <= 4) return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -3433,6 +3743,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreFsControl(
     InterlockedIncrement(&g_PreOpCounters[PREOP_FS_CTRL]);
 
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!Data->Thread) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     // Only process FSCTL (IRP_MN_USER_FS_REQUEST / IRP_MN_KERNEL_CALL)
     if (Data->Iopb->MinorFunction != IRP_MN_USER_FS_REQUEST &&
@@ -3735,6 +4046,7 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetEa(
     InterlockedIncrement(&g_PreOpCounters[PREOP_SET_EA]);
 
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!Data->Thread) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     PEPROCESS process  = IoThreadToProcess(Data->Thread);
     HANDLE    pid      = PsGetProcessId(process);
@@ -3794,6 +4106,8 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreNetworkQueryOpen(
     UNREFERENCED_PARAMETER(CompletionContext);
 
     InterlockedIncrement(&g_PreOpCounters[PREOP_NET_QUERY]);
+
+    if (!Data->Thread) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     PFLT_FILE_NAME_INFORMATION nameInfo = nullptr;
     NTSTATUS status = FltGetFileNameInformation(

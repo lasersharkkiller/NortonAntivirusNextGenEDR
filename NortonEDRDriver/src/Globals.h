@@ -1350,8 +1350,18 @@ public:
     static VOID TrackImageSectionFile(PFILE_OBJECT FileObject);
     static VOID UntrackImageSectionFile(PFILE_OBJECT FileObject);
 
-    // PostCreate — detect STATUS_REPARSE abuse by adversary filter above us
+    // PostCreate — STATUS_REPARSE abuse detection + FLT_CALLBACK_DATA tampering validation
     static FLT_POSTOP_CALLBACK_STATUS FLTAPI PostCreate(
+        PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects,
+        PVOID CompletionContext, FLT_POST_OPERATION_FLAGS Flags);
+
+    // PostSetInformation — FLT_CALLBACK_DATA tampering validation for rename/delete/timestomp
+    static FLT_POSTOP_CALLBACK_STATUS FLTAPI PostSetInformation(
+        PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects,
+        PVOID CompletionContext, FLT_POST_OPERATION_FLAGS Flags);
+
+    // PostWrite — FLT_CALLBACK_DATA tampering validation for write params
+    static FLT_POSTOP_CALLBACK_STATUS FLTAPI PostWrite(
         PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects,
         PVOID CompletionContext, FLT_POST_OPERATION_FLAGS Flags);
 
