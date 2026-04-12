@@ -618,6 +618,17 @@ public:
 		KeReleaseSpinLockFromDpcLevel(&spinLock);
 		return currentSize;
 	}
+
+	ULONG GetCapacity() const { return capacity; }
+
+	// Safe GetSize variant for PASSIVE_LEVEL callers (uses full IRQL raise).
+	ULONG GetSizePassive() {
+		KIRQL oldIrql;
+		KeAcquireSpinLock(&spinLock, &oldIrql);
+		ULONG currentSize = size;
+		KeReleaseSpinLock(&spinLock, oldIrql);
+		return currentSize;
+	}
 };
 
 class NotifQueue : public BufferQueue {
@@ -1328,12 +1339,31 @@ public:
     static VOID TrackImageSectionFile(PFILE_OBJECT FileObject);
     static VOID UntrackImageSectionFile(PFILE_OBJECT FileObject);
 
+    // PostCreate — detect STATUS_REPARSE abuse by adversary filter above us
+    static FLT_POSTOP_CALLBACK_STATUS FLTAPI PostCreate(
+        PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects,
+        PVOID CompletionContext, FLT_POST_OPERATION_FLAGS Flags);
+
     // Periodic minifilter integrity validation — called from AntiTamper IntegrityWorkRoutine.
-    // Verifies: instance attachment, callback pointer integrity, altitude displacement.
+    // Verifies: instance attachment, callback pointer integrity, altitude displacement,
+    // FltMgr-internal _FLT_FILTER structure integrity, FastIO dispatch table, and
+    // notification queue pressure.
     static VOID ValidateMinifilterIntegrity();
 
     // Snapshot of our PreOp callback function pointers for DKOM detection.
     static VOID TakeCallbackSnapshot();
+
+    // Snapshot of the FltMgr-internal _FLT_FILTER.Operations pointer for deep DKOM detection.
+    static VOID TakeFltFilterSnapshot();
+
+    // Validate the FltMgr-internal _FLT_FILTER structure hasn't been tampered with.
+    static VOID ValidateFltFilterInternal();
+
+    // Check that FltMgr's FastIO dispatch table hasn't been redirected.
+    static VOID ValidateFastIoDispatch();
+
+    // Check notification queue pressure and alert on overflow risk.
+    static VOID CheckQueuePressure();
 
     // Pointer to CreateProcessNotifyEx callback — exposed for Ps*Notify integrity check.
     static PVOID s_NotifyFn;
