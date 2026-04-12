@@ -1501,6 +1501,17 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"get-mppreference",          "Get-MpPreference — Defender configuration recon (exclusions, scan settings)", FALSE },
 				{ L"get-mpcomputerstatus",      "Get-MpComputerStatus — Defender status/version recon",                FALSE },
 				{ L"get-mpthreatdetection",     "Get-MpThreatDetection — Defender detection history recon",            FALSE },
+				// NtObjectManager PowerShell module (James Forshaw) — advanced WFP enumeration
+				// These cmdlets call WFP APIs directly and are used by red-teamers for
+				// pre-EDRSilencer reconnaissance (enumerate filters/sublayers/callouts/providers).
+				{ L"get-fwfilter",              "Get-FwFilter — NtObjectManager WFP filter enumeration (reveals EDR filter objects)",          FALSE },
+				{ L"get-fwsublayer",            "Get-FwSubLayer — NtObjectManager WFP sublayer enumeration (reveals EDR sublayer GUID/weight)", FALSE },
+				{ L"get-fwcallout",             "Get-FwCallout — NtObjectManager WFP callout enumeration (reveals EDR inspection hooks)",      FALSE },
+				{ L"get-fwprovider",            "Get-FwProvider — NtObjectManager WFP provider enumeration (fingerprints security products)",  FALSE },
+				{ L"get-fwengine",              "Get-FwEngine — NtObjectManager WFP engine handle acquisition",                                FALSE },
+				{ L"get-fwlayer",               "Get-FwLayer — NtObjectManager WFP layer enumeration (maps all monitored layers)",             FALSE },
+				{ L"get-fwnetwork",             "Get-FwNetworkEvent — NtObjectManager WFP network event enumeration",                          FALSE },
+				{ L"ntobjectmanager",           "NtObjectManager module reference — advanced Windows object/WFP/token recon toolkit",           FALSE },
 				// WFP diagnostic tool
 				{ L"wfpdiag",                   "wfpdiag — Microsoft WFP diagnostic tool (reveals all WFP state)",     FALSE },
 
