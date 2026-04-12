@@ -1196,13 +1196,13 @@ static BOOLEAN CheckLayerForForeignBlocks(
         // Attack: add a PERMIT filter at max weight to whitelist C2/exfil
         // traffic past Windows Firewall BLOCK rules, or to override our
         // sublayer's block decisions via WFP sublayer arbitration.
-        // Only flag non-persistent, high-weight permits (>= 0x8000).
+        // Explicit UINT64 weights always outrank auto UINT8 weights.
+        // Non-persistent = added at runtime (not boot-time OS component).
         if (action == FWP_ACTION_PERMIT) {
-            BOOLEAN highWeight = (entries[i]->weight.type == FWP_UINT64 &&
-                                  entries[i]->weight.uint64 &&
-                                  *entries[i]->weight.uint64 >= 0x8000ULL) ||
-                                 (entries[i]->weight.type == FWP_UINT8 &&
-                                  entries[i]->weight.uint8 >= 13);
+            BOOLEAN highWeight =
+                (entries[i]->weight.type == FWP_UINT64) ||  // explicit = always high
+                (entries[i]->weight.type == FWP_UINT8 &&
+                 entries[i]->weight.uint8 >= 13);
             BOOLEAN nonPersistent = !(entries[i]->flags & FWPM_FILTER_FLAG_PERSISTENT);
 
             if (highWeight && nonPersistent) {
@@ -1231,43 +1231,73 @@ static BOOLEAN CheckLayerForForeignBlocks(
         // Check for blanket (no conditions) — affects ALL traffic
         BOOLEAN blanket = (entries[i]->numFilterConditions == 0);
 
+        // Extract effective weight for reporting.
+        // FWP_VALUE can store weight as UINT8 (auto-generated from BFE
+        // auto-weight algorithm, 0-15), UINT64 (explicit weight set by
+        // caller), or FWP_EMPTY.  WFP evaluates higher-weight filters
+        // first within a sublayer.
+        UINT64 effectiveWeight = 0;
+        const char* weightType = "auto";
+        if (entries[i]->weight.type == FWP_UINT64 && entries[i]->weight.uint64) {
+            effectiveWeight = *entries[i]->weight.uint64;
+            weightType = "explicit";
+        } else if (entries[i]->weight.type == FWP_UINT8) {
+            effectiveWeight = entries[i]->weight.uint8;
+            weightType = "auto";
+        }
+
+        // Flag if the foreign filter outweighs ours (UINT8 0xf = 15).
+        // Our filter uses auto-weight 0xf.  An explicit UINT64 weight always
+        // outranks auto UINT8 weights.  Within UINT8, > 0xf outranks us.
+        BOOLEAN outweighsUs =
+            (entries[i]->weight.type == FWP_UINT64) ||  // explicit always wins
+            (entries[i]->weight.type == FWP_UINT8 &&
+             entries[i]->weight.uint8 >= 0xf);
+
         const char* actionStr = ActionTypeName(action);
 
+        // Build weight context string
+        char weightInfo[120];
+        RtlStringCbPrintfA(weightInfo, sizeof(weightInfo),
+            "weight=%llu(%s)%s",
+            effectiveWeight, weightType,
+            outweighsUs ? " OUTWEIGHS-NORTON" : "");
+
         // Build severity prefix and tactical context
-        char msg[900];
+        char msg[1000];
         if (targetsEdr) {
             RtlStringCbPrintfA(msg, sizeof(msg),
-                "WFP TAMPER CRITICAL: foreign %s filter (id=%llu) on %s "
+                "WFP TAMPER CRITICAL: foreign %s filter (id=%llu, %s) on %s "
                 "TARGETS EDR PROCESS — %s. display='%S', %s",
-                actionStr, entries[i]->filterId, layerName,
+                actionStr, entries[i]->filterId, weightInfo, layerName,
                 threatDesc,
                 entries[i]->displayData.name
                     ? entries[i]->displayData.name : L"<none>",
                 condDesc);
         } else if (inverted) {
             RtlStringCbPrintfA(msg, sizeof(msg),
-                "WFP TAMPER: foreign %s filter (id=%llu) on %s uses "
+                "WFP TAMPER: foreign %s filter (id=%llu, %s) on %s uses "
                 "INVERTED MATCH (NOT_EQUAL) — %s. Inverted logic may mean "
                 "'block everything EXCEPT attacker traffic'. display='%S', %s",
-                actionStr, entries[i]->filterId, layerName,
+                actionStr, entries[i]->filterId, weightInfo, layerName,
                 threatDesc,
                 entries[i]->displayData.name
                     ? entries[i]->displayData.name : L"<none>",
                 condDesc);
         } else if (blanket) {
             RtlStringCbPrintfA(msg, sizeof(msg),
-                "WFP TAMPER: foreign %s filter (id=%llu) on %s with "
+                "WFP TAMPER: foreign %s filter (id=%llu, %s) on %s with "
                 "NO CONDITIONS (blanket rule affects ALL traffic) — %s. "
                 "display='%S'",
-                actionStr, entries[i]->filterId, layerName,
+                actionStr, entries[i]->filterId, weightInfo, layerName,
                 threatDesc,
                 entries[i]->displayData.name
                     ? entries[i]->displayData.name : L"<none>");
         } else {
             RtlStringCbPrintfA(msg, sizeof(msg),
-                "WFP TAMPER: foreign %s filter (id=%llu) on %s — %s. "
+                "WFP TAMPER: foreign %s filter (id=%llu, %s) on %s — %s. "
                 "display='%S', %s",
-                actionStr, entries[i]->filterId, layerName,
+                actionStr, entries[i]->filterId, weightInfo, layerName,
                 threatDesc,
                 entries[i]->displayData.name
                     ? entries[i]->displayData.name : L"<none>",
@@ -1288,9 +1318,23 @@ BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
     BOOLEAN ok = TRUE;
 
     // -----------------------------------------------------------------------
-    // Check 1: verify our filter is still registered.
-    // Attack: FwpmFilterDeleteById from user-mode (admin) silently removes
-    // our filter — our callout never fires, all network telemetry stops.
+    // Check 1: verify our filter is still registered AND its properties
+    // have not been tampered with.
+    //
+    // Attacks beyond simple deletion:
+    //   - Weight downgrade: FwpmFilterSetSecurityInfoByKey / re-add at lower
+    //     weight — our filter evaluates last, attacker's high-weight filter
+    //     in the same sublayer blocks first.
+    //   - Action type swap: change from CALLOUT_TERMINATING to PERMIT or
+    //     CONTINUE — our callout classifyFn stops being invoked.
+    //   - Callout key swap: redirect to a rogue callout GUID — our filter
+    //     invokes attacker code instead of our classifyFn.
+    //   - Layer migration: move filter to a different layer where it's inert.
+    //   - Sublayer migration: move filter to attacker-controlled sublayer.
+    //   - Condition injection: add filterConditions that restrict which
+    //     packets reach our callout (e.g., exclude attacker C2 traffic).
+    //
+    // We baseline these values at registration and verify every cycle.
     // -----------------------------------------------------------------------
     if (FilterId != 0) {
         FWPM_FILTER* filterObj = nullptr;
@@ -1300,12 +1344,91 @@ BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
                 "WFP TAMPER: NortonEDR WFP filter DELETED (FwpmFilterDeleteById) "
                 "— network telemetry and blocking disabled! EDRSilencer-class attack");
             ok = FALSE;
+        } else {
+            // Verify weight has not been downgraded.
+            // We registered with FWP_UINT8 = 0xf.
+            BOOLEAN weightOk = FALSE;
+            if (filterObj->weight.type == FWP_UINT8 &&
+                filterObj->weight.uint8 == 0xf)
+                weightOk = TRUE;
+            if (!weightOk) {
+                char msg[300];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "WFP TAMPER: NortonEDR filter weight DOWNGRADED "
+                    "(expected UINT8/0xf, got type=%u val=%llu) — attacker "
+                    "filters at higher weight evaluate first, blocking before "
+                    "our callout fires",
+                    filterObj->weight.type,
+                    (filterObj->weight.type == FWP_UINT64 && filterObj->weight.uint64)
+                        ? *filterObj->weight.uint64
+                        : (UINT64)filterObj->weight.uint8);
+                EmitWfpAlert(bufQueue, msg);
+                ok = FALSE;
+            }
+
+            // Verify action type has not been swapped.
+            if (filterObj->action.type != FWP_ACTION_CALLOUT_TERMINATING) {
+                char msg[300];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "WFP TAMPER: NortonEDR filter action type CHANGED from "
+                    "CALLOUT_TERMINATING to %s — classifyFn may not fire or "
+                    "filter becomes a no-op",
+                    ActionTypeName(filterObj->action.type));
+                EmitWfpAlert(bufQueue, msg);
+                ok = FALSE;
+            }
+
+            // Verify callout key still points to our callout.
+            if (RtlCompareMemory(&filterObj->action.calloutKey,
+                    &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID)) {
+                EmitWfpAlert(bufQueue,
+                    "WFP TAMPER: NortonEDR filter callout key REDIRECTED to "
+                    "foreign GUID — our filter now invokes attacker code "
+                    "instead of NortonEDR classifyFn!");
+                ok = FALSE;
+            }
+
+            // Verify filter is still on our layer.
+            if (RtlCompareMemory(&filterObj->layerKey,
+                    &FWPM_LAYER_OUTBOUND_TRANSPORT_V4, sizeof(GUID)) != sizeof(GUID)) {
+                EmitWfpAlert(bufQueue,
+                    "WFP TAMPER: NortonEDR filter MOVED to different layer "
+                    "— no longer monitoring outbound transport traffic");
+                ok = FALSE;
+            }
+
+            // Verify filter is still in our sublayer.
+            if (RtlCompareMemory(&filterObj->subLayerKey,
+                    &NORTONAV_SUBLAYER_GUID, sizeof(GUID)) != sizeof(GUID)) {
+                EmitWfpAlert(bufQueue,
+                    "WFP TAMPER: NortonEDR filter MOVED to foreign sublayer "
+                    "— no longer under NortonEDR sublayer arbitration control");
+                ok = FALSE;
+            }
+
+            // Verify no conditions were injected.
+            // We registered with numFilterConditions = 0 (blanket match).
+            // Injecting conditions would restrict which packets reach our
+            // callout — e.g., exclude attacker C2 traffic by adding a
+            // NOT_EQUAL condition on IP_REMOTE_ADDRESS.
+            if (filterObj->numFilterConditions != 0) {
+                char condDesc[512];
+                DescribeFilterConditions(filterObj, condDesc, sizeof(condDesc));
+                char msg[700];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "WFP TAMPER: NortonEDR filter has %u CONDITIONS INJECTED "
+                    "(registered with 0) — attacker restricting which packets "
+                    "reach our callout. %s",
+                    filterObj->numFilterConditions, condDesc);
+                EmitWfpAlert(bufQueue, msg);
+                ok = FALSE;
+            }
         }
         if (filterObj) FwpmFreeMemory((void**)&filterObj);
     }
 
     // -----------------------------------------------------------------------
-    // Check 2: verify our callout is still registered.
+    // Check 2: verify our callout is still registered AND on the correct layer.
     // Attack: FwpmCalloutDeleteById — removes our callout from the WFP engine.
     // Even if the filter survives, with no callout behind it the filter is inert.
     // Also checks FwpsCalloutUnregisterById — removes the kernel-side callout
@@ -1319,14 +1442,31 @@ BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
                 "WFP TAMPER: NortonEDR WFP callout DELETED via FwpmCalloutDeleteById "
                 "— classifyFn will not be invoked, network monitoring blind");
             ok = FALSE;
+        } else {
+            // Verify callout is still on our layer.
+            if (RtlCompareMemory(&calloutObj->applicableLayer,
+                    &FWPM_LAYER_OUTBOUND_TRANSPORT_V4, sizeof(GUID)) != sizeof(GUID)) {
+                EmitWfpAlert(bufQueue,
+                    "WFP TAMPER: NortonEDR callout MOVED to different layer "
+                    "— classifyFn no longer fires for outbound transport");
+                ok = FALSE;
+            }
         }
         if (calloutObj) FwpmFreeMemory((void**)&calloutObj);
     }
 
     // -----------------------------------------------------------------------
-    // Check 3: verify our sublayer is still registered.
-    // Attack: FwpmSubLayerDeleteByKey — removes our sublayer, which cascades
-    // and deletes all filters associated with it (including ours).
+    // Check 3: verify our sublayer is still registered AND its weight has
+    // not been tampered with.
+    //
+    // Attacks:
+    //   - FwpmSubLayerDeleteByKey — removes our sublayer, cascading deletion
+    //     of all our filters.
+    //   - Weight downgrade: lower our sublayer weight so attacker sublayers
+    //     at higher weight get evaluated first in WFP arbitration.  If the
+    //     attacker's sublayer issues BLOCK, WFP blocks regardless of our
+    //     sublayer's PERMIT decision.
+    //   - Weight inversion: set our weight to 0 so we're dead last.
     // -----------------------------------------------------------------------
     {
         FWPM_SUBLAYER* subObj = nullptr;
@@ -1336,6 +1476,21 @@ BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
                 "WFP TAMPER: NortonEDR sublayer DELETED via FwpmSubLayerDeleteByKey "
                 "— all filters in our sublayer cascade-deleted");
             ok = FALSE;
+        } else {
+            // We registered with weight = 0x0f.
+            if (subObj->weight != 0x0f) {
+                char msg[300];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "WFP TAMPER: NortonEDR sublayer weight CHANGED from "
+                    "0x0f to 0x%04x — %s",
+                    subObj->weight,
+                    subObj->weight < 0x0f
+                        ? "DOWNGRADED — attacker sublayers now outweigh ours "
+                          "in WFP arbitration"
+                        : "MODIFIED — sublayer arbitration order altered");
+                EmitWfpAlert(bufQueue, msg);
+                ok = FALSE;
+            }
         }
         if (subObj) FwpmFreeMemory((void**)&subObj);
     }
