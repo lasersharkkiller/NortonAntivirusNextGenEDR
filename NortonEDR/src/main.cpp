@@ -5384,7 +5384,7 @@ void AltitudeAuditThread()
 {
     const wchar_t* kExpectedAltitude = L"320021";
     const ULONG    kOurAltNum        = 320021;
-    const ULONG    kSandwichRange    = 10;  // alert if foreign filter within +10
+    const ULONG    kAvRangeTop       = 329999;  // FSFilter Anti-Virus range ceiling
 
     std::cout << "[AltitudeAudit] Minifilter altitude integrity monitor active\n";
 
@@ -5516,7 +5516,7 @@ void AltitudeAuditThread()
                                 );
                             }
                             else if (foreignAlt > kOurAltNum &&
-                                     foreignAlt <= kOurAltNum + kSandwichRange)
+                                     foreignAlt <= kAvRangeTop)
                             {
                                 std::string detail = "Service '";
                                 detail += narrowSvc;
