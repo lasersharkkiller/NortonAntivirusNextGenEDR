@@ -757,6 +757,18 @@ class SyscallsUtils {
 	static ULONG NtCreateFileId;             // Variable — physical memory / raw device access detection (IOMMU bypass)
 	static ULONG NtAssignProcessToJobObjectId; // Variable — job object assignment attack detection
 
+	// Token impersonation / privilege escalation attack surface
+	static ULONG NtOpenProcessTokenExId;       // Variable — token acquisition from privileged processes
+	static ULONG NtOpenThreadTokenExId;        // Variable — thread token acquisition detection
+	static ULONG NtDuplicateTokenId;           // Variable — token cloning/conversion (impersonation→primary)
+	static ULONG NtCreateTokenExId;            // Variable — token forging (requires SeCreateTokenPrivilege)
+	static ULONG NtCreateTokenId;              // Variable — legacy token forging
+	static ULONG NtImpersonateThreadId;        // Variable — direct thread impersonation
+	static ULONG NtAlpcImpersonateClientOfPortId;  // Variable — ALPC impersonation
+	static ULONG NtAlpcImpersonateClientThreadId;  // Variable — ALPC thread impersonation
+	static ULONG NtFilterTokenId;              // Variable — restricted token manipulation
+	static ULONG NtImpersonateAnonymousTokenId;    // Variable — anonymous token impersonation
+
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
 	static RegionTracker* vmRegionTracker;
@@ -1013,9 +1025,64 @@ public:
 	// Job object assignment attack detection (KILL_ON_JOB_CLOSE)
 	static VOID NtAssignProcessToJobObjectHandler(HANDLE ProcessHandle);
 
-	// Named pipe C2 / lateral movement detection
+	// Token acquisition — detect opening tokens of privileged processes (SYSTEM, LSASS)
+	static VOID NtOpenProcessTokenExHandler(
+		HANDLE ProcessHandle,
+		ACCESS_MASK DesiredAccess,
+		ULONG HandleAttributes
+	);
+
+	// Thread token acquisition — detect stealing impersonation tokens from threads
+	static VOID NtOpenThreadTokenExHandler(
+		HANDLE ThreadHandle,
+		ACCESS_MASK DesiredAccess,
+		BOOLEAN OpenAsSelf
+	);
+
+	// Token duplication — detect cloning/converting tokens (impersonation→primary)
+	static VOID NtDuplicateTokenHandler(
+		HANDLE ExistingTokenHandle,
+		ACCESS_MASK DesiredAccess,
+		PVOID ObjectAttributes,
+		BOOLEAN EffectiveOnly,
+		ULONG TokenType    // TokenPrimary=1, TokenImpersonation=2
+	);
+
+	// Token forging — detect NtCreateTokenEx (requires SeCreateTokenPrivilege)
+	static VOID NtCreateTokenExHandler();
+
+	// Legacy token forging — NtCreateToken (same as NtCreateTokenEx but older API)
+	static VOID NtCreateTokenHandler();
+
+	// Direct thread impersonation — no pipe/ALPC needed
+	static VOID NtImpersonateThreadHandler(
+		HANDLE ServerThreadHandle,
+		HANDLE ClientThreadHandle
+	);
+
+	// ALPC-based impersonation — PrintSpoofer / COM potato variants
+	static VOID NtAlpcImpersonateClientOfPortHandler(
+		HANDLE PortHandle
+	);
+	static VOID NtAlpcImpersonateClientThreadHandler(
+		HANDLE PortHandle
+	);
+
+	// Restricted token manipulation — privilege re-escalation
+	static VOID NtFilterTokenHandler(
+		HANDLE ExistingTokenHandle,
+		ULONG  Flags
+	);
+
+	// Anonymous token impersonation — NTLM relay preparation
+	static VOID NtImpersonateAnonymousTokenHandler(
+		HANDLE ThreadHandle
+	);
+
+	// Named pipe C2 / lateral movement / squatting / DACL abuse detection
 	static VOID NtCreateNamedPipeFileHandler(
-		PVOID ObjectAttributes
+		PVOID ObjectAttributes,
+		ULONG MaximumInstances
 	);
 
 	// Mailslot C2 / lateral movement / domain enumeration detection

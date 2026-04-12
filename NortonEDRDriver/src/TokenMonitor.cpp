@@ -38,6 +38,17 @@
 
 #include "Globals.h"
 
+// PsReferenceImpersonationToken — ntoskrnl export.
+// Returns the impersonation token for a thread (or NULL if not impersonating).
+// Caller must dereference via PsDereferenceImpersonationToken.
+extern "C" PACCESS_TOKEN PsReferenceImpersonationToken(
+    _In_  PETHREAD                      Thread,
+    _Out_ PBOOLEAN                      CopyOnOpen,
+    _Out_ PBOOLEAN                      EffectiveOnly,
+    _Out_ PSECURITY_IMPERSONATION_LEVEL ImpersonationLevel);
+
+extern "C" VOID PsDereferenceImpersonationToken(_In_ PACCESS_TOKEN ImpersonationToken);
+
 // ---------------------------------------------------------------------------
 // Notification helper
 // ---------------------------------------------------------------------------
@@ -145,6 +156,23 @@ static BOOLEAN IsBuiltinLogonId(const LUID* id)
             id->LowPart == kAnonLogonId.LowPart);
 }
 
+// ---------------------------------------------------------------------------
+// GetTokenLogonIdFromToken — retrieve LogonId from a token object directly.
+// ---------------------------------------------------------------------------
+static BOOLEAN GetTokenLogonId(PACCESS_TOKEN token, LUID* outLogonId)
+{
+    if (!token || !outLogonId) return FALSE;
+
+    TOKEN_STATISTICS_PARTIAL* stats = nullptr;
+    NTSTATUS s = SeQueryInformationToken(
+        token, (TOKEN_INFORMATION_CLASS)10, (PVOID*)&stats);
+    if (!NT_SUCCESS(s) || !stats) return FALSE;
+
+    *outLogonId = stats->AuthenticationId;
+    ExFreePool(stats);
+    return TRUE;
+}
+
 static NTSTATUS NTAPI LogonSessionTerminatedCallback(_In_ PLUID LogonId)
 {
     if (!LogonId) return STATUS_SUCCESS;
@@ -186,13 +214,14 @@ static NTSTATUS NTAPI LogonSessionTerminatedCallback(_In_ PLUID LogonId)
         if (pid != nullptr && pid != (HANDLE)4) {
             PEPROCESS proc = nullptr;
             if (NT_SUCCESS(PsLookupProcessByProcessId(pid, &proc))) {
+                char* procName = PsGetProcessImageFileName(proc);
+
+                // --- (a) Primary token check: process alive, session dead ---
                 LUID procLogonId = {};
                 if (GetProcessTokenLogonId(proc, &procLogonId)) {
                     if (procLogonId.LowPart  == LogonId->LowPart &&
                         procLogonId.HighPart == LogonId->HighPart)
                     {
-                        // Process is alive but its token's logon session just died.
-                        char* procName = PsGetProcessImageFileName(proc);
                         char  alert[200];
                         RtlStringCbPrintfA(alert, sizeof(alert),
                             "Token theft / orphan token: pid=%llu ('%s') holds token "
@@ -204,13 +233,59 @@ static NTSTATUS NTAPI LogonSessionTerminatedCallback(_In_ PLUID LogonId)
 
                         EmitTokenAlert(alert, pid, procName);
                         alertCount++;
-
-                        if (alertCount >= 8) {
-                            ObDereferenceObject(proc);
-                            break;
-                        }
                     }
                 }
+
+                // --- (b) Per-thread impersonation token check ---
+                // Walk each thread in this process. If any thread holds an
+                // impersonation token whose LogonId matches the dead session,
+                // the thread is using a stolen token that outlived its source.
+                // This catches Incognito/mimikatz token::elevate/impersonation
+                // attacks where the thread impersonates but the process primary
+                // token doesn't change.
+                for (ULONG ti = 0; ti < entry->NumberOfThreads && alertCount < 16; ti++) {
+                    HANDLE tid = entry->Threads[ti].ClientId.UniqueThread;
+                    PETHREAD thread = nullptr;
+                    if (NT_SUCCESS(PsLookupThreadByThreadId(tid, &thread))) {
+                        BOOLEAN copyOnOpen = FALSE, effectiveOnly = FALSE;
+                        SECURITY_IMPERSONATION_LEVEL impLevel = SecurityAnonymous;
+
+                        PACCESS_TOKEN impToken = PsReferenceImpersonationToken(
+                            thread, &copyOnOpen, &effectiveOnly, &impLevel);
+
+                        if (impToken) {
+                            LUID impLogonId = {};
+                            if (GetTokenLogonId(impToken, &impLogonId)) {
+                                if (impLogonId.LowPart == LogonId->LowPart &&
+                                    impLogonId.HighPart == LogonId->HighPart)
+                                {
+                                    char alert[256];
+                                    RtlStringCbPrintfA(alert, sizeof(alert),
+                                        "Impersonation token theft: pid=%llu ('%s') "
+                                        "tid=%llu holds impersonation token (level=%d) "
+                                        "for terminated logon session {0x%lX,0x%lX} — "
+                                        "stolen token retained on thread",
+                                        (ULONG64)(ULONG_PTR)pid,
+                                        procName ? procName : "?",
+                                        (ULONG64)(ULONG_PTR)tid,
+                                        (int)impLevel,
+                                        LogonId->HighPart, LogonId->LowPart);
+
+                                    EmitTokenAlert(alert, pid, procName);
+                                    alertCount++;
+                                }
+                            }
+                            PsDereferenceImpersonationToken(impToken);
+                        }
+                        ObDereferenceObject(thread);
+                    }
+                }
+
+                if (alertCount >= 16) {
+                    ObDereferenceObject(proc);
+                    break;
+                }
+
                 ObDereferenceObject(proc);
             }
         }

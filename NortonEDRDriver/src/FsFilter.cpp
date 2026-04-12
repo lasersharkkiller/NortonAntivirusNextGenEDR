@@ -1461,6 +1461,291 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
                 }
             }
         }
+
+        // ---- T1006: Raw disk / volume device access ----
+        // Opening \\.\PhysicalDriveX or \\.\X: or \Device\HarddiskVolumeX bypasses
+        // NTFS ACLs entirely — enables offline SAM/SYSTEM extraction, MBR/GPT wiping,
+        // bootkit installation, and direct partition reads.
+        // Only System (PID 4), disk management tools, and our driver should do this.
+        {
+            static const PCWSTR kRawDiskPatterns[] = {
+                L"\\device\\harddisk",           // \Device\HarddiskX\PartitionY
+                L"\\device\\physicaldrive",       // \\.\PhysicalDriveX (kernel path)
+                L"physicaldrive",                 // user-mode \\.\PhysicalDriveX
+                L"\\device\\harddiskvolume",      // \Device\HarddiskVolumeX (raw volume)
+                L"\\global??\\physicaldrive",     // object directory variant
+            };
+
+            for (SIZE_T i = 0; i < ARRAYSIZE(kRawDiskPatterns); i++) {
+                if (WcsContainsLower(&nameInfo->Name, kRawDiskPatterns[i])) {
+                    // Allow System, disk management, and backup tools
+                    if ((ULONG_PTR)pid <= 4) break;
+                    if (procName) {
+                        if (strcmp(procName, "svchost.exe") == 0 ||
+                            strcmp(procName, "vds.exe") == 0 ||
+                            strcmp(procName, "vssvc.exe") == 0 ||
+                            strcmp(procName, "diskmgmt.msc") == 0 ||
+                            strcmp(procName, "wbengine.exe") == 0 ||
+                            strcmp(procName, "TrustedInsta") == 0 ||
+                            strcmp(procName, "MsMpEng.exe") == 0 ||
+                            strcmp(procName, "NortonEDR.exe") == 0)
+                            break;
+                    }
+
+                    char msg[224];
+                    RtlStringCchPrintfA(msg, sizeof(msg),
+                        "FS: Raw disk/volume device access by '%s' (pid=%llu) "
+                        "— bypasses NTFS ACLs, possible bootkit / offline cred extraction (T1006)",
+                        procName ? procName : "?",
+                        (ULONG64)(ULONG_PTR)pid);
+                    EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                    break;
+                }
+            }
+        }
+
+        // ---- T1574.001: Executable drop in system directories ----
+        // Writing .exe/.dll/.sys to System32, SysWOW64, or drivers\ from a
+        // non-installer/non-TrustedInstaller process = DLL search order hijack,
+        // driver planting, or LOLBin replacement.
+        // NOTE: This differs from the existing "executable drop in suspicious path"
+        // (kDropPaths) which covers temp/appdata.  Here we cover SYSTEM directories.
+        {
+            ULONG createDispSys = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
+            BOOLEAN isSysCreate =
+                (createDispSys == FILE_CREATE || createDispSys == FILE_OVERWRITE_IF ||
+                 createDispSys == FILE_SUPERSEDE);
+
+            if (isSysCreate) {
+                // Check for driver-specific extension (.sys) in drivers directory
+                static const PCWSTR kSysDirPaths[] = {
+                    L"\\windows\\system32\\drivers\\",
+                    L"\\windows\\system32\\",
+                    L"\\windows\\syswow64\\",
+                };
+
+                for (SIZE_T i = 0; i < ARRAYSIZE(kSysDirPaths); i++) {
+                    if (WcsContainsLower(&nameInfo->Name, kSysDirPaths[i])) {
+                        // Check if dropping an executable/driver file
+                        static const PCWSTR kSysExecExts[] = {
+                            L".exe", L".dll", L".sys", L".drv", L".ocx", L".cpl", nullptr
+                        };
+                        BOOLEAN isSysExec = FALSE;
+                        for (int ei = 0; kSysExecExts[ei]; ei++) {
+                            if (ExtMatch(&nameInfo->Extension, kSysExecExts[ei])) {
+                                isSysExec = TRUE; break;
+                            }
+                        }
+                        if (!isSysExec) break;
+
+                        // Allow servicing processes
+                        if ((ULONG_PTR)pid <= 4) break;
+                        if (procName) {
+                            BOOLEAN allowed = FALSE;
+                            for (int ai = 0; kBinWriteAllowedProcs[ai]; ai++) {
+                                if (strcmp(procName, kBinWriteAllowedProcs[ai]) == 0) {
+                                    allowed = TRUE; break;
+                                }
+                            }
+                            if (allowed) break;
+                        }
+
+                        char fileBuf[64] = {};
+                        ANSI_STRING ansiSys;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiSys, &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiSys.Length < sizeof(fileBuf) - 1 ? ansiSys.Length : sizeof(fileBuf) - 1;
+                            RtlCopyMemory(fileBuf, ansiSys.Buffer, n);
+                            RtlFreeAnsiString(&ansiSys);
+                        }
+                        char msg[256];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: Executable/driver drop in system directory — %s by '%s' (pid=%llu) "
+                            "— possible DLL search-order hijack / driver planting (T1574.001)",
+                            fileBuf[0] ? fileBuf : "?",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid);
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---- T1070.004: DELETE_ON_CLOSE on protected files ----
+        // FILE_DELETE_ON_CLOSE (CreateOptions bit 12) causes the file to be deleted
+        // when the last handle closes.  Attackers use this to bypass explicit delete
+        // ACLs because the delete happens as a side effect of closing a read handle.
+        // Flag DELETE_ON_CLOSE on system binaries, security configs, event logs, and
+        // EDR components.
+        {
+            ULONG createOptsDel = Data->Iopb->Parameters.Create.Options & 0x00FFFFFF;
+
+            if (createOptsDel & FILE_DELETE_ON_CLOSE) {
+                static const PCWSTR kDelProtPaths[] = {
+                    L"\\windows\\system32\\",
+                    L"\\windows\\syswow64\\",
+                    L"\\program files\\",
+                    L"\\program files (x86)\\",
+                    L"\\winevt\\logs\\",           // Event logs
+                    L"\\windows\\system32\\config\\", // SAM/SYSTEM/SECURITY
+                    L"\\windows\\system32\\drivers\\", // Kernel drivers
+                    L"\\nortonedr\\",              // Our own components
+                };
+
+                for (SIZE_T i = 0; i < ARRAYSIZE(kDelProtPaths); i++) {
+                    if (WcsContainsLower(&nameInfo->Name, kDelProtPaths[i])) {
+                        // Allow System and TrustedInstaller
+                        if ((ULONG_PTR)pid <= 4) break;
+                        if (procName && (strcmp(procName, "TrustedInsta") == 0 ||
+                                         strcmp(procName, "msiexec.exe") == 0 ||
+                                         strcmp(procName, "tiworker.exe") == 0))
+                            break;
+
+                        char fileBuf[64] = {};
+                        ANSI_STRING ansiDel;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiDel, &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiDel.Length < sizeof(fileBuf) - 1 ? ansiDel.Length : sizeof(fileBuf) - 1;
+                            RtlCopyMemory(fileBuf, ansiDel.Buffer, n);
+                            RtlFreeAnsiString(&ansiDel);
+                        }
+                        char msg[256];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: DELETE_ON_CLOSE on protected file — %s by '%s' (pid=%llu) "
+                            "— possible ACL bypass / EDR component removal (T1070.004)",
+                            fileBuf[0] ? fileBuf : "?",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid);
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---- T1547: Reparse point / mount point / symlink abuse in sensitive dirs ----
+        // FILE_OPEN_REPARSE_POINT (CreateOptions bit 21) opens the reparse point itself
+        // rather than following it.  Combined with write access in System32 or
+        // Program Files, this enables TOCTOU symlink attacks: redirect a privileged
+        // file write (e.g., Windows Installer, Update, MSI custom actions) to an
+        // arbitrary location for EoP.
+        {
+            ULONG createOptsRp = Data->Iopb->Parameters.Create.Options & 0x00FFFFFF;
+            ACCESS_MASK daRp = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+
+            BOOLEAN hasReparseFlag = (createOptsRp & FILE_OPEN_REPARSE_POINT) != 0;
+            BOOLEAN wantsWrite = (daRp & (FILE_WRITE_DATA | FILE_APPEND_DATA |
+                                          FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA |
+                                          DELETE | WRITE_DAC | WRITE_OWNER)) != 0;
+
+            if (hasReparseFlag && wantsWrite) {
+                static const PCWSTR kRpSensitivePaths[] = {
+                    L"\\windows\\system32\\",
+                    L"\\windows\\syswow64\\",
+                    L"\\windows\\winsxs\\",
+                    L"\\program files\\",
+                    L"\\program files (x86)\\",
+                    L"\\windows\\temp\\",
+                    L"\\windows\\installer\\",
+                    L"\\programdata\\",
+                };
+
+                for (SIZE_T i = 0; i < ARRAYSIZE(kRpSensitivePaths); i++) {
+                    if (WcsContainsLower(&nameInfo->Name, kRpSensitivePaths[i])) {
+                        // Allow System and TrustedInstaller
+                        if ((ULONG_PTR)pid <= 4) break;
+                        if (procName && (strcmp(procName, "TrustedInsta") == 0 ||
+                                         strcmp(procName, "msiexec.exe") == 0 ||
+                                         strcmp(procName, "tiworker.exe") == 0 ||
+                                         strcmp(procName, "svchost.exe") == 0))
+                            break;
+
+                        char fileBuf[64] = {};
+                        ANSI_STRING ansiRp;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiRp, &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiRp.Length < sizeof(fileBuf) - 1 ? ansiRp.Length : sizeof(fileBuf) - 1;
+                            RtlCopyMemory(fileBuf, ansiRp.Buffer, n);
+                            RtlFreeAnsiString(&ansiRp);
+                        }
+                        char msg[256];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: Reparse point write in sensitive directory — %s by '%s' (pid=%llu) "
+                            "— possible TOCTOU symlink EoP attack (T1547)",
+                            fileBuf[0] ? fileBuf : "?",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid);
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---- T1204.002: Executable open from untrusted drop locations ----
+        // Catch stagers and reflective loaders executing from %TEMP%, Downloads,
+        // AppData\Local\Temp, and ProgramData.  We flag CREATE disposition (new file
+        // being loaded) for executable extensions in these directories.
+        // This complements the existing kDropPaths check which flags drops but not
+        // opens-for-execution (FILE_EXECUTE / FILE_READ_DATA on an .exe).
+        {
+            ACCESS_MASK daExec = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            BOOLEAN wantsExecute = (daExec & (FILE_EXECUTE)) != 0;
+
+            if (wantsExecute) {
+                static const PCWSTR kUntrustedExecPaths[] = {
+                    L"\\temp\\",
+                    L"\\appdata\\local\\temp\\",
+                    L"\\downloads\\",
+                    L"\\users\\public\\",
+                    L"\\programdata\\",
+                    L"\\recycle",
+                };
+
+                // Check if file has an executable extension
+                static const PCWSTR kExecExtsLoad[] = {
+                    L".exe", L".dll", L".scr", L".com", L".pif",
+                    L".hta", L".cpl", L".ocx", nullptr
+                };
+
+                BOOLEAN isExecFile = FALSE;
+                for (int ei = 0; kExecExtsLoad[ei]; ei++) {
+                    if (ExtMatch(&nameInfo->Extension, kExecExtsLoad[ei])) {
+                        isExecFile = TRUE; break;
+                    }
+                }
+
+                if (isExecFile) {
+                    for (SIZE_T i = 0; i < ARRAYSIZE(kUntrustedExecPaths); i++) {
+                        if (WcsContainsLower(&nameInfo->Name, kUntrustedExecPaths[i])) {
+                            // Allow common legitimate launchers
+                            if (procName) {
+                                if (strcmp(procName, "explorer.exe") == 0 ||
+                                    strcmp(procName, "svchost.exe") == 0 ||
+                                    strcmp(procName, "MsMpEng.exe") == 0 ||
+                                    strcmp(procName, "NortonEDR.exe") == 0)
+                                    break;
+                            }
+
+                            char fileBuf[96] = {};
+                            ANSI_STRING ansiEx;
+                            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiEx, &nameInfo->FinalComponent, TRUE))) {
+                                SIZE_T n = ansiEx.Length < sizeof(fileBuf) - 1 ? ansiEx.Length : sizeof(fileBuf) - 1;
+                                RtlCopyMemory(fileBuf, ansiEx.Buffer, n);
+                                RtlFreeAnsiString(&ansiEx);
+                            }
+                            char msg[256];
+                            RtlStringCchPrintfA(msg, sizeof(msg),
+                                "FS: Executable image load from untrusted location — %s by '%s' (pid=%llu) "
+                                "— possible stager / reflective loader execution (T1204.002)",
+                                fileBuf[0] ? fileBuf : "?",
+                                procName ? procName : "?",
+                                (ULONG64)(ULONG_PTR)pid);
+                            EnqueueFsAlert(pid, procName, msg, FALSE);  // WARNING (high volume)
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 
@@ -1959,6 +2244,78 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreFsControl(
             (ULONG64)(ULONG_PTR)pid,
             pathBuf[0] ? pathBuf : "?");
         EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+    }
+
+    // ---- Named pipe impersonation (FSCTL_PIPE_IMPERSONATE) ----
+    // FSCTL_PIPE_IMPERSONATE (0x110018) is the actual execution moment for
+    // EVERY potato-family privilege escalation attack:
+    //   JuicyPotato, SweetPotato, GodPotato, PrintSpoofer, EfsPotato,
+    //   RottenPotato, RoguePotato, CoercedPotato, etc.
+    //
+    // Attack flow:
+    //   1. Create a named pipe with FILE_CREATE_PIPE_INSTANCE (detected above)
+    //   2. Coerce a SYSTEM service to connect as a client (RPC/DCOM/EFS/Print)
+    //   3. Call FSCTL_PIPE_IMPERSONATE on the server end → kernel assigns the
+    //      client's (SYSTEM) token to the server thread
+    //   4. The attacker's thread is now running as SYSTEM
+    //
+    // This is the critical moment — the transition from "prepared" to "escalated".
+    // We detect the pipe creation (step 1) and the integrity mismatch (step 4's
+    // output), but this catches step 3 itself — the impersonation act.
+    //
+    // Normal pipe servers: svchost.exe (RPC), lsass.exe, smss.exe, csrss.exe,
+    // spoolsv.exe, wininit.exe — these legitimately impersonate pipe clients.
+    else if (fsctl == 0x110018) {  // FSCTL_PIPE_IMPERSONATE
+        PEPROCESS process  = IoThreadToProcess(Data->Thread);
+        HANDLE    pid      = PsGetProcessId(process);
+        char*     procName = PsGetProcessImageFileName(process);
+
+        if ((ULONG_PTR)pid <= 4) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+        // Allowlist: legitimate pipe servers that impersonate clients
+        BOOLEAN isLegitServer = FALSE;
+        if (procName) {
+            static const char* kLegitPipeServers[] = {
+                "svchost.exe", "lsass.exe", "smss.exe", "csrss.exe",
+                "spoolsv.exe", "wininit.exe", "services.exe",
+                "SearchIndex", "WmiPrvSE.exe", "dllhost.exe",
+                "msdtc.exe", "dns.exe", "MsMpEng.exe",
+                nullptr
+            };
+            for (int i = 0; kLegitPipeServers[i]; i++) {
+                if (strcmp(procName, kLegitPipeServers[i]) == 0) {
+                    isLegitServer = TRUE;
+                    break;
+                }
+            }
+        }
+
+        if (!isLegitServer) {
+            // Get the pipe name for context
+            PFLT_FILE_NAME_INFORMATION pipeNameInfo = nullptr;
+            char pipeBuf[96] = {};
+            NTSTATUS pst = FltGetFileNameInformation(
+                Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &pipeNameInfo);
+            if (NT_SUCCESS(pst) && pipeNameInfo) {
+                FltParseFileNameInformation(pipeNameInfo);
+                ANSI_STRING ansi;
+                if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, &pipeNameInfo->Name, TRUE))) {
+                    SIZE_T n = ansi.Length < sizeof(pipeBuf) - 1 ? ansi.Length : sizeof(pipeBuf) - 1;
+                    RtlCopyMemory(pipeBuf, ansi.Buffer, n);
+                    RtlFreeAnsiString(&ansi);
+                }
+                FltReleaseFileNameInformation(pipeNameInfo);
+            }
+
+            char msg[280];
+            RtlStringCchPrintfA(msg, sizeof(msg),
+                "FS-NPFS: FSCTL_PIPE_IMPERSONATE by '%s' (pid=%llu) on pipe=%s "
+                "— pipe client impersonation / potato privilege escalation (T1134.001)",
+                procName ? procName : "?",
+                (ULONG64)(ULONG_PTR)pid,
+                pipeBuf[0] ? pipeBuf : "?");
+            EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+        }
     }
 
     return FLT_PREOP_SUCCESS_NO_CALLBACK;

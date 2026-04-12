@@ -12,6 +12,7 @@
 // Process information classes
 #define PROCESS_PROTECTION_LEVEL_CLASS  0x3Du   // ProcessProtectionLevel (61)
 #define PROCESS_MITIGATION_POLICY_CLASS 0x34u   // ProcessMitigationPolicy (52) — SetProcessMitigationPolicy
+#define PROCESS_ACCESS_TOKEN_CLASS      0x09u   // ProcessAccessToken — primary token replacement
 
 PSSDT_TABLE SyscallsUtils::ssdtTable = nullptr;
 PFUNCTION_MAP SyscallsUtils::exportsMap = nullptr;
@@ -66,6 +67,16 @@ ULONG SyscallsUtils::NtOpenThreadId = 0;               // Resolve dynamically
 ULONG SyscallsUtils::NtFlushInstructionCacheId = 0;    // Resolve dynamically
 ULONG SyscallsUtils::NtCreateFileId = 0;              // Resolve dynamically — physical memory / raw device access detection
 ULONG SyscallsUtils::NtAssignProcessToJobObjectId = 0; // Resolve dynamically — job object kill attack detection
+ULONG SyscallsUtils::NtOpenProcessTokenExId = 0;      // Resolve dynamically — token acquisition detection
+ULONG SyscallsUtils::NtOpenThreadTokenExId = 0;       // Resolve dynamically — thread token acquisition detection
+ULONG SyscallsUtils::NtDuplicateTokenId = 0;          // Resolve dynamically — token cloning detection
+ULONG SyscallsUtils::NtCreateTokenExId = 0;           // Resolve dynamically — token forging detection
+ULONG SyscallsUtils::NtCreateTokenId = 0;             // Resolve dynamically — legacy token forging
+ULONG SyscallsUtils::NtImpersonateThreadId = 0;       // Resolve dynamically — direct thread impersonation
+ULONG SyscallsUtils::NtAlpcImpersonateClientOfPortId = 0;  // Resolve dynamically — ALPC impersonation
+ULONG SyscallsUtils::NtAlpcImpersonateClientThreadId = 0;  // Resolve dynamically — ALPC thread impersonation
+ULONG SyscallsUtils::NtFilterTokenId = 0;             // Resolve dynamically — restricted token manipulation
+ULONG SyscallsUtils::NtImpersonateAnonymousTokenId = 0;    // Resolve dynamically — anonymous token impersonation
 
 BufferQueue* SyscallsUtils::bufQueue = nullptr;
 StackUtils* SyscallsUtils::stackUtils = nullptr;
@@ -681,10 +692,16 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		NtTraceControlHandler((ULONG)trapFrame->Rdx);
 	}
 	else if (NtCreateNamedPipeFileId != 0 && id == NtCreateNamedPipeFileId) {
-		// NtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, TypeBits, ReadModeBits, CompletionMode, MaxInstances, InboundQuota, OutboundQuota, Timeout)
-		// We care about the pipe name in ObjectAttributes->ObjectName
-		PVOID objAttr = (PVOID)trapFrame->Rdx;
-		NtCreateNamedPipeFileHandler(objAttr);
+		// NtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
+		//   ShareAccess, CreateDisposition, CreateOptions, TypeBits, ReadModeBits,
+		//   CompletionMode, MaxInstances, InboundQuota, OutboundQuota, Timeout)
+		// RCX=FileHandle  RDX=DesiredAccess  R8=ObjectAttributes  R9=IoStatusBlock
+		// MaxInstances = arg11 = RSP+0x58
+		PVOID objAttr = (PVOID)trapFrame->R8;
+		PULONGLONG pMaxInst = (PULONGLONG)((ULONG_PTR)trapFrame->Rsp + 0x58);
+		ULONG maxInst = 0;
+		if (MmIsAddressValid(pMaxInst)) maxInst = (ULONG)*pMaxInst;
+		NtCreateNamedPipeFileHandler(objAttr, maxInst);
 	}
 	else if (NtCreateMailslotFileId != 0 && id == NtCreateMailslotFileId) {
 		// NtCreateMailslotFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, CreateOptions, MailslotQuota, MaximumMessageSize, ReadTimeout)
@@ -720,6 +737,72 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		// NtAssignProcessToJobObject(JobHandle, ProcessHandle)
 		// ProcessHandle = arg2 = RDX
 		NtAssignProcessToJobObjectHandler((HANDLE)trapFrame->Rdx);
+	}
+	// --- Token impersonation / privilege escalation syscalls ---
+	else if (NtOpenProcessTokenExId != 0 && id == NtOpenProcessTokenExId) {
+		// NtOpenProcessTokenEx(ProcessHandle, DesiredAccess, HandleAttributes, TokenHandle)
+		// RCX=process  RDX=access  R8=attrs  R9=outHandle
+		NtOpenProcessTokenExHandler(
+			(HANDLE)trapFrame->Rcx,
+			(ACCESS_MASK)trapFrame->Rdx,
+			(ULONG)trapFrame->R8);
+	}
+	else if (NtOpenThreadTokenExId != 0 && id == NtOpenThreadTokenExId) {
+		// NtOpenThreadTokenEx(ThreadHandle, DesiredAccess, OpenAsSelf, HandleAttributes, TokenHandle)
+		// RCX=thread  RDX=access  R8=openAsSelf  R9=attrs
+		NtOpenThreadTokenExHandler(
+			(HANDLE)trapFrame->Rcx,
+			(ACCESS_MASK)trapFrame->Rdx,
+			(BOOLEAN)trapFrame->R8);
+	}
+	else if (NtDuplicateTokenId != 0 && id == NtDuplicateTokenId) {
+		// NtDuplicateToken(ExistingTokenHandle, DesiredAccess, ObjectAttributes, EffectiveOnly, TokenType, NewTokenHandle)
+		// RCX=existing  RDX=access  R8=objAttr  R9=effectiveOnly  [RSP+0x28]=tokenType
+		PULONGLONG pTokenType = (PULONGLONG)((ULONG_PTR)trapFrame->Rsp + 0x28);
+		ULONG tokenType = (ULONG)(MmIsAddressValid(pTokenType) ? *pTokenType : 0);
+		NtDuplicateTokenHandler(
+			(HANDLE)trapFrame->Rcx,
+			(ACCESS_MASK)trapFrame->Rdx,
+			(PVOID)trapFrame->R8,
+			(BOOLEAN)trapFrame->R9,
+			tokenType);
+	}
+	else if (NtCreateTokenExId != 0 && id == NtCreateTokenExId) {
+		// NtCreateTokenEx — any invocation is suspicious (requires SeCreateTokenPrivilege)
+		NtCreateTokenExHandler();
+	}
+	else if (NtCreateTokenId != 0 && id == NtCreateTokenId) {
+		// NtCreateToken (legacy) — same detection as NtCreateTokenEx
+		NtCreateTokenHandler();
+	}
+	else if (NtImpersonateThreadId != 0 && id == NtImpersonateThreadId) {
+		// NtImpersonateThread(ServerThread, ClientThread, SecurityQoS)
+		// RCX=server  RDX=client  R8=qos
+		NtImpersonateThreadHandler(
+			(HANDLE)trapFrame->Rcx,
+			(HANDLE)trapFrame->Rdx);
+	}
+	else if (NtAlpcImpersonateClientOfPortId != 0 && id == NtAlpcImpersonateClientOfPortId) {
+		// NtAlpcImpersonateClientOfPort(PortHandle, PortMessage, Reserved)
+		// RCX=port
+		NtAlpcImpersonateClientOfPortHandler((HANDLE)trapFrame->Rcx);
+	}
+	else if (NtAlpcImpersonateClientThreadId != 0 && id == NtAlpcImpersonateClientThreadId) {
+		// NtAlpcImpersonateClientThread(PortHandle, PortMessage, Flags)
+		// RCX=port
+		NtAlpcImpersonateClientThreadHandler((HANDLE)trapFrame->Rcx);
+	}
+	else if (NtFilterTokenId != 0 && id == NtFilterTokenId) {
+		// NtFilterToken(ExistingTokenHandle, Flags, SidsToDisable, PrivilegesToDelete, RestrictedSids, NewTokenHandle)
+		// RCX=existing  RDX=flags
+		NtFilterTokenHandler(
+			(HANDLE)trapFrame->Rcx,
+			(ULONG)trapFrame->Rdx);
+	}
+	else if (NtImpersonateAnonymousTokenId != 0 && id == NtImpersonateAnonymousTokenId) {
+		// NtImpersonateAnonymousToken(ThreadHandle)
+		// RCX=thread
+		NtImpersonateAnonymousTokenHandler((HANDLE)trapFrame->Rcx);
 	}
 
 	return TRUE;
@@ -1181,6 +1264,47 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtAssignJob;
 	RtlInitUnicodeString(&usNtAssignJob, L"NtAssignProcessToJobObject");
 	NtAssignProcessToJobObjectId = getSSNByName(ssdtTable, &usNtAssignJob, exportsMap);
+
+	// Token impersonation / privilege escalation syscalls
+	UNICODE_STRING usNtOpenProcessTokenEx;
+	RtlInitUnicodeString(&usNtOpenProcessTokenEx, L"NtOpenProcessTokenEx");
+	NtOpenProcessTokenExId = getSSNByName(ssdtTable, &usNtOpenProcessTokenEx, exportsMap);
+
+	UNICODE_STRING usNtOpenThreadTokenEx;
+	RtlInitUnicodeString(&usNtOpenThreadTokenEx, L"NtOpenThreadTokenEx");
+	NtOpenThreadTokenExId = getSSNByName(ssdtTable, &usNtOpenThreadTokenEx, exportsMap);
+
+	UNICODE_STRING usNtDuplicateToken;
+	RtlInitUnicodeString(&usNtDuplicateToken, L"NtDuplicateToken");
+	NtDuplicateTokenId = getSSNByName(ssdtTable, &usNtDuplicateToken, exportsMap);
+
+	UNICODE_STRING usNtCreateTokenEx;
+	RtlInitUnicodeString(&usNtCreateTokenEx, L"NtCreateTokenEx");
+	NtCreateTokenExId = getSSNByName(ssdtTable, &usNtCreateTokenEx, exportsMap);
+
+	UNICODE_STRING usNtCreateToken;
+	RtlInitUnicodeString(&usNtCreateToken, L"NtCreateToken");
+	NtCreateTokenId = getSSNByName(ssdtTable, &usNtCreateToken, exportsMap);
+
+	UNICODE_STRING usNtImpersonateThread;
+	RtlInitUnicodeString(&usNtImpersonateThread, L"NtImpersonateThread");
+	NtImpersonateThreadId = getSSNByName(ssdtTable, &usNtImpersonateThread, exportsMap);
+
+	UNICODE_STRING usNtAlpcImpClient;
+	RtlInitUnicodeString(&usNtAlpcImpClient, L"NtAlpcImpersonateClientOfPort");
+	NtAlpcImpersonateClientOfPortId = getSSNByName(ssdtTable, &usNtAlpcImpClient, exportsMap);
+
+	UNICODE_STRING usNtAlpcImpThread;
+	RtlInitUnicodeString(&usNtAlpcImpThread, L"NtAlpcImpersonateClientThread");
+	NtAlpcImpersonateClientThreadId = getSSNByName(ssdtTable, &usNtAlpcImpThread, exportsMap);
+
+	UNICODE_STRING usNtFilterToken;
+	RtlInitUnicodeString(&usNtFilterToken, L"NtFilterToken");
+	NtFilterTokenId = getSSNByName(ssdtTable, &usNtFilterToken, exportsMap);
+
+	UNICODE_STRING usNtImpersonateAnon;
+	RtlInitUnicodeString(&usNtImpersonateAnon, L"NtImpersonateAnonymousToken");
+	NtImpersonateAnonymousTokenId = getSSNByName(ssdtTable, &usNtImpersonateAnon, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -2671,7 +2795,8 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 	ULONG  ProcessInformationLength)
 {
 	if (ProcessInformationClass != PROCESS_PROTECTION_LEVEL_CLASS &&
-		ProcessInformationClass != PROCESS_MITIGATION_POLICY_CLASS)
+		ProcessInformationClass != PROCESS_MITIGATION_POLICY_CLASS &&
+		ProcessInformationClass != PROCESS_ACCESS_TOKEN_CLASS)
 		return;
 
 	PEPROCESS caller = IoGetCurrentProcess();
@@ -2765,6 +2890,29 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 			}
 			EmitSyscallNotif(0, msg, caller, target, FALSE /* warning */);
 		}
+	}
+
+	else if (ProcessInformationClass == PROCESS_ACCESS_TOKEN_CLASS) {
+		// ProcessAccessToken (class 0x9): replaces the primary token of a process.
+		// Layout: PROCESS_ACCESS_TOKEN { HANDLE Token; HANDLE Thread; }
+		// This is how CreateProcessAsUser/CreateProcessWithToken works internally,
+		// and how attackers assign a stolen SYSTEM token to a new process.
+		// Any non-SYSTEM, non-PPL caller doing this is highly suspicious.
+		char targetName[15] = {};
+		if (target) {
+			PUCHAR imgName = PsGetProcessImageFileName(target);
+			if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
+		}
+
+		BOOLEAN isCrossProcess = (target != caller);
+
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"CRITICAL: NtSetInformationProcess(ProcessAccessToken) — "
+			"primary token replacement on '%s'%s "
+			"— token impersonation / privilege escalation (T1134.002)",
+			targetName[0] ? targetName : "?",
+			isCrossProcess ? " (cross-process)" : "");
+		EmitSyscallNotif(0, msg, caller, target, TRUE /* critical */);
 	}
 
 	if (ownedRef && target) ObDereferenceObject(target);
@@ -3002,6 +3150,582 @@ VOID SyscallsUtils::NtSetInformationThreadHandler(
 	ObDereferenceObject(token);
 }
 
+// ---------------------------------------------------------------------------
+// NtOpenProcessTokenEx — detect token acquisition from privileged processes.
+//
+// This is the first syscall in the token theft chain:
+//   1. NtOpenProcessTokenEx(TargetProcess, TOKEN_DUPLICATE|TOKEN_QUERY, ...)
+//   2. NtDuplicateToken → convert impersonation to primary
+//   3. NtSetInformationThread(ThreadImpersonationToken) or CreateProcessAsUser
+//
+// Mimikatz token::elevate, Incognito, Meterpreter steal_token, and Cobalt Strike
+// getuid/getsystem all start here. We flag token opens against SYSTEM-level and
+// sensitive processes (LSASS, services, csrss) from non-PPL user-mode callers.
+// ---------------------------------------------------------------------------
+VOID SyscallsUtils::NtOpenProcessTokenExHandler(
+	HANDLE ProcessHandle,
+	ACCESS_MASK DesiredAccess,
+	ULONG HandleAttributes)
+{
+	UNREFERENCED_PARAMETER(HandleAttributes);
+
+	// Only flag TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_ASSIGN_PRIMARY, or TOKEN_ALL_ACCESS
+	const ACCESS_MASK kDangerousMask =
+		0x0002 |  // TOKEN_DUPLICATE
+		0x0004 |  // TOKEN_IMPERSONATE
+		0x0001 |  // TOKEN_ASSIGN_PRIMARY
+		0xF01FF;  // TOKEN_ALL_ACCESS
+	if (!(DesiredAccess & kDangerousMask)) return;
+
+	PEPROCESS caller = IoGetCurrentProcess();
+
+	// Skip PPL callers — legitimate security services
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	// Self-open is normal — skip
+	if (ProcessHandle == NtCurrentProcess()) return;
+
+	// Resolve target process
+	PEPROCESS target = nullptr;
+	NTSTATUS st = ObReferenceObjectByHandle(
+		ProcessHandle, PROCESS_QUERY_INFORMATION, *PsProcessType, UserMode,
+		(PVOID*)&target, nullptr);
+	if (!NT_SUCCESS(st) || !target) return;
+
+	// Only alert on opens against sensitive/elevated processes
+	BOOLEAN isSensitive = ObjectUtils::IsSensitiveProcess(target);
+	BOOLEAN isLsass = ObjectUtils::IsLsass(target);
+
+	// Check if target is a SYSTEM process (PID <= 4 or running as SYSTEM)
+	BOOLEAN isSystem = ((ULONG_PTR)PsGetProcessId(target) <= 4);
+	if (!isSystem) {
+		PACCESS_TOKEN targetToken = PsReferencePrimaryToken(target);
+		if (targetToken) {
+			TOKEN_STATISTICS* stats = nullptr;
+			if (NT_SUCCESS(SeQueryInformationToken(targetToken, TokenStatistics, (PVOID*)&stats)) && stats) {
+				// SYSTEM logon session = {0, 0x3e7}
+				if (stats->AuthenticationId.HighPart == 0 && stats->AuthenticationId.LowPart == 0x3e7)
+					isSystem = TRUE;
+				ExFreePool(stats);
+			}
+			PsDereferencePrimaryToken(targetToken);
+		}
+	}
+
+	if (isSensitive || isLsass || isSystem) {
+		char targetName[15] = {};
+		PUCHAR imgName = PsGetProcessImageFileName(target);
+		if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
+
+		char msg[256];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"%s: NtOpenProcessTokenEx on '%s' (pid=%llu) with access=0x%X "
+			"— token acquisition for %s (T1134.001)",
+			(isLsass || isSystem) ? "CRITICAL" : "WARNING",
+			targetName[0] ? targetName : "?",
+			(ULONG64)(ULONG_PTR)PsGetProcessId(target),
+			DesiredAccess,
+			isLsass ? "LSASS credential theft" :
+			isSystem ? "SYSTEM token theft" : "privilege escalation");
+
+		EmitSyscallNotif(0, msg, caller, target, isLsass || isSystem);
+	}
+
+	ObDereferenceObject(target);
+}
+
+// ---------------------------------------------------------------------------
+// NtOpenThreadTokenEx — detect stealing impersonation tokens from threads.
+//
+// Service threads often impersonate higher-privilege clients (RPC, COM, named pipe).
+// An attacker can open the thread token while the thread is impersonating to get
+// a handle to the high-privilege token without needing to touch the privileged
+// process directly. This bypasses process-level token theft detection.
+// ---------------------------------------------------------------------------
+VOID SyscallsUtils::NtOpenThreadTokenExHandler(
+	HANDLE ThreadHandle,
+	ACCESS_MASK DesiredAccess,
+	BOOLEAN OpenAsSelf)
+{
+	const ACCESS_MASK kDangerousMask = 0x0002 | 0x0004 | 0x0001; // DUPLICATE|IMPERSONATE|ASSIGN_PRIMARY
+	if (!(DesiredAccess & kDangerousMask)) return;
+
+	PEPROCESS caller = IoGetCurrentProcess();
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	// Self-thread is normal
+	if (ThreadHandle == NtCurrentThread()) return;
+
+	// Resolve the thread to check if it belongs to a different process
+	PETHREAD thread = nullptr;
+	NTSTATUS st = ObReferenceObjectByHandle(
+		ThreadHandle, THREAD_QUERY_INFORMATION, *PsThreadType, UserMode,
+		(PVOID*)&thread, nullptr);
+	if (!NT_SUCCESS(st) || !thread) return;
+
+	PEPROCESS threadOwner = IoThreadToProcess(thread);
+	BOOLEAN isCrossProcess = (threadOwner != caller);
+
+	if (isCrossProcess) {
+		char ownerName[15] = {};
+		PUCHAR imgName = PsGetProcessImageFileName(threadOwner);
+		if (imgName) RtlCopyMemory(ownerName, imgName, min(strlen((char*)imgName), 14u));
+
+		BOOLEAN isSensitive = ObjectUtils::IsSensitiveProcess(threadOwner);
+
+		char msg[256];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"%s: NtOpenThreadTokenEx cross-process on thread in '%s' (pid=%llu) "
+			"access=0x%X openAsSelf=%d — impersonation token theft (T1134.001)",
+			isSensitive ? "CRITICAL" : "WARNING",
+			ownerName[0] ? ownerName : "?",
+			(ULONG64)(ULONG_PTR)PsGetProcessId(threadOwner),
+			DesiredAccess,
+			OpenAsSelf ? 1 : 0);
+
+		EmitSyscallNotif(0, msg, caller, threadOwner, isSensitive);
+	}
+
+	ObDereferenceObject(thread);
+}
+
+// ---------------------------------------------------------------------------
+// NtDuplicateToken — detect token cloning / impersonation→primary conversion.
+//
+// This is the pivotal step in token theft: the attacker has a TOKEN_DUPLICATE
+// handle from NtOpenProcessTokenEx and now calls NtDuplicateToken to:
+//   a) Convert an impersonation token to a primary token (for CreateProcessAsUser)
+//   b) Clone with SecurityImpersonation for thread impersonation
+//   c) Downgrade privilege set (EffectiveOnly) to hide capabilities
+//
+// Mimikatz token::duplicate, Cobalt Strike make_token, and Incognito all use this.
+// TokenType=1 (TokenPrimary) conversion is the most dangerous — it enables
+// launching new processes under the stolen identity.
+// ---------------------------------------------------------------------------
+VOID SyscallsUtils::NtDuplicateTokenHandler(
+	HANDLE ExistingTokenHandle,
+	ACCESS_MASK DesiredAccess,
+	PVOID ObjectAttributes,
+	BOOLEAN EffectiveOnly,
+	ULONG TokenType)
+{
+	PEPROCESS caller = IoGetCurrentProcess();
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	// --- Check for SecurityDelegation impersonation level ---
+	// The OBJECT_ATTRIBUTES→SecurityQualityOfService contains the requested
+	// SECURITY_IMPERSONATION_LEVEL. SecurityDelegation (3) allows the token
+	// to be used across network hops — Kerberos unconstrained delegation abuse.
+	// Layout: OA→SecurityQualityOfService → SECURITY_QUALITY_OF_SERVICE.ImpersonationLevel
+	BOOLEAN isDelegation = FALSE;
+	if (ObjectAttributes && MmIsAddressValid(ObjectAttributes)) {
+		__try {
+			OBJECT_ATTRIBUTES* oa = (OBJECT_ATTRIBUTES*)ObjectAttributes;
+			if (oa->SecurityQualityOfService &&
+				MmIsAddressValid(oa->SecurityQualityOfService)) {
+				SECURITY_QUALITY_OF_SERVICE* qos =
+					(SECURITY_QUALITY_OF_SERVICE*)oa->SecurityQualityOfService;
+				if (qos->ImpersonationLevel == SecurityDelegation)
+					isDelegation = TRUE;
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+
+	// Resolve the source token to check its privilege level
+	PVOID tokenObj = nullptr;
+	NTSTATUS st = ObReferenceObjectByHandle(
+		ExistingTokenHandle, TOKEN_QUERY, NULL, UserMode, &tokenObj, nullptr);
+	if (!NT_SUCCESS(st) || !tokenObj) return;
+
+	// Check token privileges
+	TOKEN_PRIVILEGES* privs = nullptr;
+	BOOLEAN hasDebug = FALSE, hasTcb = FALSE, hasImpersonate = FALSE, hasAssignPrimary = FALSE;
+
+	__try {
+		st = SeQueryInformationToken(tokenObj, TokenPrivileges, (PVOID*)&privs);
+		if (NT_SUCCESS(st) && privs) {
+			for (ULONG i = 0; i < privs->PrivilegeCount; i++) {
+				ULONG luid = privs->Privileges[i].Luid.LowPart;
+				if (luid == SE_DEBUG_PRIVILEGE) hasDebug = TRUE;
+				else if (luid == SE_TCB_PRIVILEGE) hasTcb = TRUE;
+				else if (luid == SE_IMPERSONATE_PRIVILEGE) hasImpersonate = TRUE;
+				else if (luid == 3) hasAssignPrimary = TRUE; // SE_ASSIGNPRIMARYTOKEN_PRIVILEGE
+			}
+			ExFreePool(privs);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+
+	BOOLEAN isHighPriv = hasDebug || hasTcb || hasAssignPrimary;
+	BOOLEAN isPrimaryConversion = (TokenType == 1); // TokenPrimary
+
+	// Alert on: high-privilege token duplication, primary conversion, or SecurityDelegation
+	if (isHighPriv || isPrimaryConversion || isDelegation) {
+		char msg[300];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"%s: NtDuplicateToken — %s%s%s token with %s%s%s%s (access=0x%X effectiveOnly=%d) "
+			"— token theft / privilege escalation (T1134.001)",
+			(isHighPriv || isDelegation) ? "CRITICAL" : "WARNING",
+			isPrimaryConversion ? "converting to PRIMARY" : "duplicating",
+			isDelegation ? " with SecurityDelegation (Kerberos delegation abuse)" : "",
+			EffectiveOnly ? " (EffectiveOnly — privilege hiding)" : "",
+			hasDebug ? "SeDebug " : "",
+			hasTcb ? "SeTcb " : "",
+			hasAssignPrimary ? "SeAssignPrimary " : "",
+			hasImpersonate ? "SeImpersonate" : "privileges",
+			DesiredAccess,
+			EffectiveOnly ? 1 : 0);
+
+		EmitSyscallNotif(0, msg, caller, nullptr, isHighPriv || isDelegation);
+	}
+
+	ObDereferenceObject(tokenObj);
+}
+
+// ---------------------------------------------------------------------------
+// NtCreateTokenEx — detect token forging.
+//
+// NtCreateTokenEx (and the older NtCreateToken) create a brand new token with
+// arbitrary SIDs, privileges, and group memberships. This requires
+// SeCreateTokenPrivilege (which we flag via NtAdjustPrivilegesToken), but the
+// actual creation syscall is a critical detection point — any invocation from
+// a non-SYSTEM, non-PPL caller is extremely suspicious and usually indicates:
+//   - Custom token forging tool (golden ticket equivalent for local tokens)
+//   - Privilege escalation via crafted token + NtSetInformationProcess(ProcessAccessToken)
+//   - James Forshaw's TokenKidnapping / CreateTokenAsWhoami-style attacks
+// ---------------------------------------------------------------------------
+VOID SyscallsUtils::NtCreateTokenExHandler()
+{
+	PEPROCESS caller = IoGetCurrentProcess();
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	// SYSTEM (PID 4), lsass.exe, and smss.exe legitimately create tokens
+	HANDLE callerPid = PsGetProcessId(caller);
+	if ((ULONG_PTR)callerPid <= 4) return;
+
+	char* procName = PsGetProcessImageFileName(caller);
+	if (procName) {
+		if (strcmp(procName, "lsass.exe") == 0 ||
+			strcmp(procName, "smss.exe") == 0 ||
+			strcmp(procName, "services.exe") == 0)
+			return;
+	}
+
+	char msg[192];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"CRITICAL: NtCreateTokenEx — token forging by '%s' (pid=%llu) "
+		"— arbitrary token creation / privilege escalation (T1134.005)",
+		procName ? procName : "?",
+		(ULONG64)(ULONG_PTR)callerPid);
+
+	EmitSyscallNotif(0, msg, caller, nullptr, TRUE);
+}
+
+// ---------------------------------------------------------------------------
+// NtCreateToken (legacy) — identical detection to NtCreateTokenEx.
+// Some older tools and PoCs use NtCreateToken instead of NtCreateTokenEx.
+// ---------------------------------------------------------------------------
+VOID SyscallsUtils::NtCreateTokenHandler()
+{
+	PEPROCESS caller = IoGetCurrentProcess();
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	HANDLE callerPid = PsGetProcessId(caller);
+	if ((ULONG_PTR)callerPid <= 4) return;
+
+	char* procName = PsGetProcessImageFileName(caller);
+	if (procName) {
+		if (strcmp(procName, "lsass.exe") == 0 ||
+			strcmp(procName, "smss.exe") == 0 ||
+			strcmp(procName, "services.exe") == 0)
+			return;
+	}
+
+	char msg[192];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"CRITICAL: NtCreateToken — legacy token forging by '%s' (pid=%llu) "
+		"— arbitrary token creation / privilege escalation (T1134.005)",
+		procName ? procName : "?",
+		(ULONG64)(ULONG_PTR)callerPid);
+
+	EmitSyscallNotif(0, msg, caller, nullptr, TRUE);
+}
+
+// ---------------------------------------------------------------------------
+// NtImpersonateThread — direct thread-to-thread impersonation.
+//
+// The server thread takes on the security context of the client thread
+// without needing a pipe or ALPC port. This is a less common but valid
+// impersonation vector used by custom privilege escalation tools.
+//
+// Normal usage: RPC runtime, COM, SSPI — these run in svchost.exe.
+// Suspicious: any non-service process impersonating a thread in another process.
+// ---------------------------------------------------------------------------
+VOID SyscallsUtils::NtImpersonateThreadHandler(
+	HANDLE ServerThreadHandle,
+	HANDLE ClientThreadHandle)
+{
+	PEPROCESS caller = IoGetCurrentProcess();
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	// Self-impersonation (both handles are current thread) is benign
+	if (ServerThreadHandle == NtCurrentThread() &&
+		ClientThreadHandle == NtCurrentThread()) return;
+
+	// Resolve client thread to see if it's cross-process
+	PETHREAD clientThread = nullptr;
+	BOOLEAN isCrossProcess = FALSE;
+	PEPROCESS clientOwner = nullptr;
+
+	if (ClientThreadHandle != NtCurrentThread()) {
+		NTSTATUS st = ObReferenceObjectByHandle(
+			ClientThreadHandle, THREAD_QUERY_INFORMATION, *PsThreadType,
+			UserMode, (PVOID*)&clientThread, nullptr);
+		if (NT_SUCCESS(st) && clientThread) {
+			clientOwner = IoThreadToProcess(clientThread);
+			if (clientOwner != caller) isCrossProcess = TRUE;
+		}
+	}
+
+	if (isCrossProcess) {
+		char* procName = PsGetProcessImageFileName(caller);
+		BOOLEAN isLegit = FALSE;
+		if (procName) {
+			isLegit = (strcmp(procName, "svchost.exe") == 0 ||
+			           strcmp(procName, "lsass.exe") == 0 ||
+			           strcmp(procName, "csrss.exe") == 0 ||
+			           strcmp(procName, "services.exe") == 0);
+		}
+
+		if (!isLegit) {
+			char clientName[15] = {};
+			if (clientOwner) {
+				PUCHAR img = PsGetProcessImageFileName(clientOwner);
+				if (img) RtlCopyMemory(clientName, img, min(strlen((char*)img), 14u));
+			}
+
+			BOOLEAN isSensitive = clientOwner ?
+				ObjectUtils::IsSensitiveProcess(clientOwner) : FALSE;
+
+			char msg[256];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"%s: NtImpersonateThread — '%s' (pid=%llu) impersonating thread "
+				"from '%s' — direct thread impersonation / privilege escalation (T1134.001)",
+				isSensitive ? "CRITICAL" : "WARNING",
+				procName ? procName : "?",
+				(ULONG64)(ULONG_PTR)PsGetProcessId(caller),
+				clientName[0] ? clientName : "?");
+
+			EmitSyscallNotif(0, msg, caller, clientOwner, isSensitive);
+		}
+	}
+
+	if (clientThread) ObDereferenceObject(clientThread);
+}
+
+// ---------------------------------------------------------------------------
+// NtAlpcImpersonateClientOfPort / NtAlpcImpersonateClientThread
+//
+// ALPC (Advanced Local Procedure Call) is the foundation of Windows IPC.
+// COM/DCOM, RPC, and many system services use ALPC internally. When a server
+// calls NtAlpcImpersonateClientOfPort, the kernel assigns the client's token
+// to the server thread — identical to pipe impersonation but via ALPC.
+//
+// PrintSpoofer, some potato variants, and COM-based coercion attacks trigger
+// impersonation through ALPC rather than named pipes, so pipe-only monitoring
+// misses them.
+//
+// Legitimate ALPC servers: svchost.exe, lsass.exe, csrss.exe, rpcss,
+// dllhost.exe (COM surrogate), wmiprvse.exe.
+// ---------------------------------------------------------------------------
+VOID SyscallsUtils::NtAlpcImpersonateClientOfPortHandler(HANDLE PortHandle)
+{
+	UNREFERENCED_PARAMETER(PortHandle);
+
+	PEPROCESS caller = IoGetCurrentProcess();
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	HANDLE callerPid = PsGetProcessId(caller);
+	if ((ULONG_PTR)callerPid <= 4) return;
+
+	char* procName = PsGetProcessImageFileName(caller);
+
+	// Allowlist legitimate ALPC servers
+	if (procName) {
+		static const char* kLegitAlpcServers[] = {
+			"svchost.exe", "lsass.exe", "csrss.exe", "services.exe",
+			"dllhost.exe", "WmiPrvSE.exe", "spoolsv.exe", "wininit.exe",
+			"sihost.exe", "RuntimeBroke", "SearchIndex", "MsMpEng.exe",
+			"fontdrvhost", "dwm.exe",
+			nullptr
+		};
+		for (int i = 0; kLegitAlpcServers[i]; i++) {
+			if (strcmp(procName, kLegitAlpcServers[i]) == 0) return;
+		}
+	}
+
+	char msg[224];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"CRITICAL: NtAlpcImpersonateClientOfPort by '%s' (pid=%llu) "
+		"— ALPC client impersonation / COM potato / privilege escalation (T1134.001)",
+		procName ? procName : "?",
+		(ULONG64)(ULONG_PTR)callerPid);
+
+	EmitSyscallNotif(0, msg, caller, nullptr, TRUE);
+}
+
+VOID SyscallsUtils::NtAlpcImpersonateClientThreadHandler(HANDLE PortHandle)
+{
+	UNREFERENCED_PARAMETER(PortHandle);
+
+	PEPROCESS caller = IoGetCurrentProcess();
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	HANDLE callerPid = PsGetProcessId(caller);
+	if ((ULONG_PTR)callerPid <= 4) return;
+
+	char* procName = PsGetProcessImageFileName(caller);
+
+	// Same allowlist as NtAlpcImpersonateClientOfPort
+	if (procName) {
+		static const char* kLegitAlpcServers[] = {
+			"svchost.exe", "lsass.exe", "csrss.exe", "services.exe",
+			"dllhost.exe", "WmiPrvSE.exe", "spoolsv.exe", "wininit.exe",
+			"sihost.exe", "RuntimeBroke", "SearchIndex", "MsMpEng.exe",
+			"fontdrvhost", "dwm.exe",
+			nullptr
+		};
+		for (int i = 0; kLegitAlpcServers[i]; i++) {
+			if (strcmp(procName, kLegitAlpcServers[i]) == 0) return;
+		}
+	}
+
+	char msg[224];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"CRITICAL: NtAlpcImpersonateClientThread by '%s' (pid=%llu) "
+		"— ALPC thread impersonation / COM potato / privilege escalation (T1134.001)",
+		procName ? procName : "?",
+		(ULONG64)(ULONG_PTR)callerPid);
+
+	EmitSyscallNotif(0, msg, caller, nullptr, TRUE);
+}
+
+// ---------------------------------------------------------------------------
+// NtFilterToken — restricted token manipulation.
+//
+// NtFilterToken creates a new token with optional restrictions: disabling
+// SIDs, deleting privileges, adding restricted SIDs. Legitimate use:
+// CreateRestrictedToken for sandboxing (Chrome, Edge, Office).
+//
+// Attacker use:
+//   - SANDBOX_INERT flag (0x1): creates a token that bypasses SAFER/SRP
+//     software restriction policies entirely
+//   - LUA_TOKEN flag (0x4): creates a "filtered admin" token but attackers
+//     can use it in reverse to understand which privileges were stripped
+//   - WRITE_RESTRICTED flag (0x8): token appears restricted but retains
+//     write access — used in sandbox escape research
+//
+// We flag non-sandboxing callers using SANDBOX_INERT (SRP bypass).
+// ---------------------------------------------------------------------------
+VOID SyscallsUtils::NtFilterTokenHandler(
+	HANDLE ExistingTokenHandle,
+	ULONG  Flags)
+{
+	UNREFERENCED_PARAMETER(ExistingTokenHandle);
+
+	// SANDBOX_INERT (0x1) — bypasses Software Restriction Policies (SRP)
+	// This flag is the most abused; Chrome/Edge use it but from sandboxed processes.
+	if (!(Flags & 0x1)) return;  // Only flag SANDBOX_INERT
+
+	PEPROCESS caller = IoGetCurrentProcess();
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	HANDLE callerPid = PsGetProcessId(caller);
+	if ((ULONG_PTR)callerPid <= 4) return;
+
+	char* procName = PsGetProcessImageFileName(caller);
+
+	// Allowlist: browsers and Office that legitimately use SANDBOX_INERT
+	if (procName) {
+		static const char* kSandboxProcs[] = {
+			"chrome.exe", "msedge.exe", "firefox.exe", "opera.exe",
+			"WINWORD.EXE", "EXCEL.EXE", "POWERPNT.EXE",
+			"iexplore.exe", "MicrosoftEdg",
+			nullptr
+		};
+		for (int i = 0; kSandboxProcs[i]; i++) {
+			if (strcmp(procName, kSandboxProcs[i]) == 0) return;
+		}
+	}
+
+	char msg[192];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"WARNING: NtFilterToken with SANDBOX_INERT (0x%X) by '%s' (pid=%llu) "
+		"— SRP/SAFER policy bypass / restricted token manipulation",
+		Flags,
+		procName ? procName : "?",
+		(ULONG64)(ULONG_PTR)callerPid);
+
+	EmitSyscallNotif(0, msg, caller, nullptr, FALSE);
+}
+
+// ---------------------------------------------------------------------------
+// NtImpersonateAnonymousToken — force anonymous logon impersonation.
+//
+// This syscall makes the calling thread impersonate the ANONYMOUS LOGON
+// (S-1-5-7) token.  Legitimate use is rare — mainly SSPI/NTLM internals.
+//
+// Attacker use:
+//   - NTLM relay attacks: WebClient → coerce NTLM auth → relay to LDAP/SMB.
+//     Between relay steps the attacker resets to anonymous to avoid leaving
+//     the previous impersonation active.
+//   - Privilege escalation pre-step: impersonate anonymous to force a
+//     lower-privilege context before triggering a service that will
+//     auto-elevate (some COM activation paths).
+//
+// Any non-SYSTEM, non-RPC-runtime call is suspicious.
+// ---------------------------------------------------------------------------
+VOID SyscallsUtils::NtImpersonateAnonymousTokenHandler(HANDLE ThreadHandle)
+{
+	UNREFERENCED_PARAMETER(ThreadHandle);
+
+	PEPROCESS caller = IoGetCurrentProcess();
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	HANDLE callerPid = PsGetProcessId(caller);
+	if ((ULONG_PTR)callerPid <= 4) return;
+
+	char* procName = PsGetProcessImageFileName(caller);
+
+	// Allowlist: RPC/SSPI infrastructure
+	if (procName) {
+		if (strcmp(procName, "svchost.exe") == 0 ||
+			strcmp(procName, "lsass.exe") == 0 ||
+			strcmp(procName, "services.exe") == 0)
+			return;
+	}
+
+	char msg[192];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"WARNING: NtImpersonateAnonymousToken by '%s' (pid=%llu) "
+		"— anonymous token impersonation / NTLM relay preparation (T1557.001)",
+		procName ? procName : "?",
+		(ULONG64)(ULONG_PTR)callerPid);
+
+	EmitSyscallNotif(0, msg, caller, nullptr, FALSE);
+}
+
 // NtTraceControl — detect ETW provider/session manipulation.
 //
 // ETW can be disabled or manipulated via NtTraceControl without hooking any ETW functions.
@@ -3025,14 +3749,21 @@ VOID SyscallsUtils::NtTraceControlHandler(ULONG FunctionCode)
 	}
 }
 
-// NtCreateNamedPipeFile — detect named pipe C2 / lateral movement.
+// NtCreateNamedPipeFile — detect named pipe C2 / lateral movement / squatting /
+// NULL DACL / unlimited instances.
 //
 // Cobalt Strike SMB beacons and PsExec lateral movement use named pipes as C2 transport.
 // Alert on named pipe creation from non-system processes, especially pipes not in
-// well-known system list.
-VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes)
+// well-known system list.  Also detects:
+//   - Pipe squatting: non-system process creating a pipe with a system pipe name
+//     (lsarpc, samr, svcctl, etc.) to intercept RPC clients
+//   - NULL / permissive DACL: pipe created without a security descriptor or with
+//     a NULL DACL — allows any user to connect (potato attacks, EoP)
+//   - Unlimited MaximumInstances on well-known pipes: creating unlimited instances
+//     of existing system pipes to race the real server for client connections
+VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes, ULONG MaximumInstances)
 {
-	// Static list of system-owned named pipes (legitimate)
+	// System-owned named pipes — creation by non-system = pipe squatting
 	static const WCHAR* kSystemPipes[] = {
 		L"\\Device\\NamedPipe\\lsass",
 		L"\\Device\\NamedPipe\\winlogon",
@@ -3041,6 +3772,25 @@ VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes)
 		L"\\Device\\NamedPipe\\samr",
 		L"\\Device\\NamedPipe\\ntsvcs",
 		L"\\Device\\NamedPipe\\protected_storage",
+		nullptr
+	};
+
+	// Sensitive RPC / system pipe name fragments — used for pipe squatting detection
+	// (case-insensitive substring match against pipe name)
+	static const WCHAR* kSquatTargets[] = {
+		L"lsarpc",            // LSA RPC — credential theft
+		L"samr",              // SAM Remote Protocol — user enumeration
+		L"svcctl",            // Service Control Manager — remote service creation
+		L"atsvc",             // Task Scheduler — remote task creation
+		L"epmapper",          // RPC Endpoint Mapper
+		L"eventlog",          // Event Log — log manipulation
+		L"winreg",            // Remote Registry
+		L"srvsvc",            // Server Service — share enumeration
+		L"wkssvc",            // Workstation Service
+		L"spoolss",           // Print Spooler — PrintNightmare
+		L"netlogon",          // NETLOGON — domain auth
+		L"drsuapi",           // Directory Replication — DCSync
+		L"ipc$",              // IPC share
 		nullptr
 	};
 
@@ -3058,10 +3808,10 @@ VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes)
 		lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i];
 
 	// Whitelist: services.exe, svchost.exe, lsass.exe, wininit.exe, csrss.exe, System
-	if (strcmp(lower, "services.exe") == 0 || strcmp(lower, "svchost.exe") == 0 ||
-		strcmp(lower, "lsass.exe") == 0 || strcmp(lower, "wininit.exe") == 0 ||
-		strcmp(lower, "csrss.exe") == 0 || strcmp(lower, "system") == 0)
-		return;
+	BOOLEAN isSystemProc =
+		(strcmp(lower, "services.exe") == 0 || strcmp(lower, "svchost.exe") == 0 ||
+		 strcmp(lower, "lsass.exe") == 0 || strcmp(lower, "wininit.exe") == 0 ||
+		 strcmp(lower, "csrss.exe") == 0 || strcmp(lower, "system") == 0);
 
 	// Extract pipe name from ObjectAttributes
 	if (!ObjectAttributes || !MmIsAddressValid(ObjectAttributes)) return;
@@ -3072,7 +3822,79 @@ VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes)
 	UNICODE_STRING* pipeName = (UNICODE_STRING*)objAttr->ObjectName;
 	if (!pipeName->Length || !MmIsAddressValid(pipeName->Buffer)) return;
 
-	// Check against system pipe list
+	// ---- Gap #2: NULL / permissive DACL detection ----
+	// A pipe with no SecurityDescriptor or a NULL DACL allows any user to connect.
+	// This is the core setup for potato-family attacks (Sweet/Juicy/Rogue/God Potato).
+	// Check BEFORE the system-process allowlist — even system processes shouldn't do this
+	// on sensitive pipes.
+	{
+		PSECURITY_DESCRIPTOR sd = objAttr->SecurityDescriptor;
+		BOOLEAN hasNullDacl = FALSE;
+
+		if (!sd || !MmIsAddressValid(sd)) {
+			// No security descriptor at all — wide open
+			hasNullDacl = TRUE;
+		} else {
+			// Check if the DACL is present but NULL (SE_DACL_PRESENT set, but DACL pointer is NULL)
+			// Use RtlGetDaclSecurityDescriptor to safely parse
+			BOOLEAN daclPresent = FALSE;
+			BOOLEAN daclDefaulted = FALSE;
+			PACL dacl = nullptr;
+			NTSTATUS sdStatus = RtlGetDaclSecurityDescriptor(sd, &daclPresent, &dacl, &daclDefaulted);
+			if (NT_SUCCESS(sdStatus)) {
+				if (!daclPresent || dacl == nullptr) {
+					// No DACL = full access to everyone
+					hasNullDacl = TRUE;
+				} else if (MmIsAddressValid(dacl) && dacl->AceCount == 0) {
+					// Empty DACL = deny all access (different from NULL DACL)
+					// Not flagging this — it's restrictive, not permissive
+				}
+			}
+		}
+
+		if (hasNullDacl) {
+			char msg[224];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtCreateNamedPipeFile: NULL/missing DACL on pipe — wide-open access "
+				"(potato EoP / pipe impersonation) by '%s'",
+				name);
+			EmitSyscallNotif(0, msg, caller, nullptr, TRUE); // CRITICAL
+		}
+	}
+
+	// System processes are allowed to create pipes — skip remaining checks
+	if (isSystemProc) return;
+
+	// ---- Gap #1: Pipe squatting detection ----
+	// Non-system process creating a pipe with a name matching a sensitive system
+	// pipe (lsarpc, svcctl, samr, etc.) — attacker creates a fake pipe to intercept
+	// RPC clients and steal credentials or gain impersonation tokens.
+	{
+		for (int i = 0; kSquatTargets[i]; i++) {
+			UNICODE_STRING pattern;
+			RtlInitUnicodeString(&pattern, kSquatTargets[i]);
+			if (pipeName->Length >= pattern.Length) {
+				USHORT maxOff = (pipeName->Length - pattern.Length) / sizeof(WCHAR);
+				for (USHORT off = 0; off <= maxOff; off++) {
+					UNICODE_STRING slice;
+					slice.Buffer = pipeName->Buffer + off;
+					slice.Length = pattern.Length;
+					slice.MaximumLength = pattern.Length;
+					if (RtlEqualUnicodeString(&slice, &pattern, TRUE)) {
+						char msg[224];
+						RtlStringCbPrintfA(msg, sizeof(msg),
+							"NtCreateNamedPipeFile: PIPE SQUATTING — '%s' creating "
+							"system RPC pipe name (credential theft / impersonation)",
+							name);
+						EmitSyscallNotif(0, msg, caller, nullptr, TRUE); // CRITICAL
+						return;
+					}
+				}
+			}
+		}
+	}
+
+	// Check against full system pipe list
 	BOOLEAN isSystemPipe = FALSE;
 	for (int i = 0; kSystemPipes[i]; i++) {
 		UNICODE_STRING sysPipe;
@@ -3081,6 +3903,20 @@ VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes)
 			isSystemPipe = TRUE;
 			break;
 		}
+	}
+
+	// ---- Gap #3: MaximumInstances abuse ----
+	// MaximumInstances = 0xFFFFFFFF (FILE_PIPE_UNLIMITED_INSTANCES) on system pipe
+	// names allows an attacker to create additional instances to race the real server.
+	// Legitimate system pipes typically use MaxInstances=1 or a small fixed number.
+	if (isSystemPipe && MaximumInstances == 0xFFFFFFFF) {
+		char msg[224];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtCreateNamedPipeFile: unlimited MaxInstances on system pipe "
+			"— instance racing attack by '%s'",
+			name);
+		EmitSyscallNotif(0, msg, caller, nullptr, TRUE); // CRITICAL
+		return;
 	}
 
 	if (!isSystemPipe) {

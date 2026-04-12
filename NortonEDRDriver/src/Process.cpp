@@ -1396,6 +1396,134 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 			}
 		}
 
+		// -----------------------------------------------------------------------
+		// Parent-child token integrity level mismatch detection (T1134.002)
+		//
+		// When potato/PrintSpoofer/GodPotato/EfsPotato-style attacks succeed,
+		// the output is a SYSTEM-integrity child spawned from a medium-integrity
+		// parent. Similarly, mimikatz token::elevate + CreateProcessAsUser yields
+		// a high/system-integrity child under a low-privilege parent.
+		//
+		// Normal elevation (UAC) always goes through consent.exe or svchost.exe
+		// as the actual creator — the real parent never appears as the low-priv
+		// process. So a direct medium→SYSTEM parent-child link with no consent.exe
+		// intermediary is a strong indicator of token impersonation abuse.
+		//
+		// We compare the primary token integrity level of the child process vs.
+		// the creating process. If child is SYSTEM/High and creator is Medium/Low,
+		// and the creator is not a known legitimate elevation broker, alert.
+		// -----------------------------------------------------------------------
+		{
+			PEPROCESS creator = IoGetCurrentProcess();
+			HANDLE creatorPid = PsGetProcessId(creator);
+			HANDLE childPid   = PsGetProcessId(Process);
+
+			// Only check if both are user-mode processes
+			if ((ULONG_PTR)creatorPid > 4 && (ULONG_PTR)childPid > 4) {
+				// Get integrity levels via token
+				PACCESS_TOKEN creatorToken = PsReferencePrimaryToken(creator);
+				PACCESS_TOKEN childToken   = PsReferencePrimaryToken(Process);
+
+				if (creatorToken && childToken) {
+					// Query TOKEN_MANDATORY_LABEL (IntegrityLevel)
+					// SeQueryInformationToken(TokenIntegrityLevel) returns TOKEN_MANDATORY_LABEL
+					// which has a SID — last sub-authority is the integrity RID.
+					typedef struct _TOKEN_MANDATORY_LABEL2 {
+						SID_AND_ATTRIBUTES Label;
+					} TOKEN_MANDATORY_LABEL2;
+
+					TOKEN_MANDATORY_LABEL2* creatorLabel = nullptr;
+					TOKEN_MANDATORY_LABEL2* childLabel   = nullptr;
+					// TokenIntegrityLevel = 25 in TOKEN_INFORMATION_CLASS
+					NTSTATUS s1 = SeQueryInformationToken(
+						creatorToken, (TOKEN_INFORMATION_CLASS)25, (PVOID*)&creatorLabel);
+					NTSTATUS s2 = SeQueryInformationToken(
+						childToken, (TOKEN_INFORMATION_CLASS)25, (PVOID*)&childLabel);
+
+					if (NT_SUCCESS(s1) && NT_SUCCESS(s2) && creatorLabel && childLabel) {
+						// Extract integrity RID (last sub-authority of the SID)
+						SID* creatorSid = (SID*)creatorLabel->Label.Sid;
+						SID* childSid   = (SID*)childLabel->Label.Sid;
+
+						if (creatorSid && childSid &&
+							creatorSid->SubAuthorityCount > 0 &&
+							childSid->SubAuthorityCount > 0)
+						{
+							ULONG creatorIntegrity = creatorSid->SubAuthority[creatorSid->SubAuthorityCount - 1];
+							ULONG childIntegrity   = childSid->SubAuthority[childSid->SubAuthorityCount - 1];
+
+							// Integrity levels: 0x0000=Untrusted, 0x1000=Low,
+							// 0x2000=Medium, 0x3000=High, 0x4000=System
+							BOOLEAN creatorIsLow = (creatorIntegrity <= 0x2000); // Medium or below
+							BOOLEAN childIsHigh  = (childIntegrity >= 0x3000);   // High or System
+
+							if (creatorIsLow && childIsHigh) {
+								// Check if creator is a legitimate elevation broker
+								char* cName = PsGetProcessImageFileName(creator);
+								BOOLEAN isBroker = FALSE;
+								if (cName) {
+									isBroker = (strcmp(cName, "consent.exe") == 0 ||
+									            strcmp(cName, "svchost.exe") == 0 ||
+									            strcmp(cName, "services.exe") == 0 ||
+									            strcmp(cName, "lsass.exe") == 0 ||
+									            strcmp(cName, "winlogon.exe") == 0 ||
+									            strcmp(cName, "csrss.exe") == 0 ||
+									            strcmp(cName, "smss.exe") == 0 ||
+									            strcmp(cName, "wininit.exe") == 0 ||
+									            strcmp(cName, "RuntimeBroke") == 0 ||  // RuntimeBroker.exe truncated
+									            strcmp(cName, "ShellExperie") == 0);   // ShellExperienceHost truncated
+								}
+
+								if (!isBroker) {
+									char* chName = PsGetProcessImageFileName(Process);
+									char alertMsg[280];
+									RtlStringCbPrintfA(alertMsg, sizeof(alertMsg),
+										"Token integrity mismatch: '%s' (pid=%llu integrity=0x%X/Medium) "
+										"spawned '%s' (pid=%llu integrity=0x%X/%s) — "
+										"privilege escalation via token impersonation "
+										"(potato/PrintSpoofer/token::elevate) (T1134.002)",
+										cName ? cName : "?",
+										(ULONG64)(ULONG_PTR)creatorPid,
+										creatorIntegrity,
+										chName ? chName : "?",
+										(ULONG64)(ULONG_PTR)childPid,
+										childIntegrity,
+										childIntegrity >= 0x4000 ? "SYSTEM" : "High");
+
+									PKERNEL_STRUCTURED_NOTIFICATION n =
+										(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+											POOL_FLAG_NON_PAGED,
+											sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+									if (n) {
+										RtlZeroMemory(n, sizeof(*n));
+										SET_CRITICAL(*n);
+										SET_TOKEN_CHECK(*n);
+										n->isPath = FALSE;
+										n->pid    = childPid;
+										if (cName) RtlCopyMemory(n->procName, cName, min(strlen(cName), 14u));
+										SIZE_T msgLen = strlen(alertMsg) + 1;
+										n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+										if (n->msg) {
+											RtlCopyMemory(n->msg, alertMsg, msgLen);
+											n->bufSize = (ULONG)msgLen;
+											if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+												ExFreePool(n->msg); ExFreePool(n);
+											}
+										} else { ExFreePool(n); }
+									}
+								}
+							}
+						}
+					}
+					if (creatorLabel) ExFreePool(creatorLabel);
+					if (childLabel) ExFreePool(childLabel);
+				}
+
+				if (creatorToken) PsDereferencePrimaryToken(creatorToken);
+				if (childToken) PsDereferencePrimaryToken(childToken);
+			}
+		}
+
 	} else {
 		// Process exit — free the cmdline record, fork-run tracker, taint, and ntdll tracker slots.
 		ULONG exitPid = HandleToUlong(PsGetProcessId(Process));

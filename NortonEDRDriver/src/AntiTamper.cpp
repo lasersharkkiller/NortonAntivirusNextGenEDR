@@ -572,6 +572,105 @@ static VOID CheckUnsignedModules()
 }
 
 // ---------------------------------------------------------------------------
+// CheckEprocessTokenIntegrity — detect DKOM token pointer patching.
+//
+// Kernel-mode attacks (via vulnerable drivers — BYOVD) can directly overwrite
+// the Token field in EPROCESS to give a process a different identity without
+// calling any token syscalls. This bypasses all syscall-level detection.
+//
+// Technique:
+//   1. Read EPROCESS + Token offset → EX_FAST_REF (strip bottom 4 bits = raw ptr)
+//   2. Call PsReferencePrimaryToken → canonical kernel path to the same token
+//   3. If they differ → token pointer was patched (DKOM token theft)
+//
+// EPROCESS.Token offset: 0x4B8 on Win10 19041+ / Win11 x64.
+// This is stable across all modern Win10/11 builds.
+// ---------------------------------------------------------------------------
+#define EPROCESS_TOKEN_OFFSET  0x4B8   // Win10 19041 – Win11 24H2 (x64)
+
+static VOID CheckEprocessTokenIntegrity()
+{
+    __try {
+        ULONG bufSize = 0x40000;
+        PVOID buf = ExAllocatePool2(POOL_FLAG_PAGED, bufSize, 'tkic');
+        if (!buf) return;
+
+        NTSTATUS s = ZwQuerySystemInformation(
+            (SYSTEM_INFORMATION_CLASS)5, buf, bufSize, &bufSize);
+        if (!NT_SUCCESS(s)) {
+            ExFreePool(buf);
+            return;
+        }
+
+        PSYSTEM_PROCESS_INFORMATION entry = (PSYSTEM_PROCESS_INFORMATION)buf;
+        ULONG alertCount = 0;
+
+        for (;;) {
+            HANDLE pid = entry->UniqueProcessId;
+
+            // Skip System (PID 4) and Idle (PID 0)
+            if (pid != nullptr && pid != (HANDLE)4) {
+                PEPROCESS proc = nullptr;
+                if (NT_SUCCESS(PsLookupProcessByProcessId(pid, &proc))) {
+                    // Read the raw EPROCESS.Token field (EX_FAST_REF)
+                    ULONG_PTR rawToken = 0;
+                    __try {
+                        rawToken = *(ULONG_PTR*)((PUCHAR)proc + EPROCESS_TOKEN_OFFSET);
+                    }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {
+                        ObDereferenceObject(proc);
+                        goto next_entry;
+                    }
+
+                    // Strip EX_FAST_REF bottom bits (4 bits on x64)
+                    PVOID eprocessTokenPtr = (PVOID)(rawToken & ~(ULONG_PTR)0xF);
+
+                    // Get canonical token via PsReferencePrimaryToken
+                    PACCESS_TOKEN canonicalToken = PsReferencePrimaryToken(proc);
+                    if (canonicalToken) {
+                        if (eprocessTokenPtr != (PVOID)canonicalToken) {
+                            // MISMATCH — token pointer was patched!
+                            char* procName = PsGetProcessImageFileName(proc);
+                            char msg[256];
+                            RtlStringCbPrintfA(msg, sizeof(msg),
+                                "DKOM TOKEN THEFT: '%s' (pid=%llu) EPROCESS.Token=0x%llX "
+                                "but PsReferencePrimaryToken=0x%llX — "
+                                "kernel-mode token pointer patching detected (T1134)",
+                                procName ? procName : "?",
+                                (ULONG64)(ULONG_PTR)pid,
+                                (ULONG64)(ULONG_PTR)eprocessTokenPtr,
+                                (ULONG64)(ULONG_PTR)canonicalToken);
+
+                            EmitAntitamperAlert(msg);
+                            alertCount++;
+                        }
+                        PsDereferencePrimaryToken(canonicalToken);
+                    }
+
+                    ObDereferenceObject(proc);
+                }
+            }
+
+        next_entry:
+            if (!entry->NextEntryOffset || alertCount >= 8) break;
+            entry = (PSYSTEM_PROCESS_INFORMATION)
+                ((PUCHAR)entry + entry->NextEntryOffset);
+        }
+
+        ExFreePool(buf);
+
+        if (alertCount > 0) {
+            DbgPrint("[!] AntiTamper: detected %lu EPROCESS token pointer mismatches\n", alertCount);
+        } else {
+            DbgPrint("[+] AntiTamper: EPROCESS token integrity check passed\n");
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] EPROCESS token integrity check: exception\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IntegrityWorkRoutine — runs at PASSIVE_LEVEL via system worker thread.
 // Executes the full hook / integrity check suite.
 // ---------------------------------------------------------------------------
@@ -609,6 +708,9 @@ static VOID IntegrityWorkRoutine(PVOID ctx)
 
     // --- Unsigned kernel module detection ---
     CheckUnsignedModules();
+
+    // --- EPROCESS token pointer integrity (DKOM token theft detection) ---
+    CheckEprocessTokenIntegrity();
 
     DbgPrint("[*] AntiTamper: periodic check complete\n");
 }
