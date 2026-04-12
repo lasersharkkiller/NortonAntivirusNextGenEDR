@@ -61,6 +61,7 @@ VOID UnloadDriver(PDRIVER_OBJECT DriverObject) {
 	g_syscallsUtils->UnInitAltSyscallHandler();
 
 	if (g_wfpUtils) {
+		g_wfpUtils->AuthorizeUnload();  // Must precede UnitializeWfp
 		g_wfpUtils->UnitializeWfp();
 		ExFreePool(g_wfpUtils);
 		g_wfpUtils = nullptr;

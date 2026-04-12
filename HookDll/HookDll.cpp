@@ -114,7 +114,14 @@ enum HookIdx : int {
     // --- Process Ghosting / Transacted Hollowing ---
     IDX_NTSETINFORMATIONFILE           = 51, // ntdll.dll — FileDispositionInformation (delete-pending)
     IDX_NTCREATETRANSACTION            = 52, // ntdll.dll — TxF for transacted hollowing
-    HOOK_COUNT                  = 53
+    // --- WFP manipulation detection (fwpuclnt.dll) ---
+    IDX_FWPMFILTERADD0                 = 53, // fwpuclnt.dll — rogue filter injection
+    IDX_FWPMFILTERDELETEBYID0          = 54, // fwpuclnt.dll — filter deletion
+    IDX_FWPMCALLOUTADD0                = 55, // fwpuclnt.dll — rogue callout injection
+    IDX_FWPMSUBLAYERADD0               = 56, // fwpuclnt.dll — rogue sublayer injection
+    IDX_FWPMSUBLAYERDELETEBYKEY0       = 57, // fwpuclnt.dll — sublayer deletion
+    IDX_FWPMENGINECLOSE0               = 58, // fwpuclnt.dll — engine handle closure
+    HOOK_COUNT                  = 59
 };
 
 struct ApiHook {
@@ -207,6 +214,21 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
     HANDLE, PVOID, PVOID, ULONG, ULONG);
 static NTSTATUS NTAPI Hook_NtCreateTransaction(
     PHANDLE, ACCESS_MASK, PVOID, PVOID, HANDLE, ULONG, ULONG, ULONG, PLARGE_INTEGER, PVOID);
+// WFP manipulation detection (fwpuclnt.dll)
+// These typedefs match the WFP user-mode API signatures.
+// We use DWORD/PVOID for opaque WFP structures to avoid pulling in fwpmu.h.
+typedef DWORD (WINAPI *FnFwpmFilterAdd0)(HANDLE, const PVOID, PVOID, UINT64*);
+typedef DWORD (WINAPI *FnFwpmFilterDeleteById0)(HANDLE, UINT64);
+typedef DWORD (WINAPI *FnFwpmCalloutAdd0)(HANDLE, const PVOID, PVOID, UINT32*);
+typedef DWORD (WINAPI *FnFwpmSubLayerAdd0)(HANDLE, const PVOID, PVOID);
+typedef DWORD (WINAPI *FnFwpmSubLayerDeleteByKey0)(HANDLE, const GUID*);
+typedef DWORD (WINAPI *FnFwpmEngineClose0)(HANDLE);
+static DWORD  WINAPI Hook_FwpmFilterAdd0(HANDLE, const PVOID, PVOID, UINT64*);
+static DWORD  WINAPI Hook_FwpmFilterDeleteById0(HANDLE, UINT64);
+static DWORD  WINAPI Hook_FwpmCalloutAdd0(HANDLE, const PVOID, PVOID, UINT32*);
+static DWORD  WINAPI Hook_FwpmSubLayerAdd0(HANDLE, const PVOID, PVOID);
+static DWORD  WINAPI Hook_FwpmSubLayerDeleteByKey0(HANDLE, const GUID*);
+static DWORD  WINAPI Hook_FwpmEngineClose0(HANDLE);
 
 static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "VirtualAlloc",         (FARPROC)Hook_VirtualAlloc,        nullptr, nullptr, {}, nullptr, false },
@@ -266,6 +288,13 @@ static ApiHook g_hooks[HOOK_COUNT] = {
     // Process Ghosting (delete-before-map) and Transacted Hollowing
     { "ntdll.dll",    "NtSetInformationFile",          (FARPROC)Hook_NtSetInformationFile,            nullptr, nullptr, {}, nullptr, false },
     { "ntdll.dll",    "NtCreateTransaction",           (FARPROC)Hook_NtCreateTransaction,             nullptr, nullptr, {}, nullptr, false },
+    // WFP manipulation detection — fwpuclnt.dll (loaded on-demand by attackers)
+    { "fwpuclnt.dll", "FwpmFilterAdd0",                (FARPROC)Hook_FwpmFilterAdd0,                  nullptr, nullptr, {}, nullptr, false },
+    { "fwpuclnt.dll", "FwpmFilterDeleteById0",         (FARPROC)Hook_FwpmFilterDeleteById0,           nullptr, nullptr, {}, nullptr, false },
+    { "fwpuclnt.dll", "FwpmCalloutAdd0",               (FARPROC)Hook_FwpmCalloutAdd0,                 nullptr, nullptr, {}, nullptr, false },
+    { "fwpuclnt.dll", "FwpmSubLayerAdd0",              (FARPROC)Hook_FwpmSubLayerAdd0,                nullptr, nullptr, {}, nullptr, false },
+    { "fwpuclnt.dll", "FwpmSubLayerDeleteByKey0",      (FARPROC)Hook_FwpmSubLayerDeleteByKey0,        nullptr, nullptr, {}, nullptr, false },
+    { "fwpuclnt.dll", "FwpmEngineClose0",              (FARPROC)Hook_FwpmEngineClose0,                nullptr, nullptr, {}, nullptr, false },
 };
 
 // Returns the correct call-through address.
@@ -2027,6 +2056,150 @@ static NTSTATUS NTAPI Hook_NtCreateTransaction(
     return ((Fn)GetCallThrough(IDX_NTCREATETRANSACTION))(
         TransactionHandle, DesiredAccess, ObjectAttributes, Uow, TmHandle,
         CreateOptions, IsolationLevel, IsolationFlags, Timeout, Description);
+}
+
+// ---------------------------------------------------------------------------
+// WFP manipulation detection — fwpuclnt.dll hooks
+//
+// EDRSilencer and similar tools call these user-mode WFP APIs to add BLOCK
+// filters, delete EDR filters, inject rogue callouts/sublayers, or close
+// WFP engine handles.  Hooking fwpuclnt.dll lets us intercept the call
+// in real-time — before it reaches the BFE service — and alert/block.
+//
+// fwpuclnt.dll is loaded on-demand; the hook infrastructure handles deferred
+// patching when the module appears.
+// ---------------------------------------------------------------------------
+
+// Helper: get process name for WFP hook alerts.
+static const char* GetWfpCallerName()
+{
+    static thread_local char s_buf[MAX_PATH];
+    GetModuleFileNameA(nullptr, s_buf, sizeof(s_buf));
+    const char* base = s_buf;
+    for (const char* p = s_buf; *p; p++)
+        if (*p == '\\' || *p == '/') base = p + 1;
+    return base;
+}
+
+static BOOL IsWfpCallerTrusted()
+{
+    const char* base = GetWfpCallerName();
+    return (_stricmp(base, "svchost.exe")    == 0 ||
+            _stricmp(base, "lsass.exe")      == 0 ||
+            _stricmp(base, "services.exe")   == 0 ||
+            _stricmp(base, "NortonEDR.exe")  == 0 ||
+            _stricmp(base, "WmiPrvSE.exe")   == 0 ||
+            _stricmp(base, "mmc.exe")        == 0);  // Firewall snap-in
+}
+
+// FwpmFilterAdd0 — detects rogue filter injection (EDRSilencer primary vector).
+static DWORD WINAPI Hook_FwpmFilterAdd0(
+    HANDLE engineHandle, const PVOID filter,
+    PVOID sd, UINT64* filterId)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP MANIPULATION: %s called FwpmFilterAdd0 — "
+            "EDRSilencer-class attack: injecting WFP filter to block "
+            "EDR telemetry or intercept network traffic",
+            GetWfpCallerName());
+        SendHookEvent("Critical", "FwpmFilterAdd0", g_selfPid, det);
+    }
+
+    return ((FnFwpmFilterAdd0)GetCallThrough(IDX_FWPMFILTERADD0))(
+        engineHandle, filter, sd, filterId);
+}
+
+// FwpmFilterDeleteById0 — detects EDR filter deletion.
+static DWORD WINAPI Hook_FwpmFilterDeleteById0(
+    HANDLE engineHandle, UINT64 filterId)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP MANIPULATION: %s called FwpmFilterDeleteById0 "
+            "(filterId=%llu) — may be deleting EDR WFP filter to "
+            "disable network monitoring",
+            GetWfpCallerName(), filterId);
+        SendHookEvent("Critical", "FwpmFilterDeleteById0", g_selfPid, det);
+    }
+
+    return ((FnFwpmFilterDeleteById0)GetCallThrough(IDX_FWPMFILTERDELETEBYID0))(
+        engineHandle, filterId);
+}
+
+// FwpmCalloutAdd0 — detects rogue callout injection.
+static DWORD WINAPI Hook_FwpmCalloutAdd0(
+    HANDLE engineHandle, const PVOID callout,
+    PVOID sd, UINT32* calloutId)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP MANIPULATION: %s called FwpmCalloutAdd0 — "
+            "rogue callout injection to intercept/modify network "
+            "packets before EDR callout fires",
+            GetWfpCallerName());
+        SendHookEvent("Critical", "FwpmCalloutAdd0", g_selfPid, det);
+    }
+
+    return ((FnFwpmCalloutAdd0)GetCallThrough(IDX_FWPMCALLOUTADD0))(
+        engineHandle, callout, sd, calloutId);
+}
+
+// FwpmSubLayerAdd0 — detects rogue sublayer injection.
+static DWORD WINAPI Hook_FwpmSubLayerAdd0(
+    HANDLE engineHandle, const PVOID subLayer, PVOID sd)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP MANIPULATION: %s called FwpmSubLayerAdd0 — "
+            "rogue sublayer injection to stage BLOCK filters or "
+            "manipulate WFP arbitration",
+            GetWfpCallerName());
+        SendHookEvent("Critical", "FwpmSubLayerAdd0", g_selfPid, det);
+    }
+
+    return ((FnFwpmSubLayerAdd0)GetCallThrough(IDX_FWPMSUBLAYERADD0))(
+        engineHandle, subLayer, sd);
+}
+
+// FwpmSubLayerDeleteByKey0 — detects sublayer deletion (cascade attack).
+static DWORD WINAPI Hook_FwpmSubLayerDeleteByKey0(
+    HANDLE engineHandle, const GUID* key)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP MANIPULATION: %s called FwpmSubLayerDeleteByKey0 — "
+            "sublayer deletion cascade-deletes all filters within it. "
+            "May be targeting NortonEDR sublayer",
+            GetWfpCallerName());
+        SendHookEvent("Critical", "FwpmSubLayerDeleteByKey0", g_selfPid, det);
+    }
+
+    return ((FnFwpmSubLayerDeleteByKey0)GetCallThrough(IDX_FWPMSUBLAYERDELETEBYKEY0))(
+        engineHandle, key);
+}
+
+// FwpmEngineClose0 — detects engine handle closure.
+// An attacker can close WFP engine handles to disrupt active sessions.
+static DWORD WINAPI Hook_FwpmEngineClose0(HANDLE engineHandle)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP MANIPULATION: %s called FwpmEngineClose0 — "
+            "closing WFP engine handle to disrupt active WFP sessions "
+            "or prevent re-registration of filters",
+            GetWfpCallerName());
+        SendHookEvent("Critical", "FwpmEngineClose0", g_selfPid, det);
+    }
+
+    return ((FnFwpmEngineClose0)GetCallThrough(IDX_FWPMENGINECLOSE0))(
+        engineHandle);
 }
 
 // ---------------------------------------------------------------------------

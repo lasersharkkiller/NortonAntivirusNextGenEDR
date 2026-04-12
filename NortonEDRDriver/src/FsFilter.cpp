@@ -3101,6 +3101,58 @@ rate_done:
             }
         }
 
+        // ---- T1546.011: Shim database (.sdb) file creation ----
+        // Attackers create malicious .sdb files containing shim fixes like
+        // InjectDll, RedirectEXE, CorrectFilePaths, DisableNX, etc.
+        // The .sdb is typically dropped to %SystemRoot%\AppPatch\Custom\ or
+        // a staging directory, then registered via sdbinst.exe or direct
+        // registry writes to AppCompatFlags\InstalledSDB.
+        //
+        // ANY .sdb creation is suspicious — legitimate .sdb creation only
+        // occurs during OS servicing or enterprise application deployment
+        // via SCCM/Intune (from TrustedInstaller/msiexec).
+        {
+            if (ExtMatch(&nameInfo->Extension, L".sdb")) {
+                ULONG createDispSdb = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
+                BOOLEAN isSdbCreate =
+                    (createDispSdb == FILE_CREATE || createDispSdb == FILE_OVERWRITE_IF ||
+                     createDispSdb == FILE_SUPERSEDE || createDispSdb == FILE_OVERWRITE);
+
+                if (isSdbCreate) {
+                    // Allow TrustedInstaller and msiexec (OS servicing / enterprise deploy)
+                    BOOLEAN sdbAllowed = FALSE;
+                    if ((ULONG_PTR)pid <= 4) sdbAllowed = TRUE;
+                    if (procName && (strcmp(procName, "TrustedInsta") == 0 ||
+                                    strcmp(procName, "msiexec.exe") == 0 ||
+                                    strcmp(procName, "TiWorker.exe") == 0))
+                        sdbAllowed = TRUE;
+
+                    if (!sdbAllowed) {
+                        // Check if dropping in AppPatch (highest severity)
+                        BOOLEAN inAppPatch = WcsContainsLower(&nameInfo->Name, L"\\apppatch\\");
+
+                        char fileBuf[64] = {};
+                        ANSI_STRING ansiSdb;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiSdb, &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiSdb.Length < sizeof(fileBuf) - 1 ? ansiSdb.Length : sizeof(fileBuf) - 1;
+                            RtlCopyMemory(fileBuf, ansiSdb.Buffer, n);
+                            RtlFreeAnsiString(&ansiSdb);
+                        }
+                        char msg[300];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: Shim database (.sdb) creation by '%s' (pid=%llu) — %s "
+                            "%s(T1546.011: malicious shim for persistence/DLL injection/"
+                            "defense evasion)",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid,
+                            fileBuf[0] ? fileBuf : "?.sdb",
+                            inAppPatch ? "in AppPatch directory! " : "");
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                    }
+                }
+            }
+        }
+
         // ---- T1070.004: DELETE_ON_CLOSE on protected files ----
         // FILE_DELETE_ON_CLOSE (CreateOptions bit 12) causes the file to be deleted
         // when the last handle closes.  Attackers use this to bypass explicit delete

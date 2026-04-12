@@ -77,6 +77,17 @@ static const WCHAR* kPersistencePaths[] = {
     // Per-user execution at logon via StubPath value.
     L"\\Active Setup\\Installed Components",
 
+    // --- T1546.011: Application Shimming persistence ---
+    // Attackers register malicious .sdb shim databases for persistence + defense evasion.
+    // AppCompatFlags\Custom — maps executable names to custom shim database GUIDs.
+    L"\\AppCompatFlags\\Custom",
+    // AppCompatFlags\InstalledSDB — installed shim database registry entries.
+    // sdbinst.exe writes here; attackers can write directly to bypass sdbinst logging.
+    L"\\AppCompatFlags\\InstalledSDB",
+    // AppCompatFlags\Layers — compatibility mode flags per-application (e.g., RUNASADMIN,
+    // DISABLEWINDOWFILTERING).  Can be abused for privilege/protection bypass.
+    L"\\AppCompatFlags\\Layers",
+
     nullptr
 };
 
@@ -98,6 +109,9 @@ static const BOOLEAN kPersistenceCritical[] = {
     TRUE,                              // Print Monitors — Critical
     TRUE,                              // Print Processors — Critical
     TRUE,                              // Active Setup — Critical
+    TRUE,                              // AppCompatFlags\Custom — Critical (T1546.011)
+    TRUE,                              // AppCompatFlags\InstalledSDB — Critical (T1546.011)
+    TRUE,                              // AppCompatFlags\Layers — Critical (T1546.011)
 };
 
 // ---------------------------------------------------------------------------
@@ -220,6 +234,33 @@ static const DefenseEvasionEntry kDefenseEvasionPaths[] = {
     // Entra ID Primary Refresh Tokens (PRT) and Azure AD session keys.
     { L"\\TokenBroker\\Accounts",          NULL,
       "TokenBroker account configuration modified — PRT/cloud token theft (T1528)", TRUE },
+
+    // --- T1546.011: Application Shimming — defense evasion ---
+    // Attackers use shim databases to:
+    //   - Inject DLLs into arbitrary processes (InjectDll shim)
+    //   - Redirect API calls (RedirectEXE, ShimRedirect)
+    //   - Disable security features (DisableNX, DisableSEH, IgnoreFreeLibrary)
+    //   - Bypass ASLR (ForceRelocateImages)
+    //   - Hijack execution flow (CorrectFilePaths, RedirectShortcut)
+    //
+    // SDB registration can be done via sdbinst.exe or by writing directly
+    // to the registry (bypasses sdbinst logging entirely).
+    { L"\\AppCompatFlags\\Custom",           NULL,
+      "Shim database registered for executable — AppCompat Custom SDB mapping "
+      "(T1546.011: persistence + defense evasion via shim injection)", TRUE },
+    { L"\\AppCompatFlags\\InstalledSDB",     NULL,
+      "Shim database installed — InstalledSDB entry added (T1546.011: "
+      "attacker may have used sdbinst.exe or direct registry write)", TRUE },
+    { L"\\AppCompatFlags\\Layers",           NULL,
+      "AppCompat compatibility layer modified (T1546.011: may set "
+      "RUNASADMIN, DISABLEWINDOWFILTERING, or other bypass flags)", TRUE },
+    // AppCompat telemetry/instrumentation disable (defense evasion)
+    { L"\\AppCompatFlags",                   L"DisableEngine",
+      "AppCompat shim engine DISABLED — defense evasion to prevent "
+      "shim-based security controls from loading", TRUE },
+    { L"\\AppCompatFlags",                   L"DisablePCA",
+      "Program Compatibility Assistant disabled — may hide attacker "
+      "compatibility flag modifications from UI", FALSE },
 
     // --- Misc defense evasion ---
     // AMSI provider unregistration (COM CLSID nuke)

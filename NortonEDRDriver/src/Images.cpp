@@ -1589,6 +1589,10 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                     { "mimilib.dll",  11, "Mimikatz SSP DLL — credential logging/Skeleton Key helper",  TRUE  },
                                     { "mimidrv.dll",  11, "Mimikatz driver companion DLL",                              TRUE  },
                                     { "dpapi.dll",    9,  "DPAPI master key / credential blob decryption (Mimikatz dpapi module)", TRUE },
+                                    // T1546.011: Application shimming — shim engine injection
+                                    { "shimeng.dll",  12, "Shim engine loaded — AppCompat shim injection active (T1546.011: DLL injection/API redirect/defense evasion via shim database)", TRUE },
+                                    // WFP manipulation — fwpuclnt.dll loading (EDRSilencer prerequisite)
+                                    { "fwpuclnt.dll", 12, "WFP user-mode API loaded — may call FwpmFilterAdd0 to inject BLOCK filters (EDRSilencer/telemetry blocking)", TRUE },
                                     { nullptr, 0, nullptr, FALSE }
                                 };
 

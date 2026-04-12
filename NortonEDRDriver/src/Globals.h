@@ -355,6 +355,15 @@ class WdfTcpipUtils {
 	UINT32 RegCalloutId = 0, AddCalloutId = 0;
 	UINT64 FilterId = 0;
 
+	// WFP change subscription handles — real-time notification when
+	// filters/sublayers are added, deleted, or modified.
+	HANDLE FilterChangeHandle = NULL;
+	HANDLE SubLayerChangeHandle = NULL;
+	HANDLE BfeStateChangeHandle = NULL;
+
+	// Guards against premature/malicious UnitializeWfp invocation.
+	volatile LONG UnloadAuthorized = 0;
+
 public:
 
 	NTSTATUS InitWfp();
@@ -363,6 +372,16 @@ public:
 	NTSTATUS WfpRegisterCallout();
 	VOID UnitializeWfp();
 	NTSTATUS AddSubLayer();
+
+	// WFP real-time change notification setup/teardown.
+	VOID SubscribeWfpChangeNotifications();
+	VOID UnsubscribeWfpChangeNotifications();
+
+	// Harden WFP object security descriptors to restrict modification.
+	VOID HardenWfpObjectSecurity();
+
+	// Authorize the unload path (called from UnloadDriver before UnitializeWfp).
+	VOID AuthorizeUnload() { InterlockedExchange(&UnloadAuthorized, 1); }
 
 	// Update the blocked-port list from user-mode (NORTONAV_SET_NETWORK_CONFIG).
 	static VOID WfpSetBlocklist(const UINT16* ports, UINT32 count);

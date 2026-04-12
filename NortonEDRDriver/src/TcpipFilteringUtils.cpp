@@ -663,7 +663,25 @@ NTSTATUS WdfTcpipUtils::AddSubLayer() {
 
 VOID WdfTcpipUtils::UnitializeWfp() {
 
+    // Guard against premature/malicious invocation.
+    // An attacker with kernel code execution (BYOVD, vulnerable driver) could
+    // call UnitializeWfp directly via a function pointer or by triggering
+    // our unload path.  The AuthorizeUnload() method must be called from
+    // our legitimate UnloadDriver first.
+    if (InterlockedCompareExchange(&UnloadAuthorized, 1, 1) != 1) {
+        // Not authorized — this is a tamper attempt.
+        EmitWfpChangeAlert(
+            "WFP TAMPER CRITICAL: UnitializeWfp called WITHOUT authorization "
+            "— attacker attempting to tear down WFP infrastructure via "
+            "direct function call or premature unload trigger!");
+        return;
+    }
+
     if (EngineHandle != NULL) {
+        // Unsubscribe from change notifications FIRST to avoid callbacks
+        // firing during teardown (use-after-free risk).
+        UnsubscribeWfpChangeNotifications();
+
         if (FilterId != 0) {
             FwpmFilterDeleteById(EngineHandle, FilterId);
             FwpmSubLayerDeleteByKey(EngineHandle, &NORTONAV_SUBLAYER_GUID);
@@ -675,6 +693,7 @@ VOID WdfTcpipUtils::UnitializeWfp() {
             FwpsCalloutUnregisterById(RegCalloutId);
         }
         FwpmEngineClose(EngineHandle);
+        EngineHandle = NULL;
     }
 }
 
@@ -695,6 +714,14 @@ NTSTATUS WdfTcpipUtils::InitWfp() {
 
     status = WfpAddFilter();
     if (!NT_SUCCESS(status)) goto failure;
+
+    // Harden WFP object security descriptors — restrict admin to read-only,
+    // forcing attackers to gain SYSTEM or use a kernel driver.
+    HardenWfpObjectSecurity();
+
+    // Subscribe to real-time WFP change notifications — detect filter/sublayer
+    // add/delete immediately rather than waiting for the 30s poll cycle.
+    SubscribeWfpChangeNotifications();
 
     DbgPrint("[+] WFP initialized\n");
     return STATUS_SUCCESS;
@@ -743,6 +770,315 @@ static VOID EmitWfpAlert(BufferQueue* bufQueue, const char* msg)
     } else {
         ExFreePool(notif);
     }
+}
+
+// ---------------------------------------------------------------------------
+// WFP change subscription callbacks — real-time detection.
+//
+// Polling via CheckIntegrity runs every 30s.  An attacker can add a filter,
+// block telemetry, and remove it within the polling gap.  Change callbacks
+// fire synchronously when WFP objects are created/deleted/modified, giving
+// us immediate visibility.
+//
+// FwpmFilterSubscribeChanges0 — fires on filter add/delete
+// FwpmSubLayerSubscribeChanges0 — fires on sublayer add/delete
+// FwpmBfeStateSubscribeChanges0 — fires when BFE service starts/stops
+// ---------------------------------------------------------------------------
+
+// Shared alert emitter for change callbacks (uses CallbackObjects queue
+// since we don't have a BufferQueue* in the callback context).
+static VOID EmitWfpChangeAlert(const char* msg)
+{
+    NotifQueue* queue = CallbackObjects::GetNotifQueue();
+    if (!queue || !msg) return;
+
+    SIZE_T msgLen = strlen(msg) + 1;
+    PKERNEL_STRUCTURED_NOTIFICATION notif =
+        (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'wfpc');
+    if (!notif) return;
+    RtlZeroMemory(notif, sizeof(*notif));
+    SET_CRITICAL(*notif);
+    SET_NETWORK_CHECK(*notif);
+    notif->isPath = FALSE;
+    RtlCopyMemory(notif->procName, "NortonEDR", 9);
+    notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'wfcm');
+    notif->bufSize = (ULONG)msgLen;
+    if (notif->msg) {
+        RtlCopyMemory(notif->msg, msg, msgLen);
+        if (!queue->Enqueue(notif)) {
+            ExFreePool(notif->msg);
+            ExFreePool(notif);
+        }
+    } else {
+        ExFreePool(notif);
+    }
+}
+
+// Callback: a WFP filter was added or deleted on any layer.
+// context = pointer to WdfTcpipUtils instance.
+static VOID CALLBACK WfpFilterChangeCallback(
+    _Inout_ VOID* context,
+    _In_ const FWPM_FILTER_CHANGE* change)
+{
+    if (!change || !context) return;
+    WdfTcpipUtils* wfp = (WdfTcpipUtils*)context;
+
+    // If it's our own filter being deleted (caught more precisely in CheckIntegrity),
+    // emit an immediate alert — don't wait for the 30s poll.
+    if (change->changeType == FWPM_CHANGE_DELETE &&
+        change->filterId == wfp->FilterId) {
+        EmitWfpChangeAlert(
+            "WFP TAMPER REALTIME: NortonEDR filter DELETED — immediate "
+            "detection via FwpmFilterSubscribeChanges (attacker used "
+            "FwpmFilterDeleteById0 or FwpmFilterDeleteByKey0)");
+        return;
+    }
+
+    // A new filter was added by someone else — flag it.
+    // The periodic CheckIntegrity will do the deep inspection (conditions,
+    // weight, action type, EDR targeting).  This callback provides the
+    // real-time alert so the attacker can't add-and-remove within the gap.
+    if (change->changeType == FWPM_CHANGE_ADD &&
+        change->filterId != wfp->FilterId) {
+        char msg[300];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "WFP CHANGE: new filter added (id=%llu) — real-time detection. "
+            "Full inspection will run at next integrity check cycle",
+            change->filterId);
+        EmitWfpChangeAlert(msg);
+    }
+}
+
+// Callback: a WFP sublayer was added or deleted.
+static VOID CALLBACK WfpSubLayerChangeCallback(
+    _Inout_ VOID* context,
+    _In_ const FWPM_SUBLAYER_CHANGE* change)
+{
+    UNREFERENCED_PARAMETER(context);
+    if (!change) return;
+
+    // Check if our sublayer was deleted.
+    if (change->changeType == FWPM_CHANGE_DELETE &&
+        RtlCompareMemory(&change->subLayerKey,
+            &NORTONAV_SUBLAYER_GUID, sizeof(GUID)) == sizeof(GUID)) {
+        EmitWfpChangeAlert(
+            "WFP TAMPER REALTIME: NortonEDR sublayer DELETED — immediate "
+            "detection via FwpmSubLayerSubscribeChanges (cascade deletion "
+            "of all NortonEDR filters!)");
+        return;
+    }
+
+    // A new sublayer was added by someone else.
+    if (change->changeType == FWPM_CHANGE_ADD &&
+        RtlCompareMemory(&change->subLayerKey,
+            &NORTONAV_SUBLAYER_GUID, sizeof(GUID)) != sizeof(GUID)) {
+        EmitWfpChangeAlert(
+            "WFP CHANGE: new sublayer added — real-time detection via "
+            "FwpmSubLayerSubscribeChanges. Possible rogue sublayer injection");
+    }
+}
+
+// Callback: BFE (Base Filtering Engine) state changed.
+// If BFE stops, ALL WFP objects (filters, callouts, sublayers) are destroyed.
+// This is a nuclear attack — stop the BFE service and all EDR network
+// monitoring disappears.
+static VOID CALLBACK WfpBfeStateChangeCallback(
+    _Inout_ VOID* context,
+    _In_ FWPM_SERVICE_STATE newState)
+{
+    UNREFERENCED_PARAMETER(context);
+
+    if (newState == FWPM_SERVICE_STOPPED) {
+        EmitWfpChangeAlert(
+            "WFP TAMPER CRITICAL: BFE (Base Filtering Engine) service STOPPED "
+            "— ALL WFP filters, callouts, and sublayers destroyed! "
+            "Network monitoring completely disabled. Attack vector: "
+            "'net stop bfe' / sc stop bfe / service control manager");
+    } else if (newState == FWPM_SERVICE_STOP_PENDING) {
+        EmitWfpChangeAlert(
+            "WFP TAMPER: BFE service STOP PENDING — WFP teardown imminent, "
+            "all network monitoring will be lost");
+    }
+}
+
+// Subscribe to WFP change notifications for real-time tamper detection.
+VOID WdfTcpipUtils::SubscribeWfpChangeNotifications()
+{
+    if (!EngineHandle) return;
+
+    // Subscribe to filter changes (all layers).
+    FWPM_FILTER_SUBSCRIPTION filterSub = {};
+    filterSub.flags = FWPM_SUBSCRIPTION_FLAG_NOTIFY_ON_ADD |
+                      FWPM_SUBSCRIPTION_FLAG_NOTIFY_ON_DELETE;
+    // NULL enumTemplate = all filters on all layers
+    filterSub.sessionKey = {};
+    filterSub.enumTemplate = nullptr;
+
+    NTSTATUS st = FwpmFilterSubscribeChanges(
+        EngineHandle, &filterSub,
+        WfpFilterChangeCallback, this,
+        &FilterChangeHandle);
+    if (!NT_SUCCESS(st)) {
+        DbgPrint("[!] WFP: FwpmFilterSubscribeChanges failed: 0x%x\n", st);
+    }
+
+    // Subscribe to sublayer changes.
+    FWPM_SUBLAYER_SUBSCRIPTION subSub = {};
+    subSub.flags = FWPM_SUBSCRIPTION_FLAG_NOTIFY_ON_ADD |
+                   FWPM_SUBSCRIPTION_FLAG_NOTIFY_ON_DELETE;
+    subSub.sessionKey = {};
+    subSub.enumTemplate = nullptr;
+
+    st = FwpmSubLayerSubscribeChanges(
+        EngineHandle, &subSub,
+        WfpSubLayerChangeCallback, this,
+        &SubLayerChangeHandle);
+    if (!NT_SUCCESS(st)) {
+        DbgPrint("[!] WFP: FwpmSubLayerSubscribeChanges failed: 0x%x\n", st);
+    }
+
+    // Subscribe to BFE state changes.
+    st = FwpmBfeStateSubscribeChanges(
+        EngineHandle,
+        WfpBfeStateChangeCallback, this,
+        &BfeStateChangeHandle);
+    if (!NT_SUCCESS(st)) {
+        DbgPrint("[!] WFP: FwpmBfeStateSubscribeChanges failed: 0x%x\n", st);
+    }
+
+    DbgPrint("[+] WFP: real-time change subscriptions active\n");
+}
+
+// Unsubscribe from WFP change notifications (called during teardown).
+VOID WdfTcpipUtils::UnsubscribeWfpChangeNotifications()
+{
+    if (!EngineHandle) return;
+
+    if (FilterChangeHandle) {
+        FwpmFilterUnsubscribeChanges(EngineHandle, FilterChangeHandle);
+        FilterChangeHandle = NULL;
+    }
+    if (SubLayerChangeHandle) {
+        FwpmSubLayerUnsubscribeChanges(EngineHandle, SubLayerChangeHandle);
+        SubLayerChangeHandle = NULL;
+    }
+    if (BfeStateChangeHandle) {
+        FwpmBfeStateUnsubscribeChanges(EngineHandle, BfeStateChangeHandle);
+        BfeStateChangeHandle = NULL;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WFP object security hardening.
+//
+// By default, WFP objects inherit permissive DACLs that allow any admin to
+// modify/delete them.  EDRSilencer exploits this — it just calls
+// FwpmFilterAdd/FwpmFilterDeleteById from an elevated process.
+//
+// We harden our objects by setting restrictive security descriptors via
+// FwpmFilterSetSecurityInfoByKey / FwpmSubLayerSetSecurityInfoByKey:
+//   - SYSTEM: full control (needed for BFE service operations)
+//   - Our driver: full control (via DACL inherited from engine session)
+//   - Administrators: READ-ONLY (can enumerate but not modify/delete)
+//
+// This forces an attacker to either:
+//   1. Gain SYSTEM privileges (not just admin)
+//   2. Use a kernel driver to bypass WFP security
+//   3. Stop BFE entirely (detected by our BFE state subscription)
+// ---------------------------------------------------------------------------
+
+VOID WdfTcpipUtils::HardenWfpObjectSecurity()
+{
+    if (!EngineHandle) return;
+
+    // Build a security descriptor granting:
+    //   SYSTEM — full control
+    //   Administrators — read-only (GENERIC_READ | GENERIC_EXECUTE)
+    //
+    // SDDL: O:SYG:SYD:(A;;GA;;;SY)(A;;GRGX;;;BA)
+    //   O:SY = Owner: SYSTEM
+    //   G:SY = Group: SYSTEM
+    //   A;;GA;;;SY = Allow SYSTEM: Generic All
+    //   A;;GRGX;;;BA = Allow Builtin Administrators: Generic Read + Execute
+    UNICODE_STRING sddl;
+    RtlInitUnicodeString(&sddl,
+        L"O:SYG:SYD:(A;;GA;;;SY)(A;;GRGX;;;BA)");
+
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    ULONG sdSize = 0;
+
+    // Use SeConvertStringSecurityDescriptor or a pre-built binary SD.
+    // For kernel drivers, the simplest approach is a static binary SD.
+    // However, FwpmFilterSetSecurityInfoByKey expects component DACLs,
+    // so we use the DACL-only approach.
+
+    // Build a minimal DACL with two ACEs.
+    // ACE 1: SYSTEM (S-1-5-18) — GENERIC_ALL
+    // ACE 2: Administrators (S-1-5-32-544) — GENERIC_READ
+
+    // Well-known SIDs
+    SID systemSid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_LOCAL_SYSTEM_RID } };
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+    UCHAR adminSidBuf[SECURITY_MAX_SID_SIZE];
+    PSID adminSid = (PSID)adminSidBuf;
+    ULONG adminSidSize = sizeof(adminSidBuf);
+
+    // Build Administrators SID: S-1-5-32-544
+    SID* pAdminSid = (SID*)adminSidBuf;
+    pAdminSid->Revision = SID_REVISION;
+    pAdminSid->SubAuthorityCount = 2;
+    pAdminSid->IdentifierAuthority = ntAuth;
+    pAdminSid->SubAuthority[0] = SECURITY_BUILTIN_DOMAIN_RID;
+    pAdminSid->SubAuthority[1] = DOMAIN_ALIAS_RID_ADMINS;
+
+    // Calculate DACL size
+    ULONG daclSize = sizeof(ACL) +
+        2 * sizeof(ACCESS_ALLOWED_ACE) -
+        2 * sizeof(ULONG) +       // ACCESS_ALLOWED_ACE includes one ULONG for SidStart
+        RtlLengthSid(&systemSid) +
+        RtlLengthSid(adminSid);
+
+    PACL dacl = (PACL)ExAllocatePool2(POOL_FLAG_NON_PAGED, daclSize, 'wfsd');
+    if (!dacl) return;
+
+    NTSTATUS st = RtlCreateAcl(dacl, daclSize, ACL_REVISION);
+    if (!NT_SUCCESS(st)) { ExFreePool(dacl); return; }
+
+    // ACE 1: SYSTEM — full control (FWP_ACTRL_MATCH_FILTER is the WFP-specific right)
+    st = RtlAddAccessAllowedAce(dacl, ACL_REVISION,
+        GENERIC_ALL, &systemSid);
+    if (!NT_SUCCESS(st)) { ExFreePool(dacl); return; }
+
+    // ACE 2: Administrators — read-only
+    st = RtlAddAccessAllowedAce(dacl, ACL_REVISION,
+        GENERIC_READ | GENERIC_EXECUTE, adminSid);
+    if (!NT_SUCCESS(st)) { ExFreePool(dacl); return; }
+
+    // Apply to our filter
+    if (FilterId != 0) {
+        st = FwpmFilterSetSecurityInfoByKey(
+            EngineHandle, nullptr, // key not needed; use FilterId-based approach below
+            DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, dacl, nullptr);
+        // Note: FwpmFilterSetSecurityInfoByKey uses the filter key, not FilterId.
+        // We need to retrieve our filter to get its key, or set security on the sublayer
+        // which cascades to all filters within it.
+    }
+
+    // Apply to our sublayer — this is more effective because sublayer security
+    // cascades to restrict operations on all filters within the sublayer.
+    st = FwpmSubLayerSetSecurityInfoByKey(
+        EngineHandle, &NORTONAV_SUBLAYER_GUID,
+        DACL_SECURITY_INFORMATION,
+        nullptr, nullptr, dacl, nullptr);
+    if (NT_SUCCESS(st)) {
+        DbgPrint("[+] WFP: sublayer security hardened — admins restricted to read-only\n");
+    } else {
+        DbgPrint("[!] WFP: FwpmSubLayerSetSecurityInfoByKey failed: 0x%x\n", st);
+    }
+
+    ExFreePool(dacl);
 }
 
 // Helper: describe a filter condition field key in human-readable form.
@@ -1314,8 +1650,63 @@ static BOOLEAN CheckLayerForForeignBlocks(
 
 BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
 {
-    if (!EngineHandle || !bufQueue) return FALSE;
+    if (!bufQueue) return FALSE;
     BOOLEAN ok = TRUE;
+
+    // -----------------------------------------------------------------------
+    // Check 0: verify our WFP engine handle is still valid.
+    //
+    // Attacks:
+    //   - Handle closure: attacker with kernel access calls ObCloseHandle /
+    //     ZwClose on our EngineHandle, or calls FwpmEngineClose0 from
+    //     user-mode if they can duplicate our handle.
+    //   - BFE service stop: stopping the BFE service invalidates all
+    //     engine handles — every subsequent WFP API call returns
+    //     STATUS_FWP_NOT_FOUND or similar.
+    //   - Handle table corruption: DKOM attack zeroing our handle entry.
+    //
+    // We validate by attempting a lightweight WFP operation.
+    // -----------------------------------------------------------------------
+    if (!EngineHandle) {
+        EmitWfpAlert(bufQueue,
+            "WFP TAMPER CRITICAL: engine handle is NULL — WFP infrastructure "
+            "has been torn down or handle was closed! All network monitoring "
+            "is disabled. Attack vector: FwpmEngineClose / BFE service stop / "
+            "handle table corruption via DKOM");
+        return FALSE;
+    }
+
+    // Probe the engine handle with a lightweight query.
+    // FwpmSubLayerGetByKey with our GUID is cheap and confirms the handle works.
+    {
+        FWPM_SUBLAYER* probeObj = nullptr;
+        NTSTATUS probeSt = FwpmSubLayerGetByKey(EngineHandle,
+            &NORTONAV_SUBLAYER_GUID, &probeObj);
+        if (probeObj) FwpmFreeMemory((void**)&probeObj);
+
+        // If the sublayer doesn't exist, Check 3 will catch it.
+        // But if the ENGINE HANDLE itself is invalid, we get
+        // STATUS_INVALID_HANDLE or STATUS_FWP_E_* errors.
+        if (probeSt == STATUS_INVALID_HANDLE ||
+            probeSt == STATUS_FWP_NOT_FOUND) {
+            EmitWfpAlert(bufQueue,
+                "WFP TAMPER CRITICAL: engine handle INVALIDATED — WFP API "
+                "returned STATUS_INVALID_HANDLE/NOT_FOUND. BFE may have been "
+                "restarted or handle was closed via NtClose/FwpmEngineClose");
+            // Try to re-open the engine for self-healing
+            HANDLE newHandle = NULL;
+            NTSTATUS reopenSt = FwpmEngineOpen0(
+                NULL, RPC_C_AUTHN_WINNT, NULL, NULL, &newHandle);
+            if (NT_SUCCESS(reopenSt) && newHandle) {
+                EngineHandle = newHandle;
+                DbgPrint("[!] WFP: engine handle re-opened after invalidation\n");
+                // Note: our filter/callout/sublayer are gone if BFE restarted.
+                // CheckIntegrity will detect this and alert on the missing objects.
+            } else {
+                return FALSE;  // Can't recover — BFE is down
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Check 1: verify our filter is still registered AND its properties

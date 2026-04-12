@@ -809,6 +809,71 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 							}
 						}
 					}
+						// ---------------------------------------------------------
+						// T1546.011: PEB pShimData pointer validation.
+						//
+						// When a shim database targets a process, shimeng.dll
+						// sets PEB.pShimData to a SHIM_DATA structure.
+						// Flag non-NULL pShimData on security-sensitive processes.
+						// ---------------------------------------------------------
+						if (peb && MmIsAddressValid(peb)) {
+							PVOID shimDataPtr = nullptr;
+							// PEB.pShimData offset 0x2D8 (Win10/11 x64)
+							PVOID pShimField = (PUCHAR)peb + 0x2D8;
+							if (MmIsAddressValid(pShimField)) {
+								ProbeForRead(pShimField, sizeof(PVOID), sizeof(BYTE));
+								RtlCopyMemory(&shimDataPtr, pShimField, sizeof(PVOID));
+							}
+
+							if (shimDataPtr != nullptr) {
+								const char* procBase = childName ? childName : "";
+								BOOLEAN isSensitive =
+									(strcmp(procBase, "lsass.exe")     == 0 ||
+									 strcmp(procBase, "csrss.exe")     == 0 ||
+									 strcmp(procBase, "services.exe")  == 0 ||
+									 strcmp(procBase, "svchost.exe")   == 0 ||
+									 strcmp(procBase, "NortonEDR.exe") == 0 ||
+									 strcmp(procBase, "smss.exe")      == 0 ||
+									 strcmp(procBase, "wininit.exe")   == 0 ||
+									 strcmp(procBase, "winlogon.exe")  == 0 ||
+									 strcmp(procBase, "spoolsv.exe")   == 0);
+
+								if (isSensitive) {
+									char shimMsg[300];
+									RtlStringCbPrintfA(shimMsg, sizeof(shimMsg),
+										"PEB SHIM INJECTION: %s (pid=%llu) has non-NULL "
+										"pShimData (%p) — shim database active on "
+										"security-sensitive process! T1546.011: "
+										"possible DLL injection via InjectDll shim",
+										procBase, (ULONG64)childPid, shimDataPtr);
+
+									PKERNEL_STRUCTURED_NOTIFICATION sn =
+										(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+											POOL_FLAG_NON_PAGED,
+											sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+									if (sn) {
+										RtlZeroMemory(sn, sizeof(*sn));
+										SET_CRITICAL(*sn);
+										SET_SE_AUDIT_INFO_CHECK(*sn);
+										sn->isPath = FALSE;
+										sn->pid = childPid;
+										if (creatorName)
+											RtlCopyMemory(sn->procName, creatorName, 14);
+										SIZE_T smLen = strlen(shimMsg) + 1;
+										sn->msg = (char*)ExAllocatePool2(
+											POOL_FLAG_NON_PAGED, smLen, 'msg');
+										if (sn->msg) {
+											RtlCopyMemory(sn->msg, shimMsg, smLen);
+											sn->bufSize = (ULONG)smLen;
+											if (!CallbackObjects::GetNotifQueue()->Enqueue(sn)) {
+												ExFreePool(sn->msg);
+												ExFreePool(sn);
+											}
+										} else { ExFreePool(sn); }
+									}
+								}
+							}
+						}
 				} __except (EXCEPTION_EXECUTE_HANDLER) {}
 
 				KeUnstackDetachProcess(&apcState);
@@ -1398,6 +1463,16 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"fltmc.exe filters",        "fltmc.exe filters -- minifilter recon enumeration",   FALSE },
 				{ L"fltmc volumes",            "fltmc volumes -- minifilter recon enumeration",       FALSE },
 				{ L"fltmc.exe volumes",        "fltmc.exe volumes -- minifilter recon enumeration",   FALSE },
+				// --- T1546.011: Application shimming ---
+				// sdbinst.exe registers a shim database (.sdb) for persistence/injection.
+				{ L"sdbinst",                  "sdbinst: shim database installation — T1546.011 persistence/DLL injection via AppCompat shim", TRUE },
+				{ L"sdbinst.exe",              "sdbinst.exe: shim database installation — T1546.011 persistence/DLL injection", TRUE },
+				// Direct AppCompat manipulation via reg.exe
+				{ L"appcompatflags\\custom",    "reg write to AppCompatFlags\\Custom — shim database registration (T1546.011)", TRUE },
+				{ L"appcompatflags\\installedsdb", "reg write to AppCompatFlags\\InstalledSDB — shim persistence (T1546.011)", TRUE },
+				// --- T1562: BFE service stop (nuclear WFP attack) ---
+				{ L"sc stop bfe",              "Stop Base Filtering Engine service — nuclear WFP teardown!", TRUE },
+				{ L"net stop bfe",             "net stop bfe — nuclear WFP teardown!",               TRUE  },
 				{ nullptr, nullptr, FALSE }
 			};
 
