@@ -3865,6 +3865,227 @@ VOID SyscallsUtils::NtCreateNamedPipeFileHandler(PVOID ObjectAttributes, ULONG M
 	// System processes are allowed to create pipes — skip remaining checks
 	if (isSystemProc) return;
 
+	// ---- LOLBin pipe creation detection ----
+	// Living-off-the-Land binaries have no legitimate reason to create named pipes.
+	// When they do, it's almost always a C2 implant or post-exploitation framework
+	// executing under the LOLBin's identity.  Near-zero false positive rate.
+	{
+		static const char* kLolBins[] = {
+			"rundll32.exe",    // DLL execution proxy — Cobalt Strike, Sliver, etc.
+			"regsvr32.exe",    // COM registration proxy — squiblydoo attacks
+			"mshta.exe",       // HTML Application host — script-based C2
+			"certutil.exe",    // Certificate utility — download cradle / decode
+			"wmic.exe",        // WMI CLI — lateral movement
+			"cmstp.exe",       // Connection Manager — UAC bypass
+			"msbuild.exe",     // Build engine — inline task execution
+			"installutil.e",   // .NET install util (15-char truncation)
+			"regasm.exe",      // .NET assembly registration
+			"regsvcs.exe",     // .NET COM+ registration
+			"csc.exe",         // C# compiler — compile-and-run attacks
+			"vbc.exe",         // VB compiler — compile-and-run attacks
+			"msiexec.exe",     // Windows Installer — DLL side-loading
+			"control.exe",     // Control Panel — DLL loading
+			"explorer.exe",    // Shell — rarely creates non-desktop pipes
+			"hh.exe",          // HTML Help — CHM-based attacks
+			"ieexec.exe",      // IE exec proxy
+			"msconfig.exe",    // System config — UAC bypass
+			"pcalua.exe",      // Program Compatibility Assistant
+			"presentationho",  // PresentationHost (15-char truncation)
+			nullptr
+		};
+
+		for (int i = 0; kLolBins[i]; i++) {
+			if (strcmp(lower, kLolBins[i]) == 0) {
+				char msg[224];
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"NtCreateNamedPipeFile: LOLBin '%s' creating named pipe "
+					"— likely C2 implant / post-exploitation framework",
+					name);
+				EmitSyscallNotif(0, msg, caller, nullptr, TRUE); // CRITICAL
+				break;
+			}
+		}
+	}
+
+	// ---- Scripting engine pipe creation detection ----
+	// PowerShell, Python, WSH, and cmd.exe creating pipes is a strong indicator of
+	// script-based C2 (Empire, Covenant, custom Python implants).  PowerShell
+	// remoting uses pipes legitimately, but any pipe creation by a scripting engine
+	// warrants monitoring.
+	{
+		static const char* kScriptEngines[] = {
+			"powershell.exe",   // PowerShell — Empire, Covenant, custom C2
+			"pwsh.exe",         // PowerShell Core
+			"powershell_is",    // PowerShell ISE (15-char truncation)
+			"python.exe",       // Python — Impacket, custom agents
+			"python3.exe",      // Python 3
+			"pythonw.exe",      // Python windowless
+			"wscript.exe",      // Windows Script Host — VBS/JS C2
+			"cscript.exe",      // Console Script Host — VBS/JS C2
+			"cmd.exe",          // Command Processor — batch C2 / lateral movement
+			"bash.exe",         // WSL bash
+			"ruby.exe",         // Ruby
+			"perl.exe",         // Perl
+			"java.exe",         // Java — rare but used in C2
+			"javaw.exe",        // Java windowless
+			"node.exe",         // Node.js
+			nullptr
+		};
+
+		for (int i = 0; kScriptEngines[i]; i++) {
+			if (strcmp(lower, kScriptEngines[i]) == 0) {
+				char msg[224];
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"NtCreateNamedPipeFile: Scripting engine '%s' creating named pipe "
+					"— possible script-based C2 / post-exploitation",
+					name);
+				EmitSyscallNotif(0, msg, caller, nullptr, FALSE); // WARNING (PS remoting legit)
+				break;
+			}
+		}
+	}
+
+	// ---- Pipe creation from untrusted process image path ----
+	// Processes running from %TEMP%, Downloads, AppData, ProgramData, Users\Public,
+	// or Recycle Bin should almost never create named pipes.  A stager or dropper
+	// executing from a temp dir that sets up a pipe-based C2 channel is highly
+	// suspicious.  Query the full NT image path via ZwQueryInformationProcess.
+	{
+		// ProcessImageFileName = 27
+		UCHAR pathBuf[280] = {};  // UNICODE_STRING header + up to ~256 chars
+		ULONG retLen = 0;
+		NTSTATUS piStatus = ZwQueryInformationProcess(
+			NtCurrentProcess(),
+			(PROCESSINFOCLASS)27,  // ProcessImageFileName
+			pathBuf,
+			sizeof(pathBuf),
+			&retLen);
+
+		if (NT_SUCCESS(piStatus)) {
+			PUNICODE_STRING imgPath = (PUNICODE_STRING)pathBuf;
+			if (imgPath->Buffer && imgPath->Length > 0 && MmIsAddressValid(imgPath->Buffer)) {
+				static const PCWSTR kUntrustedDirs[] = {
+					L"\\Temp\\",
+					L"\\AppData\\Local\\Temp\\",
+					L"\\Downloads\\",
+					L"\\Users\\Public\\",
+					L"\\ProgramData\\",
+					L"\\$Recycle.Bin\\",
+					L"\\Windows\\Temp\\",
+				};
+
+				// Case-insensitive substring check
+				for (int ui = 0; ui < ARRAYSIZE(kUntrustedDirs); ui++) {
+					SIZE_T needleLen = wcslen(kUntrustedDirs[ui]);
+					USHORT hLen = imgPath->Length / sizeof(WCHAR);
+					if ((USHORT)needleLen > hLen) continue;
+
+					for (USHORT si = 0; si <= hLen - (USHORT)needleLen; si++) {
+						BOOLEAN match = TRUE;
+						for (SIZE_T ci = 0; ci < needleLen; ci++) {
+							WCHAR hc = imgPath->Buffer[si + ci];
+							WCHAR nc = kUntrustedDirs[ui][ci];
+							// Uppercase both for case-insensitive compare
+							if (hc >= L'a' && hc <= L'z') hc -= 32;
+							if (nc >= L'a' && nc <= L'z') nc -= 32;
+							if (hc != nc) { match = FALSE; break; }
+						}
+						if (match) {
+							char msg[224];
+							RtlStringCbPrintfA(msg, sizeof(msg),
+								"NtCreateNamedPipeFile: Process from untrusted path '%s' "
+								"creating pipe — possible staged C2 channel",
+								name);
+							EmitSyscallNotif(0, msg, caller, nullptr, TRUE); // CRITICAL
+							goto done_untrusted_path;
+						}
+					}
+				}
+			}
+		}
+		done_untrusted_path:;
+	}
+
+	// ---- High-entropy / random pipe name detection ----
+	// C2 frameworks that randomize pipe names (Cobalt Strike custom profiles, Sliver,
+	// Mythic, Havoc, etc.) produce pipe names with high entropy — long sequences of
+	// hex chars or GUIDs.  Legitimate pipes typically have human-readable names or
+	// follow a structured pattern with a known prefix.
+	//
+	// Heuristic: extract the final component of the pipe name (after last backslash),
+	// count hex-only chars.  If the name is >= 8 chars and >= 75% hex digits, flag it.
+	// Allowlist Chrome, Edge, Firefox, Office (they use GUID-named pipes normally).
+	{
+		// Allowlist processes known to create GUID-named pipes legitimately
+		static const char* kGuidPipeProcs[] = {
+			"chrome.exe", "msedge.exe", "firefox.exe", "opera.exe", "brave.exe",
+			"winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
+			"teams.exe", "slack.exe", "discord.exe", "spotify.exe",
+			"code.exe",        // VS Code
+			"devenv.exe",      // Visual Studio
+			"vsls-agent.ex",   // VS Live Share (15-char truncation)
+			"rider64.exe",     // JetBrains Rider
+			nullptr
+		};
+
+		BOOLEAN isGuidProc = FALSE;
+		for (int gi = 0; kGuidPipeProcs[gi]; gi++) {
+			if (strcmp(lower, kGuidPipeProcs[gi]) == 0) {
+				isGuidProc = TRUE; break;
+			}
+		}
+
+		if (!isGuidProc) {
+			// Extract final component — find last backslash
+			USHORT pipeChars = pipeName->Length / sizeof(WCHAR);
+			USHORT lastSlash = 0;
+			for (USHORT pi = 0; pi < pipeChars; pi++) {
+				if (pipeName->Buffer[pi] == L'\\') lastSlash = pi + 1;
+			}
+
+			USHORT nameStart = lastSlash;
+			USHORT nameLen = pipeChars - nameStart;
+
+			if (nameLen >= 8) {
+				USHORT hexCount = 0;
+				USHORT dashCount = 0;
+
+				for (USHORT ci = nameStart; ci < pipeChars; ci++) {
+					WCHAR ch = pipeName->Buffer[ci];
+					if ((ch >= L'0' && ch <= L'9') ||
+						(ch >= L'a' && ch <= L'f') ||
+						(ch >= L'A' && ch <= L'F')) {
+						hexCount++;
+					} else if (ch == L'-') {
+						dashCount++;
+					}
+				}
+
+				// High-entropy: >= 75% hex digits, or looks like a GUID (has dashes + hex)
+				BOOLEAN isHighEntropy = FALSE;
+				USHORT nonDashLen = nameLen - dashCount;
+
+				if (nonDashLen > 0 && hexCount * 100 / nonDashLen >= 75) {
+					isHighEntropy = TRUE;
+				}
+
+				// GUID pattern: exactly 32 hex + 4 dashes = 36 chars (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+				if (dashCount >= 3 && hexCount >= 24 && nameLen >= 32) {
+					isHighEntropy = TRUE;
+				}
+
+				if (isHighEntropy) {
+					char msg[224];
+					RtlStringCbPrintfA(msg, sizeof(msg),
+						"NtCreateNamedPipeFile: High-entropy/random pipe name by '%s' "
+						"— possible C2 with randomized pipe names (evasion)",
+						name);
+					EmitSyscallNotif(0, msg, caller, nullptr, FALSE); // WARNING
+				}
+			}
+		}
+	}
+
 	// ---- Gap #1: Pipe squatting detection ----
 	// Non-system process creating a pipe with a name matching a sensitive system
 	// pipe (lsarpc, svcctl, samr, etc.) — attacker creates a fake pipe to intercept
