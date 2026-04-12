@@ -745,7 +745,162 @@ static VOID EmitWfpAlert(BufferQueue* bufQueue, const char* msg)
     }
 }
 
+// Helper: describe a filter condition field key in human-readable form.
+static const char* ConditionFieldName(const GUID& fieldKey)
+{
+    // FWPM_CONDITION_ALE_APP_ID
+    static const GUID kAppId =
+        { 0xd78e1e87, 0x8644, 0x4ea5,
+          { 0x94, 0x37, 0xd8, 0x09, 0xec, 0xef, 0xc9, 0x71 } };
+    // FWPM_CONDITION_IP_REMOTE_ADDRESS
+    static const GUID kRemoteAddr =
+        { 0xb235ae9a, 0x1d64, 0x49b8,
+          { 0xa4, 0x4c, 0x5f, 0xf3, 0xd9, 0x09, 0x50, 0x45 } };
+    // FWPM_CONDITION_IP_REMOTE_PORT
+    static const GUID kRemotePort =
+        { 0xc35a604d, 0xd22b, 0x4e1a,
+          { 0x91, 0xb4, 0x68, 0xf6, 0x74, 0xee, 0x67, 0x4b } };
+    // FWPM_CONDITION_IP_PROTOCOL
+    static const GUID kProtocol =
+        { 0x3971ef2b, 0x623e, 0x4f9a,
+          { 0x8c, 0xb1, 0x6e, 0x79, 0xb8, 0x06, 0xb9, 0xa7 } };
+    // FWPM_CONDITION_IP_LOCAL_PORT
+    static const GUID kLocalPort =
+        { 0x0c1ba1af, 0x5765, 0x453f,
+          { 0xaf, 0x22, 0xa8, 0xf4, 0xfe, 0x04, 0x85, 0x64 } };
+    // FWPM_CONDITION_IP_LOCAL_ADDRESS
+    static const GUID kLocalAddr =
+        { 0xd9ee00de, 0xc1ef, 0x4617,
+          { 0xbf, 0xe3, 0xff, 0xd8, 0xf5, 0xa0, 0x89, 0x57 } };
+
+    if (RtlCompareMemory(&fieldKey, &kAppId, sizeof(GUID)) == sizeof(GUID))
+        return "ALE_APP_ID";
+    if (RtlCompareMemory(&fieldKey, &kRemoteAddr, sizeof(GUID)) == sizeof(GUID))
+        return "IP_REMOTE_ADDRESS";
+    if (RtlCompareMemory(&fieldKey, &kRemotePort, sizeof(GUID)) == sizeof(GUID))
+        return "IP_REMOTE_PORT";
+    if (RtlCompareMemory(&fieldKey, &kProtocol, sizeof(GUID)) == sizeof(GUID))
+        return "IP_PROTOCOL";
+    if (RtlCompareMemory(&fieldKey, &kLocalPort, sizeof(GUID)) == sizeof(GUID))
+        return "IP_LOCAL_PORT";
+    if (RtlCompareMemory(&fieldKey, &kLocalAddr, sizeof(GUID)) == sizeof(GUID))
+        return "IP_LOCAL_ADDRESS";
+    return nullptr;
+}
+
+// Helper: check if any filter condition targets an EDR-related application path.
+// EDRSilencer enumerates EDR processes and adds per-app BLOCK filters using
+// FWPM_CONDITION_ALE_APP_ID with the device-path blob from
+// FwpmGetAppIdFromFileName.  The blob is a wide-string device path like
+// \\device\\harddiskvolume3\\program files\\norton\\nortonedr.exe
+static BOOLEAN ConditionTargetsEdr(const FWPM_FILTER_CONDITION* conds, UINT32 numConds)
+{
+    static const GUID kAppId =
+        { 0xd78e1e87, 0x8644, 0x4ea5,
+          { 0x94, 0x37, 0xd8, 0x09, 0xec, 0xef, 0xc9, 0x71 } };
+
+    // Known EDR-related executable substrings (case-insensitive compare below)
+    static const WCHAR* kEdrNames[] = {
+        L"nortonedr",    L"nortonav",     L"norton",
+        L"svchost",                       // telemetry often flows via svchost
+        L"defender",     L"msmpeng",      // adjacent EDR that attackers also target
+        L"crowdstrike",  L"csfalcon",
+        L"sentinelagent",L"sentinelone",
+        L"carbonblack",  L"cb.exe",
+        L"cylance",      L"elastic",
+        L"mdatp",        L"sense.exe",    // Microsoft Defender for Endpoint
+    };
+
+    for (UINT32 c = 0; c < numConds; c++) {
+        if (RtlCompareMemory(&conds[c].fieldKey, &kAppId, sizeof(GUID)) != sizeof(GUID))
+            continue;
+
+        // The conditionValue for ALE_APP_ID is FWP_BYTE_BLOB_TYPE
+        if (conds[c].conditionValue.type != FWP_BYTE_BLOB_TYPE ||
+            !conds[c].conditionValue.byteBlob ||
+            !conds[c].conditionValue.byteBlob->data ||
+            conds[c].conditionValue.byteBlob->size < 4)
+            continue;
+
+        // The blob is a null-terminated wide string device path
+        const WCHAR* appPath = (const WCHAR*)conds[c].conditionValue.byteBlob->data;
+        ULONG appPathLen = conds[c].conditionValue.byteBlob->size / sizeof(WCHAR);
+
+        for (int e = 0; e < ARRAYSIZE(kEdrNames); e++) {
+            // Case-insensitive substring search
+            UNICODE_STRING haystack, needle;
+            RtlInitUnicodeString(&needle, kEdrNames[e]);
+            haystack.Buffer = (PWCH)appPath;
+            haystack.Length = (USHORT)(appPathLen * sizeof(WCHAR));
+            haystack.MaximumLength = haystack.Length;
+
+            // Manual case-insensitive substring search
+            if (needle.Length / sizeof(WCHAR) > appPathLen) continue;
+            ULONG needleChars = needle.Length / sizeof(WCHAR);
+            for (ULONG pos = 0; pos + needleChars <= appPathLen; pos++) {
+                BOOLEAN match = TRUE;
+                for (ULONG k = 0; k < needleChars; k++) {
+                    WCHAR a = appPath[pos + k];
+                    WCHAR b = kEdrNames[e][k];
+                    if (a >= L'A' && a <= L'Z') a += 32;
+                    if (b >= L'A' && b <= L'Z') b += 32;
+                    if (a != b) { match = FALSE; break; }
+                }
+                if (match) return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+// Helper: build a human-readable summary of a filter's conditions.
+static void DescribeFilterConditions(const FWPM_FILTER* filter,
+                                     char* out, SIZE_T outSize)
+{
+    out[0] = '\0';
+    if (!filter->numFilterConditions || !filter->filterCondition) {
+        RtlStringCbCopyA(out, outSize, "conditions: <none/blanket>");
+        return;
+    }
+
+    SIZE_T offset = 0;
+    RtlStringCbPrintfA(out, outSize, "conditions(%u): ", filter->numFilterConditions);
+    offset = strlen(out);
+
+    for (UINT32 c = 0; c < filter->numFilterConditions && offset < outSize - 40; c++) {
+        const FWPM_FILTER_CONDITION* cond = &filter->filterCondition[c];
+        const char* name = ConditionFieldName(cond->fieldKey);
+
+        if (name) {
+            // For known fields, add the name and value summary
+            if (cond->conditionValue.type == FWP_UINT16) {
+                RtlStringCbPrintfA(out + offset, outSize - offset,
+                    "[%s=%u] ", name, cond->conditionValue.uint16);
+            } else if (cond->conditionValue.type == FWP_UINT32) {
+                RtlStringCbPrintfA(out + offset, outSize - offset,
+                    "[%s=0x%x] ", name, cond->conditionValue.uint32);
+            } else if (cond->conditionValue.type == FWP_BYTE_BLOB_TYPE &&
+                       cond->conditionValue.byteBlob &&
+                       cond->conditionValue.byteBlob->data) {
+                // For ALE_APP_ID, show a truncated path
+                const WCHAR* path = (const WCHAR*)cond->conditionValue.byteBlob->data;
+                RtlStringCbPrintfA(out + offset, outSize - offset,
+                    "[%s='%.60S'] ", name, path);
+            } else {
+                RtlStringCbPrintfA(out + offset, outSize - offset,
+                    "[%s] ", name);
+            }
+        } else {
+            RtlStringCbPrintfA(out + offset, outSize - offset, "[unknown_field] ");
+        }
+        offset = strlen(out);
+    }
+}
+
 // Helper: enumerate filters on a given layer for foreign BLOCK entries.
+// Inspects filterCondition arrays to identify EDR-targeted filters
+// (EDRSilencer uses FWPM_CONDITION_ALE_APP_ID with EDR executable paths)
+// and reports condition details for forensic analysis.
 static BOOLEAN CheckLayerForForeignBlocks(
     HANDLE engine, const GUID& layerKey, UINT64 ourFilterId,
     const char* layerName, BufferQueue* bufQueue)
@@ -772,37 +927,56 @@ static BOOLEAN CheckLayerForForeignBlocks(
                         &NORTONAV_SUBLAYER_GUID, sizeof(GUID)) == sizeof(GUID))
                     continue;
 
-                if (entries[i]->action.type == FWP_ACTION_BLOCK) {
-                    char msg[350];
-                    RtlStringCbPrintfA(msg, sizeof(msg),
-                        "WFP TAMPER: foreign BLOCK filter (id=%llu) on %s "
-                        "— EDRSilencer / telemetry blocking (display: '%S')",
-                        entries[i]->filterId, layerName,
-                        entries[i]->displayData.name
-                            ? entries[i]->displayData.name : L"<none>");
-                    EmitWfpAlert(bufQueue, msg);
-                    ok = FALSE;
-                }
+                BOOLEAN isMalicious =
+                    (entries[i]->action.type == FWP_ACTION_BLOCK) ||
+                    (entries[i]->action.type == FWP_ACTION_CALLOUT_TERMINATING &&
+                     RtlCompareMemory(&entries[i]->action.calloutKey,
+                         &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID));
 
-                // Also flag CALLOUT_TERMINATING filters that reference a non-Norton
-                // callout — an attacker can register their own callout that drops
-                // packets before our callout ever sees them.
-                if (entries[i]->action.type == FWP_ACTION_CALLOUT_TERMINATING) {
-                    if (RtlCompareMemory(&entries[i]->action.calloutKey,
-                            &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID)) {
-                        char msg[350];
-                        RtlStringCbPrintfA(msg, sizeof(msg),
-                            "WFP TAMPER: foreign CALLOUT_TERMINATING filter (id=%llu) "
-                            "on %s with non-NortonEDR callout — rogue callout may "
-                            "intercept/block traffic before our callout fires "
-                            "(display: '%S')",
-                            entries[i]->filterId, layerName,
-                            entries[i]->displayData.name
-                                ? entries[i]->displayData.name : L"<none>");
-                        EmitWfpAlert(bufQueue, msg);
-                        ok = FALSE;
-                    }
+                if (!isMalicious) continue;
+
+                // Build condition description for the alert
+                char condDesc[512];
+                DescribeFilterConditions(entries[i], condDesc, sizeof(condDesc));
+
+                // Check if conditions specifically target EDR processes
+                BOOLEAN targetsEdr = ConditionTargetsEdr(
+                    entries[i]->filterCondition,
+                    entries[i]->numFilterConditions);
+
+                const char* actionStr =
+                    (entries[i]->action.type == FWP_ACTION_BLOCK)
+                        ? "BLOCK" : "CALLOUT_TERMINATING";
+
+                char msg[700];
+                if (targetsEdr) {
+                    // CRITICAL: filter specifically targets EDR executable(s)
+                    // This is the EDRSilencer signature — per-app BLOCK filter
+                    RtlStringCbPrintfA(msg, sizeof(msg),
+                        "WFP TAMPER CRITICAL: foreign %s filter (id=%llu, weight=%llu) "
+                        "on %s TARGETS EDR PROCESS — EDRSilencer-class attack! "
+                        "display='%S', %s",
+                        actionStr,
+                        entries[i]->filterId,
+                        entries[i]->weight.uint64,
+                        layerName,
+                        entries[i]->displayData.name
+                            ? entries[i]->displayData.name : L"<none>",
+                        condDesc);
+                } else {
+                    RtlStringCbPrintfA(msg, sizeof(msg),
+                        "WFP TAMPER: foreign %s filter (id=%llu, weight=%llu) on %s "
+                        "— possible telemetry blocking, display='%S', %s",
+                        actionStr,
+                        entries[i]->filterId,
+                        entries[i]->weight.uint64,
+                        layerName,
+                        entries[i]->displayData.name
+                            ? entries[i]->displayData.name : L"<none>",
+                        condDesc);
                 }
+                EmitWfpAlert(bufQueue, msg);
+                ok = FALSE;
             }
             FwpmFreeMemory((void**)&entries);
         }
