@@ -144,6 +144,55 @@ static IO_RATE_SLOT g_IoRateSlots[IO_RATE_TRACKER_SLOTS];
 static KSPIN_LOCK   g_IoRateLock;
 
 // ---------------------------------------------------------------------------
+// Per-IRP-type invocation counters — callback silencing detection.
+// A higher-altitude malicious filter returning FLT_PREOP_COMPLETE causes FltMgr
+// to skip all lower-altitude PreOp AND PostOp callbacks.  If our counters drop
+// from active to zero for two consecutive integrity checks, a hostile filter is
+// completing I/O above us.
+// ---------------------------------------------------------------------------
+#define PREOP_COUNTER_SLOTS  7   // CREATE, WRITE, SET_INFO, DIR_CTRL, FS_CTRL, SET_EA, NET_QUERY
+enum PreOpCounterIdx : ULONG {
+    PREOP_CREATE       = 0,
+    PREOP_WRITE        = 1,
+    PREOP_SET_INFO     = 2,
+    PREOP_DIR_CTRL     = 3,
+    PREOP_FS_CTRL      = 4,
+    PREOP_SET_EA       = 5,
+    PREOP_NET_QUERY    = 6,
+};
+static const char* kPreOpNames[] = {
+    "IRP_MJ_CREATE", "IRP_MJ_WRITE", "IRP_MJ_SET_INFORMATION",
+    "IRP_MJ_DIRECTORY_CONTROL", "IRP_MJ_FILE_SYSTEM_CONTROL",
+    "IRP_MJ_SET_EA", "IRP_MJ_NETWORK_QUERY_OPEN"
+};
+// Live counters — incremented in each PreOp via InterlockedIncrement.
+static volatile LONG g_PreOpCounters[PREOP_COUNTER_SLOTS] = {};
+// Previous interval snapshot — copied from g_PreOpCounters then counters reset.
+static LONG  g_PreOpPrev[PREOP_COUNTER_SLOTS] = {};
+// Consecutive-zero count per slot.  Alert fires when this reaches 2 for a slot
+// whose previous non-zero value was above the activity threshold.
+static ULONG g_PreOpZeroRuns[PREOP_COUNTER_SLOTS] = {};
+// Minimum previous count to consider a slot "was active" (avoids false positives
+// on rarely-used IRP types like SET_EA).
+#define PREOP_ACTIVE_THRESHOLD  50
+// How many consecutive zero intervals before alerting.
+#define PREOP_ZERO_ALERT_RUNS   2
+// Whether we have completed at least one full interval (skip first check).
+static BOOLEAN g_PreOpBaselined = FALSE;
+
+// ---------------------------------------------------------------------------
+// Canary I/O heartbeat — verify our PreCreate callback is being invoked.
+// The periodic integrity check issues a ZwCreateFile on a canary path.  PreCreate
+// recognises the canary and bumps g_CanaryHits.  If the counter doesn't increment,
+// a higher-altitude filter is completing our creates before we see them.
+// ---------------------------------------------------------------------------
+static volatile LONG g_CanaryHits      = 0;
+static BOOLEAN       g_CanaryAlerted   = FALSE;
+// The canary file lives in our driver's own directory — no actual file is created
+// because we use FILE_OPEN (fail if not exists).  We only care whether PreCreate fires.
+static const WCHAR   g_CanaryPath[]    = L"\\SystemRoot\\NortonEDR_canary_heartbeat.tmp";
+
+// ---------------------------------------------------------------------------
 // Sensitive credential file path fragments (lowercase for comparison)
 // ---------------------------------------------------------------------------
 static const PCWSTR kCredPaths[] = {
@@ -1280,6 +1329,98 @@ VOID FsFilter::ValidateMinifilterIntegrity() {
     // ---- Check 6: Notification queue pressure ----
     CheckQueuePressure();
 
+    // ---- Check 7: PreOp invocation counter silence detection ----
+    // If a higher-altitude filter starts returning FLT_PREOP_COMPLETE, our PreOp
+    // callbacks stop being invoked.  Detect this by tracking per-IRP counters
+    // across intervals and alerting on sustained zero activity for previously
+    // active IRP types.
+    {
+        LONG current[PREOP_COUNTER_SLOTS];
+        for (ULONG i = 0; i < PREOP_COUNTER_SLOTS; i++) {
+            current[i] = InterlockedExchange(&g_PreOpCounters[i], 0);
+        }
+
+        if (g_PreOpBaselined) {
+            for (ULONG i = 0; i < PREOP_COUNTER_SLOTS; i++) {
+                if (current[i] == 0 && g_PreOpPrev[i] >= PREOP_ACTIVE_THRESHOLD) {
+                    // Was active, now silent — increment zero-run counter
+                    g_PreOpZeroRuns[i]++;
+                    if (g_PreOpZeroRuns[i] == PREOP_ZERO_ALERT_RUNS) {
+                        char msg[256];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "CALLBACK SILENCING: %s PreOp dropped from %ld/interval to 0 "
+                            "for %u consecutive checks — higher-altitude filter may be "
+                            "force-completing I/O (FLT_PREOP_COMPLETE attack)!",
+                            kPreOpNames[i], g_PreOpPrev[i], PREOP_ZERO_ALERT_RUNS);
+                        EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+                        DbgPrint("[!] %s\n", msg);
+                    }
+                } else if (current[i] > 0) {
+                    // Activity resumed or continues — reset zero-run counter
+                    g_PreOpZeroRuns[i] = 0;
+                }
+                // If both current and prev are 0 (IRP type never active), leave alone
+            }
+        } else {
+            g_PreOpBaselined = TRUE;
+        }
+
+        // Shift current → prev for next interval
+        for (ULONG i = 0; i < PREOP_COUNTER_SLOTS; i++) {
+            g_PreOpPrev[i] = current[i];
+        }
+    }
+
+    // ---- Check 8: Canary I/O heartbeat ----
+    // Issue a ZwCreateFile on a known canary path with FILE_OPEN (open-only, no create).
+    // Our PreCreate will recognise the canary filename and bump g_CanaryHits.
+    // If the counter doesn't increment, a higher filter is completing our creates.
+    {
+        LONG hitsBefore = InterlockedCompareExchange(&g_CanaryHits, 0, 0);
+
+        UNICODE_STRING canaryName;
+        RtlInitUnicodeString(&canaryName, g_CanaryPath);
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &canaryName,
+            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        IO_STATUS_BLOCK iosb;
+        HANDLE hCanary = nullptr;
+
+        // FILE_OPEN will fail with STATUS_OBJECT_NAME_NOT_FOUND — we don't care
+        // about the result, only that PreCreate fires.
+        NTSTATUS canSt = ZwCreateFile(
+            &hCanary, FILE_READ_ATTRIBUTES, &oa, &iosb,
+            NULL, FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,  // open only — don't create the file
+            FILE_NON_DIRECTORY_FILE,
+            NULL, 0);
+
+        if (NT_SUCCESS(canSt) && hCanary)
+            ZwClose(hCanary);
+
+        // Check if PreCreate saw the canary
+        LONG hitsAfter = InterlockedCompareExchange(&g_CanaryHits, 0, 0);
+
+        if (hitsAfter <= hitsBefore) {
+            // PreCreate didn't fire for our canary — callback silenced
+            if (!g_CanaryAlerted) {
+                char msg[256];
+                RtlStringCchPrintfA(msg, sizeof(msg),
+                    "CANARY I/O FAILED: PreCreate was NOT invoked for canary file '%ws' "
+                    "— a higher-altitude minifilter is force-completing IRP_MJ_CREATE, "
+                    "blinding the EDR to all file opens!",
+                    g_CanaryPath);
+                EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+                DbgPrint("[!] %s\n", msg);
+                g_CanaryAlerted = TRUE;
+            }
+        } else {
+            // Canary hit — pipeline is healthy
+            g_CanaryAlerted = FALSE;
+        }
+    }
+
     DbgPrint("[*] FsFilter: minifilter integrity check complete\n");
 }
 
@@ -1741,6 +1882,37 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
     PVOID*                     CompletionContext
 ) {
     UNREFERENCED_PARAMETER(CompletionContext);
+
+    InterlockedIncrement(&g_PreOpCounters[PREOP_CREATE]);
+
+    // ---- Canary I/O heartbeat recognition ----
+    // Must run BEFORE the KernelMode early-return because ZwCreateFile (used by
+    // the canary heartbeat in ValidateMinifilterIntegrity) originates from kernel
+    // mode.  If this create targets our canary path, bump the hit counter and
+    // skip all other processing.
+    if (FltObjects && FltObjects->FileObject &&
+        FltObjects->FileObject->FileName.Length > 0 &&
+        FltObjects->FileObject->FileName.Buffer)
+    {
+        static const WCHAR kCanarySuffix[] = L"NortonEDR_canary_heartbeat.tmp";
+        static const USHORT kSuffixChars = (sizeof(kCanarySuffix) / sizeof(WCHAR)) - 1;
+        USHORT fnChars = FltObjects->FileObject->FileName.Length / sizeof(WCHAR);
+        if (fnChars >= kSuffixChars) {
+            PWCHAR tail = FltObjects->FileObject->FileName.Buffer + (fnChars - kSuffixChars);
+            BOOLEAN match = TRUE;
+            for (USHORT ci = 0; ci < kSuffixChars && match; ci++) {
+                WCHAR c = tail[ci];
+                if (c >= L'A' && c <= L'Z') c |= 0x20;
+                WCHAR e = kCanarySuffix[ci];
+                if (e >= L'A' && e <= L'Z') e |= 0x20;
+                if (c != e) match = FALSE;
+            }
+            if (match) {
+                InterlockedIncrement(&g_CanaryHits);
+                return FLT_PREOP_SUCCESS_NO_CALLBACK;
+            }
+        }
+    }
 
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
@@ -2818,6 +2990,8 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreWrite(
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
 
+    InterlockedIncrement(&g_PreOpCounters[PREOP_WRITE]);
+
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     HANDLE pid = PsGetProcessId(IoThreadToProcess(Data->Thread));
@@ -2977,6 +3151,8 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetInformation(
 ) {
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
+
+    InterlockedIncrement(&g_PreOpCounters[PREOP_SET_INFO]);
 
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
@@ -3220,6 +3396,8 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreDirControl(
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
 
+    InterlockedIncrement(&g_PreOpCounters[PREOP_DIR_CTRL]);
+
     if (Data->Iopb->MinorFunction != IRP_MN_QUERY_DIRECTORY)
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -3251,6 +3429,8 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreFsControl(
 ) {
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
+
+    InterlockedIncrement(&g_PreOpCounters[PREOP_FS_CTRL]);
 
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
@@ -3552,6 +3732,8 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetEa(
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
 
+    InterlockedIncrement(&g_PreOpCounters[PREOP_SET_EA]);
+
     if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     PEPROCESS process  = IoThreadToProcess(Data->Thread);
@@ -3610,6 +3792,8 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreNetworkQueryOpen(
 ) {
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
+
+    InterlockedIncrement(&g_PreOpCounters[PREOP_NET_QUERY]);
 
     PFLT_FILE_NAME_INFORMATION nameInfo = nullptr;
     NTSTATUS status = FltGetFileNameInformation(

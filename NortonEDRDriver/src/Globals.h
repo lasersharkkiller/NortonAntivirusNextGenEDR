@@ -1357,8 +1357,9 @@ public:
 
     // Periodic minifilter integrity validation — called from AntiTamper IntegrityWorkRoutine.
     // Verifies: instance attachment, callback pointer integrity, altitude displacement,
-    // FltMgr-internal _FLT_FILTER structure integrity, FastIO dispatch table, and
-    // notification queue pressure.
+    // FltMgr-internal _FLT_FILTER structure integrity, FastIO dispatch table,
+    // notification queue pressure, PreOp invocation silence detection, and
+    // canary I/O heartbeat (FLT_PREOP_COMPLETE attack detection).
     static VOID ValidateMinifilterIntegrity();
 
     // Snapshot of our PreOp callback function pointers for DKOM detection.
