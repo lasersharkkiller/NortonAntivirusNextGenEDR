@@ -911,6 +911,17 @@ NTSTATUS FLTAPI FsFilter::FilterUnloadCallback(FLT_FILTER_UNLOAD_FLAGS Flags) {
     // Voluntary unloads (fltmc unload, FltUnloadFilter from mimidrv/BYOVD) are blocked.
     if (!(Flags & FLTFL_FILTER_UNLOAD_MANDATORY)) {
         DbgPrint("[!] FsFilter: voluntary unload attempt blocked (mimidrv defense)\n");
+
+        // Fire a CRITICAL alert — someone is actively trying to evict our minifilter.
+        char* procName = PsGetProcessImageFileName(IoGetCurrentProcess());
+        char msg[224];
+        RtlStringCchPrintfA(msg, sizeof(msg),
+            "MINIFILTER UNLOAD BLOCKED: voluntary unload attempt by '%s' (pid=%llu) "
+            "— fltmc unload / FltUnloadFilter / mimidrv eviction denied!",
+            procName ? procName : "?",
+            (ULONG64)(ULONG_PTR)PsGetCurrentProcessId());
+        EnqueueFsAlert(PsGetCurrentProcessId(), procName, msg, TRUE);
+
         return STATUS_FLT_DO_NOT_DETACH;
     }
     FsFilter::Cleanup();

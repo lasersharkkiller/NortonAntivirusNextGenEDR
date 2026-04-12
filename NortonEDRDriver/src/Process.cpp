@@ -1386,6 +1386,18 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"bcdedit /set nointegritychecks", "bcdedit nointegritychecks -- CI bypass disables image hash validation", TRUE },
 				{ L"bcdedit /set loadoptions DISABLE_INTEGRITY_CHECKS", "bcdedit DISABLE_INTEGRITY_CHECKS -- CI bypass via boot options", TRUE },
 				{ L"bcdedit /set loadoptions DDISABLE_INTEGRITY_CHECKS", "bcdedit DDISABLE_INTEGRITY_CHECKS -- CI bypass (double-D variant)", TRUE },
+				// --- T1562: fltmc.exe minifilter evasion ---
+				{ L"fltmc unload",             "fltmc unload -- minifilter unload attempt",          TRUE  },
+				{ L"fltmc.exe unload",         "fltmc.exe unload -- minifilter unload attempt",      TRUE  },
+				{ L"fltmc detach",             "fltmc detach -- minifilter instance detach attempt",  TRUE  },
+				{ L"fltmc.exe detach",         "fltmc.exe detach -- minifilter instance detach",      TRUE  },
+				// --- Reconnaissance: fltmc.exe enumeration ---
+				{ L"fltmc instances",          "fltmc instances -- minifilter recon enumeration",     FALSE },
+				{ L"fltmc.exe instances",      "fltmc.exe instances -- minifilter recon enumeration", FALSE },
+				{ L"fltmc filters",            "fltmc filters -- minifilter recon enumeration",       FALSE },
+				{ L"fltmc.exe filters",        "fltmc.exe filters -- minifilter recon enumeration",   FALSE },
+				{ L"fltmc volumes",            "fltmc volumes -- minifilter recon enumeration",       FALSE },
+				{ L"fltmc.exe volumes",        "fltmc.exe volumes -- minifilter recon enumeration",   FALSE },
 				{ nullptr, nullptr, FALSE }
 			};
 
