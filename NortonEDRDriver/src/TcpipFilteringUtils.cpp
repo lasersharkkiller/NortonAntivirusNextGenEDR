@@ -953,6 +953,69 @@ BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Check 6: enumerate foreign sublayers.
+    //
+    // Attack: FwpmSubLayerAdd from user-mode (fwpuclnt.dll) creates a rogue
+    // sublayer.  WFP arbitration evaluates sublayers independently — if any
+    // sublayer blocks, the packet is blocked regardless of other sublayers'
+    // PERMIT decisions.  A high-weight foreign sublayer with BLOCK filters
+    // will be caught by Check 4, but enumerating sublayers directly gives us:
+    //   - Early warning of staged sublayers (created but no filters yet)
+    //   - Visibility into sublayer weight manipulation
+    //   - Detection of non-persistent runtime-added sublayers (vs boot-time
+    //     system sublayers like Windows Firewall's)
+    //
+    // We flag non-persistent foreign sublayers added at runtime.  Known system
+    // sublayers (FWPM_SUBLAYER_FLAG_PERSISTENT or matching well-known provider
+    // keys) are skipped.
+    // -----------------------------------------------------------------------
+    {
+        HANDLE enumHandle = nullptr;
+        NTSTATUS st = FwpmSubLayerCreateEnumHandle(EngineHandle, nullptr, &enumHandle);
+        if (NT_SUCCESS(st) && enumHandle) {
+            FWPM_SUBLAYER** sublayers = nullptr;
+            UINT32 numSublayers = 0;
+            st = FwpmSubLayerEnum(EngineHandle, enumHandle, 64, &sublayers, &numSublayers);
+            if (NT_SUCCESS(st) && sublayers) {
+                for (UINT32 i = 0; i < numSublayers; i++) {
+                    if (!sublayers[i]) continue;
+
+                    // Skip our own sublayer
+                    if (RtlCompareMemory(&sublayers[i]->subLayerKey,
+                            &NORTONAV_SUBLAYER_GUID, sizeof(GUID)) == sizeof(GUID))
+                        continue;
+
+                    // Skip persistent (boot-time) sublayers — these are typically
+                    // Windows Firewall, IPsec, and other OS components.
+                    if (sublayers[i]->flags & FWPM_SUBLAYER_FLAG_PERSISTENT)
+                        continue;
+
+                    // Non-persistent foreign sublayer — suspicious at runtime.
+                    // High-weight sublayers are especially dangerous because WFP
+                    // evaluates higher-weight sublayers first in arbitration.
+                    const UINT16 highWeightThreshold = 0x8000;
+                    BOOLEAN highWeight = (sublayers[i]->weight >= highWeightThreshold);
+
+                    char msg[400];
+                    RtlStringCbPrintfA(msg, sizeof(msg),
+                        "WFP: non-persistent foreign sublayer detected "
+                        "(weight=%u%s, display='%S') — possible rogue sublayer "
+                        "injection via FwpmSubLayerAdd to stage BLOCK filters "
+                        "or manipulate WFP arbitration",
+                        sublayers[i]->weight,
+                        highWeight ? " HIGH-WEIGHT" : "",
+                        sublayers[i]->displayData.name
+                            ? sublayers[i]->displayData.name : L"<none>");
+                    EmitWfpAlert(bufQueue, msg);
+                    ok = FALSE;
+                }
+                FwpmFreeMemory((void**)&sublayers);
+            }
+            FwpmSubLayerDestroyEnumHandle(EngineHandle, enumHandle);
+        }
+    }
+
     return ok;
 }
 
