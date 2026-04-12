@@ -745,12 +745,82 @@ static VOID EmitWfpAlert(BufferQueue* bufQueue, const char* msg)
     }
 }
 
+// Helper: enumerate filters on a given layer for foreign BLOCK entries.
+static BOOLEAN CheckLayerForForeignBlocks(
+    HANDLE engine, const GUID& layerKey, UINT64 ourFilterId,
+    const char* layerName, BufferQueue* bufQueue)
+{
+    BOOLEAN ok = TRUE;
+    HANDLE enumHandle = nullptr;
+    FWPM_FILTER_ENUM_TEMPLATE enumTemplate = {};
+    enumTemplate.layerKey           = layerKey;
+    enumTemplate.providerKey        = nullptr;
+    enumTemplate.flags              = 0;
+    enumTemplate.numFilterConditions = 0;
+    enumTemplate.actionMask         = 0xFFFFFFFF;
+
+    NTSTATUS st = FwpmFilterCreateEnumHandle(engine, &enumTemplate, &enumHandle);
+    if (NT_SUCCESS(st) && enumHandle) {
+        FWPM_FILTER** entries = nullptr;
+        UINT32 numEntries = 0;
+        st = FwpmFilterEnum(engine, enumHandle, 128, &entries, &numEntries);
+        if (NT_SUCCESS(st) && entries) {
+            for (UINT32 i = 0; i < numEntries; i++) {
+                if (!entries[i]) continue;
+                if (entries[i]->filterId == ourFilterId) continue;
+                if (RtlCompareMemory(&entries[i]->subLayerKey,
+                        &NORTONAV_SUBLAYER_GUID, sizeof(GUID)) == sizeof(GUID))
+                    continue;
+
+                if (entries[i]->action.type == FWP_ACTION_BLOCK) {
+                    char msg[350];
+                    RtlStringCbPrintfA(msg, sizeof(msg),
+                        "WFP TAMPER: foreign BLOCK filter (id=%llu) on %s "
+                        "— EDRSilencer / telemetry blocking (display: '%S')",
+                        entries[i]->filterId, layerName,
+                        entries[i]->displayData.name
+                            ? entries[i]->displayData.name : L"<none>");
+                    EmitWfpAlert(bufQueue, msg);
+                    ok = FALSE;
+                }
+
+                // Also flag CALLOUT_TERMINATING filters that reference a non-Norton
+                // callout — an attacker can register their own callout that drops
+                // packets before our callout ever sees them.
+                if (entries[i]->action.type == FWP_ACTION_CALLOUT_TERMINATING) {
+                    if (RtlCompareMemory(&entries[i]->action.calloutKey,
+                            &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID)) {
+                        char msg[350];
+                        RtlStringCbPrintfA(msg, sizeof(msg),
+                            "WFP TAMPER: foreign CALLOUT_TERMINATING filter (id=%llu) "
+                            "on %s with non-NortonEDR callout — rogue callout may "
+                            "intercept/block traffic before our callout fires "
+                            "(display: '%S')",
+                            entries[i]->filterId, layerName,
+                            entries[i]->displayData.name
+                                ? entries[i]->displayData.name : L"<none>");
+                        EmitWfpAlert(bufQueue, msg);
+                        ok = FALSE;
+                    }
+                }
+            }
+            FwpmFreeMemory((void**)&entries);
+        }
+        FwpmFilterDestroyEnumHandle(engine, enumHandle);
+    }
+    return ok;
+}
+
 BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
 {
     if (!EngineHandle || !bufQueue) return FALSE;
     BOOLEAN ok = TRUE;
 
-    // Check 1: verify our filter is still present
+    // -----------------------------------------------------------------------
+    // Check 1: verify our filter is still registered.
+    // Attack: FwpmFilterDeleteById from user-mode (admin) silently removes
+    // our filter — our callout never fires, all network telemetry stops.
+    // -----------------------------------------------------------------------
     if (FilterId != 0) {
         FWPM_FILTER* filterObj = nullptr;
         NTSTATUS st = FwpmFilterGetById(EngineHandle, FilterId, &filterObj);
@@ -763,53 +833,123 @@ BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
         if (filterObj) FwpmFreeMemory((void**)&filterObj);
     }
 
-    // Check 2: enumerate foreign filters on our layer that could block our traffic
+    // -----------------------------------------------------------------------
+    // Check 2: verify our callout is still registered.
+    // Attack: FwpmCalloutDeleteById — removes our callout from the WFP engine.
+    // Even if the filter survives, with no callout behind it the filter is inert.
+    // Also checks FwpsCalloutUnregisterById — removes the kernel-side callout
+    // registration (classifyFn stops being invoked).
+    // -----------------------------------------------------------------------
+    if (AddCalloutId != 0) {
+        FWPM_CALLOUT* calloutObj = nullptr;
+        NTSTATUS st = FwpmCalloutGetById(EngineHandle, AddCalloutId, &calloutObj);
+        if (!NT_SUCCESS(st) || !calloutObj) {
+            EmitWfpAlert(bufQueue,
+                "WFP TAMPER: NortonEDR WFP callout DELETED via FwpmCalloutDeleteById "
+                "— classifyFn will not be invoked, network monitoring blind");
+            ok = FALSE;
+        }
+        if (calloutObj) FwpmFreeMemory((void**)&calloutObj);
+    }
+
+    // -----------------------------------------------------------------------
+    // Check 3: verify our sublayer is still registered.
+    // Attack: FwpmSubLayerDeleteByKey — removes our sublayer, which cascades
+    // and deletes all filters associated with it (including ours).
+    // -----------------------------------------------------------------------
+    {
+        FWPM_SUBLAYER* subObj = nullptr;
+        NTSTATUS st = FwpmSubLayerGetByKey(EngineHandle, &NORTONAV_SUBLAYER_GUID, &subObj);
+        if (!NT_SUCCESS(st) || !subObj) {
+            EmitWfpAlert(bufQueue,
+                "WFP TAMPER: NortonEDR sublayer DELETED via FwpmSubLayerDeleteByKey "
+                "— all filters in our sublayer cascade-deleted");
+            ok = FALSE;
+        }
+        if (subObj) FwpmFreeMemory((void**)&subObj);
+    }
+
+    // -----------------------------------------------------------------------
+    // Check 4: enumerate foreign filters on our layer AND adjacent layers.
+    //
+    // Our callout lives on FWPM_LAYER_OUTBOUND_TRANSPORT_V4, but an attacker
+    // can also block traffic at:
+    //   - ALE_AUTH_CONNECT_V4: fires BEFORE the transport layer, can block
+    //     NortonEDR.exe outbound connections at the connection-auth stage
+    //   - OUTBOUND_NETWORK_V4: IP-level layer, also pre-empts transport
+    //
+    // We check all three for foreign BLOCK filters and for CALLOUT_TERMINATING
+    // filters that reference a non-Norton callout (rogue callout injection via
+    // fwpuclnt!FwpmCalloutAdd).
+    // -----------------------------------------------------------------------
+    if (!CheckLayerForForeignBlocks(EngineHandle,
+            FWPM_LAYER_OUTBOUND_TRANSPORT_V4, FilterId,
+            "OUTBOUND_TRANSPORT_V4", bufQueue))
+        ok = FALSE;
+
+    if (!CheckLayerForForeignBlocks(EngineHandle,
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0,
+            "ALE_AUTH_CONNECT_V4", bufQueue))
+        ok = FALSE;
+
+    if (!CheckLayerForForeignBlocks(EngineHandle,
+            FWPM_LAYER_OUTBOUND_IPPACKET_V4, 0,
+            "OUTBOUND_IPPACKET_V4", bufQueue))
+        ok = FALSE;
+
+    // -----------------------------------------------------------------------
+    // Check 5: enumerate foreign callouts on our layer.
+    //
+    // Attack: fwpuclnt!FwpmCalloutAdd registers a rogue callout on
+    // FWPM_LAYER_OUTBOUND_TRANSPORT_V4.  Paired with a high-weight filter,
+    // the rogue callout's classifyFn fires first and issues FWP_ACTION_BLOCK
+    // before our callout ever sees the packet.
+    //
+    // We enumerate all callouts on our layer and flag any that don't match
+    // our NORTONAV_CALLOUT_GUID.
+    // -----------------------------------------------------------------------
     {
         HANDLE enumHandle = nullptr;
-        FWPM_FILTER_ENUM_TEMPLATE enumTemplate = {};
-        enumTemplate.layerKey           = FWPM_LAYER_OUTBOUND_TRANSPORT_V4;
-        enumTemplate.providerKey        = nullptr;
-        enumTemplate.flags              = 0;
-        enumTemplate.numFilterConditions = 0;
-        enumTemplate.actionMask         = 0xFFFFFFFF;
+        FWPM_CALLOUT_ENUM_TEMPLATE enumTemplate = {};
+        enumTemplate.layerKey = FWPM_LAYER_OUTBOUND_TRANSPORT_V4;
 
-        NTSTATUS st = FwpmFilterCreateEnumHandle(
+        NTSTATUS st = FwpmCalloutCreateEnumHandle(
             EngineHandle, &enumTemplate, &enumHandle);
         if (NT_SUCCESS(st) && enumHandle) {
-            FWPM_FILTER** entries = nullptr;
-            UINT32 numEntries = 0;
-            st = FwpmFilterEnum(EngineHandle, enumHandle, 64, &entries, &numEntries);
-            if (NT_SUCCESS(st) && entries) {
-                for (UINT32 i = 0; i < numEntries; i++) {
-                    if (!entries[i]) continue;
-                    // Skip our own filter
-                    if (entries[i]->filterId == FilterId) continue;
-                    // Skip our own sublayer
-                    if (RtlCompareMemory(&entries[i]->subLayerKey,
-                            &NORTONAV_SUBLAYER_GUID, sizeof(GUID)) == sizeof(GUID))
+            FWPM_CALLOUT** callouts = nullptr;
+            UINT32 numCallouts = 0;
+            st = FwpmCalloutEnum(EngineHandle, enumHandle, 64, &callouts, &numCallouts);
+            if (NT_SUCCESS(st) && callouts) {
+                for (UINT32 i = 0; i < numCallouts; i++) {
+                    if (!callouts[i]) continue;
+                    // Skip our own callout
+                    if (RtlCompareMemory(&callouts[i]->calloutKey,
+                            &NORTONAV_CALLOUT_GUID, sizeof(GUID)) == sizeof(GUID))
                         continue;
 
-                    // Flag any BLOCK action filter on our layer — this is the
-                    // EDRSilencer pattern: add a BLOCK filter that prevents
-                    // NortonEDR.exe from sending telemetry.
-                    if (entries[i]->action.type == FWP_ACTION_BLOCK) {
-                        char msg[300];
+                    // Foreign callout on our layer — suspicious.
+                    // Not all foreign callouts are malicious (Windows Firewall uses
+                    // them), so check if they were added AFTER boot by examining
+                    // flags.  Persistent system callouts have FWPM_CALLOUT_FLAG_PERSISTENT.
+                    // Non-persistent foreign callouts added at runtime are more suspicious.
+                    BOOLEAN suspicious = !(callouts[i]->flags & FWPM_CALLOUT_FLAG_PERSISTENT);
+
+                    if (suspicious) {
+                        char msg[350];
                         RtlStringCbPrintfA(msg, sizeof(msg),
-                            "WFP TAMPER: foreign BLOCK filter (id=%llu, weight=%u) "
-                            "detected on OUTBOUND_TRANSPORT_V4 — possible EDRSilencer "
-                            "/ telemetry blocking attack (display: '%S')",
-                            entries[i]->filterId,
-                            entries[i]->weight.type == FWP_UINT8
-                                ? entries[i]->weight.uint8 : 0,
-                            entries[i]->displayData.name
-                                ? entries[i]->displayData.name : L"<none>");
+                            "WFP: non-persistent foreign callout on OUTBOUND_TRANSPORT_V4 "
+                            "(id=%lu, display='%S') — possible rogue callout injection "
+                            "via fwpuclnt!FwpmCalloutAdd to intercept/block EDR traffic",
+                            callouts[i]->calloutId,
+                            callouts[i]->displayData.name
+                                ? callouts[i]->displayData.name : L"<none>");
                         EmitWfpAlert(bufQueue, msg);
                         ok = FALSE;
                     }
                 }
-                FwpmFreeMemory((void**)&entries);
+                FwpmFreeMemory((void**)&callouts);
             }
-            FwpmFilterDestroyEnumHandle(EngineHandle, enumHandle);
+            FwpmCalloutDestroyEnumHandle(EngineHandle, enumHandle);
         }
     }
 
