@@ -750,6 +750,7 @@ class SyscallsUtils {
 	static ULONG NtCreateSectionId;      // Variable — resolved in InitIds()
 	static ULONG NtUnmapViewOfSectionId;        // Variable — resolved in InitIds()
 	static ULONG NtLoadDriverId;               // Variable — resolved in InitIds()
+	static ULONG NtUnloadDriverId;             // Variable — resolved in InitIds()
 	static ULONG NtProtectVirtualMemoryId;     // Variable — resolved in InitIds()
 	static ULONG NtCreateTransactionId;        // Variable — doppelgänging telemetry
 	static ULONG NtRollbackTransactionId;      // Variable — doppelgänging telemetry
@@ -980,6 +981,10 @@ public:
 	);
 
 	static VOID NtLoadDriverHandler(
+		PUNICODE_STRING  // DriverServiceName
+	);
+
+	static VOID NtUnloadDriverHandler(
 		PUNICODE_STRING  // DriverServiceName
 	);
 

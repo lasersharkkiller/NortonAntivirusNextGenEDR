@@ -50,6 +50,7 @@ ULONG SyscallsUtils::NtSuspendThreadId = 0;
 ULONG SyscallsUtils::NtCreateSectionId = 0;
 ULONG SyscallsUtils::NtUnmapViewOfSectionId = 0;
 ULONG SyscallsUtils::NtLoadDriverId = 0;
+ULONG SyscallsUtils::NtUnloadDriverId = 0;
 ULONG SyscallsUtils::NtProtectVirtualMemoryId = 0;
 ULONG SyscallsUtils::NtCreateTransactionId = 0;
 ULONG SyscallsUtils::NtRollbackTransactionId = 0;
@@ -614,6 +615,11 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 	else if (NtLoadDriverId != 0 && id == NtLoadDriverId) {  // NtLoadDriver — always suspicious
 
 		NtLoadDriverHandler(
+			(PUNICODE_STRING)trapFrame->Rcx  // DriverServiceName
+		);
+	}
+	else if (NtUnloadDriverId != 0 && id == NtUnloadDriverId) {  // NtUnloadDriver — EDR eviction attempt
+		NtUnloadDriverHandler(
 			(PUNICODE_STRING)trapFrame->Rcx  // DriverServiceName
 		);
 	}
@@ -1204,6 +1210,10 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtLoadDriver;
 	RtlInitUnicodeString(&usNtLoadDriver, L"NtLoadDriver");
 	NtLoadDriverId = getSSNByName(ssdtTable, &usNtLoadDriver, exportsMap);
+
+	UNICODE_STRING usNtUnloadDriver;
+	RtlInitUnicodeString(&usNtUnloadDriver, L"NtUnloadDriver");
+	NtUnloadDriverId = getSSNByName(ssdtTable, &usNtUnloadDriver, exportsMap);
 
 	UNICODE_STRING usNtProtectVm;
 	RtlInitUnicodeString(&usNtProtectVm, L"NtProtectVirtualMemory");
@@ -2633,6 +2643,52 @@ VOID SyscallsUtils::NtLoadDriverHandler(
 	}
 
 	EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, TRUE);
+}
+
+// NtUnloadDriver — direct kernel driver unload (SeLoadDriverPrivilege required).
+// An attacker with SeLoadDriverPrivilege can call NtUnloadDriver to unload
+// any kernel driver including the EDR itself.  Our ObReferenceObject bump
+// mitigates but doesn't prevent the unload request.
+// This is always CRITICAL — no legitimate user-mode software calls NtUnloadDriver
+// directly (driver management goes through SCM → services.exe).
+VOID SyscallsUtils::NtUnloadDriverHandler(
+	PUNICODE_STRING DriverServiceName
+) {
+	char msg[220] = "NtUnloadDriver: direct kernel driver UNLOAD attempt — service: ";
+	SIZE_T prefixLen = strlen(msg);
+
+	BOOLEAN isOurDriver = FALSE;
+
+	if (DriverServiceName && MmIsAddressValid(DriverServiceName)) {
+		__try {
+			if (DriverServiceName->Buffer && DriverServiceName->Length > 0) {
+				ULONG copyLen = min(
+					(ULONG)(DriverServiceName->Length / sizeof(WCHAR)),
+					(ULONG)(sizeof(msg) - prefixLen - 2));
+				for (ULONG i = 0; i < copyLen; i++) {
+					WCHAR wc = DriverServiceName->Buffer[i];
+					msg[prefixLen + i] = (wc < 128) ? (char)wc : '?';
+				}
+				msg[prefixLen + copyLen] = '\0';
+
+				// Check if they're trying to unload US specifically
+				if (UnicodeStringContains(DriverServiceName, L"NortonEDR"))
+					isOurDriver = TRUE;
+			}
+		} __except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+
+	if (isOurDriver) {
+		char edrMsg[256];
+		RtlStringCbPrintfA(edrMsg, sizeof(edrMsg),
+			"NtUnloadDriver: DIRECT EDR UNLOAD ATTEMPT by '%s' (pid=%llu) — "
+			"attacker is trying to evict NortonEDR via NtUnloadDriver!",
+			PsGetProcessImageFileName(IoGetCurrentProcess()),
+			(ULONG64)(ULONG_PTR)PsGetCurrentProcessId());
+		EmitSyscallNotif(0, edrMsg, IoGetCurrentProcess(), nullptr, TRUE);
+	} else {
+		EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, TRUE);
+	}
 }
 
 // NtCreateTransaction — Process Doppelgänging step 1.
@@ -5021,7 +5077,7 @@ static const struct { ULONG luid; const char* name; BOOLEAN critical; } kDangero
 	{ 3,  "SeAssignPrimaryTokenPrivilege", FALSE },
 	{ 7,  "SeTcbPrivilege",                TRUE  },
 	{ 9,  "SeTakeOwnershipPrivilege",      FALSE },
-	{ 10, "SeLoadDriverPrivilege",         FALSE },
+	{ 10, "SeLoadDriverPrivilege",         TRUE  },
 	{ 20, "SeDebugPrivilege",              TRUE  },
 	{ 29, "SeImpersonatePrivilege",        FALSE },
 	{ 30, "SeCreateGlobalPrivilege",       FALSE },

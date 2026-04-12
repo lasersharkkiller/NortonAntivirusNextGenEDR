@@ -763,10 +763,12 @@ NTSTATUS FsFilter::Init(PDRIVER_OBJECT DriverObject, NotifQueue* queue) {
                                 EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
                                 DbgPrint("[!] %s\n", msg);
                             }
-                            // Check 2: sandwiching — foreign filter just above us
-                            // (altitude ours+1 .. ours+10)
+                            // Check 2: sandwiching — foreign filter above us in the
+                            // FSFilter Anti-Virus range (320000–329999).  Any filter
+                            // in this range above our altitude can see all I/O before
+                            // we do and can modify/suppress it.
                             else if (foreignAlt > ourAltitude &&
-                                     foreignAlt <= ourAltitude + 10)
+                                     foreignAlt <= 329999)
                             {
                                 char nameBuf[64] = {};
                                 ANSI_STRING ansiN;
@@ -780,7 +782,7 @@ NTSTATUS FsFilter::Init(PDRIVER_OBJECT DriverObject, NotifQueue* queue) {
                                 char msg[256];
                                 RtlStringCchPrintfA(msg, sizeof(msg),
                                     "ALTITUDE SANDWICH: filter '%s' at altitude %lu is positioned "
-                                    "just above us (%lu) — may intercept/hide I/O before EDR sees it",
+                                    "above us (%lu) in the AV range — may intercept/hide I/O before EDR sees it",
                                     nameBuf[0] ? nameBuf : "?", foreignAlt, ourAltitude);
                                 EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
                                 DbgPrint("[!] %s\n", msg);
@@ -1227,9 +1229,9 @@ VOID FsFilter::ValidateMinifilterIntegrity() {
                                 EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
                                 DbgPrint("[!] %s\n", msg);
                             }
-                            // Sandwiching: filter positioned just above us
+                            // Sandwiching: filter positioned above us in AV range
                             else if (foreignAlt > ourAltitude &&
-                                     foreignAlt <= ourAltitude + 10)
+                                     foreignAlt <= 329999)
                             {
                                 char nameBuf[64] = {};
                                 ANSI_STRING ansiN;
@@ -1243,7 +1245,7 @@ VOID FsFilter::ValidateMinifilterIntegrity() {
                                 char msg[256];
                                 RtlStringCchPrintfA(msg, sizeof(msg),
                                     "ALTITUDE SANDWICH (periodic): filter '%s' at altitude %lu "
-                                    "just above us (%lu)!",
+                                    "above us (%lu) in AV range!",
                                     nameBuf[0] ? nameBuf : "?", foreignAlt, ourAltitude);
                                 EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
                                 DbgPrint("[!] %s\n", msg);

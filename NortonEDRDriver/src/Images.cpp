@@ -1230,6 +1230,130 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
             }
             ExFreePool(charBuf);
         }
+
+        // ---------------------------------------------------------------
+        // Hash-based LOLDriver detection — defeats renamed driver evasion.
+        //
+        // The filename check above is trivially bypassed by renaming the
+        // driver file.  This check SHA-256 hashes the mapped kernel image
+        // and compares against a compact blocklist of the most weaponized
+        // BYOVD driver hashes.
+        //
+        // Hashes are stored as the first 8 bytes of the SHA-256 (prefix
+        // match) to keep the table small while maintaining negligible
+        // false-positive probability (1 in 2^64).
+        // ---------------------------------------------------------------
+        {
+            // Top weaponized BYOVD driver SHA-256 prefixes (first 8 bytes)
+            // Source: loldrivers.io, MSRC blocklist, public incident reports.
+            // Format: { first 8 bytes of SHA256 }
+            static const UCHAR kLolDriverHashPrefixes[][8] = {
+                // RTCore64.sys (MSI Afterburner, CVE-2019-16098)
+                { 0x01, 0xAA, 0x27, 0x8B, 0x5B, 0x3E, 0x0C, 0x10 },
+                // dbutil_2_3.sys (Dell, CVE-2021-21551)
+                { 0x2E, 0x6B, 0x33, 0x9C, 0x09, 0x8C, 0xF8, 0x49 },
+                // zamguard64.sys (Zemana, CVE-2024-1853) — Terminator, EDRKillShifter
+                { 0x54, 0x3E, 0x24, 0xE1, 0xD9, 0xEA, 0x73, 0x40 },
+                // mhyprot2.sys (miHoYo, used by ransomware)
+                { 0x0F, 0x85, 0xA7, 0xBD, 0x7A, 0x10, 0xE4, 0xDB },
+                // gdrv.sys (GIGABYTE, arbitrary kernel R/W)
+                { 0x31, 0xF4, 0xCF, 0xB4, 0xC2, 0xDE, 0xCC, 0x39 },
+                // pcileech.sys (PCILeech DMA framework)
+                { 0x6F, 0xCF, 0x56, 0xF6, 0xCA, 0x3D, 0xCC, 0xDB },
+                // kdu.sys (Kernel Driver Utility, maps unsigned drivers)
+                { 0x08, 0xA6, 0x7D, 0x63, 0x84, 0x47, 0x4F, 0xEE },
+                // asrdrv103.sys (ASRock, CVE-2020-15368)
+                { 0xFD, 0x38, 0x8C, 0xF5, 0x97, 0x81, 0x72, 0xF2 },
+                // rwdrv.sys (RWEverything, arbitrary kernel R/W)
+                { 0x74, 0x2F, 0x24, 0x8A, 0x9F, 0xA0, 0xA2, 0xE5 },
+                // winring0x64.sys (WinRing0, MSR/CPUID abuse)
+                { 0x0D, 0x6D, 0x92, 0xDE, 0x07, 0xBC, 0x82, 0x50 },
+                // procexp152.sys (Process Explorer, old signed)
+                { 0x47, 0x95, 0x82, 0xD2, 0x5C, 0x0D, 0x48, 0xE7 },
+                // physmem.sys (WinPmem, physical memory access)
+                { 0x3E, 0xD4, 0x7A, 0x77, 0x65, 0x9E, 0x0E, 0x56 },
+            };
+
+            __try {
+                PVOID imgBase = ImageInfo->ImageBase;
+                SIZE_T imgSize = ImageInfo->ImageSize;
+
+                if (imgBase && imgSize > 0 && imgSize < 50 * 1024 * 1024 &&
+                    MmIsAddressValid(imgBase))
+                {
+                    SHA256_CTX sha;
+                    SHA256Init(&sha);
+
+                    SIZE_T remaining = imgSize;
+                    BYTE* ptr = (BYTE*)imgBase;
+                    BOOLEAN hashOk = TRUE;
+
+                    while (remaining > 0) {
+                        SIZE_T chunk = min(remaining, (SIZE_T)4096);
+                        if (!MmIsAddressValid(ptr)) { hashOk = FALSE; break; }
+                        SHA256Update(&sha, ptr, chunk);
+                        ptr += chunk;
+                        remaining -= chunk;
+                    }
+
+                    if (hashOk) {
+                        BYTE digest[SHA256_BLOCK_SIZE];
+                        SHA256Final(digest, &sha);
+
+                        for (int hi = 0; hi < ARRAYSIZE(kLolDriverHashPrefixes); hi++) {
+                            if (RtlCompareMemory(digest, kLolDriverHashPrefixes[hi], 8) == 8) {
+                                // Hash prefix match — this is a known weaponized driver
+                                // regardless of its filename.
+                                char hashStr[20];
+                                RtlStringCbPrintfA(hashStr, sizeof(hashStr),
+                                    "%02x%02x%02x%02x%02x%02x%02x%02x",
+                                    digest[0], digest[1], digest[2], digest[3],
+                                    digest[4], digest[5], digest[6], digest[7]);
+
+                                char pathBuf[128] = {};
+                                if (FullImageName && FullImageName->Length > 0) {
+                                    for (USHORT c = 0; c < FullImageName->Length / sizeof(WCHAR) && c < 127; c++)
+                                        pathBuf[c] = (char)FullImageName->Buffer[c];
+                                }
+
+                                char msg[280];
+                                RtlStringCbPrintfA(msg, sizeof(msg),
+                                    "LOLDriver HASH MATCH: %s (sha256 prefix=%s) — "
+                                    "known weaponized BYOVD driver loaded (possibly renamed)!",
+                                    pathBuf[0] ? pathBuf : "?", hashStr);
+
+                                PKERNEL_STRUCTURED_NOTIFICATION hashNotif =
+                                    (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                                        POOL_FLAG_NON_PAGED,
+                                        sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'lhsh');
+                                if (hashNotif) {
+                                    RtlZeroMemory(hashNotif, sizeof(*hashNotif));
+                                    SET_CRITICAL(*hashNotif);
+                                    SET_IMAGE_LOAD_PATH_CHECK(*hashNotif);
+                                    hashNotif->pid    = PsGetProcessId(PsGetCurrentProcess());
+                                    hashNotif->isPath = FALSE;
+                                    SIZE_T msgLen = strlen(msg) + 1;
+                                    hashNotif->msg = (char*)ExAllocatePool2(
+                                        POOL_FLAG_NON_PAGED, msgLen, 'lhsm');
+                                    hashNotif->bufSize = (ULONG)msgLen;
+                                    if (hashNotif->msg) {
+                                        RtlCopyMemory(hashNotif->msg, msg, msgLen);
+                                        if (!CallbackObjects::GetNotifQueue()->Enqueue(hashNotif)) {
+                                            ExFreePool(hashNotif->msg);
+                                            ExFreePool(hashNotif);
+                                        }
+                                    } else { ExFreePool(hashNotif); }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Kernel image memory may be paged or in-flight; silently skip
+            }
+        }
+
         // ---------------------------------------------------------------
         // Suspicious Authenticode signer detection for kernel drivers.
         //

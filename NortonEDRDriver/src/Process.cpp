@@ -1524,6 +1524,97 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 			}
 		}
 
+		// -----------------------------------------------------------------------
+		// SeLoadDriverPrivilege presence check at process creation (T1543.003)
+		//
+		// If an attacker steals a token that already has SeLoadDriverPrivilege
+		// enabled (via token theft / impersonation rather than NtAdjustPrivilegesToken),
+		// the syscall-level privilege enablement detection never fires.
+		// This check catches that by inspecting the child process's primary token
+		// at creation time — any non-system process with SeLoadDriverPrivilege is
+		// a BYOVD pre-attack signal.
+		//
+		// SeLoadDriverPrivilege LUID = { 10, 0 } on all Windows versions.
+		// SE_PRIVILEGE_ENABLED = 0x00000002
+		// -----------------------------------------------------------------------
+		{
+			HANDLE childPidLdp = PsGetProcessId(Process);
+			if ((ULONG_PTR)childPidLdp > 4) {
+				PACCESS_TOKEN childTok = PsReferencePrimaryToken(Process);
+				if (childTok) {
+					// TokenPrivileges = 3 in TOKEN_INFORMATION_CLASS
+					TOKEN_PRIVILEGES* privs = nullptr;
+					NTSTATUS pSt = SeQueryInformationToken(
+						childTok, TokenPrivileges, (PVOID*)&privs);
+					if (NT_SUCCESS(pSt) && privs) {
+						for (ULONG pi = 0; pi < privs->PrivilegeCount; pi++) {
+							// SeLoadDriverPrivilege = LUID { LowPart=10, HighPart=0 }
+							if (privs->Privileges[pi].Luid.LowPart == 10 &&
+								privs->Privileges[pi].Luid.HighPart == 0 &&
+								(privs->Privileges[pi].Attributes & SE_PRIVILEGE_ENABLED))
+							{
+								char* ldpName = PsGetProcessImageFileName(Process);
+
+								// Allowlist: services.exe, svchost.exe, TrustedInstaller,
+								// csrss.exe, lsass.exe, wininit.exe — these legitimately
+								// hold SeLoadDriverPrivilege
+								BOOLEAN ldpAllowed = FALSE;
+								if (ldpName) {
+									ldpAllowed = (strcmp(ldpName, "services.exe") == 0 ||
+									              strcmp(ldpName, "svchost.exe") == 0 ||
+									              strcmp(ldpName, "TrustedInsta") == 0 ||
+									              strcmp(ldpName, "csrss.exe") == 0 ||
+									              strcmp(ldpName, "lsass.exe") == 0 ||
+									              strcmp(ldpName, "wininit.exe") == 0 ||
+									              strcmp(ldpName, "smss.exe") == 0 ||
+									              strcmp(ldpName, "MsMpEng.exe") == 0);
+								}
+
+								if (!ldpAllowed) {
+									PEPROCESS creatorLdp = IoGetCurrentProcess();
+									char* creatorName = PsGetProcessImageFileName(creatorLdp);
+
+									char alertMsg[280];
+									RtlStringCbPrintfA(alertMsg, sizeof(alertMsg),
+										"SeLoadDriverPrivilege ENABLED in new process '%s' "
+										"(pid=%llu) created by '%s' — token may have been "
+										"stolen/impersonated; BYOVD attack imminent (T1543.003)",
+										ldpName ? ldpName : "?",
+										(ULONG64)(ULONG_PTR)childPidLdp,
+										creatorName ? creatorName : "?");
+
+									PKERNEL_STRUCTURED_NOTIFICATION n =
+										(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+											POOL_FLAG_NON_PAGED,
+											sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+									if (n) {
+										RtlZeroMemory(n, sizeof(*n));
+										SET_CRITICAL(*n);
+										SET_TOKEN_CHECK(*n);
+										n->isPath = FALSE;
+										n->pid    = childPidLdp;
+										if (ldpName) RtlCopyMemory(n->procName, ldpName, min(strlen(ldpName), 14u));
+										SIZE_T msgLen = strlen(alertMsg) + 1;
+										n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+										if (n->msg) {
+											RtlCopyMemory(n->msg, alertMsg, msgLen);
+											n->bufSize = (ULONG)msgLen;
+											if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+												ExFreePool(n->msg); ExFreePool(n);
+											}
+										} else { ExFreePool(n); }
+									}
+								}
+								break;  // found the privilege, no need to continue
+							}
+						}
+						ExFreePool(privs);
+					}
+					PsDereferencePrimaryToken(childTok);
+				}
+			}
+		}
+
 	} else {
 		// Process exit — free the cmdline record, fork-run tracker, taint, and ntdll tracker slots.
 		ULONG exitPid = HandleToUlong(PsGetProcessId(Process));
