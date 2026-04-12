@@ -249,6 +249,20 @@ static const PCWSTR kCredPaths[] = {
     L".kirbi",              // Mimikatz/Rubeus Kerberos ticket export format
     L".ccache",             // Impacket/MIT Kerberos credential cache
     L"krb5cc_",             // MIT Kerberos default ccache filename prefix
+    // --- Browser credential harvesting (DPAPI + AES-GCM) ---
+    // SharpChromium, HackBrowserData, Mimikatz dpapi::chrome, CookieMonster
+    L"\\login data",        // Chrome/Edge saved passwords SQLite DB
+    L"\\local state",       // Chrome/Edge DPAPI-encrypted AES-GCM master key
+    L"\\cookies",           // Chrome/Edge session cookies (combined with master key)
+    L"\\web data",          // Chrome/Edge autofill / credit card data
+    L"logins.json",         // Firefox saved passwords
+    L"key4.db",             // Firefox key database (NSS / PKCS#11)
+    L"\\network\\cookies",  // Chrome network service cookies path
+    // --- Cloud / Entra ID token theft (PRT harvesting) ---
+    // ROADtools, AADInternals, RequestAADRefreshToken, CloudAP DPAPI theft
+    L"microsoft.aad.brokerplugin",  // Entra PRT / session key cache
+    L"\\tokenbroker\\",     // Windows TokenBroker cached refresh tokens
+    L"tbres",               // TokenBroker result files with cached tokens
 };
 
 // ---------------------------------------------------------------------------
@@ -2385,11 +2399,48 @@ rate_done:
                     RtlCopyMemory(pathBuf, ansi.Buffer, copyLen);
                     RtlFreeAnsiString(&ansi);
                 }
-                char msg[192];
+
+                // Elevate severity for browser credential theft by non-browser processes
+                // and cloud token theft by non-system processes.
+                BOOLEAN isCritical = FALSE;
+                BOOLEAN isBrowserCred = WcsContainsLower(&nameInfo->Name, L"\\login data") ||
+                    WcsContainsLower(&nameInfo->Name, L"\\local state") ||
+                    WcsContainsLower(&nameInfo->Name, L"\\cookies") ||
+                    WcsContainsLower(&nameInfo->Name, L"\\web data") ||
+                    WcsContainsLower(&nameInfo->Name, L"logins.json") ||
+                    WcsContainsLower(&nameInfo->Name, L"key4.db");
+                BOOLEAN isCloudToken = WcsContainsLower(&nameInfo->Name, L"microsoft.aad.brokerplugin") ||
+                    WcsContainsLower(&nameInfo->Name, L"\\tokenbroker\\") ||
+                    WcsContainsLower(&nameInfo->Name, L"tbres");
+
+                if (isBrowserCred && procName) {
+                    // Browsers legitimately access their own credential stores
+                    BOOLEAN isBrowser = (strcmp(procName, "chrome.exe")  == 0 ||
+                                         strcmp(procName, "msedge.exe")  == 0 ||
+                                         strcmp(procName, "firefox.exe") == 0 ||
+                                         strcmp(procName, "opera.exe")   == 0 ||
+                                         strcmp(procName, "brave.exe")   == 0 ||
+                                         strcmp(procName, "vivaldi.exe") == 0);
+                    if (!isBrowser) isCritical = TRUE;
+                }
+                if (isCloudToken && procName) {
+                    // Only lsass/svchost/AAD broker should access PRT files
+                    BOOLEAN isCloudAllowed = (strcmp(procName, "lsass.exe")   == 0 ||
+                                              strcmp(procName, "svchost.exe") == 0 ||
+                                              strcmp(procName, "Microsof")    == 0);  // Microsoft.AAD.* truncated
+                    if (!isCloudAllowed) isCritical = TRUE;
+                }
+
+                const char* tag = isBrowserCred ? "Browser credential theft" :
+                                  isCloudToken  ? "Cloud/Entra PRT token theft" :
+                                                  "Credential file access";
+                char msg[256];
                 RtlStringCchPrintfA(msg, sizeof(msg),
-                    "FS: Credential file access — %s (pid=%llu)",
-                    pathBuf[0] ? pathBuf : "?", (ULONG64)(ULONG_PTR)pid);
-                EnqueueFsAlert(pid, procName, msg, FALSE);
+                    "FS: %s — %s by '%s' (pid=%llu)",
+                    tag, pathBuf[0] ? pathBuf : "?",
+                    procName ? procName : "unknown",
+                    (ULONG64)(ULONG_PTR)pid);
+                EnqueueFsAlert(pid, procName, msg, isCritical);
                 __leave;
             }
         }

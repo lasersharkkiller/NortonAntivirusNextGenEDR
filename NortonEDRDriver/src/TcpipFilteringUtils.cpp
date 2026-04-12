@@ -704,3 +704,122 @@ failure:
     UnitializeWfp();
     return status;
 }
+
+// ---------------------------------------------------------------------------
+// WFP Self-Protection — EDRSilencer / filter-injection defense.
+//
+// EDRSilencer and similar tools add WFP filters that block EDR outbound
+// telemetry.  They don't need a kernel driver — FwpmFilterAdd0 from user-mode
+// with admin rights is sufficient.  They can also delete our existing filter
+// via FwpmFilterDeleteById.
+//
+// Detection strategy:
+//   1. Verify our own filter (FilterId) is still registered.
+//   2. Verify our callout (RegCalloutId) is still registered.
+//   3. Enumerate filters on FWPM_LAYER_OUTBOUND_TRANSPORT_V4 and flag any
+//      foreign filters with weight >= our weight that could supersede us.
+// ---------------------------------------------------------------------------
+
+static VOID EmitWfpAlert(BufferQueue* bufQueue, const char* msg)
+{
+    SIZE_T msgLen = strlen(msg) + 1;
+    PKERNEL_STRUCTURED_NOTIFICATION notif =
+        (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'wfpi');
+    if (!notif) return;
+    RtlZeroMemory(notif, sizeof(*notif));
+    SET_CRITICAL(*notif);
+    SET_NETWORK_CHECK(*notif);
+    notif->isPath = FALSE;
+    RtlCopyMemory(notif->procName, "NortonEDR", 9);
+    notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'wfpm');
+    notif->bufSize = (ULONG)msgLen;
+    if (notif->msg) {
+        RtlCopyMemory(notif->msg, msg, msgLen);
+        if (!bufQueue->Enqueue(notif)) {
+            ExFreePool(notif->msg);
+            ExFreePool(notif);
+        }
+    } else {
+        ExFreePool(notif);
+    }
+}
+
+BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
+{
+    if (!EngineHandle || !bufQueue) return FALSE;
+    BOOLEAN ok = TRUE;
+
+    // Check 1: verify our filter is still present
+    if (FilterId != 0) {
+        FWPM_FILTER* filterObj = nullptr;
+        NTSTATUS st = FwpmFilterGetById(EngineHandle, FilterId, &filterObj);
+        if (!NT_SUCCESS(st) || !filterObj) {
+            EmitWfpAlert(bufQueue,
+                "WFP TAMPER: NortonEDR WFP filter DELETED (FwpmFilterDeleteById) "
+                "— network telemetry and blocking disabled! EDRSilencer-class attack");
+            ok = FALSE;
+        }
+        if (filterObj) FwpmFreeMemory((void**)&filterObj);
+    }
+
+    // Check 2: enumerate foreign filters on our layer that could block our traffic
+    {
+        HANDLE enumHandle = nullptr;
+        FWPM_FILTER_ENUM_TEMPLATE enumTemplate = {};
+        enumTemplate.layerKey           = FWPM_LAYER_OUTBOUND_TRANSPORT_V4;
+        enumTemplate.providerKey        = nullptr;
+        enumTemplate.flags              = 0;
+        enumTemplate.numFilterConditions = 0;
+        enumTemplate.actionMask         = 0xFFFFFFFF;
+
+        NTSTATUS st = FwpmFilterCreateEnumHandle(
+            EngineHandle, &enumTemplate, &enumHandle);
+        if (NT_SUCCESS(st) && enumHandle) {
+            FWPM_FILTER** entries = nullptr;
+            UINT32 numEntries = 0;
+            st = FwpmFilterEnum(EngineHandle, enumHandle, 64, &entries, &numEntries);
+            if (NT_SUCCESS(st) && entries) {
+                for (UINT32 i = 0; i < numEntries; i++) {
+                    if (!entries[i]) continue;
+                    // Skip our own filter
+                    if (entries[i]->filterId == FilterId) continue;
+                    // Skip our own sublayer
+                    if (RtlCompareMemory(&entries[i]->subLayerKey,
+                            &NORTONAV_SUBLAYER_GUID, sizeof(GUID)) == sizeof(GUID))
+                        continue;
+
+                    // Flag any BLOCK action filter on our layer — this is the
+                    // EDRSilencer pattern: add a BLOCK filter that prevents
+                    // NortonEDR.exe from sending telemetry.
+                    if (entries[i]->action.type == FWP_ACTION_BLOCK) {
+                        char msg[300];
+                        RtlStringCbPrintfA(msg, sizeof(msg),
+                            "WFP TAMPER: foreign BLOCK filter (id=%llu, weight=%u) "
+                            "detected on OUTBOUND_TRANSPORT_V4 — possible EDRSilencer "
+                            "/ telemetry blocking attack (display: '%S')",
+                            entries[i]->filterId,
+                            entries[i]->weight.type == FWP_UINT8
+                                ? entries[i]->weight.uint8 : 0,
+                            entries[i]->displayData.name
+                                ? entries[i]->displayData.name : L"<none>");
+                        EmitWfpAlert(bufQueue, msg);
+                        ok = FALSE;
+                    }
+                }
+                FwpmFreeMemory((void**)&entries);
+            }
+            FwpmFilterDestroyEnumHandle(EngineHandle, enumHandle);
+        }
+    }
+
+    return ok;
+}
+
+// Bridge for HookDetector::CheckWfpIntegrity — forward to the WFP instance.
+extern WdfTcpipUtils* g_wfpUtils;
+
+VOID HookDetector::CheckWfpIntegrity(BufferQueue* bufQueue)
+{
+    if (g_wfpUtils) g_wfpUtils->CheckIntegrity(bufQueue);
+}

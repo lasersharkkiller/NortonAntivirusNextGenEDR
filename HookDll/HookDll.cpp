@@ -107,7 +107,14 @@ enum HookIdx : int {
     // --- Authentication downgrade detection: SSPI hooks ---
     IDX_INITIALIZESECURITYCONTEXTW     = 47, // sspicli.dll — Negotiate→NTLM fallback
     IDX_ACQUIRECREDENTIALSHANDLEW      = 48, // sspicli.dll — explicit NTLM/WDigest credential acquisition
-    HOOK_COUNT                  = 49
+    // --- Sleep obfuscation detection ---
+    IDX_SYSTEMFUNCTION032              = 49, // advapi32.dll — RC4 encrypt used by Ekko/Foliage
+    // --- DPAPI credential harvesting ---
+    IDX_CRYPTUNPROTECTDATA             = 50, // crypt32.dll — DPAPI decryption
+    // --- Process Ghosting / Transacted Hollowing ---
+    IDX_NTSETINFORMATIONFILE           = 51, // ntdll.dll — FileDispositionInformation (delete-pending)
+    IDX_NTCREATETRANSACTION            = 52, // ntdll.dll — TxF for transacted hollowing
+    HOOK_COUNT                  = 53
 };
 
 struct ApiHook {
@@ -178,17 +185,28 @@ static PVOID   WINAPI Hook_AddVectoredContinueHandler(ULONG, PVECTORED_EXCEPTION
 static PVOID   NTAPI  Hook_RtlAddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
 static PVOID   NTAPI  Hook_RtlAddVectoredContinueHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
 // SSPI authentication downgrade hooks
-// SecBufferDesc / CtxtHandle / CredHandle / TimeStamp are from sspi.h but we
-// keep them opaque (PVOID / PVOID* / PLARGE_INTEGER) to avoid header conflicts
-// with WIN32_LEAN_AND_MEAN.  The hook only inspects string parameters.
 typedef void* PCtxtHandle;
 typedef void* PCredHandle;
 typedef void* PSecBufferDesc;
+// DPAPI hook — CryptUnprotectData uses DATA_BLOB structures
+typedef struct { DWORD cbData; BYTE* pbData; } HOOK_DATA_BLOB;
+// SystemFunction032 — RC4 encryption (sleep obfuscation)
+typedef struct { ULONG Length; ULONG MaximumLength; PUCHAR Buffer; } USTRING;
 static LONG  WINAPI Hook_InitializeSecurityContextW(
     PCredHandle, PCtxtHandle, wchar_t*, ULONG, ULONG, ULONG,
     PSecBufferDesc, ULONG, PCtxtHandle, PSecBufferDesc, ULONG*, PLARGE_INTEGER);
 static LONG  WINAPI Hook_AcquireCredentialsHandleW(
     wchar_t*, wchar_t*, ULONG, PVOID, PVOID, PVOID, PVOID, PCredHandle, PLARGE_INTEGER);
+// Sleep obfuscation
+static NTSTATUS WINAPI Hook_SystemFunction032(USTRING* data, USTRING* key);
+// DPAPI credential harvesting
+static BOOL WINAPI Hook_CryptUnprotectData(
+    HOOK_DATA_BLOB*, wchar_t**, HOOK_DATA_BLOB*, PVOID, PVOID, DWORD, HOOK_DATA_BLOB*);
+// Process Ghosting / Transacted Hollowing
+static NTSTATUS NTAPI Hook_NtSetInformationFile(
+    HANDLE, PVOID, PVOID, ULONG, ULONG);
+static NTSTATUS NTAPI Hook_NtCreateTransaction(
+    PHANDLE, ACCESS_MASK, PVOID, PVOID, HANDLE, ULONG, ULONG, ULONG, PLARGE_INTEGER, PVOID);
 
 static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "VirtualAlloc",         (FARPROC)Hook_VirtualAlloc,        nullptr, nullptr, {}, nullptr, false },
@@ -241,6 +259,13 @@ static ApiHook g_hooks[HOOK_COUNT] = {
     // SSPI authentication downgrade detection
     { "sspicli.dll",  "InitializeSecurityContextW",    (FARPROC)Hook_InitializeSecurityContextW,      nullptr, nullptr, {}, nullptr, false },
     { "sspicli.dll",  "AcquireCredentialsHandleW",     (FARPROC)Hook_AcquireCredentialsHandleW,      nullptr, nullptr, {}, nullptr, false },
+    // Sleep obfuscation detection (Ekko/Foliage use SystemFunction032 = RC4)
+    { "advapi32.dll", "SystemFunction032",             (FARPROC)Hook_SystemFunction032,               nullptr, nullptr, {}, nullptr, false },
+    // DPAPI browser credential harvesting
+    { "crypt32.dll",  "CryptUnprotectData",            (FARPROC)Hook_CryptUnprotectData,              nullptr, nullptr, {}, nullptr, false },
+    // Process Ghosting (delete-before-map) and Transacted Hollowing
+    { "ntdll.dll",    "NtSetInformationFile",          (FARPROC)Hook_NtSetInformationFile,            nullptr, nullptr, {}, nullptr, false },
+    { "ntdll.dll",    "NtCreateTransaction",           (FARPROC)Hook_NtCreateTransaction,             nullptr, nullptr, {}, nullptr, false },
 };
 
 // Returns the correct call-through address.
@@ -614,6 +639,86 @@ static void RefreshAmsiGuards() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hardware breakpoint hooking detection (DR0-DR3 abuse)
+//
+// Attackers use SetThreadContext to set hardware breakpoints (DR0-DR3) on
+// ETW/AMSI/ntdll functions, then register a VEH handler that intercepts the
+// breakpoint exception, modifies registers/return values, and continues.
+// This hooks functions WITHOUT modifying code bytes, bypassing prologue
+// integrity checks.
+//
+// Detection: GetThreadContext on the current thread and check if any DR0-DR3
+// registers point into security-critical DLLs (ntdll, amsi, sspicli, etc.).
+// Legitimate software almost never sets hardware breakpoints; only debuggers
+// and offensive tools (TamperingSyscalls, HWSyscalls, AMSI-bypass-via-hwbp).
+// ---------------------------------------------------------------------------
+
+static void CheckHardwareBreakpoints()
+{
+    CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(GetCurrentThread(), &ctx)) return;
+
+    // DR7 bit layout: bits 0,2,4,6 = local enable for DR0-DR3
+    // If no breakpoints are enabled, skip.
+    if ((ctx.Dr7 & 0x55) == 0) return;
+
+    ULONG_PTR breakpoints[4] = { ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3 };
+    BYTE localEnable[4] = {
+        (BYTE)(ctx.Dr7 & 1),
+        (BYTE)((ctx.Dr7 >> 2) & 1),
+        (BYTE)((ctx.Dr7 >> 4) & 1),
+        (BYTE)((ctx.Dr7 >> 6) & 1),
+    };
+
+    // Critical modules where hardware breakpoints indicate hooking
+    struct { const char* mod; HMODULE hMod; } critMods[] = {
+        { "ntdll.dll",    GetModuleHandleA("ntdll.dll") },
+        { "amsi.dll",     GetModuleHandleA("amsi.dll") },
+        { "sspicli.dll",  GetModuleHandleA("sspicli.dll") },
+        { "kernelbase.dll", GetModuleHandleA("kernelbase.dll") },
+    };
+
+    for (int i = 0; i < 4; i++) {
+        if (!localEnable[i] || breakpoints[i] == 0) continue;
+
+        for (int m = 0; m < _countof(critMods); m++) {
+            if (!critMods[m].hMod) continue;
+
+            MODULEINFO mi = {};
+            if (!GetModuleInformation(GetCurrentProcess(), critMods[m].hMod,
+                    &mi, sizeof(mi)))
+                continue;
+
+            ULONG_PTR base = (ULONG_PTR)mi.lpBaseOfDll;
+            ULONG_PTR end  = base + mi.SizeOfImage;
+
+            if (breakpoints[i] >= base && breakpoints[i] < end) {
+                char det[256];
+                _snprintf_s(det, sizeof(det), _TRUNCATE,
+                    "Hardware breakpoint hooking: DR%d=0x%llX points into %s — "
+                    "VEH-based function hooking without code modification "
+                    "(AMSI/ETW/syscall bypass via hardware breakpoints)",
+                    i, (unsigned long long)breakpoints[i], critMods[m].mod);
+                SendHookEvent("Critical", "HardwareBreakpointHook", 0, det);
+
+                // Clear the breakpoint to neutralize the hook
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                switch (i) {
+                    case 0: ctx.Dr0 = 0; break;
+                    case 1: ctx.Dr1 = 0; break;
+                    case 2: ctx.Dr2 = 0; break;
+                    case 3: ctx.Dr3 = 0; break;
+                }
+                ctx.Dr7 &= ~(3ULL << (i * 2)); // clear local+global enable
+                SetThreadContext(GetCurrentThread(), &ctx);
+                break;
+            }
+        }
+    }
+}
+
 static DWORD WINAPI WatchThreadProc(LPVOID) {
     // WaitForSingleObject with 2000 ms timeout: fires VerifyHooks on each expiry,
     // exits cleanly when g_watchStop is signalled from RemoveHooks().
@@ -621,6 +726,7 @@ static DWORD WINAPI WatchThreadProc(LPVOID) {
         VerifyHooks();
         RefreshAmsiGuards();
         VerifyCriticalFuncIntegrity();
+        CheckHardwareBreakpoints();
     }
     return 0;
 }
@@ -1716,6 +1822,211 @@ static PVOID NTAPI Hook_RtlAddVectoredContinueHandler(
     typedef PVOID(NTAPI* Fn)(ULONG, PVECTORED_EXCEPTION_HANDLER);
     CheckVehHandler("RtlAddVectoredContinueHandler", VectoredHandler);
     return ((Fn)GetCallThrough(IDX_RTLADDVECTOREDCONTINUEHANDLER))(FirstHandler, VectoredHandler);
+}
+
+// ---------------------------------------------------------------------------
+// Sleep obfuscation detection — SystemFunction032 hook (Ekko/Foliage/Cronos)
+//
+// Sleep obfuscation frameworks (Ekko, Foliage, Cronos, Havoc sleep masks)
+// use SystemFunction032 (RC4) to encrypt their implant's memory while sleeping.
+// The pattern: VirtualProtect(RX→RW) → SystemFunction032(encrypt) → Sleep →
+// SystemFunction032(decrypt) → VirtualProtect(RW→RX).
+//
+// Detection: when SystemFunction032 is called on a buffer that resides in a
+// MEM_PRIVATE region (not a loaded module), this is almost certainly sleep
+// obfuscation — legitimate code uses CryptEncrypt or BCrypt, not the
+// undocumented SystemFunction032.
+// ---------------------------------------------------------------------------
+
+static NTSTATUS WINAPI Hook_SystemFunction032(USTRING* data, USTRING* key)
+{
+    typedef NTSTATUS(WINAPI* Fn)(USTRING*, USTRING*);
+
+    if (data && data->Buffer && data->Length > 0) {
+        // Check if the target buffer is in a private (non-module) region
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(data->Buffer, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            // MEM_PRIVATE + large buffer = sleep obfuscation indicator
+            // Legitimate RC4 usage is on small data blobs, not entire PE sections.
+            if (mbi.Type == MEM_PRIVATE && data->Length > 4096) {
+                char det[256];
+                _snprintf_s(det, sizeof(det), _TRUNCATE,
+                    "Sleep obfuscation (Ekko/Foliage/Cronos): SystemFunction032 called on "
+                    "MEM_PRIVATE region at %p (size=%lu, protect=0x%lx) — "
+                    "RC4 encrypt/decrypt of implant memory during beacon sleep",
+                    (void*)data->Buffer, data->Length, mbi.Protect);
+                SendHookEvent("Critical", "SystemFunction032", 0, det);
+            }
+        }
+    }
+
+    return ((Fn)GetCallThrough(IDX_SYSTEMFUNCTION032))(data, key);
+}
+
+// ---------------------------------------------------------------------------
+// DPAPI credential harvesting — CryptUnprotectData hook
+//
+// Browser credential stealers (SharpChromium, HackBrowserData, Mimikatz
+// dpapi::chrome, CookieMonster) call CryptUnprotectData to decrypt the
+// browser's AES-GCM master key (stored in Local State, DPAPI-encrypted).
+// Legitimate browsers call this themselves; any OTHER process calling it
+// is harvesting credentials.
+// ---------------------------------------------------------------------------
+
+static BOOL WINAPI Hook_CryptUnprotectData(
+    HOOK_DATA_BLOB* pDataIn, wchar_t** ppszDataDescr,
+    HOOK_DATA_BLOB* pOptionalEntropy, PVOID pvReserved,
+    PVOID pPromptStruct, DWORD dwFlags, HOOK_DATA_BLOB* pDataOut)
+{
+    typedef BOOL(WINAPI* Fn)(HOOK_DATA_BLOB*, wchar_t**, HOOK_DATA_BLOB*,
+                              PVOID, PVOID, DWORD, HOOK_DATA_BLOB*);
+
+    // Only flag non-browser processes calling CryptUnprotectData
+    char exeName[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exeName, sizeof(exeName));
+    const char* base = exeName;
+    for (const char* p = exeName; *p; p++)
+        if (*p == '\\' || *p == '/') base = p + 1;
+
+    BOOL isBrowser = (_stricmp(base, "chrome.exe")   == 0 ||
+                      _stricmp(base, "msedge.exe")   == 0 ||
+                      _stricmp(base, "firefox.exe")  == 0 ||
+                      _stricmp(base, "opera.exe")    == 0 ||
+                      _stricmp(base, "brave.exe")    == 0 ||
+                      _stricmp(base, "vivaldi.exe")  == 0 ||
+                      _stricmp(base, "iexplore.exe") == 0);
+
+    // Legitimate DPAPI callers: browsers, credential manager, system
+    BOOL isSystem = (_stricmp(base, "lsass.exe")     == 0 ||
+                     _stricmp(base, "svchost.exe")   == 0 ||
+                     _stricmp(base, "services.exe")  == 0 ||
+                     _stricmp(base, "NortonEDR.exe") == 0);
+
+    if (!isBrowser && !isSystem && pDataIn && pDataIn->cbData > 0) {
+        // CRYPTPROTECT_UI_FORBIDDEN (0x01) = programmatic access without UI prompt
+        // — credential stealers always set this flag.
+        const char* severity = (dwFlags & 0x01) ? "Critical" : "Warning";
+        char det[256];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "DPAPI credential harvesting: %s called CryptUnprotectData "
+            "(size=%lu, flags=0x%lx) — possible browser/credential theft "
+            "(SharpChromium/HackBrowserData/Mimikatz dpapi)",
+            base, pDataIn->cbData, dwFlags);
+        SendHookEvent(severity, "CryptUnprotectData", 0, det);
+    }
+
+    return ((Fn)GetCallThrough(IDX_CRYPTUNPROTECTDATA))(
+        pDataIn, ppszDataDescr, pOptionalEntropy, pvReserved,
+        pPromptStruct, dwFlags, pDataOut);
+}
+
+// ---------------------------------------------------------------------------
+// Process Ghosting detection — NtSetInformationFile hook
+//
+// Process Ghosting: attacker creates a file, writes malicious PE, marks it
+// delete-pending (NtSetInformationFile with FileDispositionInformation),
+// creates a section from it, then closes the handle (file is deleted).
+// The section survives, and the process is created from a "ghost" file
+// that no longer exists on disk.
+//
+// Detection: NtSetInformationFile with FileDispositionInformation (class 13)
+// or FileDispositionInformationEx (class 64) from a non-system process.
+// Legitimate software rarely marks files delete-pending while keeping the
+// handle open for section creation.
+// ---------------------------------------------------------------------------
+
+static NTSTATUS NTAPI Hook_NtSetInformationFile(
+    HANDLE FileHandle, PVOID IoStatusBlock, PVOID FileInformation,
+    ULONG Length, ULONG FileInformationClass)
+{
+    typedef NTSTATUS(NTAPI* Fn)(HANDLE, PVOID, PVOID, ULONG, ULONG);
+
+    // FileDispositionInformation = 13, FileDispositionInformationEx = 64
+    if ((FileInformationClass == 13 || FileInformationClass == 64) &&
+        FileInformation && Length >= sizeof(BOOLEAN))
+    {
+        BOOLEAN deleteFile = *(BOOLEAN*)FileInformation;
+        if (deleteFile) {
+            // Check if this file handle was recently written to (heuristic for ghosting)
+            // For now, flag delete-pending from non-system processes as suspicious
+            char exeName[MAX_PATH] = {};
+            GetModuleFileNameA(nullptr, exeName, sizeof(exeName));
+            const char* base = exeName;
+            for (const char* p = exeName; *p; p++)
+                if (*p == '\\' || *p == '/') base = p + 1;
+
+            BOOL isTrusted = (_stricmp(base, "explorer.exe") == 0 ||
+                              _stricmp(base, "svchost.exe")  == 0 ||
+                              _stricmp(base, "msiexec.exe")  == 0 ||
+                              _stricmp(base, "TiWorker.exe") == 0 ||
+                              _stricmp(base, "setup.exe")    == 0 ||
+                              _stricmp(base, "NortonEDR.exe") == 0);
+
+            if (!isTrusted) {
+                char det[256];
+                _snprintf_s(det, sizeof(det), _TRUNCATE,
+                    "Process Ghosting indicator: %s set FileDispositionInfo%s "
+                    "(delete-pending) — file may be used for ghost process creation "
+                    "(T1055.012 variant)",
+                    base,
+                    FileInformationClass == 64 ? "Ex" : "");
+                SendHookEvent("Warning", "NtSetInformationFile", 0, det);
+            }
+        }
+    }
+
+    return ((Fn)GetCallThrough(IDX_NTSETINFORMATIONFILE))(
+        FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+}
+
+// ---------------------------------------------------------------------------
+// Transacted Hollowing — NtCreateTransaction hook (user-mode complement)
+//
+// The kernel syscall hook already catches NtCreateTransaction; this user-mode
+// hook provides redundancy and catches cases where the syscall hook is bypassed
+// (e.g., via direct syscall from injected code that was already inside a
+// process before HookDll loaded).
+//
+// Transacted Hollowing combines TxF (NTFS transactions) with process hollowing:
+// create a transaction, write malicious PE to a transacted file, create a
+// MEM_IMAGE section from it, then rollback (artifact-free on disk).
+// ---------------------------------------------------------------------------
+
+static NTSTATUS NTAPI Hook_NtCreateTransaction(
+    PHANDLE TransactionHandle, ACCESS_MASK DesiredAccess,
+    PVOID ObjectAttributes, PVOID Uow, HANDLE TmHandle,
+    ULONG CreateOptions, ULONG IsolationLevel, ULONG IsolationFlags,
+    PLARGE_INTEGER Timeout, PVOID Description)
+{
+    typedef NTSTATUS(NTAPI* Fn)(PHANDLE, ACCESS_MASK, PVOID, PVOID, HANDLE,
+                                 ULONG, ULONG, ULONG, PLARGE_INTEGER, PVOID);
+
+    // NtCreateTransaction is almost never called by legitimate user-mode software.
+    // TxF is deprecated since Windows 8 and MS discourages its use.
+    char exeName[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exeName, sizeof(exeName));
+    const char* base = exeName;
+    for (const char* p = exeName; *p; p++)
+        if (*p == '\\' || *p == '/') base = p + 1;
+
+    BOOL isTrusted = (_stricmp(base, "svchost.exe")  == 0 ||
+                      _stricmp(base, "msiexec.exe")  == 0 ||
+                      _stricmp(base, "TiWorker.exe") == 0 ||
+                      _stricmp(base, "NortonEDR.exe") == 0);
+
+    if (!isTrusted) {
+        char det[256];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "Transacted Hollowing: %s called NtCreateTransaction "
+            "— TxF is deprecated; likely Process Doppelganging / "
+            "Transacted Hollowing evasion technique",
+            base);
+        SendHookEvent("Warning", "NtCreateTransaction", 0, det);
+    }
+
+    return ((Fn)GetCallThrough(IDX_NTCREATETRANSACTION))(
+        TransactionHandle, DesiredAccess, ObjectAttributes, Uow, TmHandle,
+        CreateOptions, IsolationLevel, IsolationFlags, Timeout, Description);
 }
 
 // ---------------------------------------------------------------------------

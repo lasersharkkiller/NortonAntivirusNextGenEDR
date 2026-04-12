@@ -444,6 +444,11 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	// onto our callback entry points to silently neuter the EDR.
 	HookDetector::TakeCallbackPrologueBaseline();
 
+	// PspNotifyEnableMask baseline — single byte that globally enables/disables
+	// all Ps*Notify callbacks.  If cleared by BYOVD, all callback arrays stop
+	// being invoked even though the entries are intact.
+	HookDetector::TakePspNotifyEnableMaskBaseline();
+
 	SsdtUtils ssdtUtils;
 	PVOID moduleBase = ssdtUtils.GetKernelBaseAddress();
 	if (moduleBase) {

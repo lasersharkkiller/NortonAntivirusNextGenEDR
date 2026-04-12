@@ -215,6 +215,12 @@ static const DefenseEvasionEntry kDefenseEvasionPaths[] = {
     { L"\\Control\\Lsa\\OSConfig",          L"Security Packages",
       "LSA OSConfig Security Packages modified — SSP persistence (T1556.001)", TRUE },
 
+    // --- T1528: Cloud credential theft — TokenBroker / CloudAP ---
+    // Attackers modify TokenBroker cache configuration to intercept or extract
+    // Entra ID Primary Refresh Tokens (PRT) and Azure AD session keys.
+    { L"\\TokenBroker\\Accounts",          NULL,
+      "TokenBroker account configuration modified — PRT/cloud token theft (T1528)", TRUE },
+
     // --- Misc defense evasion ---
     // AMSI provider unregistration (COM CLSID nuke)
     { L"\\AMSI\\Providers",                 NULL,

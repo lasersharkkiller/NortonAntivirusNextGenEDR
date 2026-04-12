@@ -372,6 +372,10 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 
 		// Indirect syscall check — catches Type 2 from shellcode (non-CET systems)
 		isSyscallIndirect(trapFrame->Rsp);
+
+		// Call stack spoofing check — catches LayeredSyscall / timer-based
+		// spoofing on non-CET systems (Cobalt Strike 4.9+, CallstackSpoofingPOC)
+		isCallStackSpoofed(trapFrame->Rsp);
 	}
 
 
@@ -1018,6 +1022,122 @@ BOOLEAN SyscallsUtils::isSyscallIndirect(ULONG64 Rsp)
 
 	KeUnstackDetachProcess(&apcState);
 	return result;
+}
+
+// ---------------------------------------------------------------------------
+// Call stack spoofing detection for non-CET systems.
+//
+// Indirect syscalls with spoofed call stacks (CallstackSpoofingPOC,
+// LayeredSyscall, Cobalt Strike 4.9+ timer-based stack spoofing) fabricate
+// call stack frames that look like legitimate kernel32→ntdll transitions.
+//
+// On CET-enabled systems the shadow stack catches this; on non-CET systems
+// we validate the frame chain by walking user-mode stack frames and checking:
+//   1. Frame count anomaly: legitimate syscalls have 3+ frames (ntdll→kernel32→app).
+//      Spoofed stacks often have exactly 2 frames (fabricated kernel32 + ntdll).
+//   2. Module gap: each frame's return address must be in a file-backed module.
+//      Spoofed stacks sometimes have gaps where a frame points to a ROP gadget
+//      inside ntdll but the next frame jumps to a non-contiguous code region.
+//   3. Frame chain discontinuity: RBP-based frame chains should be monotonically
+//      increasing (growing toward higher addresses on x64).  Spoofed frames often
+//      have discontinuous RBP values because they're fabricated, not real.
+// ---------------------------------------------------------------------------
+BOOLEAN SyscallsUtils::isCallStackSpoofed(ULONG64 Rsp)
+{
+    if (!stackUtils) return FALSE;
+
+    // Skip CET-enabled systems — the shadow stack is authoritative
+    if (stackUtils->isCETEnabled()) return FALSE;
+
+    PEPROCESS curproc = IoGetCurrentProcess();
+    PPS_PROTECTION prot = PsGetProcessProtection(curproc);
+    if (prot && prot->Level != 0) return FALSE;
+
+    PVOID frames[16] = {};
+    ULONG frameCount = 0;
+
+    __try {
+        frameCount = RtlWalkFrameChain(frames, 16, RTL_WALK_USER_MODE_STACK);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+
+    if (frameCount < 2) return FALSE;
+
+    // Check 1: Too-shallow call stack for a sensitive syscall.
+    // NtAllocateVirtualMemory from legitimate code: main→kernel32→ntdll = 3+ frames.
+    // Timer-based spoofing often yields exactly 2 frames (the spoofed pair).
+    BOOLEAN shallow = (frameCount == 2);
+
+    // Check 2: module-backed frame validation on non-CET systems.
+    // Walk user frames and count how many are in file-backed (MEM_IMAGE) regions.
+    ULONG imageFrames = 0;
+    ULONG privateFrames = 0;
+
+    KAPC_STATE apcState;
+    KeStackAttachProcess(curproc, &apcState);
+    __try {
+        for (ULONG i = 0; i < frameCount; i++) {
+            if (!frames[i]) continue;
+            // Skip kernel-mode frames
+            if ((ULONG64)frames[i] >= 0xFFFF800000000000ULL) continue;
+
+            RTL_AVL_TREE* root = (RTL_AVL_TREE*)
+                ((PUCHAR)curproc + OffsetsMgt::GetOffsets()->VadRoot);
+
+            if (VadUtils::IsAddressInPrivateExecVad(
+                    (PRTL_BALANCED_NODE)root, (ULONG64)frames[i])) {
+                privateFrames++;
+            } else {
+                imageFrames++;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    KeUnstackDetachProcess(&apcState);
+
+    // Heuristic: if we have shallow stack AND private frames in the chain,
+    // this looks like a spoofed stack from timer-based spoofing or VEH-based
+    // indirect syscalls.
+    if (shallow && privateFrames > 0) {
+        InjectionTaintTracker::MarkTainted(PsGetProcessId(curproc));
+
+        char msgBuf[256];
+        RtlStringCbPrintfA(msgBuf, sizeof(msgBuf),
+            "Call stack spoofing: shallow frame chain (%lu frames, %lu private) "
+            "on non-CET system — LayeredSyscall / timer-based stack spoofing "
+            "(Cobalt Strike 4.9+ / CallstackSpoofingPOC)",
+            frameCount, privateFrames);
+
+        PKERNEL_STRUCTURED_NOTIFICATION notif =
+            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED,
+                sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'cspf');
+        if (notif) {
+            RtlZeroMemory(notif, sizeof(*notif));
+            SET_WARNING(*notif);
+            SET_SYSCALL_CHECK(*notif);
+            notif->pid    = PsGetProcessId(curproc);
+            notif->isPath = FALSE;
+            RtlCopyMemory(notif->procName, PsGetProcessImageFileName(curproc), 14);
+            SIZE_T msgLen = strlen(msgBuf) + 1;
+            notif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'cspm');
+            notif->bufSize = (ULONG)msgLen;
+            if (notif->msg) {
+                RtlCopyMemory(notif->msg, msgBuf, msgLen);
+                if (!CallbackObjects::GetNotifQueue()->Enqueue(notif)) {
+                    ExFreePool(notif->msg);
+                    ExFreePool(notif);
+                }
+            } else {
+                ExFreePool(notif);
+            }
+        }
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 VOID SyscallsUtils::UnInitAltSyscallHandler() {

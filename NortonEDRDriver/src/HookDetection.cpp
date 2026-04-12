@@ -2012,6 +2012,145 @@ VOID HookDetector::CheckCallbackPrologueIntegrity(BufferQueue* bufQueue)
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// PspNotifyEnableMask integrity — the single-byte global kill switch.
+//
+// PspNotifyEnableMask is a UCHAR in ntoskrnl that acts as a bitmask controlling
+// which Ps*Notify callback arrays are invoked.  If an attacker (via BYOVD or
+// rootkit) clears any bit, ALL callbacks of that type stop firing — but the
+// callback arrays themselves remain intact, so our array-integrity checks pass.
+//
+// Bit 0 = PsSetCreateProcessNotifyRoutine
+// Bit 1 = PsSetCreateThreadNotifyRoutine
+// Bit 2 = PsSetLoadImageNotifyRoutine
+//
+// Detection: resolve PspNotifyEnableMask by scanning PsSetCreateProcessNotifyRoutineEx
+// for a MOV/TEST byte [rip+disp32] pattern near the LEA for PspCreateProcessNotifyRoutine.
+// Snapshot the mask at init, verify periodically.
+// ---------------------------------------------------------------------------
+
+static PUCHAR  s_PspNotifyEnableMaskAddr = nullptr;
+static UCHAR   s_PspNotifyEnableMaskBaseline = 0;
+static BOOLEAN s_PspNotifyEnableMaskValid = FALSE;
+
+VOID HookDetector::TakePspNotifyEnableMaskBaseline()
+{
+    // Scan PsSetCreateProcessNotifyRoutineEx for byte-sized RIP-relative memory
+    // accesses near the callback array reference.  PspNotifyEnableMask is typically
+    // accessed via TEST/OR byte ptr [rip+disp32] or MOV cl, [rip+disp32] within
+    // the first 0x100 bytes of the function.
+
+    UNICODE_STRING uName;
+    RtlInitUnicodeString(&uName, L"PsSetCreateProcessNotifyRoutineEx");
+    PVOID setFn = MmGetSystemRoutineAddress(&uName);
+    if (!setFn || !MmIsAddressValid(setFn)) {
+        DbgPrint("[-] PspNotifyEnableMask: PsSetCreateProcessNotifyRoutineEx not found\n");
+        return;
+    }
+
+    PUCHAR p = (PUCHAR)setFn;
+    __try {
+        for (ULONG i = 0; i < 0x100 - 7; i++) {
+            // Pattern 1: F6 05 xx xx xx xx yy = TEST byte ptr [rip+disp32], imm8
+            if (p[i] == 0xF6 && p[i+1] == 0x05) {
+                LONG disp = *(LONG*)(p + i + 2);
+                PUCHAR candidate = p + i + 7 + disp; // 7 = opcode(2) + disp32(4) + imm8(1)
+                // But TEST is 7 bytes total, RIP is at i+7
+                candidate = p + i + 2 + 4 + 1 + disp; // wrong — let me recalculate
+                // F6 05 [disp32] [imm8] — RIP points to next insn = p + i + 7
+                candidate = (PUCHAR)((p + i + 7) + disp);
+                if (MmIsAddressValid(candidate) && (ULONG_PTR)candidate > 0xFFFF800000000000ULL) {
+                    UCHAR val = *candidate;
+                    // Sanity: mask should have bits 0-2 set (all three callback types enabled)
+                    if ((val & 0x07) == 0x07) {
+                        s_PspNotifyEnableMaskAddr = candidate;
+                        s_PspNotifyEnableMaskBaseline = val;
+                        s_PspNotifyEnableMaskValid = TRUE;
+                        DbgPrint("[+] PspNotifyEnableMask: found at %p, value=0x%02X\n",
+                            candidate, val);
+                        return;
+                    }
+                }
+            }
+
+            // Pattern 2: 80 0D xx xx xx xx yy = OR byte ptr [rip+disp32], imm8
+            if (p[i] == 0x80 && p[i+1] == 0x0D) {
+                LONG disp = *(LONG*)(p + i + 2);
+                PUCHAR candidate = (PUCHAR)((p + i + 7) + disp);
+                if (MmIsAddressValid(candidate) && (ULONG_PTR)candidate > 0xFFFF800000000000ULL) {
+                    UCHAR val = *candidate;
+                    if ((val & 0x07) == 0x07) {
+                        s_PspNotifyEnableMaskAddr = candidate;
+                        s_PspNotifyEnableMaskBaseline = val;
+                        s_PspNotifyEnableMaskValid = TRUE;
+                        DbgPrint("[+] PspNotifyEnableMask: found (OR pattern) at %p, value=0x%02X\n",
+                            candidate, val);
+                        return;
+                    }
+                }
+            }
+
+            // Pattern 3: 0F BA 2D xx xx xx xx yy = BTS dword ptr [rip+disp32], imm8
+            // Used in some Windows builds to set individual bits.
+            if (p[i] == 0x0F && p[i+1] == 0xBA && (p[i+2] & 0x38) == 0x28) {
+                LONG disp = *(LONG*)(p + i + 3);
+                PUCHAR candidate = (PUCHAR)((p + i + 8) + disp);
+                if (MmIsAddressValid(candidate) && (ULONG_PTR)candidate > 0xFFFF800000000000ULL) {
+                    UCHAR val = *candidate;
+                    if ((val & 0x07) == 0x07) {
+                        s_PspNotifyEnableMaskAddr = candidate;
+                        s_PspNotifyEnableMaskBaseline = val;
+                        s_PspNotifyEnableMaskValid = TRUE;
+                        DbgPrint("[+] PspNotifyEnableMask: found (BTS pattern) at %p, value=0x%02X\n",
+                            candidate, val);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] PspNotifyEnableMask: exception during scan\n");
+    }
+
+    DbgPrint("[-] PspNotifyEnableMask: pattern not found — check disabled\n");
+}
+
+VOID HookDetector::CheckPspNotifyEnableMask(BufferQueue* bufQueue)
+{
+    if (!s_PspNotifyEnableMaskValid || !s_PspNotifyEnableMaskAddr || !bufQueue)
+        return;
+
+    __try {
+        if (!MmIsAddressValid(s_PspNotifyEnableMaskAddr)) return;
+
+        UCHAR current = *s_PspNotifyEnableMaskAddr;
+        if (current == s_PspNotifyEnableMaskBaseline) return;
+
+        // Determine which callback types were disabled
+        UCHAR diff = s_PspNotifyEnableMaskBaseline & ~current;
+        const char* disabled = "";
+        if (diff & 0x01) disabled = "Process";
+        else if (diff & 0x02) disabled = "Thread";
+        else if (diff & 0x04) disabled = "Image";
+        if ((diff & 0x07) > 0x04) disabled = "Multiple";
+
+        char msg[300];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "ANTI-TAMPER CRITICAL: PspNotifyEnableMask modified 0x%02X→0x%02X at %p — "
+            "%s callback(s) globally disabled! All EDR/AV Ps*Notify callbacks silenced "
+            "(BYOVD single-byte kill switch attack)",
+            s_PspNotifyEnableMaskBaseline, current, s_PspNotifyEnableMaskAddr, disabled);
+
+        EmitPsCallbackAlert(bufQueue, msg, s_PspNotifyEnableMaskAddr);
+
+        // Update baseline to avoid spam — but keep alerting if further bits cleared
+        s_PspNotifyEnableMaskBaseline = current;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// ---------------------------------------------------------------------------
 // RunAllHookChecks — run all detection routines in sequence.
 // Call after driver init is complete (and periodically from AntiTamper).
 // ---------------------------------------------------------------------------
@@ -2037,6 +2176,8 @@ VOID HookDetector::RunAllHookChecks(
     CheckLsassAuthDllIntegrity(bufQueue);
     CheckMajorFunctionIntegrity(bufQueue);
     CheckCallbackPrologueIntegrity(bufQueue);
+    CheckPspNotifyEnableMask(bufQueue);
+    CheckWfpIntegrity(bufQueue);
 
     DbgPrint("[*] HookDetector results — SSDT=%lu Inline=%lu EAT=%lu ETW=%d\n",
         ssdt, inl, eat, (int)etw);

@@ -366,6 +366,10 @@ public:
 
 	// Update the blocked-port list from user-mode (NORTONAV_SET_NETWORK_CONFIG).
 	static VOID WfpSetBlocklist(const UINT16* ports, UINT32 count);
+
+	// WFP self-protection: verify our filter/callout/sublayer are still registered
+	// and no foreign higher-weight filter has been added (EDRSilencer defense).
+	BOOLEAN CheckIntegrity(BufferQueue* bufQueue);
 	
 	static VOID TcpipFilteringCallback(
 		const FWPS_INCOMING_VALUES*,
@@ -824,6 +828,11 @@ public:
 	);
 
 	BOOLEAN isSyscallIndirect(
+		ULONG64
+	);
+
+	// Call stack spoofing detection — non-CET frame chain validation
+	BOOLEAN isCallStackSpoofed(
 		ULONG64
 	);
 
@@ -1827,6 +1836,15 @@ public:
     // onto our callback entry points to silently neuter the EDR.
     static VOID     TakeCallbackPrologueBaseline();
     static VOID     CheckCallbackPrologueIntegrity(BufferQueue* bufQueue);
+
+    // PspNotifyEnableMask integrity — single-byte global kill switch for all
+    // Ps*Notify callbacks.  Resolve at init, snapshot, periodic verify.
+    static VOID     TakePspNotifyEnableMaskBaseline();
+    static VOID     CheckPspNotifyEnableMask(BufferQueue* bufQueue);
+
+    // WFP self-protection — verify our callout/filter/sublayer haven't been
+    // deleted or superseded by a higher-weight filter (EDRSilencer defense).
+    static VOID     CheckWfpIntegrity(BufferQueue* bufQueue);
 
     static VOID RunAllHookChecks(
         PFUNCTION_MAP exportsMap,
