@@ -179,6 +179,42 @@ static const DefenseEvasionEntry kDefenseEvasionPaths[] = {
     { L"\\Control\\Lsa",                    L"RunAsPPL",
       "LSA RunAsPPL protection modified — credential guard downgrade",  TRUE  },
 
+    // --- T1556.001: Authentication downgrade — Kerberos encryption ---
+    // Attackers lower SupportedEncryptionTypes to force RC4-HMAC (etype 23)
+    // instead of AES256 — RC4 tickets are crackable via Kerberoasting.
+    // Rubeus: /enctype:rc4; Mimikatz: kerberos::ptt with RC4 golden tickets.
+    { L"\\Control\\Lsa\\Kerberos\\Parameters", L"SupportedEncryptionTypes",
+      "Kerberos encryption downgrade — SupportedEncryptionTypes modified (T1556.001)", TRUE },
+
+    // --- T1556.001: Authentication downgrade — NTLM level ---
+    // LmCompatibilityLevel < 5 allows NTLMv1 or LM responses which are trivially
+    // crackable.  Attackers downgrade this to capture relay-able hashes.
+    { L"\\Control\\Lsa",                    L"LmCompatibilityLevel",
+      "NTLM authentication downgrade — LmCompatibilityLevel modified (T1556.001)", TRUE },
+
+    // --- T1556.001: Authentication downgrade — restrict NTLM ---
+    // Disabling RestrictSendingNTLMTraffic allows outbound NTLM auth which
+    // enables relay attacks (ntlmrelayx, Responder).
+    { L"\\Control\\Lsa\\MSV1_0",            L"RestrictSendingNTLMTraffic",
+      "NTLM outbound restriction weakened — relay attack enablement (T1556.001)", TRUE },
+
+    // --- T1556.001: Authentication downgrade — NTLMv2 session security ---
+    // NtlmMinClientSec / NtlmMinServerSec below 0x20080000 disables NTLMv2
+    // session security and 128-bit encryption, enabling downgrade-to-NTLMv1.
+    { L"\\Control\\Lsa\\MSV1_0",            L"NtlmMinClientSec",
+      "NTLM client minimum security weakened — NTLMv1 downgrade (T1556.001)", TRUE },
+    { L"\\Control\\Lsa\\MSV1_0",            L"NtlmMinServerSec",
+      "NTLM server minimum security weakened — NTLMv1 downgrade (T1556.001)", TRUE },
+
+    // --- T1556.001: Skeleton Key — SSP registration ---
+    // Skeleton Key (misc::skeleton) and SSP credential loggers register a malicious
+    // Security Support Provider DLL via the Security Packages registry value.
+    // mimilib.dll is the canonical example — it logs plaintext passwords to disk.
+    { L"\\Control\\Lsa",                    L"Security Packages",
+      "LSA Security Packages modified — Skeleton Key / malicious SSP registration (T1556.001)", TRUE },
+    { L"\\Control\\Lsa\\OSConfig",          L"Security Packages",
+      "LSA OSConfig Security Packages modified — SSP persistence (T1556.001)", TRUE },
+
     // --- Misc defense evasion ---
     // AMSI provider unregistration (COM CLSID nuke)
     { L"\\AMSI\\Providers",                 NULL,

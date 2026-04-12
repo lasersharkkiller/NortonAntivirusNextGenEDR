@@ -104,7 +104,10 @@ enum HookIdx : int {
     IDX_ADDVECTOREDCONTINUEHANDLER    = 44,  // kernel32.dll
     IDX_RTLADDVECTOREDEXCEPTIONHANDLER = 45, // ntdll.dll — direct call path
     IDX_RTLADDVECTOREDCONTINUEHANDLER  = 46, // ntdll.dll — direct call path
-    HOOK_COUNT                  = 47
+    // --- Authentication downgrade detection: SSPI hooks ---
+    IDX_INITIALIZESECURITYCONTEXTW     = 47, // sspicli.dll — Negotiate→NTLM fallback
+    IDX_ACQUIRECREDENTIALSHANDLEW      = 48, // sspicli.dll — explicit NTLM/WDigest credential acquisition
+    HOOK_COUNT                  = 49
 };
 
 struct ApiHook {
@@ -174,6 +177,18 @@ static PVOID   WINAPI Hook_AddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTIO
 static PVOID   WINAPI Hook_AddVectoredContinueHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
 static PVOID   NTAPI  Hook_RtlAddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
 static PVOID   NTAPI  Hook_RtlAddVectoredContinueHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
+// SSPI authentication downgrade hooks
+// SecBufferDesc / CtxtHandle / CredHandle / TimeStamp are from sspi.h but we
+// keep them opaque (PVOID / PVOID* / PLARGE_INTEGER) to avoid header conflicts
+// with WIN32_LEAN_AND_MEAN.  The hook only inspects string parameters.
+typedef void* PCtxtHandle;
+typedef void* PCredHandle;
+typedef void* PSecBufferDesc;
+static LONG  WINAPI Hook_InitializeSecurityContextW(
+    PCredHandle, PCtxtHandle, wchar_t*, ULONG, ULONG, ULONG,
+    PSecBufferDesc, ULONG, PCtxtHandle, PSecBufferDesc, ULONG*, PLARGE_INTEGER);
+static LONG  WINAPI Hook_AcquireCredentialsHandleW(
+    wchar_t*, wchar_t*, ULONG, PVOID, PVOID, PVOID, PVOID, PCredHandle, PLARGE_INTEGER);
 
 static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "VirtualAlloc",         (FARPROC)Hook_VirtualAlloc,        nullptr, nullptr, {}, nullptr, false },
@@ -223,6 +238,9 @@ static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "AddVectoredContinueHandler",    (FARPROC)Hook_AddVectoredContinueHandler,     nullptr, nullptr, {}, nullptr, false },
     { "ntdll.dll",    "RtlAddVectoredExceptionHandler",(FARPROC)Hook_RtlAddVectoredExceptionHandler, nullptr, nullptr, {}, nullptr, false },
     { "ntdll.dll",    "RtlAddVectoredContinueHandler", (FARPROC)Hook_RtlAddVectoredContinueHandler,  nullptr, nullptr, {}, nullptr, false },
+    // SSPI authentication downgrade detection
+    { "sspicli.dll",  "InitializeSecurityContextW",    (FARPROC)Hook_InitializeSecurityContextW,      nullptr, nullptr, {}, nullptr, false },
+    { "sspicli.dll",  "AcquireCredentialsHandleW",     (FARPROC)Hook_AcquireCredentialsHandleW,      nullptr, nullptr, {}, nullptr, false },
 };
 
 // Returns the correct call-through address.
@@ -1698,6 +1716,127 @@ static PVOID NTAPI Hook_RtlAddVectoredContinueHandler(
     typedef PVOID(NTAPI* Fn)(ULONG, PVECTORED_EXCEPTION_HANDLER);
     CheckVehHandler("RtlAddVectoredContinueHandler", VectoredHandler);
     return ((Fn)GetCallThrough(IDX_RTLADDVECTOREDCONTINUEHANDLER))(FirstHandler, VectoredHandler);
+}
+
+// ---------------------------------------------------------------------------
+// Authentication downgrade detection — SSPI hooks (T1556.001)
+//
+// 1. AcquireCredentialsHandleW — monitors which authentication package is
+//    requested.  Explicit "NTLM" or "WDigest" acquisition from a non-system
+//    process is suspicious (mimikatz sekurlsa, ntlmrelayx, Inveigh).
+//    Legitimate apps use "Negotiate" which prefers Kerberos.
+//
+// 2. InitializeSecurityContextW — monitors the target SPN.  When pszTargetName
+//    is NULL or contains "NTLM" (forced NTLM instead of Kerberos), the
+//    Negotiate SSP falls back to NTLM — this is the runtime downgrade.
+//    Also detects missing SPN (common in relay attacks where the attacker
+//    intentionally omits the SPN to force NTLM).
+// ---------------------------------------------------------------------------
+
+// Case-insensitive wide-string comparison for SSP package names.
+static bool WideStrEqualI(const wchar_t* a, const wchar_t* b) {
+    if (!a || !b) return false;
+    for (int i = 0; ; i++) {
+        wchar_t ca = (a[i] >= L'A' && a[i] <= L'Z') ? a[i] + 32 : a[i];
+        wchar_t cb = (b[i] >= L'A' && b[i] <= L'Z') ? b[i] + 32 : b[i];
+        if (ca != cb) return false;
+        if (ca == L'\0') return true;
+    }
+}
+
+// Processes that legitimately acquire NTLM credentials (lsass, svchost, etc.).
+static bool IsSspiTrustedProcess() {
+    char name[MAX_PATH] = {};
+    if (!GetModuleFileNameA(nullptr, name, sizeof(name))) return false;
+    // Extract just the filename
+    const char* base = name;
+    for (const char* p = name; *p; p++) {
+        if (*p == '\\' || *p == '/') base = p + 1;
+    }
+    return (_stricmp(base, "lsass.exe")    == 0 ||
+            _stricmp(base, "svchost.exe")  == 0 ||
+            _stricmp(base, "services.exe") == 0 ||
+            _stricmp(base, "winlogon.exe") == 0 ||
+            _stricmp(base, "System")       == 0 ||
+            _stricmp(base, "NortonEDR.exe") == 0);
+}
+
+static LONG WINAPI Hook_AcquireCredentialsHandleW(
+    wchar_t* pszPrincipal, wchar_t* pszPackage, ULONG fCredentialUse,
+    PVOID pvLogonID, PVOID pAuthData, PVOID pGetKeyFn,
+    PVOID pvGetKeyArgument, PCredHandle phCredential, PLARGE_INTEGER ptsExpiry)
+{
+    typedef LONG(WINAPI* Fn)(wchar_t*, wchar_t*, ULONG, PVOID, PVOID,
+                              PVOID, PVOID, PCredHandle, PLARGE_INTEGER);
+
+    // Flag explicit NTLM / WDigest / LM package acquisition from non-system processes.
+    // Legitimate apps use "Negotiate" (which tries Kerberos first).
+    if (pszPackage && !IsSspiTrustedProcess()) {
+        bool isNtlm    = WideStrEqualI(pszPackage, L"NTLM");
+        bool isWDigest = WideStrEqualI(pszPackage, L"WDigest");
+
+        if (isNtlm || isWDigest) {
+            char det[200];
+            char pkgA[32] = {};
+            for (int i = 0; i < 31 && pszPackage[i]; i++)
+                pkgA[i] = (char)(pszPackage[i] & 0x7F);
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "Auth downgrade (T1556.001): explicit %s credential acquisition "
+                "— non-Negotiate auth enables relay/downgrade attacks",
+                pkgA);
+            SendHookEvent(isWDigest ? "Critical" : "Warning",
+                "AcquireCredentialsHandleW", 0, det);
+        }
+    }
+
+    return ((Fn)GetCallThrough(IDX_ACQUIRECREDENTIALSHANDLEW))(
+        pszPrincipal, pszPackage, fCredentialUse, pvLogonID, pAuthData,
+        pGetKeyFn, pvGetKeyArgument, phCredential, ptsExpiry);
+}
+
+static LONG WINAPI Hook_InitializeSecurityContextW(
+    PCredHandle phCredential, PCtxtHandle phContext, wchar_t* pszTargetName,
+    ULONG fContextReq, ULONG Reserved1, ULONG TargetDataRep,
+    PSecBufferDesc pInput, ULONG Reserved2, PCtxtHandle phNewContext,
+    PSecBufferDesc pOutput, ULONG* pfContextAttr, PLARGE_INTEGER ptsExpiry)
+{
+    typedef LONG(WINAPI* Fn)(PCredHandle, PCtxtHandle, wchar_t*, ULONG, ULONG,
+                              ULONG, PSecBufferDesc, ULONG, PCtxtHandle,
+                              PSecBufferDesc, ULONG*, PLARGE_INTEGER);
+
+    if (!IsSspiTrustedProcess()) {
+        // Detection 1: NULL target SPN — forces NTLM fallback.
+        // Legitimate Kerberos auth always specifies an SPN (e.g., "HTTP/server.domain").
+        // Relay tools (ntlmrelayx, Inveigh) omit the SPN to force NTLM.
+        if (!pszTargetName && !phContext) {
+            // First call (phContext==NULL) with no SPN = forced NTLM
+            SendHookEvent("Warning", "InitializeSecurityContextW", 0,
+                "Auth downgrade (T1556.001): InitializeSecurityContext called "
+                "with NULL target SPN — forces Negotiate→NTLM fallback "
+                "(relay attack / credential theft)");
+        }
+
+        // Detection 2: Target name containing explicit NTLM force-strings.
+        // Some attack tools pass pszTargetName = "NTLM" or empty string
+        // to override the Negotiate package's Kerberos preference.
+        if (pszTargetName && !phContext) {
+            bool forceNtlm = (pszTargetName[0] == L'\0') ||
+                              WideStrEqualI(pszTargetName, L"NTLM");
+            if (forceNtlm) {
+                char det[200];
+                _snprintf_s(det, sizeof(det), _TRUNCATE,
+                    "Auth downgrade (T1556.001): InitializeSecurityContext "
+                    "target='%S' — forced NTLM authentication bypass of Kerberos",
+                    pszTargetName[0] ? pszTargetName : L"(empty)");
+                SendHookEvent("Warning", "InitializeSecurityContextW", 0, det);
+            }
+        }
+    }
+
+    return ((Fn)GetCallThrough(IDX_INITIALIZESECURITYCONTEXTW))(
+        phCredential, phContext, pszTargetName, fContextReq, Reserved1,
+        TargetDataRep, pInput, Reserved2, phNewContext, pOutput,
+        pfContextAttr, ptsExpiry);
 }
 
 // ---------------------------------------------------------------------------
