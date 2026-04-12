@@ -753,6 +753,7 @@ class SyscallsUtils {
 	static ULONG NtProtectVirtualMemoryId;     // Variable — resolved in InitIds()
 	static ULONG NtCreateTransactionId;        // Variable — doppelgänging telemetry
 	static ULONG NtRollbackTransactionId;      // Variable — doppelgänging telemetry
+	static ULONG NtCommitTransactionId;        // Variable — TxF commit-path evasion detection
 	static ULONG NtCreateProcessExId;          // Variable — legacy section-based process creation
 	static ULONG NtCreateProcessId;            // Variable — even older legacy API (same technique)
 	static ULONG NtQuerySystemInformationId;   // Variable — EDR callback enumeration recon
@@ -984,6 +985,7 @@ public:
 
 	static VOID NtCreateTransactionHandler();   // doppelgänging telemetry
 	static VOID NtRollbackTransactionHandler(); // doppelgänging telemetry
+	static VOID NtCommitTransactionHandler();  // TxF commit-path evasion detection
 	// Legacy process creation from explicit image section (process injection / doppelgänging)
 	// Also detects process cloning (lsass/sensitive parent process)
 	static VOID NtCreateProcessExHandler(HANDLE ParentProcess, ULONG Flags, HANDLE SectionHandle);
@@ -1310,6 +1312,10 @@ public:
 
     // IRP_MJ_FILE_SYSTEM_CONTROL — reparse point abuse, EFS encryption abuse
     static FLT_PREOP_CALLBACK_STATUS FLTAPI PreFsControl(
+        PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
+
+    // IRP_MJ_SET_EA — Extended Attribute abuse detection
+    static FLT_PREOP_CALLBACK_STATUS FLTAPI PreSetEa(
         PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID* CompletionContext);
 
     static NTSTATUS FLTAPI FilterUnloadCallback(FLT_FILTER_UNLOAD_FLAGS Flags);

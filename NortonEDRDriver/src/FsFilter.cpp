@@ -124,6 +124,26 @@ static HERP_SLOT  g_HerpSlots[HERP_TRACK_MAX];
 static KSPIN_LOCK g_HerpLock;
 
 // ---------------------------------------------------------------------------
+// Per-process I/O rate tracker — CPU-burn / filter-flood detection.
+// An attacker can generate massive benign I/O to keep our PreCreate spinning,
+// degrading EDR performance without saturating the output queue.
+// We track IRP_MJ_CREATE ops/second per PID and alert on sustained high rates.
+// ---------------------------------------------------------------------------
+#define IO_RATE_WINDOW_100NS   10000000LL   // 1 second in 100-ns units
+#define IO_RATE_THRESHOLD      5000         // creates/second before alert
+#define IO_RATE_TRACKER_SLOTS  32
+
+typedef struct _IO_RATE_SLOT {
+    HANDLE        Pid;
+    ULONG         Count;
+    LARGE_INTEGER WindowStart;
+    BOOLEAN       Alerted;
+} IO_RATE_SLOT;
+
+static IO_RATE_SLOT g_IoRateSlots[IO_RATE_TRACKER_SLOTS];
+static KSPIN_LOCK   g_IoRateLock;
+
+// ---------------------------------------------------------------------------
 // Sensitive credential file path fragments (lowercase for comparison)
 // ---------------------------------------------------------------------------
 static const PCWSTR kCredPaths[] = {
@@ -512,6 +532,7 @@ static FLT_OPERATION_REGISTRATION g_FsCallbacks[] = {
     { IRP_MJ_SET_INFORMATION,     0, FsFilter::PreSetInformation,    nullptr },
     { IRP_MJ_DIRECTORY_CONTROL,   0, FsFilter::PreDirControl,        nullptr },
     { IRP_MJ_FILE_SYSTEM_CONTROL, 0, FsFilter::PreFsControl,        nullptr },
+    { IRP_MJ_SET_EA,              0, FsFilter::PreSetEa,             nullptr },
     { IRP_MJ_NETWORK_QUERY_OPEN,  0, FsFilter::PreNetworkQueryOpen,  nullptr },
     { IRP_MJ_OPERATION_END }
 };
@@ -541,6 +562,8 @@ NTSTATUS FsFilter::Init(PDRIVER_OBJECT DriverObject, NotifQueue* queue) {
     KeInitializeSpinLock(&g_DirSlotLock);
     RtlZeroMemory(g_HerpSlots, sizeof(g_HerpSlots));
     KeInitializeSpinLock(&g_HerpLock);
+    RtlZeroMemory(g_IoRateSlots, sizeof(g_IoRateSlots));
+    KeInitializeSpinLock(&g_IoRateLock);
 
     NTSTATUS status = FltRegisterFilter(DriverObject, &g_FltRegistration, &g_FilterHandle);
     if (!NT_SUCCESS(status)) {
@@ -1721,6 +1744,162 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreate(
         }
     }
 
+    // ---- Per-process I/O rate tracking (CPU-burn / filter-flood detection) ----
+    {
+        PEPROCESS rateProc = IoThreadToProcess(Data->Thread);
+        HANDLE    ratePid  = PsGetProcessId(rateProc);
+
+        if ((ULONG_PTR)ratePid > 4) {
+            LARGE_INTEGER now;
+            KeQuerySystemTime(&now);
+
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&g_IoRateLock, &oldIrql);
+
+            IO_RATE_SLOT* slot = nullptr;
+            IO_RATE_SLOT* freeSlot = nullptr;
+            for (int i = 0; i < IO_RATE_TRACKER_SLOTS; i++) {
+                if (g_IoRateSlots[i].Pid == ratePid) { slot = &g_IoRateSlots[i]; break; }
+                if (!freeSlot && !g_IoRateSlots[i].Pid) freeSlot = &g_IoRateSlots[i];
+            }
+
+            if (slot) {
+                if ((now.QuadPart - slot->WindowStart.QuadPart) > IO_RATE_WINDOW_100NS) {
+                    // Window expired — reset
+                    slot->Count = 1;
+                    slot->WindowStart = now;
+                    slot->Alerted = FALSE;
+                } else {
+                    slot->Count++;
+                    if (slot->Count >= IO_RATE_THRESHOLD && !slot->Alerted) {
+                        slot->Alerted = TRUE;
+                        KeReleaseSpinLock(&g_IoRateLock, oldIrql);
+
+                        char* ratePName = PsGetProcessImageFileName(rateProc);
+                        char msg[192];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: I/O FLOOD — '%s' (pid=%llu) issued %lu creates in 1 second "
+                            "— possible minifilter CPU-burn evasion attack",
+                            ratePName ? ratePName : "?", (ULONG64)(ULONG_PTR)ratePid,
+                            slot->Count);
+                        EnqueueFsAlert(ratePid, ratePName, msg, TRUE);
+                        goto rate_done;
+                    }
+                }
+            } else if (freeSlot) {
+                freeSlot->Pid = ratePid;
+                freeSlot->Count = 1;
+                freeSlot->WindowStart = now;
+                freeSlot->Alerted = FALSE;
+            }
+
+            KeReleaseSpinLock(&g_IoRateLock, oldIrql);
+        }
+    }
+rate_done:
+
+    // ---- FILE_OPEN_BY_FILE_ID detection ----
+    // Opening files by 64-bit NTFS File ID or 128-bit Object ID bypasses ALL
+    // name-based detection rules.  This is rare in legitimate user-mode code
+    // (mainly used by defrag, backup, and indexing services).
+    {
+        ULONG createOptions = Data->Iopb->Parameters.Create.Options & 0x00FFFFFF;
+        if (createOptions & FILE_OPEN_BY_FILE_ID) {
+            PEPROCESS fidProc  = IoThreadToProcess(Data->Thread);
+            HANDLE    fidPid   = PsGetProcessId(fidProc);
+            char*     fidPName = PsGetProcessImageFileName(fidProc);
+
+            // Allowlist: System, defrag, backup, search indexer, antimalware
+            BOOLEAN fidAllowed = ((ULONG_PTR)fidPid <= 4);
+            if (!fidAllowed && fidPName) {
+                fidAllowed = (strcmp(fidPName, "defrag.exe") == 0 ||
+                              strcmp(fidPName, "SearchIndex") == 0 ||
+                              strcmp(fidPName, "SearchProto") == 0 ||
+                              strcmp(fidPName, "TrustedInsta") == 0 ||
+                              strcmp(fidPName, "vssvc.exe") == 0 ||
+                              strcmp(fidPName, "wbengine.exe") == 0 ||
+                              strcmp(fidPName, "MsMpEng.exe") == 0 ||
+                              strcmp(fidPName, "NortonEDR.e") == 0);
+            }
+
+            if (!fidAllowed) {
+                ACCESS_MASK fidAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+                const char* accessStr = (fidAccess & (FILE_WRITE_DATA | DELETE)) ? "WRITE/DELETE" :
+                                        (fidAccess & FILE_EXECUTE) ? "EXECUTE" : "READ";
+                char msg[192];
+                RtlStringCchPrintfA(msg, sizeof(msg),
+                    "FS: FILE_OPEN_BY_FILE_ID by '%s' (pid=%llu) access=%s "
+                    "— bypasses name-based detection! (T1006)",
+                    fidPName ? fidPName : "?", (ULONG64)(ULONG_PTR)fidPid, accessStr);
+                EnqueueFsAlert(fidPid, fidPName, msg,
+                    (fidAccess & (FILE_WRITE_DATA | DELETE | FILE_EXECUTE)) ? TRUE : FALSE);
+            }
+        }
+    }
+
+    // ---- IRP parameter validation (upstream filter spoofing detection) ----
+    // Cross-reference the file name from FltGetFileNameInformation (which goes
+    // through FltMgr's name provider chain and is authoritative) against the
+    // FileObject->FileName that the I/O manager populated from the original
+    // NtCreateFile call.  If a malicious filter above us rewrote the FileName
+    // in the FileObject, these two will diverge.
+    // We do this check on a sampling basis (every 64th create) to avoid perf impact.
+    {
+        static volatile LONG s_CreateCounter = 0;
+        LONG count = InterlockedIncrement(&s_CreateCounter);
+        if ((count & 0x3F) == 0 && FltObjects && FltObjects->FileObject &&
+            FltObjects->FileObject->FileName.Length > 0)
+        {
+            PFLT_FILE_NAME_INFORMATION authNameInfo = nullptr;
+            NTSTATUS authSt = FltGetFileNameInformation(
+                Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &authNameInfo);
+            if (NT_SUCCESS(authSt) && authNameInfo) {
+                FltParseFileNameInformation(authNameInfo);
+                // Compare the final component (filename) — full path comparison is
+                // unreliable because FltMgr normalises the volume prefix.
+                UNICODE_STRING* foName = &FltObjects->FileObject->FileName;
+                // Extract just the last component from both
+                PWCHAR authFinal = authNameInfo->FinalComponent.Buffer;
+                USHORT authLen   = authNameInfo->FinalComponent.Length;
+
+                if (authFinal && authLen > 0 && foName->Length > 0) {
+                    // Find last component of FileObject->FileName
+                    PWCHAR foFinal = foName->Buffer;
+                    USHORT foLen   = foName->Length;
+                    for (USHORT i = foName->Length / sizeof(WCHAR); i > 0; i--) {
+                        if (foName->Buffer[i - 1] == L'\\') {
+                            foFinal = &foName->Buffer[i];
+                            foLen   = foName->Length - i * sizeof(WCHAR);
+                            break;
+                        }
+                    }
+
+                    // Case-insensitive compare
+                    UNICODE_STRING a = { authLen, authLen, authFinal };
+                    UNICODE_STRING b = { foLen, foLen, foFinal };
+                    if (!RtlEqualUnicodeString(&a, &b, TRUE)) {
+                        PEPROCESS vpProc  = IoThreadToProcess(Data->Thread);
+                        HANDLE    vpPid   = PsGetProcessId(vpProc);
+
+                        char authA[64] = {}, foA[64] = {};
+                        for (USHORT c = 0; c < authLen / sizeof(WCHAR) && c < 63; c++)
+                            authA[c] = (char)authFinal[c];
+                        for (USHORT c = 0; c < foLen / sizeof(WCHAR) && c < 63; c++)
+                            foA[c] = (char)foFinal[c];
+
+                        char msg[256];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: IRP NAME MISMATCH — FltMgr says '%s' but FileObject says '%s' "
+                            "— adversary filter may be spoofing IRP parameters!",
+                            authA, foA);
+                        EnqueueFsAlert(vpPid, nullptr, msg, TRUE);
+                    }
+                }
+                FltReleaseFileNameInformation(authNameInfo);
+            }
+        }
+    }
+
     PFLT_FILE_NAME_INFORMATION nameInfo = nullptr;
     NTSTATUS status = FltGetFileNameInformation(
         Data,
@@ -2798,6 +2977,69 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetInformation(
     BOOLEAN isDelete   = (infoClass == FileDispositionInformation ||
                           infoClass == FileDispositionInformationEx);
 
+    // ---- Timestomping detection (T1070.006) ----
+    // FileBasicInformation (class 4) carries CreationTime, LastAccessTime,
+    // LastWriteTime, ChangeTime.  Backdating timestamps hides recently modified
+    // files from forensic timelines.  Only explorer.exe and TrustedInstaller are
+    // expected to modify timestamps on user request.
+    if (infoClass == FileBasicInformation) {
+        PEPROCESS tsProc  = IoThreadToProcess(Data->Thread);
+        HANDLE    tsPid   = PsGetProcessId(tsProc);
+        char*     tsPName = PsGetProcessImageFileName(tsProc);
+
+        // Allow system PID, explorer (right-click → Properties → timestamp edit),
+        // TrustedInstaller, and WER
+        BOOLEAN tsAllowed = ((ULONG_PTR)tsPid <= 4);
+        if (!tsAllowed && tsPName) {
+            tsAllowed = (strcmp(tsPName, "explorer.exe") == 0 ||
+                         strcmp(tsPName, "TrustedInsta") == 0 ||
+                         strcmp(tsPName, "svchost.exe") == 0 ||
+                         strcmp(tsPName, "MsMpEng.exe") == 0);
+        }
+
+        if (!tsAllowed) {
+            FILE_BASIC_INFORMATION* basicInfo =
+                (FILE_BASIC_INFORMATION*)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+            if (basicInfo && MmIsAddressValid(basicInfo)) {
+                // Check if any timestamp is being set to a value in the past
+                // (zeroed fields = "don't change", so only flag non-zero values)
+                BOOLEAN suspicious = FALSE;
+                LARGE_INTEGER now;
+                KeQuerySystemTime(&now);
+
+                // Flag if CreationTime or LastWriteTime is being set to a past value
+                // (more than 1 hour ago) — this is the classic timestomp pattern
+                if (basicInfo->CreationTime.QuadPart > 0 &&
+                    (now.QuadPart - basicInfo->CreationTime.QuadPart) > 36000000000LL)
+                    suspicious = TRUE;
+                if (basicInfo->LastWriteTime.QuadPart > 0 &&
+                    (now.QuadPart - basicInfo->LastWriteTime.QuadPart) > 36000000000LL)
+                    suspicious = TRUE;
+
+                if (suspicious) {
+                    PFLT_FILE_NAME_INFORMATION tsNameInfo = nullptr;
+                    char tsPath[128] = {};
+                    NTSTATUS tsSt = FltGetFileNameInformation(
+                        Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &tsNameInfo);
+                    if (NT_SUCCESS(tsSt) && tsNameInfo) {
+                        FltParseFileNameInformation(tsNameInfo);
+                        for (ULONG c = 0; c < tsNameInfo->Name.Length / sizeof(WCHAR) && c < 127; c++)
+                            tsPath[c] = (char)tsNameInfo->Name.Buffer[c];
+                        FltReleaseFileNameInformation(tsNameInfo);
+                    }
+                    char msg[256];
+                    RtlStringCchPrintfA(msg, sizeof(msg),
+                        "FS: TIMESTOMPING — '%s' (pid=%llu) backdating timestamps on %s "
+                        "— anti-forensics / timeline manipulation (T1070.006)",
+                        tsPName ? tsPName : "?", (ULONG64)(ULONG_PTR)tsPid,
+                        tsPath[0] ? tsPath : "?");
+                    EnqueueFsAlert(tsPid, tsPName, msg, TRUE);
+                }
+            }
+        }
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
     if (!isRename && !isHardLink && !isDelete) return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     PEPROCESS process  = IoThreadToProcess(Data->Thread);
@@ -3107,6 +3349,100 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreFsControl(
         EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
     }
 
+    // ---- USN Journal manipulation (anti-forensics) ----
+    // FSCTL_DELETE_USN_JOURNAL (0x900D8) disables or deletes the USN change journal.
+    // FSCTL_CREATE_USN_JOURNAL (0x900C7) can also be abused to reset journal parameters.
+    // Only TrustedInstaller, System, and chkdsk should touch the journal.
+    else if (fsctl == 0x000900D8 || fsctl == 0x000900C7) {
+        PEPROCESS process  = IoThreadToProcess(Data->Thread);
+        HANDLE    pid      = PsGetProcessId(process);
+        char*     procName = PsGetProcessImageFileName(process);
+
+        if ((ULONG_PTR)pid <= 4) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+        BOOLEAN usnAllowed = FALSE;
+        if (procName) {
+            usnAllowed = (strcmp(procName, "TrustedInsta") == 0 ||
+                          strcmp(procName, "chkdsk.exe") == 0 ||
+                          strcmp(procName, "autochk.exe") == 0 ||
+                          strcmp(procName, "MsMpEng.exe") == 0);
+        }
+
+        if (!usnAllowed) {
+            const char* usnVerb = (fsctl == 0x000900D8) ? "DELETE" : "CREATE/RESET";
+            char msg[192];
+            RtlStringCchPrintfA(msg, sizeof(msg),
+                "FS: USN JOURNAL %s by '%s' (pid=%llu) "
+                "— anti-forensics / hiding file system activity (T1070)",
+                usnVerb, procName ? procName : "?", (ULONG64)(ULONG_PTR)pid);
+            EnqueueFsAlert(pid, procName, msg, TRUE);
+        }
+    }
+
+    // ---- Oplock abuse detection ----
+    // FSCTL_REQUEST_OPLOCK (0x90144) and legacy FSCTL_REQUEST_BATCH_OPLOCK (0x90008),
+    // FSCTL_REQUEST_FILTER_OPLOCK (0x90018) — taking opportunistic locks on files
+    // can delay or block EDR file inspection.  Legitimate oplock users: NTFS defrag,
+    // SMB server, search indexer.  Unusual oplock requests from non-system processes
+    // on system files are suspicious.
+    else if (fsctl == 0x00090144 || fsctl == 0x00090008 ||
+             fsctl == 0x00090018 || fsctl == 0x0009000C) {
+        PEPROCESS process  = IoThreadToProcess(Data->Thread);
+        HANDLE    pid      = PsGetProcessId(process);
+        char*     procName = PsGetProcessImageFileName(process);
+
+        if ((ULONG_PTR)pid <= 4) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+        BOOLEAN oplockAllowed = FALSE;
+        if (procName) {
+            oplockAllowed = (strcmp(procName, "svchost.exe") == 0 ||
+                             strcmp(procName, "SearchIndex") == 0 ||
+                             strcmp(procName, "SearchProto") == 0 ||
+                             strcmp(procName, "defrag.exe") == 0 ||
+                             strcmp(procName, "explorer.exe") == 0 ||
+                             strcmp(procName, "MsMpEng.exe") == 0);
+        }
+
+        if (!oplockAllowed) {
+            // Check if the target file is in a sensitive directory
+            PFLT_FILE_NAME_INFORMATION oplNameInfo = nullptr;
+            char oplPath[128] = {};
+            NTSTATUS oplSt = FltGetFileNameInformation(
+                Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &oplNameInfo);
+            if (NT_SUCCESS(oplSt) && oplNameInfo) {
+                FltParseFileNameInformation(oplNameInfo);
+
+                BOOLEAN isSensitive = FALSE;
+                static const PCWSTR kOplockSensitivePaths[] = {
+                    L"\\Windows\\System32\\",
+                    L"\\Windows\\SysWOW64\\",
+                    L"\\Program Files\\",
+                    L"\\ProgramData\\NortonEDR",
+                };
+                for (int i = 0; i < ARRAYSIZE(kOplockSensitivePaths); i++) {
+                    if (UnicodeStringContains(&oplNameInfo->Name, kOplockSensitivePaths[i])) {
+                        isSensitive = TRUE;
+                        break;
+                    }
+                }
+
+                if (isSensitive) {
+                    for (ULONG c = 0; c < oplNameInfo->Name.Length / sizeof(WCHAR) && c < 127; c++)
+                        oplPath[c] = (char)oplNameInfo->Name.Buffer[c];
+
+                    char msg[256];
+                    RtlStringCchPrintfA(msg, sizeof(msg),
+                        "FS: OPLOCK REQUEST on system file by '%s' (pid=%llu) fsctl=0x%x target=%s "
+                        "— may delay/block EDR inspection",
+                        procName ? procName : "?", (ULONG64)(ULONG_PTR)pid,
+                        fsctl, oplPath[0] ? oplPath : "?");
+                    EnqueueFsAlert(pid, procName, msg, FALSE);  // WARNING
+                }
+                FltReleaseFileNameInformation(oplNameInfo);
+            }
+        }
+    }
+
     // ---- Named pipe impersonation (FSCTL_PIPE_IMPERSONATE) ----
     // FSCTL_PIPE_IMPERSONATE (0x110018) is the actual execution moment for
     // EVERY potato-family privilege escalation attack:
@@ -3178,6 +3514,73 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreFsControl(
             EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
         }
     }
+
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+// ---------------------------------------------------------------------------
+// IRP_MJ_SET_EA — Extended Attribute abuse detection.
+//
+// NTFS Extended Attributes (EAs) are a rarely-used alternate data storage
+// mechanism.  Attackers use EAs to:
+//   - Hide payloads that bypass normal file content scanning
+//   - Store C2 configuration data invisibly to most tools
+//   - Persist data that survives file content wipes
+//
+// Legitimate EA users: SMB server (svchost), NTFS defrag, System, and
+// specific applications that use EAs for metadata (e.g., WSL stores
+// Linux permissions in EAs).
+// ---------------------------------------------------------------------------
+FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetEa(
+    PFLT_CALLBACK_DATA         Data,
+    PCFLT_RELATED_OBJECTS      FltObjects,
+    PVOID*                     CompletionContext
+) {
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    if (Data->RequestorMode == KernelMode) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    PEPROCESS process  = IoThreadToProcess(Data->Thread);
+    HANDLE    pid      = PsGetProcessId(process);
+    char*     procName = PsGetProcessImageFileName(process);
+
+    // Allowlist: System, svchost (SMB), wsl (Linux FS layer), TrustedInstaller
+    if ((ULONG_PTR)pid <= 4) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (procName) {
+        if (strcmp(procName, "svchost.exe") == 0 ||
+            strcmp(procName, "TrustedInsta") == 0 ||
+            strcmp(procName, "wsl.exe") == 0 ||
+            strcmp(procName, "wslhost.exe") == 0 ||
+            strcmp(procName, "MsMpEng.exe") == 0)
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    // Get the EA buffer size for context
+    ULONG eaLength = Data->Iopb->Parameters.SetEa.Length;
+
+    PFLT_FILE_NAME_INFORMATION eaNameInfo = nullptr;
+    char eaPath[128] = {};
+    NTSTATUS eaSt = FltGetFileNameInformation(
+        Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &eaNameInfo);
+    if (NT_SUCCESS(eaSt) && eaNameInfo) {
+        FltParseFileNameInformation(eaNameInfo);
+        for (ULONG c = 0; c < eaNameInfo->Name.Length / sizeof(WCHAR) && c < 127; c++)
+            eaPath[c] = (char)eaNameInfo->Name.Buffer[c];
+        FltReleaseFileNameInformation(eaNameInfo);
+    }
+
+    // Flag large EA writes (>256 bytes) as higher severity — likely payload storage
+    BOOLEAN isLarge = (eaLength > 256);
+
+    char msg[256];
+    RtlStringCchPrintfA(msg, sizeof(msg),
+        "FS: EXTENDED ATTRIBUTE write by '%s' (pid=%llu) size=%lu on %s "
+        "— %s data hiding (T1564.004)",
+        procName ? procName : "?", (ULONG64)(ULONG_PTR)pid, eaLength,
+        eaPath[0] ? eaPath : "?",
+        isLarge ? "LARGE payload" : "possible");
+    EnqueueFsAlert(pid, procName, msg, isLarge);
 
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }

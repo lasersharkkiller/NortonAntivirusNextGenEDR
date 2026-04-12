@@ -53,6 +53,7 @@ ULONG SyscallsUtils::NtLoadDriverId = 0;
 ULONG SyscallsUtils::NtProtectVirtualMemoryId = 0;
 ULONG SyscallsUtils::NtCreateTransactionId = 0;
 ULONG SyscallsUtils::NtRollbackTransactionId = 0;
+ULONG SyscallsUtils::NtCommitTransactionId = 0;
 ULONG SyscallsUtils::NtCreateProcessExId = 0;
 ULONG SyscallsUtils::NtCreateProcessId = 0;
 ULONG SyscallsUtils::NtQuerySystemInformationId = 0;
@@ -630,6 +631,9 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 	}
 	else if (NtRollbackTransactionId != 0 && id == NtRollbackTransactionId) {  // NtRollbackTransaction
 		NtRollbackTransactionHandler();
+	}
+	else if (NtCommitTransactionId != 0 && id == NtCommitTransactionId) {  // NtCommitTransaction
+		NtCommitTransactionHandler();
 	}
 	else if (NtCreateProcessExId != 0 && id == NtCreateProcessExId) {  // NtCreateProcessEx
 		// NtCreateProcessEx(ProcessHandle*, Access, ObjAttr, ParentProcess, Flags, SectionHandle, ...)
@@ -1212,6 +1216,10 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtRollbackTransaction;
 	RtlInitUnicodeString(&usNtRollbackTransaction, L"NtRollbackTransaction");
 	NtRollbackTransactionId = getSSNByName(ssdtTable, &usNtRollbackTransaction, exportsMap);
+
+	UNICODE_STRING usNtCommitTransaction;
+	RtlInitUnicodeString(&usNtCommitTransaction, L"NtCommitTransaction");
+	NtCommitTransactionId = getSSNByName(ssdtTable, &usNtCommitTransaction, exportsMap);
 
 	UNICODE_STRING usNtCreateProcessEx;
 	RtlInitUnicodeString(&usNtCreateProcessEx, L"NtCreateProcessEx");
@@ -2517,6 +2525,55 @@ VOID SyscallsUtils::NtMapViewOfSectionHandler(
 	// UnicodeStringContains does a case-insensitive substring search.
 	// Matches "\Windows\System32\ntdll.dll" and "\KnownDlls\ntdll.dll".
 	BOOLEAN isNtdll = UnicodeStringContains(&nameInfo->Name, L"ntdll.dll");
+
+	// ---- Memory-mapped write evasion detection ----
+	// If the section is backed by a sensitive file AND the protection is PAGE_READWRITE
+	// (or PAGE_WRITECOPY), the caller can modify file content via the mapped view.
+	// These dirty pages flush through paging I/O, completely bypassing IRP_MJ_WRITE
+	// callbacks.  This is a known minifilter evasion technique.
+	if (!isNtdll && Win32Protect != 0) {
+		BOOLEAN isWritable = (Win32Protect == PAGE_READWRITE ||
+		                      Win32Protect == PAGE_WRITECOPY ||
+		                      Win32Protect == PAGE_EXECUTE_READWRITE ||
+		                      Win32Protect == PAGE_EXECUTE_WRITECOPY);
+		if (isWritable) {
+			// Check if the backing file is in a sensitive location
+			static const PCWSTR kSensitiveMappedPaths[] = {
+				L"\\Windows\\System32\\",
+				L"\\Windows\\SysWOW64\\",
+				L"\\config\\sam",
+				L"\\config\\system",
+				L"\\config\\security",
+				L"\\ntds\\ntds.dit",
+				L"\\winevt\\Logs\\",
+				L"\\NortonEDR",
+			};
+			BOOLEAN isSensitive = FALSE;
+			for (int i = 0; i < ARRAYSIZE(kSensitiveMappedPaths); i++) {
+				if (UnicodeStringContains(&nameInfo->Name, kSensitiveMappedPaths[i])) {
+					isSensitive = TRUE;
+					break;
+				}
+			}
+
+			if (isSensitive) {
+				// Convert the file name for the alert
+				char fileNameA[128] = {};
+				for (USHORT c = 0; c < nameInfo->Name.Length / sizeof(WCHAR) && c < 127; c++)
+					fileNameA[c] = (char)nameInfo->Name.Buffer[c];
+
+				char msg[256];
+				RtlStringCbPrintfA(msg, sizeof(msg),
+					"NtMapViewOfSection: PAGE_READWRITE mapping of sensitive file '%s' "
+					"— file can be modified via mapped view, bypassing IRP_MJ_WRITE detection!",
+					fileNameA);
+				EmitSyscallNotif(
+					(BaseAddress && MmIsAddressValid(BaseAddress)) ? (ULONG64)*BaseAddress : 0,
+					msg, IoGetCurrentProcess(), nullptr, TRUE);
+			}
+		}
+	}
+
 	ExFreePool(nameInfo);
 
 	if (isNtdll) {
@@ -2611,6 +2668,31 @@ VOID SyscallsUtils::NtRollbackTransactionHandler() {
 		"Process Doppelganging cleanup step (erases on-disk PE)",
 		procName);
 	EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, TRUE);  // Critical: cleanup = committed
+}
+
+// NtCommitTransaction — TxF commit-path evasion.
+// An attacker can:
+//   1. Create an NTFS transaction (already detected)
+//   2. Write malicious content to a file within the transaction
+//   3. Commit the transaction — the file is atomically updated
+// The commit writes bypass normal minifilter IRP_MJ_WRITE callbacks because
+// NTFS applies the transacted changes internally.  Legitimate TxF use is
+// extremely rare in modern Windows (deprecated since Win8, removed from most APIs).
+VOID SyscallsUtils::NtCommitTransactionHandler() {
+	char procName[16] = {};
+	char* pn = PsGetProcessImageFileName(IoGetCurrentProcess());
+	if (pn) RtlStringCbCopyA(procName, sizeof(procName), pn);
+
+	// Allowlist: DTC (Distributed Transaction Coordinator) via msdtc.exe
+	if (strcmp(procName, "msdtc.exe") == 0) return;
+
+	char msg[192];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"NtCommitTransaction: NTFS transaction committed by '%s' — "
+		"TxF commit-path evasion: file content may have been atomically replaced "
+		"without triggering minifilter IRP_MJ_WRITE!",
+		procName);
+	EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, TRUE);  // CRITICAL
 }
 
 // NtCreateProcessEx — legacy process creation API that accepts an explicit SectionHandle.
