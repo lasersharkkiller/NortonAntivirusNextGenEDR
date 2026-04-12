@@ -1887,52 +1887,125 @@ BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
     }
 
     // -----------------------------------------------------------------------
-    // Check 4: enumerate foreign filters on our layer AND adjacent layers.
+    // Check 4: enumerate foreign filters across ALL attackable WFP layers.
     //
-    // Our callout lives on FWPM_LAYER_OUTBOUND_TRANSPORT_V4, but an attacker
-    // can also block traffic at:
-    //   - ALE_AUTH_CONNECT_V4: fires BEFORE the transport layer, can block
-    //     NortonEDR.exe outbound connections at the connection-auth stage
-    //   - OUTBOUND_NETWORK_V4: IP-level layer, also pre-empts transport
+    // WFP has 20+ layers.  An attacker is not limited to the layer we monitor
+    // — they can block, intercept, or modify traffic at any layer in the
+    // network stack.  We check every layer category:
     //
-    // We check all three for foreign BLOCK filters and for CALLOUT_TERMINATING
-    // filters that reference a non-Norton callout (rogue callout injection via
-    // fwpuclnt!FwpmCalloutAdd).
+    // OUTBOUND (block EDR telemetry leaving the host):
+    //   - OUTBOUND_TRANSPORT_V4/V6 — our callout layer; most common target
+    //   - OUTBOUND_IPPACKET_V4/V6  — IP-level; pre-empts transport
+    //
+    // ALE (connection lifecycle control):
+    //   - ALE_AUTH_CONNECT_V4/V6      — block outbound connection auth
+    //   - ALE_AUTH_RECV_ACCEPT_V4/V6  — block inbound connections to EDR
+    //   - ALE_AUTH_LISTEN_V4/V6       — prevent EDR from binding listeners
+    //   - ALE_RESOURCE_ASSIGNMENT_V4/V6 — prevent socket resource acquisition
+    //   - ALE_ENDPOINT_CLOSURE_V4/V6  — force-close EDR connections
+    //   - ALE_FLOW_ESTABLISHED_V4/V6  — intercept established flows
+    //
+    // STREAM (TCP content MITM — inspect/modify/drop stream data):
+    //   - STREAM_V4/V6            — modify TCP payload in-flight
+    //   - STREAM_PACKET_V4/V6    — raw TCP segment manipulation
+    //   An attacker with a stream callout can silently modify telemetry
+    //   payloads (change severity, drop detections, inject false data)
+    //   without blocking the connection — invisible to our transport check.
+    //
+    // INBOUND (block telemetry server responses / C2 command replies):
+    //   - INBOUND_TRANSPORT_V4/V6 — block inbound TCP/UDP
+    //   - INBOUND_IPPACKET_V4/V6  — block at IP level
+    //
+    // DATAGRAM (UDP telemetry — DNS, syslog, SNMP traps):
+    //   - DATAGRAM_DATA_V4/V6     — block/modify UDP payloads
+    //
     // -----------------------------------------------------------------------
-    if (!CheckLayerForForeignBlocks(EngineHandle,
-            FWPM_LAYER_OUTBOUND_TRANSPORT_V4, FilterId,
-            "OUTBOUND_TRANSPORT_V4", bufQueue))
-        ok = FALSE;
 
-    if (!CheckLayerForForeignBlocks(EngineHandle,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0,
-            "ALE_AUTH_CONNECT_V4", bufQueue))
-        ok = FALSE;
+    // Structure to drive the layer scan — layer GUID + human-readable name.
+    static const struct {
+        const GUID* layerKey;
+        const char* layerName;
+    } kLayersToCheck[] = {
+        // Outbound — block EDR telemetry
+        { &FWPM_LAYER_OUTBOUND_TRANSPORT_V4,        "OUTBOUND_TRANSPORT_V4" },
+        { &FWPM_LAYER_OUTBOUND_TRANSPORT_V6,        "OUTBOUND_TRANSPORT_V6" },
+        { &FWPM_LAYER_OUTBOUND_IPPACKET_V4,         "OUTBOUND_IPPACKET_V4" },
+        { &FWPM_LAYER_OUTBOUND_IPPACKET_V6,         "OUTBOUND_IPPACKET_V6" },
+        // ALE — connection lifecycle attacks
+        { &FWPM_LAYER_ALE_AUTH_CONNECT_V4,           "ALE_AUTH_CONNECT_V4" },
+        { &FWPM_LAYER_ALE_AUTH_CONNECT_V6,           "ALE_AUTH_CONNECT_V6" },
+        { &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,       "ALE_AUTH_RECV_ACCEPT_V4" },
+        { &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,       "ALE_AUTH_RECV_ACCEPT_V6" },
+        { &FWPM_LAYER_ALE_AUTH_LISTEN_V4,            "ALE_AUTH_LISTEN_V4" },
+        { &FWPM_LAYER_ALE_AUTH_LISTEN_V6,            "ALE_AUTH_LISTEN_V6" },
+        { &FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V4,    "ALE_RESOURCE_ASSIGNMENT_V4" },
+        { &FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V6,    "ALE_RESOURCE_ASSIGNMENT_V6" },
+        { &FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V4,       "ALE_ENDPOINT_CLOSURE_V4" },
+        { &FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V6,       "ALE_ENDPOINT_CLOSURE_V6" },
+        { &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4,       "ALE_FLOW_ESTABLISHED_V4" },
+        { &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V6,       "ALE_FLOW_ESTABLISHED_V6" },
+        // Stream — TCP content MITM (silent telemetry modification)
+        { &FWPM_LAYER_STREAM_V4,                     "STREAM_V4" },
+        { &FWPM_LAYER_STREAM_V6,                     "STREAM_V6" },
+        // Datagram — UDP telemetry (DNS, syslog, SNMP)
+        { &FWPM_LAYER_DATAGRAM_DATA_V4,              "DATAGRAM_DATA_V4" },
+        { &FWPM_LAYER_DATAGRAM_DATA_V6,              "DATAGRAM_DATA_V6" },
+        // Inbound — block telemetry server responses
+        { &FWPM_LAYER_INBOUND_TRANSPORT_V4,          "INBOUND_TRANSPORT_V4" },
+        { &FWPM_LAYER_INBOUND_TRANSPORT_V6,          "INBOUND_TRANSPORT_V6" },
+        { &FWPM_LAYER_INBOUND_IPPACKET_V4,           "INBOUND_IPPACKET_V4" },
+        { &FWPM_LAYER_INBOUND_IPPACKET_V6,           "INBOUND_IPPACKET_V6" },
+    };
 
-    if (!CheckLayerForForeignBlocks(EngineHandle,
-            FWPM_LAYER_OUTBOUND_IPPACKET_V4, 0,
-            "OUTBOUND_IPPACKET_V4", bufQueue))
-        ok = FALSE;
+    for (int li = 0; li < ARRAYSIZE(kLayersToCheck); li++) {
+        // Pass our FilterId only for our own layer so it gets skipped
+        UINT64 skipId = (RtlCompareMemory(kLayersToCheck[li].layerKey,
+            &FWPM_LAYER_OUTBOUND_TRANSPORT_V4, sizeof(GUID)) == sizeof(GUID))
+            ? FilterId : 0;
+
+        if (!CheckLayerForForeignBlocks(EngineHandle,
+                *kLayersToCheck[li].layerKey, skipId,
+                kLayersToCheck[li].layerName, bufQueue))
+            ok = FALSE;
+    }
 
     // -----------------------------------------------------------------------
-    // Check 5: enumerate foreign callouts on our layer.
+    // Check 5: enumerate foreign callouts on critical layers.
     //
-    // Attack: fwpuclnt!FwpmCalloutAdd registers a rogue callout on
-    // FWPM_LAYER_OUTBOUND_TRANSPORT_V4.  Paired with a high-weight filter,
-    // the rogue callout's classifyFn fires first and issues FWP_ACTION_BLOCK
-    // before our callout ever sees the packet.
+    // Attack: fwpuclnt!FwpmCalloutAdd registers a rogue callout.  Paired with
+    // a high-weight CALLOUT_TERMINATING filter, the rogue callout's classifyFn
+    // fires first and can block/modify traffic before ours.
     //
-    // We enumerate all callouts on our layer and flag any that don't match
-    // our NORTONAV_CALLOUT_GUID.
+    // Stream layers are especially dangerous — a CALLOUT_INSPECTION callout
+    // on STREAM_V4 can silently read/modify TCP payload data (MITM attack on
+    // telemetry content) without blocking the connection at all.
+    //
+    // We enumerate callouts across our layer + stream + inbound layers.
     // -----------------------------------------------------------------------
     {
-        HANDLE enumHandle = nullptr;
-        FWPM_CALLOUT_ENUM_TEMPLATE enumTemplate = {};
-        enumTemplate.layerKey = FWPM_LAYER_OUTBOUND_TRANSPORT_V4;
+        static const struct {
+            const GUID* layerKey;
+            const char* layerName;
+        } kCalloutLayers[] = {
+            { &FWPM_LAYER_OUTBOUND_TRANSPORT_V4, "OUTBOUND_TRANSPORT_V4" },
+            { &FWPM_LAYER_OUTBOUND_TRANSPORT_V6, "OUTBOUND_TRANSPORT_V6" },
+            { &FWPM_LAYER_STREAM_V4,             "STREAM_V4" },
+            { &FWPM_LAYER_STREAM_V6,             "STREAM_V6" },
+            { &FWPM_LAYER_INBOUND_TRANSPORT_V4,  "INBOUND_TRANSPORT_V4" },
+            { &FWPM_LAYER_INBOUND_TRANSPORT_V6,  "INBOUND_TRANSPORT_V6" },
+            { &FWPM_LAYER_ALE_AUTH_CONNECT_V4,   "ALE_AUTH_CONNECT_V4" },
+            { &FWPM_LAYER_ALE_AUTH_CONNECT_V6,   "ALE_AUTH_CONNECT_V6" },
+        };
 
-        NTSTATUS st = FwpmCalloutCreateEnumHandle(
-            EngineHandle, &enumTemplate, &enumHandle);
-        if (NT_SUCCESS(st) && enumHandle) {
+        for (int cl = 0; cl < ARRAYSIZE(kCalloutLayers); cl++) {
+            HANDLE enumHandle = nullptr;
+            FWPM_CALLOUT_ENUM_TEMPLATE enumTemplate = {};
+            enumTemplate.layerKey = *kCalloutLayers[cl].layerKey;
+
+            NTSTATUS st = FwpmCalloutCreateEnumHandle(
+                EngineHandle, &enumTemplate, &enumHandle);
+            if (!NT_SUCCESS(st) || !enumHandle) continue;
+
             FWPM_CALLOUT** callouts = nullptr;
             UINT32 numCallouts = 0;
             st = FwpmCalloutEnum(EngineHandle, enumHandle, 64, &callouts, &numCallouts);
@@ -1944,22 +2017,30 @@ BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
                             &NORTONAV_CALLOUT_GUID, sizeof(GUID)) == sizeof(GUID))
                         continue;
 
-                    // Foreign callout on our layer — suspicious.
-                    // Not all foreign callouts are malicious (Windows Firewall uses
-                    // them), so check if they were added AFTER boot by examining
-                    // flags.  Persistent system callouts have FWPM_CALLOUT_FLAG_PERSISTENT.
-                    // Non-persistent foreign callouts added at runtime are more suspicious.
+                    // Non-persistent foreign callouts are suspicious.
                     BOOLEAN suspicious = !(callouts[i]->flags & FWPM_CALLOUT_FLAG_PERSISTENT);
 
                     if (suspicious) {
-                        char msg[350];
+                        // Stream layer callouts are especially dangerous — MITM
+                        BOOLEAN isStreamLayer =
+                            (RtlCompareMemory(kCalloutLayers[cl].layerKey,
+                                &FWPM_LAYER_STREAM_V4, sizeof(GUID)) == sizeof(GUID)) ||
+                            (RtlCompareMemory(kCalloutLayers[cl].layerKey,
+                                &FWPM_LAYER_STREAM_V6, sizeof(GUID)) == sizeof(GUID));
+
+                        char msg[400];
                         RtlStringCbPrintfA(msg, sizeof(msg),
-                            "WFP: non-persistent foreign callout on OUTBOUND_TRANSPORT_V4 "
-                            "(id=%lu, display='%S') — possible rogue callout injection "
-                            "via fwpuclnt!FwpmCalloutAdd to intercept/block EDR traffic",
+                            "WFP: non-persistent foreign callout on %s "
+                            "(id=%lu, display='%S') — %s",
+                            kCalloutLayers[cl].layerName,
                             callouts[i]->calloutId,
                             callouts[i]->displayData.name
-                                ? callouts[i]->displayData.name : L"<none>");
+                                ? callouts[i]->displayData.name : L"<none>",
+                            isStreamLayer
+                                ? "STREAM LAYER MITM: callout can silently read/modify "
+                                  "TCP payload data (telemetry tampering) without blocking!"
+                                : "possible rogue callout injection via "
+                                  "fwpuclnt!FwpmCalloutAdd to intercept/block traffic");
                         EmitWfpAlert(bufQueue, msg);
                         ok = FALSE;
                     }
