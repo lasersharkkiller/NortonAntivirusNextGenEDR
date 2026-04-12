@@ -1473,6 +1473,46 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				// --- T1562: BFE service stop (nuclear WFP attack) ---
 				{ L"sc stop bfe",              "Stop Base Filtering Engine service — nuclear WFP teardown!", TRUE },
 				{ L"net stop bfe",             "net stop bfe — nuclear WFP teardown!",               TRUE  },
+
+				// --- T1518.001 / Reconnaissance: firewall & WFP rule enumeration ---
+				// Attackers enumerate firewall rules and WFP state before adding
+				// BLOCK filters (EDRSilencer) or disabling firewall profiles.
+				// Pre-attack recon is Warning-level (not destructive yet).
+
+				// netsh firewall/advfirewall show commands
+				{ L"advfirewall show",          "netsh advfirewall show — firewall profile/rule recon",                 FALSE },
+				{ L"advfirewall firewall show", "netsh advfirewall firewall show — firewall rule enumeration",          FALSE },
+				{ L"advfirewall firewall show rule name=all", "netsh firewall show ALL rules — full ruleset dump",      FALSE },
+				{ L"advfirewall export",        "netsh advfirewall export — firewall policy export for offline analysis", FALSE },
+				// netsh WFP state/filter dump (reveals EDR WFP filters, callouts, sublayers)
+				{ L"netsh wfp show",            "netsh wfp show — WFP filter/state/callout enumeration (pre-EDRSilencer recon)", FALSE },
+				{ L"netsh wfp show filters",    "netsh wfp show filters — WFP filter enumeration (reveals EDR filter IDs)",     FALSE },
+				{ L"netsh wfp show state",      "netsh wfp show state — full WFP state dump (filters+callouts+sublayers)",      FALSE },
+				{ L"netsh wfp show netevents",  "netsh wfp show netevents — WFP network event monitoring",                      FALSE },
+				{ L"netsh wfp capture",         "netsh wfp capture — WFP diagnostic capture (advanced recon)",                  FALSE },
+				// PowerShell firewall enumeration
+				{ L"get-netfirewallrule",       "Get-NetFirewallRule — PowerShell firewall rule enumeration",           FALSE },
+				{ L"get-netfirewallprofile",    "Get-NetFirewallProfile — PowerShell firewall profile recon",           FALSE },
+				{ L"get-netfirewallsetting",    "Get-NetFirewallSetting — PowerShell firewall global settings recon",   FALSE },
+				{ L"get-netfirewallportfilter", "Get-NetFirewallPortFilter — PowerShell port filter enumeration",       FALSE },
+				{ L"get-netfirewalladdressfilter", "Get-NetFirewallAddressFilter — PowerShell address filter recon",    FALSE },
+				{ L"get-netfirewallapplicationfilter", "Get-NetFirewallApplicationFilter — PowerShell app filter recon (reveals EDR exe paths)", FALSE },
+				// Defender configuration enumeration (pre-exclusion/disable recon)
+				{ L"get-mppreference",          "Get-MpPreference — Defender configuration recon (exclusions, scan settings)", FALSE },
+				{ L"get-mpcomputerstatus",      "Get-MpComputerStatus — Defender status/version recon",                FALSE },
+				{ L"get-mpthreatdetection",     "Get-MpThreatDetection — Defender detection history recon",            FALSE },
+				// WFP diagnostic tool
+				{ L"wfpdiag",                   "wfpdiag — Microsoft WFP diagnostic tool (reveals all WFP state)",     FALSE },
+
+				// --- T1518.001: Security software discovery ---
+				// Attackers enumerate installed EDR/AV before evasion attempts.
+				{ L"sc query windefend",        "sc query windefend — Defender service status recon",                   FALSE },
+				{ L"sc qc windefend",           "sc qc windefend — Defender service config recon",                     FALSE },
+				{ L"sc query sense",            "sc query sense — Defender ATP sensor recon",                          FALSE },
+				{ L"fltmc",                     "fltmc — bare minifilter enumeration (EDR discovery)",                 FALSE },
+				{ L"driverquery",               "driverquery — kernel driver enumeration (EDR/AV driver discovery)",   FALSE },
+				{ L"tasklist /svc",             "tasklist /svc — service-to-process mapping (EDR process discovery)",  FALSE },
+
 				{ nullptr, nullptr, FALSE }
 			};
 

@@ -121,7 +121,14 @@ enum HookIdx : int {
     IDX_FWPMSUBLAYERADD0               = 56, // fwpuclnt.dll — rogue sublayer injection
     IDX_FWPMSUBLAYERDELETEBYKEY0       = 57, // fwpuclnt.dll — sublayer deletion
     IDX_FWPMENGINECLOSE0               = 58, // fwpuclnt.dll — engine handle closure
-    HOOK_COUNT                  = 59
+    // --- WFP enumeration/recon detection (fwpuclnt.dll) ---
+    IDX_FWPMFILTERENUM0                = 59, // fwpuclnt.dll — filter enumeration (recon)
+    IDX_FWPMCALLOUTENUM0               = 60, // fwpuclnt.dll — callout enumeration (recon)
+    IDX_FWPMSUBLAYERENUM0              = 61, // fwpuclnt.dll — sublayer enumeration (recon)
+    IDX_FWPMPROVIDERENUM0              = 62, // fwpuclnt.dll — provider enumeration (recon)
+    IDX_FWPMENGINEGETSECINFOBYKEY0     = 63, // fwpuclnt.dll — engine security descriptor query
+    IDX_FWPMFILTERGETSECINFOBYKEY0     = 64, // fwpuclnt.dll — filter security descriptor query
+    HOOK_COUNT                  = 65
 };
 
 struct ApiHook {
@@ -223,12 +230,25 @@ typedef DWORD (WINAPI *FnFwpmCalloutAdd0)(HANDLE, const PVOID, PVOID, UINT32*);
 typedef DWORD (WINAPI *FnFwpmSubLayerAdd0)(HANDLE, const PVOID, PVOID);
 typedef DWORD (WINAPI *FnFwpmSubLayerDeleteByKey0)(HANDLE, const GUID*);
 typedef DWORD (WINAPI *FnFwpmEngineClose0)(HANDLE);
+// WFP enumeration/recon typedefs
+typedef DWORD (WINAPI *FnFwpmFilterEnum0)(HANDLE, HANDLE, UINT32, PVOID*, UINT32*);
+typedef DWORD (WINAPI *FnFwpmCalloutEnum0)(HANDLE, HANDLE, UINT32, PVOID*, UINT32*);
+typedef DWORD (WINAPI *FnFwpmSubLayerEnum0)(HANDLE, HANDLE, UINT32, PVOID*, UINT32*);
+typedef DWORD (WINAPI *FnFwpmProviderEnum0)(HANDLE, HANDLE, UINT32, PVOID*, UINT32*);
+typedef DWORD (WINAPI *FnFwpmEngineGetSecurityInfo0)(HANDLE, SECURITY_INFORMATION, PSID*, PSID*, PACL*, PACL*, PSECURITY_DESCRIPTOR*);
+typedef DWORD (WINAPI *FnFwpmFilterGetSecurityInfoByKey0)(HANDLE, const GUID*, SECURITY_INFORMATION, PSID*, PSID*, PACL*, PACL*, PSECURITY_DESCRIPTOR*);
 static DWORD  WINAPI Hook_FwpmFilterAdd0(HANDLE, const PVOID, PVOID, UINT64*);
 static DWORD  WINAPI Hook_FwpmFilterDeleteById0(HANDLE, UINT64);
 static DWORD  WINAPI Hook_FwpmCalloutAdd0(HANDLE, const PVOID, PVOID, UINT32*);
 static DWORD  WINAPI Hook_FwpmSubLayerAdd0(HANDLE, const PVOID, PVOID);
 static DWORD  WINAPI Hook_FwpmSubLayerDeleteByKey0(HANDLE, const GUID*);
 static DWORD  WINAPI Hook_FwpmEngineClose0(HANDLE);
+static DWORD  WINAPI Hook_FwpmFilterEnum0(HANDLE, HANDLE, UINT32, PVOID*, UINT32*);
+static DWORD  WINAPI Hook_FwpmCalloutEnum0(HANDLE, HANDLE, UINT32, PVOID*, UINT32*);
+static DWORD  WINAPI Hook_FwpmSubLayerEnum0(HANDLE, HANDLE, UINT32, PVOID*, UINT32*);
+static DWORD  WINAPI Hook_FwpmProviderEnum0(HANDLE, HANDLE, UINT32, PVOID*, UINT32*);
+static DWORD  WINAPI Hook_FwpmEngineGetSecurityInfo0(HANDLE, SECURITY_INFORMATION, PSID*, PSID*, PACL*, PACL*, PSECURITY_DESCRIPTOR*);
+static DWORD  WINAPI Hook_FwpmFilterGetSecurityInfoByKey0(HANDLE, const GUID*, SECURITY_INFORMATION, PSID*, PSID*, PACL*, PACL*, PSECURITY_DESCRIPTOR*);
 
 static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "VirtualAlloc",         (FARPROC)Hook_VirtualAlloc,        nullptr, nullptr, {}, nullptr, false },
@@ -295,6 +315,13 @@ static ApiHook g_hooks[HOOK_COUNT] = {
     { "fwpuclnt.dll", "FwpmSubLayerAdd0",              (FARPROC)Hook_FwpmSubLayerAdd0,                nullptr, nullptr, {}, nullptr, false },
     { "fwpuclnt.dll", "FwpmSubLayerDeleteByKey0",      (FARPROC)Hook_FwpmSubLayerDeleteByKey0,        nullptr, nullptr, {}, nullptr, false },
     { "fwpuclnt.dll", "FwpmEngineClose0",              (FARPROC)Hook_FwpmEngineClose0,                nullptr, nullptr, {}, nullptr, false },
+    // --- WFP enumeration/recon hooks ---
+    { "fwpuclnt.dll", "FwpmFilterEnum0",              (FARPROC)Hook_FwpmFilterEnum0,                 nullptr, nullptr, {}, nullptr, false },
+    { "fwpuclnt.dll", "FwpmCalloutEnum0",             (FARPROC)Hook_FwpmCalloutEnum0,                nullptr, nullptr, {}, nullptr, false },
+    { "fwpuclnt.dll", "FwpmSubLayerEnum0",            (FARPROC)Hook_FwpmSubLayerEnum0,               nullptr, nullptr, {}, nullptr, false },
+    { "fwpuclnt.dll", "FwpmProviderEnum0",            (FARPROC)Hook_FwpmProviderEnum0,               nullptr, nullptr, {}, nullptr, false },
+    { "fwpuclnt.dll", "FwpmEngineGetSecurityInfo0",   (FARPROC)Hook_FwpmEngineGetSecurityInfo0,       nullptr, nullptr, {}, nullptr, false },
+    { "fwpuclnt.dll", "FwpmFilterGetSecurityInfoByKey0", (FARPROC)Hook_FwpmFilterGetSecurityInfoByKey0, nullptr, nullptr, {}, nullptr, false },
 };
 
 // Returns the correct call-through address.
@@ -2200,6 +2227,131 @@ static DWORD WINAPI Hook_FwpmEngineClose0(HANDLE engineHandle)
 
     return ((FnFwpmEngineClose0)GetCallThrough(IDX_FWPMENGINECLOSE0))(
         engineHandle);
+}
+
+// ---------------------------------------------------------------------------
+// WFP enumeration/recon detection — fwpuclnt.dll hooks
+//
+// EDRSilencer and similar tools enumerate WFP state (filters, callouts,
+// sublayers, providers, security descriptors) before injecting BLOCK filters.
+// Detecting enumeration catches the recon phase of the attack — before any
+// modification occurs.  These are Warning-level (recon is not destructive).
+// ---------------------------------------------------------------------------
+
+// FwpmFilterEnum0 — enumerating all WFP filters (EDRSilencer recon phase).
+static DWORD WINAPI Hook_FwpmFilterEnum0(
+    HANDLE engineHandle, HANDLE enumHandle,
+    UINT32 numEntriesRequested, PVOID* entries, UINT32* numEntriesReturned)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP RECON: %s called FwpmFilterEnum0 — "
+            "enumerating WFP filters to discover EDR filter rules "
+            "before tampering (pre-attack reconnaissance)",
+            GetWfpCallerName());
+        SendHookEvent("Warning", "FwpmFilterEnum0", g_selfPid, det);
+    }
+
+    return ((FnFwpmFilterEnum0)GetCallThrough(IDX_FWPMFILTERENUM0))(
+        engineHandle, enumHandle, numEntriesRequested, entries, numEntriesReturned);
+}
+
+// FwpmCalloutEnum0 — enumerating WFP callouts to find EDR inspection points.
+static DWORD WINAPI Hook_FwpmCalloutEnum0(
+    HANDLE engineHandle, HANDLE enumHandle,
+    UINT32 numEntriesRequested, PVOID* entries, UINT32* numEntriesReturned)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP RECON: %s called FwpmCalloutEnum0 — "
+            "enumerating WFP callouts to identify EDR inspection "
+            "hooks before disabling or outweighing them",
+            GetWfpCallerName());
+        SendHookEvent("Warning", "FwpmCalloutEnum0", g_selfPid, det);
+    }
+
+    return ((FnFwpmCalloutEnum0)GetCallThrough(IDX_FWPMCALLOUTENUM0))(
+        engineHandle, enumHandle, numEntriesRequested, entries, numEntriesReturned);
+}
+
+// FwpmSubLayerEnum0 — enumerating sublayers to find EDR sublayer for deletion.
+static DWORD WINAPI Hook_FwpmSubLayerEnum0(
+    HANDLE engineHandle, HANDLE enumHandle,
+    UINT32 numEntriesRequested, PVOID* entries, UINT32* numEntriesReturned)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP RECON: %s called FwpmSubLayerEnum0 — "
+            "enumerating WFP sublayers to identify EDR sublayer "
+            "GUID for targeted deletion or weight manipulation",
+            GetWfpCallerName());
+        SendHookEvent("Warning", "FwpmSubLayerEnum0", g_selfPid, det);
+    }
+
+    return ((FnFwpmSubLayerEnum0)GetCallThrough(IDX_FWPMSUBLAYERENUM0))(
+        engineHandle, enumHandle, numEntriesRequested, entries, numEntriesReturned);
+}
+
+// FwpmProviderEnum0 — enumerating providers to fingerprint security products.
+static DWORD WINAPI Hook_FwpmProviderEnum0(
+    HANDLE engineHandle, HANDLE enumHandle,
+    UINT32 numEntriesRequested, PVOID* entries, UINT32* numEntriesReturned)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP RECON: %s called FwpmProviderEnum0 — "
+            "enumerating WFP providers to fingerprint installed "
+            "security products and their WFP registrations",
+            GetWfpCallerName());
+        SendHookEvent("Warning", "FwpmProviderEnum0", g_selfPid, det);
+    }
+
+    return ((FnFwpmProviderEnum0)GetCallThrough(IDX_FWPMPROVIDERENUM0))(
+        engineHandle, enumHandle, numEntriesRequested, entries, numEntriesReturned);
+}
+
+// FwpmEngineGetSecurityInfo0 — querying WFP engine ACL to check permissions.
+static DWORD WINAPI Hook_FwpmEngineGetSecurityInfo0(
+    HANDLE engineHandle, SECURITY_INFORMATION secInfo,
+    PSID* sidOwner, PSID* sidGroup, PACL* dacl, PACL* sacl,
+    PSECURITY_DESCRIPTOR* sd)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP RECON: %s called FwpmEngineGetSecurityInfo0 — "
+            "querying WFP engine security descriptor to probe "
+            "whether modification attacks are permitted",
+            GetWfpCallerName());
+        SendHookEvent("Warning", "FwpmEngineGetSecurityInfo0", g_selfPid, det);
+    }
+
+    return ((FnFwpmEngineGetSecurityInfo0)GetCallThrough(IDX_FWPMENGINEGETSECINFOBYKEY0))(
+        engineHandle, secInfo, sidOwner, sidGroup, dacl, sacl, sd);
+}
+
+// FwpmFilterGetSecurityInfoByKey0 — querying filter-level ACL before tampering.
+static DWORD WINAPI Hook_FwpmFilterGetSecurityInfoByKey0(
+    HANDLE engineHandle, const GUID* key, SECURITY_INFORMATION secInfo,
+    PSID* sidOwner, PSID* sidGroup, PACL* dacl, PACL* sacl,
+    PSECURITY_DESCRIPTOR* sd)
+{
+    if (!IsWfpCallerTrusted()) {
+        char det[300];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "WFP RECON: %s called FwpmFilterGetSecurityInfoByKey0 — "
+            "querying filter security descriptor to check if EDR "
+            "filter can be deleted or modified",
+            GetWfpCallerName());
+        SendHookEvent("Warning", "FwpmFilterGetSecurityInfoByKey0", g_selfPid, det);
+    }
+
+    return ((FnFwpmFilterGetSecurityInfoByKey0)GetCallThrough(IDX_FWPMFILTERGETSECINFOBYKEY0))(
+        engineHandle, key, secInfo, sidOwner, sidGroup, dacl, sacl, sd);
 }
 
 // ---------------------------------------------------------------------------
