@@ -344,10 +344,52 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
     UINT16 localPort     = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_LOCAL_PORT].value.uint16;
     UINT16 remotePort    = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_REMOTE_PORT].value.uint16;
 
-    // PID attribution — available at the transport layer.
+    // ---------------------------------------------------------------
+    // Metadata extraction — use FWPS_IS_METADATA_FIELD_PRESENT macro
+    // for each field as per Microsoft documentation.
+    //
+    // Available metadata at OUTBOUND_TRANSPORT_V4:
+    //   PROCESS_ID         — PID of owning process
+    //   PROCESS_PATH       — full NT path of owning executable
+    //   TOKEN              — process token (privilege/impersonation)
+    //   TRANSPORT_ENDPOINT_HANDLE — endpoint for association
+    //   COMPARTMENT_ID     — network compartment (container isolation)
+    // ---------------------------------------------------------------
+
     UINT64 pid = 0;
-    if (metadata && (metadata->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID)) {
+    if (metadata && FWPS_IS_METADATA_FIELD_PRESENT(metadata, FWPS_METADATA_FIELD_PROCESS_ID)) {
         pid = metadata->processId;
+    }
+
+    // Process path — full NT device path of the process creating the connection.
+    // More reliable than PID lookup because:
+    //   1. PID can be recycled by the time we alert
+    //   2. Attacker can spoof PEB image path but WFP gets path from kernel
+    //   3. Enables direct EDR-targeting detection (is this OUR process being blocked?)
+    WCHAR processPath[260] = {};
+    BOOLEAN hasProcessPath = FALSE;
+    if (metadata && FWPS_IS_METADATA_FIELD_PRESENT(metadata, FWPS_METADATA_FIELD_PROCESS_PATH)) {
+        if (metadata->processPath && metadata->processPath->size > 0 &&
+            metadata->processPath->data) {
+            ULONG copyLen = min((ULONG)(metadata->processPath->size), (ULONG)(sizeof(processPath) - sizeof(WCHAR)));
+            RtlCopyMemory(processPath, metadata->processPath->data, copyLen);
+            processPath[copyLen / sizeof(WCHAR)] = L'\0';
+            hasProcessPath = TRUE;
+        }
+    }
+
+    // Token access check — detect connections from elevated/SYSTEM processes.
+    // Useful for identifying privilege escalation + network exfil combos.
+    ULONG tokenAccessFlags = 0;
+    if (metadata && FWPS_IS_METADATA_FIELD_PRESENT(metadata, FWPS_METADATA_FIELD_TOKEN)) {
+        tokenAccessFlags = metadata->token;
+    }
+
+    // Compartment ID — network compartment isolation.  Non-default compartments
+    // may indicate container escape or attacker-created network namespaces.
+    UINT32 compartmentId = 0;
+    if (metadata && FWPS_IS_METADATA_FIELD_PRESENT(metadata, FWPS_METADATA_FIELD_COMPARTMENT_ID)) {
+        compartmentId = metadata->compartmentId;
     }
 
     BOOLEAN blocked    = IsPortBlocked(remotePort);
@@ -371,11 +413,19 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
     // -----------------------------------------------------------------
     if (IsKerberosPort(remotePort) && !IsSystemProcess(pid) && queue) {
         if (KerbCheckAndCount(pid)) {
-            char kMsg[200] = {};
-            RtlStringCchPrintfA(kMsg, sizeof(kMsg),
-                "Kerberoasting: pid=%llu issued >=%d Kerberos (port 88) connections "
-                "within 30 s — possible AS-REQ/TGS-REQ spray (Rubeus/Impacket)",
-                pid, KERB_ALERT_THRESHOLD);
+            char kMsg[400] = {};
+            if (hasProcessPath) {
+                RtlStringCchPrintfA(kMsg, sizeof(kMsg),
+                    "Kerberoasting: pid=%llu ('%S') issued >=%d Kerberos (port 88) "
+                    "connections within 30 s — possible AS-REQ/TGS-REQ spray "
+                    "(Rubeus/Impacket)",
+                    pid, processPath, KERB_ALERT_THRESHOLD);
+            } else {
+                RtlStringCchPrintfA(kMsg, sizeof(kMsg),
+                    "Kerberoasting: pid=%llu issued >=%d Kerberos (port 88) connections "
+                    "within 30 s — possible AS-REQ/TGS-REQ spray (Rubeus/Impacket)",
+                    pid, KERB_ALERT_THRESHOLD);
+            }
 
             PKERNEL_STRUCTURED_NOTIFICATION kNotif =
                 (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
@@ -429,12 +479,20 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
         // Allow lsass — it legitimately binds to LDAP for authentication.
         BOOLEAN isLsass = (RtlCompareMemory(ldapProcName, "lsass.exe", 9) == 9);
         if (!isLsass) {
-            char dcMsg[240] = {};
-            RtlStringCchPrintfA(dcMsg, sizeof(dcMsg),
-                "DCSync/LDAP: pid=%llu (%s) connecting to LDAP port %u "
-                "-> %u.%u.%u.%u — possible DCSync/secretsdump replication",
-                pid, ldapProcName, remotePort,
-                FORMAT_ADDR(remoteAddress));
+            char dcMsg[400] = {};
+            if (hasProcessPath) {
+                RtlStringCchPrintfA(dcMsg, sizeof(dcMsg),
+                    "DCSync/LDAP: pid=%llu (%s, path='%S') connecting to LDAP port %u "
+                    "-> %u.%u.%u.%u — possible DCSync/secretsdump replication",
+                    pid, ldapProcName, processPath, remotePort,
+                    FORMAT_ADDR(remoteAddress));
+            } else {
+                RtlStringCchPrintfA(dcMsg, sizeof(dcMsg),
+                    "DCSync/LDAP: pid=%llu (%s) connecting to LDAP port %u "
+                    "-> %u.%u.%u.%u — possible DCSync/secretsdump replication",
+                    pid, ldapProcName, remotePort,
+                    FORMAT_ADDR(remoteAddress));
+            }
 
             PKERNEL_STRUCTURED_NOTIFICATION dcNotif =
                 (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
@@ -488,16 +546,28 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
 
             BOOLEAN tainted = InjectionTaintTracker::IsTainted(pid);
 
-            char c2Msg[350] = {};
-            RtlStringCchPrintfA(c2Msg, sizeof(c2Msg),
-                "Interactive C2 session: pid=%llu (%s) made >=%d connections "
-                "to %u.%u.%u.%u:%u within 60s — possible sleep~0 beacon / "
-                "SOCKS proxy (Cobalt Strike, Sliver, Mythic)%s",
-                pid, c2ProcName, C2_ALERT_THRESHOLD,
-                FORMAT_ADDR(remoteAddress), remotePort,
-                tainted
-                    ? " [INJECTION-TAINTED: prior code injection detected in this process]"
-                    : "");
+            char c2Msg[500] = {};
+            if (hasProcessPath) {
+                RtlStringCchPrintfA(c2Msg, sizeof(c2Msg),
+                    "Interactive C2 session: pid=%llu (%s, path='%S') made >=%d "
+                    "connections to %u.%u.%u.%u:%u within 60s — possible sleep~0 "
+                    "beacon / SOCKS proxy (Cobalt Strike, Sliver, Mythic)%s",
+                    pid, c2ProcName, processPath, C2_ALERT_THRESHOLD,
+                    FORMAT_ADDR(remoteAddress), remotePort,
+                    tainted
+                        ? " [INJECTION-TAINTED]"
+                        : "");
+            } else {
+                RtlStringCchPrintfA(c2Msg, sizeof(c2Msg),
+                    "Interactive C2 session: pid=%llu (%s) made >=%d connections "
+                    "to %u.%u.%u.%u:%u within 60s — possible sleep~0 beacon / "
+                    "SOCKS proxy (Cobalt Strike, Sliver, Mythic)%s",
+                    pid, c2ProcName, C2_ALERT_THRESHOLD,
+                    FORMAT_ADDR(remoteAddress), remotePort,
+                    tainted
+                        ? " [INJECTION-TAINTED]"
+                        : "");
+            }
 
             PKERNEL_STRUCTURED_NOTIFICATION c2Notif =
                 (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
@@ -542,12 +612,20 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
 
     const char* tag = blocked ? " [BLOCKED]" : " [SUSPICIOUS PORT]";
 
-    char msg[160] = {};
-    RtlStringCchPrintfA(msg, sizeof(msg),
-        "Net: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (pid=%llu)%s",
-        FORMAT_ADDR(localAddress),  localPort,
-        FORMAT_ADDR(remoteAddress), remotePort,
-        pid, tag);
+    char msg[350] = {};
+    if (hasProcessPath) {
+        RtlStringCchPrintfA(msg, sizeof(msg),
+            "Net: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (pid=%llu, '%S')%s",
+            FORMAT_ADDR(localAddress),  localPort,
+            FORMAT_ADDR(remoteAddress), remotePort,
+            pid, processPath, tag);
+    } else {
+        RtlStringCchPrintfA(msg, sizeof(msg),
+            "Net: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (pid=%llu)%s",
+            FORMAT_ADDR(localAddress),  localPort,
+            FORMAT_ADDR(remoteAddress), remotePort,
+            pid, tag);
+    }
 
     PKERNEL_STRUCTURED_NOTIFICATION notif =
         (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
