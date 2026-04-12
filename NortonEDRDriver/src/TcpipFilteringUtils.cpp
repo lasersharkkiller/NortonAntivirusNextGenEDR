@@ -853,7 +853,68 @@ static BOOLEAN ConditionTargetsEdr(const FWPM_FILTER_CONDITION* conds, UINT32 nu
     return FALSE;
 }
 
+// Helper: translate FWP_MATCH_TYPE to string — reveals attacker intent.
+// FWP_MATCH_NOT_EQUAL inverts logic (block everything EXCEPT attacker's C2).
+static const char* MatchTypeName(FWP_MATCH_TYPE mt)
+{
+    switch (mt) {
+    case FWP_MATCH_EQUAL:               return "==";
+    case FWP_MATCH_GREATER:             return ">";
+    case FWP_MATCH_LESS:                return "<";
+    case FWP_MATCH_GREATER_OR_EQUAL:    return ">=";
+    case FWP_MATCH_LESS_OR_EQUAL:       return "<=";
+    case FWP_MATCH_RANGE:               return "RANGE";
+    case FWP_MATCH_FLAGS_ALL_SET:       return "FLAGS_ALL";
+    case FWP_MATCH_FLAGS_ANY_SET:       return "FLAGS_ANY";
+    case FWP_MATCH_FLAGS_NONE_SET:      return "FLAGS_NONE";
+    case FWP_MATCH_EQUAL_CASE_INSENSITIVE: return "==i";
+    case FWP_MATCH_NOT_EQUAL:           return "!=";
+    case FWP_MATCH_PREFIX:              return "PREFIX";
+    case FWP_MATCH_NOT_PREFIX:          return "!PREFIX";
+    default:                            return "?";
+    }
+}
+
+// Helper: translate FWP_DATA_TYPE enum to readable name for diagnostics.
+static const char* DataTypeName(FWP_DATA_TYPE dt)
+{
+    switch (dt) {
+    case FWP_EMPTY:                     return "EMPTY";
+    case FWP_UINT8:                     return "UINT8";
+    case FWP_UINT16:                    return "UINT16";
+    case FWP_UINT32:                    return "UINT32";
+    case FWP_UINT64:                    return "UINT64";
+    case FWP_INT8:                      return "INT8";
+    case FWP_INT16:                     return "INT16";
+    case FWP_INT32:                     return "INT32";
+    case FWP_INT64:                     return "INT64";
+    case FWP_FLOAT:                     return "FLOAT";
+    case FWP_DOUBLE:                    return "DOUBLE";
+    case FWP_BYTE_ARRAY16_TYPE:         return "BYTE_ARRAY16";
+    case FWP_BYTE_BLOB_TYPE:            return "BYTE_BLOB";
+    case FWP_SID:                       return "SID";
+    case FWP_SECURITY_DESCRIPTOR_TYPE:  return "SEC_DESC";
+    case FWP_TOKEN_INFORMATION_TYPE:    return "TOKEN_INFO";
+    case FWP_TOKEN_ACCESS_INFORMATION_TYPE: return "TOKEN_ACCESS";
+    case FWP_V4_ADDR_MASK:              return "V4_ADDR_MASK";
+    case FWP_V6_ADDR_MASK:              return "V6_ADDR_MASK";
+    case FWP_RANGE_TYPE:                return "RANGE";
+    default:                            return "UNKNOWN";
+    }
+}
+
+// Helper: format an IPv4 address (network byte order UINT32) as dotted-quad.
+static void FormatIPv4(UINT32 addr, char* out, SIZE_T outSize)
+{
+    RtlStringCbPrintfA(out, outSize, "%u.%u.%u.%u",
+        (addr >> 24) & 0xFF, (addr >> 16) & 0xFF,
+        (addr >> 8) & 0xFF, addr & 0xFF);
+}
+
 // Helper: build a human-readable summary of a filter's conditions.
+// Handles all FWP_DATA_TYPE values and includes FWP_MATCH_TYPE for each
+// condition, which is critical for detecting inverted logic attacks
+// (FWP_MATCH_NOT_EQUAL = "block everything EXCEPT this address/app").
 static void DescribeFilterConditions(const FWPM_FILTER* filter,
                                      char* out, SIZE_T outSize)
 {
@@ -867,40 +928,187 @@ static void DescribeFilterConditions(const FWPM_FILTER* filter,
     RtlStringCbPrintfA(out, outSize, "conditions(%u): ", filter->numFilterConditions);
     offset = strlen(out);
 
-    for (UINT32 c = 0; c < filter->numFilterConditions && offset < outSize - 40; c++) {
+    for (UINT32 c = 0; c < filter->numFilterConditions && offset < outSize - 60; c++) {
         const FWPM_FILTER_CONDITION* cond = &filter->filterCondition[c];
-        const char* name = ConditionFieldName(cond->fieldKey);
+        const char* fieldName = ConditionFieldName(cond->fieldKey);
+        const char* matchOp = MatchTypeName(cond->matchType);
+        const char* field = fieldName ? fieldName : "unk_field";
 
-        if (name) {
-            // For known fields, add the name and value summary
-            if (cond->conditionValue.type == FWP_UINT16) {
+        switch (cond->conditionValue.type) {
+
+        case FWP_UINT8:
+            RtlStringCbPrintfA(out + offset, outSize - offset,
+                "[%s %s %u] ", field, matchOp, cond->conditionValue.uint8);
+            break;
+
+        case FWP_UINT16:
+            RtlStringCbPrintfA(out + offset, outSize - offset,
+                "[%s %s %u] ", field, matchOp, cond->conditionValue.uint16);
+            break;
+
+        case FWP_UINT32: {
+            // IP_REMOTE_ADDRESS and IP_LOCAL_ADDRESS are UINT32 IPv4 addrs
+            if (fieldName &&
+                (_stricmp(fieldName, "IP_REMOTE_ADDRESS") == 0 ||
+                 _stricmp(fieldName, "IP_LOCAL_ADDRESS") == 0)) {
+                char ipStr[20];
+                FormatIPv4(cond->conditionValue.uint32, ipStr, sizeof(ipStr));
                 RtlStringCbPrintfA(out + offset, outSize - offset,
-                    "[%s=%u] ", name, cond->conditionValue.uint16);
-            } else if (cond->conditionValue.type == FWP_UINT32) {
-                RtlStringCbPrintfA(out + offset, outSize - offset,
-                    "[%s=0x%x] ", name, cond->conditionValue.uint32);
-            } else if (cond->conditionValue.type == FWP_BYTE_BLOB_TYPE &&
-                       cond->conditionValue.byteBlob &&
-                       cond->conditionValue.byteBlob->data) {
-                // For ALE_APP_ID, show a truncated path
-                const WCHAR* path = (const WCHAR*)cond->conditionValue.byteBlob->data;
-                RtlStringCbPrintfA(out + offset, outSize - offset,
-                    "[%s='%.60S'] ", name, path);
+                    "[%s %s %s] ", field, matchOp, ipStr);
             } else {
                 RtlStringCbPrintfA(out + offset, outSize - offset,
-                    "[%s] ", name);
+                    "[%s %s 0x%x] ", field, matchOp, cond->conditionValue.uint32);
             }
-        } else {
-            RtlStringCbPrintfA(out + offset, outSize - offset, "[unknown_field] ");
+            break;
+        }
+
+        case FWP_UINT64:
+            RtlStringCbPrintfA(out + offset, outSize - offset,
+                "[%s %s 0x%llx] ", field, matchOp,
+                cond->conditionValue.uint64 ? *cond->conditionValue.uint64 : 0ULL);
+            break;
+
+        case FWP_BYTE_BLOB_TYPE:
+            if (cond->conditionValue.byteBlob &&
+                cond->conditionValue.byteBlob->data) {
+                const WCHAR* path = (const WCHAR*)cond->conditionValue.byteBlob->data;
+                RtlStringCbPrintfA(out + offset, outSize - offset,
+                    "[%s %s '%.60S'] ", field, matchOp, path);
+            } else {
+                RtlStringCbPrintfA(out + offset, outSize - offset,
+                    "[%s %s <blob>] ", field, matchOp);
+            }
+            break;
+
+        case FWP_V4_ADDR_MASK:
+            if (cond->conditionValue.v4AddrMask) {
+                char addrStr[20], maskStr[20];
+                FormatIPv4(cond->conditionValue.v4AddrMask->addr,
+                           addrStr, sizeof(addrStr));
+                FormatIPv4(cond->conditionValue.v4AddrMask->mask,
+                           maskStr, sizeof(maskStr));
+                RtlStringCbPrintfA(out + offset, outSize - offset,
+                    "[%s %s %s/%s] ", field, matchOp, addrStr, maskStr);
+            } else {
+                RtlStringCbPrintfA(out + offset, outSize - offset,
+                    "[%s %s <v4mask>] ", field, matchOp);
+            }
+            break;
+
+        case FWP_V6_ADDR_MASK:
+            RtlStringCbPrintfA(out + offset, outSize - offset,
+                "[%s %s <v6mask>] ", field, matchOp);
+            break;
+
+        case FWP_BYTE_ARRAY16_TYPE:
+            // IPv6 address — 16 bytes, show abbreviated
+            if (cond->conditionValue.byteArray16) {
+                const UINT8* b = cond->conditionValue.byteArray16->byteArray16;
+                RtlStringCbPrintfA(out + offset, outSize - offset,
+                    "[%s %s %02x%02x:%02x%02x:..:%02x%02x] ", field, matchOp,
+                    b[0], b[1], b[2], b[3], b[14], b[15]);
+            } else {
+                RtlStringCbPrintfA(out + offset, outSize - offset,
+                    "[%s %s <ipv6>] ", field, matchOp);
+            }
+            break;
+
+        case FWP_RANGE_TYPE:
+            // FWP_RANGE contains valueLow and valueHigh — commonly port ranges
+            if (cond->conditionValue.rangeValue) {
+                FWP_RANGE* r = cond->conditionValue.rangeValue;
+                if (r->valueLow.type == FWP_UINT16) {
+                    RtlStringCbPrintfA(out + offset, outSize - offset,
+                        "[%s %s %u-%u] ", field, matchOp,
+                        r->valueLow.uint16, r->valueHigh.uint16);
+                } else if (r->valueLow.type == FWP_UINT32) {
+                    char loStr[20], hiStr[20];
+                    FormatIPv4(r->valueLow.uint32, loStr, sizeof(loStr));
+                    FormatIPv4(r->valueHigh.uint32, hiStr, sizeof(hiStr));
+                    RtlStringCbPrintfA(out + offset, outSize - offset,
+                        "[%s %s %s..%s] ", field, matchOp, loStr, hiStr);
+                } else {
+                    RtlStringCbPrintfA(out + offset, outSize - offset,
+                        "[%s %s <range:%s>] ", field, matchOp,
+                        DataTypeName(r->valueLow.type));
+                }
+            }
+            break;
+
+        case FWP_SID:
+            RtlStringCbPrintfA(out + offset, outSize - offset,
+                "[%s %s <SID>] ", field, matchOp);
+            break;
+
+        case FWP_SECURITY_DESCRIPTOR_TYPE:
+            RtlStringCbPrintfA(out + offset, outSize - offset,
+                "[%s %s <SEC_DESC>] ", field, matchOp);
+            break;
+
+        case FWP_TOKEN_INFORMATION_TYPE:
+        case FWP_TOKEN_ACCESS_INFORMATION_TYPE:
+            RtlStringCbPrintfA(out + offset, outSize - offset,
+                "[%s %s <TOKEN>] ", field, matchOp);
+            break;
+
+        default:
+            RtlStringCbPrintfA(out + offset, outSize - offset,
+                "[%s %s <type=%s>] ", field, matchOp,
+                DataTypeName(cond->conditionValue.type));
+            break;
         }
         offset = strlen(out);
     }
 }
 
-// Helper: enumerate filters on a given layer for foreign BLOCK entries.
-// Inspects filterCondition arrays to identify EDR-targeted filters
-// (EDRSilencer uses FWPM_CONDITION_ALE_APP_ID with EDR executable paths)
-// and reports condition details for forensic analysis.
+// Helper: check if any condition uses inverted match logic.
+// FWP_MATCH_NOT_EQUAL is an attacker technique to create "block everything
+// EXCEPT my C2 traffic" or "permit ONLY my exfil destination" rules.
+static BOOLEAN HasInvertedMatchCondition(const FWPM_FILTER_CONDITION* conds,
+                                         UINT32 numConds)
+{
+    for (UINT32 c = 0; c < numConds; c++) {
+        if (conds[c].matchType == FWP_MATCH_NOT_EQUAL ||
+            conds[c].matchType == FWP_MATCH_NOT_PREFIX)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// Helper: translate FWP_ACTION_TYPE to readable string.
+static const char* ActionTypeName(UINT32 actionType)
+{
+    switch (actionType) {
+    case FWP_ACTION_BLOCK:                return "BLOCK";
+    case FWP_ACTION_PERMIT:               return "PERMIT";
+    case FWP_ACTION_CALLOUT_TERMINATING:  return "CALLOUT_TERMINATING";
+    case FWP_ACTION_CALLOUT_INSPECTION:   return "CALLOUT_INSPECTION";
+    case FWP_ACTION_CALLOUT_UNKNOWN:      return "CALLOUT_UNKNOWN";
+    case FWP_ACTION_CONTINUE:             return "CONTINUE";
+    case FWP_ACTION_NONE:                 return "NONE";
+    case FWP_ACTION_NONE_NO_MATCH:        return "NONE_NO_MATCH";
+    default:                              return "UNKNOWN_ACTION";
+    }
+}
+
+// Helper: enumerate foreign filters on a given layer.
+// Detects the full spectrum of WFP firewalling attacks:
+//
+//   BLOCK                  — EDRSilencer: block EDR telemetry outright
+//   CALLOUT_TERMINATING    — rogue callout drops packets before ours fires
+//   CALLOUT_INSPECTION     — silent MITM: inspect/modify packets without
+//                            blocking; attacker can exfiltrate or tamper
+//                            with telemetry content in-flight
+//   CALLOUT_UNKNOWN        — undetermined callout that may block or pass
+//   PERMIT (high-weight)   — whitelist attacker C2/exfil traffic past
+//                            Windows Firewall BLOCK rules; also used to
+//                            override our sublayer's BLOCK decisions via
+//                            sublayer arbitration if placed in a different
+//                            sublayer with higher weight
+//   Inverted match logic   — FWP_MATCH_NOT_EQUAL conditions create
+//                            "block everything EXCEPT <C2 addr>" rules
+//   Blanket filters        — 0 conditions = affects ALL traffic on the layer
+//
 static BOOLEAN CheckLayerForForeignBlocks(
     HANDLE engine, const GUID& layerKey, UINT64 ourFilterId,
     const char* layerName, BufferQueue* bufQueue)
@@ -912,76 +1120,165 @@ static BOOLEAN CheckLayerForForeignBlocks(
     enumTemplate.providerKey        = nullptr;
     enumTemplate.flags              = 0;
     enumTemplate.numFilterConditions = 0;
-    enumTemplate.actionMask         = 0xFFFFFFFF;
+    enumTemplate.actionMask         = 0xFFFFFFFF;  // all action types
 
     NTSTATUS st = FwpmFilterCreateEnumHandle(engine, &enumTemplate, &enumHandle);
-    if (NT_SUCCESS(st) && enumHandle) {
-        FWPM_FILTER** entries = nullptr;
-        UINT32 numEntries = 0;
-        st = FwpmFilterEnum(engine, enumHandle, 128, &entries, &numEntries);
-        if (NT_SUCCESS(st) && entries) {
-            for (UINT32 i = 0; i < numEntries; i++) {
-                if (!entries[i]) continue;
-                if (entries[i]->filterId == ourFilterId) continue;
-                if (RtlCompareMemory(&entries[i]->subLayerKey,
-                        &NORTONAV_SUBLAYER_GUID, sizeof(GUID)) == sizeof(GUID))
-                    continue;
+    if (!NT_SUCCESS(st) || !enumHandle) return ok;
 
-                BOOLEAN isMalicious =
-                    (entries[i]->action.type == FWP_ACTION_BLOCK) ||
-                    (entries[i]->action.type == FWP_ACTION_CALLOUT_TERMINATING &&
-                     RtlCompareMemory(&entries[i]->action.calloutKey,
-                         &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID));
-
-                if (!isMalicious) continue;
-
-                // Build condition description for the alert
-                char condDesc[512];
-                DescribeFilterConditions(entries[i], condDesc, sizeof(condDesc));
-
-                // Check if conditions specifically target EDR processes
-                BOOLEAN targetsEdr = ConditionTargetsEdr(
-                    entries[i]->filterCondition,
-                    entries[i]->numFilterConditions);
-
-                const char* actionStr =
-                    (entries[i]->action.type == FWP_ACTION_BLOCK)
-                        ? "BLOCK" : "CALLOUT_TERMINATING";
-
-                char msg[700];
-                if (targetsEdr) {
-                    // CRITICAL: filter specifically targets EDR executable(s)
-                    // This is the EDRSilencer signature — per-app BLOCK filter
-                    RtlStringCbPrintfA(msg, sizeof(msg),
-                        "WFP TAMPER CRITICAL: foreign %s filter (id=%llu, weight=%llu) "
-                        "on %s TARGETS EDR PROCESS — EDRSilencer-class attack! "
-                        "display='%S', %s",
-                        actionStr,
-                        entries[i]->filterId,
-                        entries[i]->weight.uint64,
-                        layerName,
-                        entries[i]->displayData.name
-                            ? entries[i]->displayData.name : L"<none>",
-                        condDesc);
-                } else {
-                    RtlStringCbPrintfA(msg, sizeof(msg),
-                        "WFP TAMPER: foreign %s filter (id=%llu, weight=%llu) on %s "
-                        "— possible telemetry blocking, display='%S', %s",
-                        actionStr,
-                        entries[i]->filterId,
-                        entries[i]->weight.uint64,
-                        layerName,
-                        entries[i]->displayData.name
-                            ? entries[i]->displayData.name : L"<none>",
-                        condDesc);
-                }
-                EmitWfpAlert(bufQueue, msg);
-                ok = FALSE;
-            }
-            FwpmFreeMemory((void**)&entries);
-        }
+    FWPM_FILTER** entries = nullptr;
+    UINT32 numEntries = 0;
+    st = FwpmFilterEnum(engine, enumHandle, 128, &entries, &numEntries);
+    if (!NT_SUCCESS(st) || !entries) {
         FwpmFilterDestroyEnumHandle(engine, enumHandle);
+        return ok;
     }
+
+    for (UINT32 i = 0; i < numEntries; i++) {
+        if (!entries[i]) continue;
+        // Skip our own filter
+        if (entries[i]->filterId == ourFilterId) continue;
+        // Skip filters in our own sublayer
+        if (RtlCompareMemory(&entries[i]->subLayerKey,
+                &NORTONAV_SUBLAYER_GUID, sizeof(GUID)) == sizeof(GUID))
+            continue;
+
+        const UINT32 action = entries[i]->action.type;
+        BOOLEAN foreignCallout = FALSE;
+        BOOLEAN suspicious = FALSE;
+        const char* threatDesc = nullptr;
+
+        // --- Category 1: BLOCK filters (EDRSilencer) ---
+        if (action == FWP_ACTION_BLOCK) {
+            suspicious = TRUE;
+            threatDesc = "EDRSilencer / telemetry blocking";
+        }
+
+        // --- Category 2: CALLOUT_TERMINATING with foreign callout key ---
+        // Rogue callout drops packets before ours fires.
+        if (action == FWP_ACTION_CALLOUT_TERMINATING) {
+            if (RtlCompareMemory(&entries[i]->action.calloutKey,
+                    &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID)) {
+                suspicious = TRUE;
+                foreignCallout = TRUE;
+                threatDesc = "rogue terminating callout may drop packets "
+                             "before NortonEDR callout fires";
+            }
+        }
+
+        // --- Category 3: CALLOUT_INSPECTION with foreign callout key ---
+        // Silent interception: callout can read/modify packet content
+        // without blocking.  Used for MITM, telemetry tampering, or
+        // covert exfil channel injection.
+        if (action == FWP_ACTION_CALLOUT_INSPECTION) {
+            if (RtlCompareMemory(&entries[i]->action.calloutKey,
+                    &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID)) {
+                suspicious = TRUE;
+                foreignCallout = TRUE;
+                threatDesc = "silent inspection callout — may MITM, tamper "
+                             "with, or exfiltrate packet data without blocking";
+            }
+        }
+
+        // --- Category 4: CALLOUT_UNKNOWN with foreign callout key ---
+        // Undetermined action — the callout decides at runtime whether to
+        // block, permit, or continue.  Effectively a wildcard.
+        if (action == FWP_ACTION_CALLOUT_UNKNOWN) {
+            if (RtlCompareMemory(&entries[i]->action.calloutKey,
+                    &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID)) {
+                suspicious = TRUE;
+                foreignCallout = TRUE;
+                threatDesc = "unknown-action callout — runtime decision to "
+                             "block/permit, unpredictable interception";
+            }
+        }
+
+        // --- Category 5: High-weight PERMIT filters ---
+        // Attack: add a PERMIT filter at max weight to whitelist C2/exfil
+        // traffic past Windows Firewall BLOCK rules, or to override our
+        // sublayer's block decisions via WFP sublayer arbitration.
+        // Only flag non-persistent, high-weight permits (>= 0x8000).
+        if (action == FWP_ACTION_PERMIT) {
+            BOOLEAN highWeight = (entries[i]->weight.type == FWP_UINT64 &&
+                                  entries[i]->weight.uint64 &&
+                                  *entries[i]->weight.uint64 >= 0x8000ULL) ||
+                                 (entries[i]->weight.type == FWP_UINT8 &&
+                                  entries[i]->weight.uint8 >= 13);
+            BOOLEAN nonPersistent = !(entries[i]->flags & FWPM_FILTER_FLAG_PERSISTENT);
+
+            if (highWeight && nonPersistent) {
+                suspicious = TRUE;
+                threatDesc = "high-weight non-persistent PERMIT — may whitelist "
+                             "C2/exfil traffic or override BLOCK decisions";
+            }
+        }
+
+        if (!suspicious) continue;
+
+        // Build condition description with full FWP_DATA_TYPE + FWP_MATCH_TYPE
+        char condDesc[700];
+        DescribeFilterConditions(entries[i], condDesc, sizeof(condDesc));
+
+        // Check if conditions specifically target EDR processes
+        BOOLEAN targetsEdr = ConditionTargetsEdr(
+            entries[i]->filterCondition,
+            entries[i]->numFilterConditions);
+
+        // Check for inverted match logic (NOT_EQUAL / NOT_PREFIX)
+        BOOLEAN inverted = HasInvertedMatchCondition(
+            entries[i]->filterCondition,
+            entries[i]->numFilterConditions);
+
+        // Check for blanket (no conditions) — affects ALL traffic
+        BOOLEAN blanket = (entries[i]->numFilterConditions == 0);
+
+        const char* actionStr = ActionTypeName(action);
+
+        // Build severity prefix and tactical context
+        char msg[900];
+        if (targetsEdr) {
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "WFP TAMPER CRITICAL: foreign %s filter (id=%llu) on %s "
+                "TARGETS EDR PROCESS — %s. display='%S', %s",
+                actionStr, entries[i]->filterId, layerName,
+                threatDesc,
+                entries[i]->displayData.name
+                    ? entries[i]->displayData.name : L"<none>",
+                condDesc);
+        } else if (inverted) {
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "WFP TAMPER: foreign %s filter (id=%llu) on %s uses "
+                "INVERTED MATCH (NOT_EQUAL) — %s. Inverted logic may mean "
+                "'block everything EXCEPT attacker traffic'. display='%S', %s",
+                actionStr, entries[i]->filterId, layerName,
+                threatDesc,
+                entries[i]->displayData.name
+                    ? entries[i]->displayData.name : L"<none>",
+                condDesc);
+        } else if (blanket) {
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "WFP TAMPER: foreign %s filter (id=%llu) on %s with "
+                "NO CONDITIONS (blanket rule affects ALL traffic) — %s. "
+                "display='%S'",
+                actionStr, entries[i]->filterId, layerName,
+                threatDesc,
+                entries[i]->displayData.name
+                    ? entries[i]->displayData.name : L"<none>");
+        } else {
+            RtlStringCbPrintfA(msg, sizeof(msg),
+                "WFP TAMPER: foreign %s filter (id=%llu) on %s — %s. "
+                "display='%S', %s",
+                actionStr, entries[i]->filterId, layerName,
+                threatDesc,
+                entries[i]->displayData.name
+                    ? entries[i]->displayData.name : L"<none>",
+                condDesc);
+        }
+        EmitWfpAlert(bufQueue, msg);
+        ok = FALSE;
+    }
+
+    FwpmFreeMemory((void**)&entries);
+    FwpmFilterDestroyEnumHandle(engine, enumHandle);
     return ok;
 }
 
