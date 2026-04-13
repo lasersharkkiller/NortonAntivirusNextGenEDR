@@ -314,6 +314,33 @@ static const PCWSTR kDropPaths[] = {
 };
 
 // ---------------------------------------------------------------------------
+// Weaver Ant: Web shell file extensions — server-side script files that can
+// execute arbitrary code when accessed via HTTP.
+// ---------------------------------------------------------------------------
+static const PCWSTR kWebShellExts[] = {
+    L".aspx", L".asp", L".ashx", L".asmx",   // IIS / ASP.NET
+    L".jsp",  L".jspx", L".jspa", L".jsw",   // Tomcat / Java
+    L".php",  L".php5", L".phtml",            // PHP
+    L".cfm",  L".cfc",                        // ColdFusion
+    L".cshtml", L".vbhtml",                   // Razor / MVC
+};
+
+// Web server document root paths (lowercase) — web shell drops here can be
+// accessed remotely via HTTP, making them immediately weaponizable.
+static const PCWSTR kWebRootPaths[] = {
+    L"\\inetpub\\wwwroot\\",
+    L"\\inetpub\\",
+    L"\\wwwroot\\",
+    L"\\htdocs\\",
+    L"\\www\\",
+    L"\\webapps\\",
+    L"\\web-inf\\",
+    L"\\tomcat\\",
+    L"\\xampp\\",
+    L"\\nginx\\html\\",
+};
+
+// ---------------------------------------------------------------------------
 // Protected binary directories — write-open of existing executables here is
 // suspicious (DLL hijack, binary replacement, trojanizing signed binaries).
 // ---------------------------------------------------------------------------
@@ -2985,6 +3012,78 @@ rate_done:
                             pathBuf[0] ? pathBuf : "?", (ULONG64)(ULONG_PTR)pid);
                         EnqueueFsAlert(pid, procName, msg, FALSE);
                         break;
+                    }
+                }
+            }
+
+            // ---- Weaver Ant: Web shell file drop detection ----
+            // Server-side script files (.aspx/.asp/.jsp/.php etc.) created/overwritten
+            // in web server document roots are immediately accessible via HTTP.
+            // This is the primary persistence mechanism for China Chopper, Godzilla,
+            // Behinder, AntSword, and Weaver Ant's INMemory web shell.
+            //
+            // Any process writing these extensions to web-accessible paths is suspicious;
+            // w3wp.exe writing them indicates a web shell uploading another web shell.
+            {
+                BOOLEAN isWebShellExt = FALSE;
+                for (SIZE_T wi = 0; wi < ARRAYSIZE(kWebShellExts); wi++) {
+                    if (ExtMatch(&nameInfo->Extension, kWebShellExts[wi])) {
+                        isWebShellExt = TRUE;
+                        break;
+                    }
+                }
+                if (isWebShellExt) {
+                    ULONG wsDisp = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
+                    ACCESS_MASK wsAccess =
+                        Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+                    BOOLEAN isWriteCreate = (wsDisp == FILE_CREATE ||
+                        wsDisp == FILE_OVERWRITE_IF || wsDisp == FILE_SUPERSEDE) ||
+                        (wsAccess & (FILE_WRITE_DATA | FILE_APPEND_DATA));
+
+                    if (isWriteCreate) {
+                        // Check if the path is in a web-accessible directory
+                        BOOLEAN inWebRoot = FALSE;
+                        for (SIZE_T wr = 0; wr < ARRAYSIZE(kWebRootPaths); wr++) {
+                            if (WcsContainsLower(&nameInfo->Name, kWebRootPaths[wr])) {
+                                inWebRoot = TRUE;
+                                break;
+                            }
+                        }
+
+                        // Web shell in web root = Critical (remotely accessible)
+                        // Web shell elsewhere = High (may be staged for later move)
+                        char wsBuf[128] = {};
+                        ANSI_STRING ansiWs;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(
+                                &ansiWs, &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiWs.Length < sizeof(wsBuf) - 1
+                                ? ansiWs.Length : sizeof(wsBuf) - 1;
+                            RtlCopyMemory(wsBuf, ansiWs.Buffer, n);
+                            RtlFreeAnsiString(&ansiWs);
+                        }
+
+                        // Is the writer a web server process? (web shell uploading web shell)
+                        BOOLEAN isWebProc = FALSE;
+                        if (procName) {
+                            isWebProc = (strcmp(procName, "w3wp.exe") == 0 ||
+                                         strcmp(procName, "httpd.exe") == 0 ||
+                                         strcmp(procName, "nginx.exe") == 0 ||
+                                         strcmp(procName, "php-cgi.exe") == 0 ||
+                                         strcmp(procName, "java.exe") == 0 ||
+                                         strcmp(procName, "tomcat9.exe") == 0);
+                        }
+
+                        char wsMsg[320];
+                        RtlStringCchPrintfA(wsMsg, sizeof(wsMsg),
+                            "FS: Web shell file %s — %s by '%s' (pid=%llu)%s%s",
+                            inWebRoot ? "DROP in web root" : "write",
+                            wsBuf[0] ? wsBuf : "?",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid,
+                            isWebProc ? " — WEB SHELL UPLOADING WEB SHELL" : "",
+                            inWebRoot ? " — China Chopper / Godzilla / Behinder" : "");
+                        EnqueueFsAlert(pid, procName, wsMsg,
+                            inWebRoot || isWebProc);  // CRITICAL
                     }
                 }
             }

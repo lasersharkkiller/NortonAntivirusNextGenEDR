@@ -949,59 +949,231 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 			}
 		}
 
-		// Lateral movement: remote execution host (WMI, WinRM) spawning interactive shell
+		// -----------------------------------------------------------------------
+		// Lateral movement / WMI execution: remote execution host spawning
+		// child processes.
+		//
+		// WMI process call create (T1047) and WinRM (T1021.006) use
+		// wmiprvse.exe / wsmprovhost.exe as the parent process for all
+		// remotely executed commands.  Attackers also use scrcons.exe
+		// (ActiveScriptEventConsumer) for WMI persistence execution.
+		//
+		// Detection levels:
+		//   CRITICAL: shells, LOLBins, compilers (confirmed lateral move / exec)
+		//   HIGH: any other child from WMI hosts (unusual, worth investigating)
+		//
+		// Also detect mofcomp.exe spawning — MOF compilation for WMI persistence.
+		// -----------------------------------------------------------------------
 		{
 			PEPROCESS parentProcess = NULL;
 			if (NT_SUCCESS(PsLookupProcessByProcessId(CreateInfo->ParentProcessId, &parentProcess))) {
 
 				char* parentName = PsGetProcessImageFileName(parentProcess);
 
-				if (parentName != NULL &&
+				// Category 1: WMI/WinRM/DCOM remote execution hosts
+				BOOLEAN isRemoteExecHost = (parentName != NULL &&
 					(strcmp(parentName, "wmiprvse.exe") == 0 ||
-					 strcmp(parentName, "wsmprovhost.exe") == 0 ||
+					 strcmp(parentName, "wsmprovhost.") == 0 ||  // truncated to 15 chars
 					 strcmp(parentName, "winrshost.exe") == 0 ||
 					 strcmp(parentName, "dllhost.exe") == 0 ||
-					 strcmp(parentName, "mmc.exe") == 0)) {
+					 strcmp(parentName, "mmc.exe") == 0));
 
-					if (CreateInfo->ImageFileName != NULL &&
-						(UnicodeStringContains(CreateInfo->ImageFileName, L"cmd.exe") ||
-						 UnicodeStringContains(CreateInfo->ImageFileName, L"powershell.exe") ||
-						 UnicodeStringContains(CreateInfo->ImageFileName, L"pwsh.exe") ||
-						 UnicodeStringContains(CreateInfo->ImageFileName, L"wscript.exe") ||
-						 UnicodeStringContains(CreateInfo->ImageFileName, L"cscript.exe") ||
-						 UnicodeStringContains(CreateInfo->ImageFileName, L"mshta.exe"))) {
+				// Category 2: WMI persistence execution hosts
+				BOOLEAN isWmiPersistHost = (parentName != NULL &&
+					(strcmp(parentName, "scrcons.exe") == 0));  // ActiveScriptEventConsumer
+
+				if (isRemoteExecHost || isWmiPersistHost) {
+					char* childName = PsGetProcessImageFileName(Process);
+
+					// Known-dangerous children — definitive lateral movement / persistence exec
+					BOOLEAN isCriticalChild = FALSE;
+					if (CreateInfo->ImageFileName != NULL) {
+						static const WCHAR* kWmiCriticalChildren[] = {
+							// Shells
+							L"cmd.exe", L"powershell.exe", L"pwsh.exe",
+							L"wscript.exe", L"cscript.exe", L"mshta.exe",
+							// LOLBins commonly used in WMI lateral movement
+							L"certutil.exe", L"bitsadmin.exe", L"rundll32.exe",
+							L"regsvr32.exe", L"msbuild.exe", L"installutil.exe",
+							L"msiexec.exe", L"schtasks.exe", L"reg.exe",
+							// .NET compilers (in-memory payload compilation)
+							L"csc.exe", L"vbc.exe", L"jsc.exe",
+							// Network recon / exfil
+							L"net.exe", L"net1.exe", L"nltest.exe",
+							L"dsquery.exe", L"wmic.exe",
+							// Process manipulation
+							L"taskkill.exe", L"sc.exe",
+							nullptr
+						};
+						for (int i = 0; kWmiCriticalChildren[i]; i++) {
+							if (UnicodeStringContains(CreateInfo->ImageFileName, kWmiCriticalChildren[i])) {
+								isCriticalChild = TRUE;
+								break;
+							}
+						}
+					}
+
+					// Allowlist: legitimate children of wmiprvse
+					BOOLEAN isAllowedChild = FALSE;
+					if (childName) {
+						static const char* kWmiAllowedChildren[] = {
+							"WmiPrvSE.exe", "WmiApSrv.exe", "mofcomp.exe",
+							"wmiadap.exe", "conhost.exe",
+							nullptr
+						};
+						for (int i = 0; kWmiAllowedChildren[i]; i++) {
+							if (strcmp(childName, kWmiAllowedChildren[i]) == 0) {
+								isAllowedChild = TRUE;
+								break;
+							}
+						}
+					}
+
+					if (!isAllowedChild) {
+						const char* technique = isWmiPersistHost
+							? "WMI Persistence Execution (T1546.003)"
+							: "Lateral Movement via WMI/WinRM/DCOM (T1047)";
+
+						char wmiMsg[350];
+						RtlStringCbPrintfA(wmiMsg, sizeof(wmiMsg),
+							"%s: %s (pid=%llu) spawned '%s' (pid=%llu)%s",
+							technique,
+							parentName,
+							(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+							childName ? childName : "?",
+							(ULONG64)PsGetProcessId(Process),
+							isCriticalChild ? " [SHELL/LOLBIN]" : "");
 
 						PKERNEL_STRUCTURED_NOTIFICATION kernelNotif =
 							(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
-								POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
-
+								POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'wmnt');
 						if (kernelNotif) {
-							char* msg = "Lateral Movement: Remote exec host (WMI/WinRM/DCOM) spawned shell process";
-
-							SET_CRITICAL(*kernelNotif);
+							RtlZeroMemory(kernelNotif, sizeof(*kernelNotif));
+							if (isCriticalChild) { SET_CRITICAL(*kernelNotif); }
+							else                 { SET_WARNING(*kernelNotif);  }
 							SET_CALLING_PROC_PID_CHECK(*kernelNotif);
-
-							kernelNotif->bufSize = (ULONG)(strlen(msg) + 1);
 							kernelNotif->isPath = FALSE;
-							kernelNotif->pid = PsGetProcessId(Process);  // the spawned shell
+							kernelNotif->pid = PsGetProcessId(Process);
 							RtlCopyMemory(kernelNotif->procName, parentName, 15);
-							kernelNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, strlen(msg) + 1, 'msg');
-
+							SIZE_T mLen = strlen(wmiMsg) + 1;
+							kernelNotif->msg = (char*)ExAllocatePool2(
+								POOL_FLAG_NON_PAGED, mLen, 'wmmg');
 							if (kernelNotif->msg) {
-								RtlCopyMemory(kernelNotif->msg, msg, strlen(msg) + 1);
+								RtlCopyMemory(kernelNotif->msg, wmiMsg, mLen);
+								kernelNotif->bufSize = (ULONG)mLen;
 								if (!CallbackObjects::GetNotifQueue()->Enqueue(kernelNotif)) {
 									ExFreePool(kernelNotif->msg);
 									ExFreePool(kernelNotif);
 								}
-							}
-							else {
-								ExFreePool(kernelNotif);
-							}
+							} else { ExFreePool(kernelNotif); }
 						}
 					}
 				}
 
 				ObDereferenceObject(parentProcess);
+			}
+		}
+
+		// -----------------------------------------------------------------------
+		// mofcomp.exe execution detection — MOF compilation for WMI persistence.
+		//
+		// Attackers compile .mof files containing __EventFilter, __EventConsumer,
+		// and __FilterToConsumerBinding definitions to install WMI persistence
+		// without touching PowerShell or the WMI scripting API (T1546.003).
+		//
+		// mofcomp.exe is rarely used in normal operations — flag any invocation.
+		// -----------------------------------------------------------------------
+		if (CreateInfo->ImageFileName &&
+			UnicodeStringContains(CreateInfo->ImageFileName, L"mofcomp.exe"))
+		{
+			char* creatorName = PsGetProcessImageFileName(IoGetCurrentProcess());
+
+			// Extract command line for MOF file path context
+			char cmdBuf[200] = {};
+			if (CreateInfo->CommandLine && CreateInfo->CommandLine->Buffer &&
+				CreateInfo->CommandLine->Length > 0)
+			{
+				USHORT copyChars = min(
+					(USHORT)(CreateInfo->CommandLine->Length / sizeof(WCHAR)),
+					(USHORT)(sizeof(cmdBuf) - 1));
+				for (USHORT ci = 0; ci < copyChars; ci++) {
+					WCHAR wc = CreateInfo->CommandLine->Buffer[ci];
+					cmdBuf[ci] = (wc < 128) ? (char)wc : '?';
+				}
+			}
+
+			char mofMsg[400];
+			RtlStringCbPrintfA(mofMsg, sizeof(mofMsg),
+				"WMI MOF Compilation (T1546.003): mofcomp.exe spawned by '%s' "
+				"(pid=%llu) — cmd: %.180s",
+				creatorName ? creatorName : "?",
+				(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+				cmdBuf[0] ? cmdBuf : "<empty>");
+
+			PKERNEL_STRUCTURED_NOTIFICATION mofNotif =
+				(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'mfnt');
+			if (mofNotif) {
+				RtlZeroMemory(mofNotif, sizeof(*mofNotif));
+				SET_CRITICAL(*mofNotif);
+				SET_CALLING_PROC_PID_CHECK(*mofNotif);
+				mofNotif->isPath = FALSE;
+				mofNotif->pid = PsGetProcessId(Process);
+				if (creatorName) RtlCopyMemory(mofNotif->procName, creatorName, 14);
+				SIZE_T mLen = strlen(mofMsg) + 1;
+				mofNotif->msg = (char*)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, mLen, 'mfmg');
+				if (mofNotif->msg) {
+					RtlCopyMemory(mofNotif->msg, mofMsg, mLen);
+					mofNotif->bufSize = (ULONG)mLen;
+					if (!CallbackObjects::GetNotifQueue()->Enqueue(mofNotif)) {
+						ExFreePool(mofNotif->msg);
+						ExFreePool(mofNotif);
+					}
+				} else { ExFreePool(mofNotif); }
+			}
+		}
+
+		// -----------------------------------------------------------------------
+		// scrcons.exe execution detection — WMI ActiveScriptEventConsumer host.
+		//
+		// scrcons.exe is the process that executes VBScript/JScript payloads
+		// registered via WMI ActiveScriptEventConsumer persistence.
+		// It should almost never run on modern systems — flag any invocation.
+		// -----------------------------------------------------------------------
+		if (CreateInfo->ImageFileName &&
+			UnicodeStringContains(CreateInfo->ImageFileName, L"scrcons.exe"))
+		{
+			char* creatorName = PsGetProcessImageFileName(IoGetCurrentProcess());
+
+			char scrMsg[280];
+			RtlStringCbPrintfA(scrMsg, sizeof(scrMsg),
+				"WMI Script Consumer (T1546.003): scrcons.exe launched by '%s' "
+				"(pid=%llu) — ActiveScriptEventConsumer executing VBS/JS payload",
+				creatorName ? creatorName : "?",
+				(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId);
+
+			PKERNEL_STRUCTURED_NOTIFICATION scrNotif =
+				(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'scnt');
+			if (scrNotif) {
+				RtlZeroMemory(scrNotif, sizeof(*scrNotif));
+				SET_CRITICAL(*scrNotif);
+				SET_CALLING_PROC_PID_CHECK(*scrNotif);
+				scrNotif->isPath = FALSE;
+				scrNotif->pid = PsGetProcessId(Process);
+				if (creatorName) RtlCopyMemory(scrNotif->procName, creatorName, 14);
+				SIZE_T sLen = strlen(scrMsg) + 1;
+				scrNotif->msg = (char*)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, sLen, 'scmg');
+				if (scrNotif->msg) {
+					RtlCopyMemory(scrNotif->msg, scrMsg, sLen);
+					scrNotif->bufSize = (ULONG)sLen;
+					if (!CallbackObjects::GetNotifQueue()->Enqueue(scrNotif)) {
+						ExFreePool(scrNotif->msg);
+						ExFreePool(scrNotif);
+					}
+				} else { ExFreePool(scrNotif); }
 			}
 		}
 
@@ -1042,6 +1214,15 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 							L"net.exe", L"net1.exe", L"whoami.exe", L"ipconfig.exe",
 							L"systeminfo.exe", L"tasklist.exe", L"arp.exe",
 							L"nslookup.exe", L"ping.exe", L"curl.exe",
+							// INMemory web shell: runtime .NET compilation
+							// Behinder/Godzilla compile C#/VB.NET payloads on the fly
+							L"csc.exe", L"vbc.exe", L"jsc.exe",
+							// Additional recon / exfil LOLBins
+							L"nltest.exe", L"dsquery.exe", L"csvde.exe",
+							L"ldifde.exe", L"netstat.exe", L"route.exe",
+							L"schtasks.exe", L"reg.exe", L"wmic.exe",
+							L"attrib.exe", L"icacls.exe", L"takeown.exe",
+							L"findstr.exe", L"xcopy.exe", L"robocopy.exe",
 							nullptr
 						};
 						for (int i = 0; kWebShellChildren[i]; i++) {

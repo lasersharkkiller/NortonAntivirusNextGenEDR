@@ -130,7 +130,9 @@ enum HookIdx : int {
     IDX_FWPMFILTERGETSECINFOBYKEY0     = 64, // fwpuclnt.dll — filter security descriptor query
     // --- Weaver Ant: JScript/VBScript script engine instantiation ---
     IDX_COCREATEINSTANCE               = 65, // ole32.dll — COM object creation (script engines)
-    HOOK_COUNT                  = 66
+    IDX_COCREATEINSTANCEEX             = 66, // ole32.dll — DCOM remote COM instantiation
+    IDX_CLSIDFROMPROGID                = 67, // ole32.dll — ProgID → CLSID resolution
+    HOOK_COUNT                  = 68
 };
 
 struct ApiHook {
@@ -255,6 +257,16 @@ static DWORD  WINAPI Hook_FwpmFilterGetSecurityInfoByKey0(HANDLE, const GUID*, S
 typedef HRESULT (WINAPI *FnCoCreateInstance)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
 static HRESULT WINAPI Hook_CoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter,
     DWORD dwClsContext, REFIID riid, LPVOID* ppv);
+// DCOM remote instantiation — attackers use CoCreateInstanceEx for remote COM
+// (MMC20.Application, ShellWindows, etc.) lateral movement.
+typedef struct { CLSID* pClsid; LPUNKNOWN punkOuter; DWORD dwFlags; } MULTI_QI_STUB;
+typedef HRESULT (WINAPI *FnCoCreateInstanceEx)(REFCLSID, LPUNKNOWN, DWORD, PVOID, DWORD, PVOID);
+static HRESULT WINAPI Hook_CoCreateInstanceEx(REFCLSID rclsid, LPUNKNOWN pUnkOuter,
+    DWORD dwClsContext, PVOID pServerInfo, DWORD dwCount, PVOID pResults);
+// CLSIDFromProgID — attackers resolve "JScript", "VBScript", "WScript.Shell"
+// ProgIDs to avoid hardcoding CLSIDs.
+typedef HRESULT (WINAPI *FnCLSIDFromProgID)(LPCOLESTR, LPCLSID);
+static HRESULT WINAPI Hook_CLSIDFromProgID(LPCOLESTR lpszProgID, LPCLSID lpclsid);
 
 static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "VirtualAlloc",         (FARPROC)Hook_VirtualAlloc,        nullptr, nullptr, {}, nullptr, false },
@@ -328,8 +340,10 @@ static ApiHook g_hooks[HOOK_COUNT] = {
     { "fwpuclnt.dll", "FwpmProviderEnum0",            (FARPROC)Hook_FwpmProviderEnum0,               nullptr, nullptr, {}, nullptr, false },
     { "fwpuclnt.dll", "FwpmEngineGetSecurityInfo0",   (FARPROC)Hook_FwpmEngineGetSecurityInfo0,       nullptr, nullptr, {}, nullptr, false },
     { "fwpuclnt.dll", "FwpmFilterGetSecurityInfoByKey0", (FARPROC)Hook_FwpmFilterGetSecurityInfoByKey0, nullptr, nullptr, {}, nullptr, false },
-    // Weaver Ant: script engine COM instantiation
+    // Weaver Ant: script engine COM instantiation + DCOM lateral movement
     { "ole32.dll",    "CoCreateInstance",               (FARPROC)Hook_CoCreateInstance,              nullptr, nullptr, {}, nullptr, false },
+    { "ole32.dll",    "CoCreateInstanceEx",             (FARPROC)Hook_CoCreateInstanceEx,            nullptr, nullptr, {}, nullptr, false },
+    { "ole32.dll",    "CLSIDFromProgID",                (FARPROC)Hook_CLSIDFromProgID,               nullptr, nullptr, {}, nullptr, false },
 };
 
 // Returns the correct call-through address.
@@ -2370,91 +2384,256 @@ static DWORD WINAPI Hook_FwpmFilterGetSecurityInfoByKey0(
 }
 
 // ---------------------------------------------------------------------------
-// Weaver Ant: JScript/VBScript script engine COM instantiation detection
+// Weaver Ant: COM object monitoring — script engines, shell execution,
+// and DCOM lateral movement CLSIDs.
 //
-// China Chopper and INMemory web shells use CoCreateInstance to instantiate
-// script engines (JScript, VBScript, ScriptControl, scrobj.dll scriptlets)
-// for in-memory payload execution via eval().  Detecting COM creation of
-// these CLSIDs catches the attack at the execution pivot point.
-//
-// Monitored CLSIDs:
+// Category 1 — Script engines (China Chopper / INMemory eval() execution):
 //   {F414C260-6AC0-11CF-B6D1-00AA00BBBB58} — JScript
 //   {B54F3741-5B07-11CF-A4B0-00AA004A55E8} — VBScript
 //   {0E59F1D5-1FBE-11D0-8FF2-00A0D10038BC} — MSScriptControl.ScriptControl
 //   {06290BD5-48AA-11D2-8432-006008C3FBFC} — scrobj.dll Scriptlet factory
+//
+// Category 2 — Shell execution (web shell Run/Exec, lateral movement):
+//   {72C24DD5-D70A-438B-8A42-98424B88AFB8} — WScript.Shell (Run/Exec)
+//   {13709620-C279-11CE-A49E-444553540000} — Shell.Application (ShellExecute)
+//
+// Category 3 — DCOM lateral movement (impacket, CrackMapExec, Evil-WinRM):
+//   {49B2791A-B1AE-4C90-9B8E-E860BA07F889} — MMC20.Application (ExecuteShellCommand)
+//   {9BA05972-F6A8-11CF-A442-00A0C90A8F39} — ShellWindows (Document.Application.ShellExecute)
+//   {C08AFD90-F2A1-11D1-8455-00A0C91F3880} — ShellBrowserWindow
 // ---------------------------------------------------------------------------
 
-// {F414C260-6AC0-11CF-B6D1-00AA00BBBB58}
-static const GUID CLSID_JScript = {
-    0xF414C260, 0x6AC0, 0x11CF, { 0xB6, 0xD1, 0x00, 0xAA, 0x00, 0xBB, 0xBB, 0x58 }
-};
-// {B54F3741-5B07-11CF-A4B0-00AA004A55E8}
-static const GUID CLSID_VBScript = {
-    0xB54F3741, 0x5B07, 0x11CF, { 0xA4, 0xB0, 0x00, 0xAA, 0x00, 0x4A, 0x55, 0xE8 }
-};
-// {0E59F1D5-1FBE-11D0-8FF2-00A0D10038BC}
-static const GUID CLSID_ScriptControl = {
-    0x0E59F1D5, 0x1FBE, 0x11D0, { 0x8F, 0xF2, 0x00, 0xA0, 0xD1, 0x00, 0x38, 0xBC }
-};
-// {06290BD5-48AA-11D2-8432-006008C3FBFC}
-static const GUID CLSID_Scriptlet = {
-    0x06290BD5, 0x48AA, 0x11D2, { 0x84, 0x32, 0x00, 0x60, 0x08, 0xC3, 0xFB, 0xFC }
-};
+// Category 1: Script engines
+static const GUID CLSID_JScript         = { 0xF414C260, 0x6AC0, 0x11CF, { 0xB6, 0xD1, 0x00, 0xAA, 0x00, 0xBB, 0xBB, 0x58 } };
+static const GUID CLSID_VBScript        = { 0xB54F3741, 0x5B07, 0x11CF, { 0xA4, 0xB0, 0x00, 0xAA, 0x00, 0x4A, 0x55, 0xE8 } };
+static const GUID CLSID_ScriptControl   = { 0x0E59F1D5, 0x1FBE, 0x11D0, { 0x8F, 0xF2, 0x00, 0xA0, 0xD1, 0x00, 0x38, 0xBC } };
+static const GUID CLSID_Scriptlet       = { 0x06290BD5, 0x48AA, 0x11D2, { 0x84, 0x32, 0x00, 0x60, 0x08, 0xC3, 0xFB, 0xFC } };
+// Category 2: Shell execution
+static const GUID CLSID_WScriptShell    = { 0x72C24DD5, 0xD70A, 0x438B, { 0x8A, 0x42, 0x98, 0x42, 0x4B, 0x88, 0xAF, 0xB8 } };
+static const GUID CLSID_ShellApp        = { 0x13709620, 0xC279, 0x11CE, { 0xA4, 0x9E, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+// Category 3: DCOM lateral movement
+static const GUID CLSID_MMC20App        = { 0x49B2791A, 0xB1AE, 0x4C90, { 0x9B, 0x8E, 0xE8, 0x60, 0xBA, 0x07, 0xF8, 0x89 } };
+static const GUID CLSID_ShellWindows    = { 0x9BA05972, 0xF6A8, 0x11CF, { 0xA4, 0x42, 0x00, 0xA0, 0xC9, 0x0A, 0x8F, 0x39 } };
+static const GUID CLSID_ShellBrowser    = { 0xC08AFD90, 0xF2A1, 0x11D1, { 0x84, 0x55, 0x00, 0xA0, 0xC9, 0x1F, 0x38, 0x80 } };
 
-struct ScriptEngineCLSID {
+struct MonitoredCLSID {
     const GUID*  clsid;
     const char*  name;
+    const char*  category;   // "ScriptEngine", "ShellExec", "DCOM-LateralMove"
 };
 
-static const ScriptEngineCLSID kScriptEngines[] = {
-    { &CLSID_JScript,        "JScript (F414C260)" },
-    { &CLSID_VBScript,       "VBScript (B54F3741)" },
-    { &CLSID_ScriptControl,  "MSScriptControl (0E59F1D5)" },
-    { &CLSID_Scriptlet,      "scrobj Scriptlet (06290BD5)" },
+static const MonitoredCLSID kMonitoredCLSIDs[] = {
+    // Script engines
+    { &CLSID_JScript,        "JScript",                  "ScriptEngine" },
+    { &CLSID_VBScript,       "VBScript",                 "ScriptEngine" },
+    { &CLSID_ScriptControl,  "MSScriptControl",          "ScriptEngine" },
+    { &CLSID_Scriptlet,      "scrobj Scriptlet",         "ScriptEngine" },
+    // Shell execution
+    { &CLSID_WScriptShell,   "WScript.Shell",            "ShellExec" },
+    { &CLSID_ShellApp,       "Shell.Application",        "ShellExec" },
+    // DCOM lateral movement
+    { &CLSID_MMC20App,       "MMC20.Application",        "DCOM-LateralMove" },
+    { &CLSID_ShellWindows,   "ShellWindows",             "DCOM-LateralMove" },
+    { &CLSID_ShellBrowser,   "ShellBrowserWindow",       "DCOM-LateralMove" },
 };
+
+// Shared helper: determine host process name and legitimacy.
+static const char* kScriptLegitHosts[] = {
+    "wscript.exe", "cscript.exe", "mshta.exe", "iexplore.exe",
+    "msedge.exe", "excel.exe", "winword.exe", "powerpnt.exe",
+    "outlook.exe", "mmc.exe",
+    nullptr
+};
+
+static bool IsScriptLegitHost(const char* baseName) {
+    for (int j = 0; kScriptLegitHosts[j]; j++) {
+        if (_stricmp(baseName, kScriptLegitHosts[j]) == 0) return true;
+    }
+    return false;
+}
+
+static const char* GetHostBaseName(char* buf, SIZE_T bufSize) {
+    GetModuleFileNameA(nullptr, buf, (DWORD)bufSize);
+    const char* base = strrchr(buf, '\\');
+    return base ? base + 1 : buf;
+}
+
+// Check a CLSID against the monitored table and emit alert if matched.
+// Returns the matched entry or nullptr.
+static const MonitoredCLSID* CheckMonitoredCLSID(
+    REFCLSID rclsid, const char* apiName, DWORD dwClsContext)
+{
+    for (int i = 0; i < ARRAYSIZE(kMonitoredCLSIDs); i++) {
+        if (memcmp(&rclsid, kMonitoredCLSIDs[i].clsid, sizeof(GUID)) == 0) {
+            char hostExe[MAX_PATH] = {};
+            const char* base = GetHostBaseName(hostExe, sizeof(hostExe));
+
+            // DCOM lateral movement CLSIDs are always critical — they should
+            // never be instantiated from user workstations in normal operation.
+            bool isDcom = (strcmp(kMonitoredCLSIDs[i].category, "DCOM-LateralMove") == 0);
+            bool isLegit = !isDcom && IsScriptLegitHost(base);
+
+            // WScript.Shell from cmd.exe/powershell is suspicious but common
+            // in admin scripts; from w3wp.exe it's critical (web shell).
+            bool isWebServer = (_stricmp(base, "w3wp.exe") == 0 ||
+                                _stricmp(base, "httpd.exe") == 0 ||
+                                _stricmp(base, "nginx.exe") == 0 ||
+                                _stricmp(base, "php-cgi.exe") == 0 ||
+                                _stricmp(base, "java.exe") == 0 ||
+                                _stricmp(base, "tomcat9.exe") == 0);
+
+            const char* sev;
+            if (isDcom || isWebServer)
+                sev = "Critical";
+            else if (isLegit)
+                sev = "Info";
+            else
+                sev = "High";
+
+            char det[420];
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "%s: %s [%s] instantiated in %s (CLSCTX=0x%lX)%s%s",
+                apiName, kMonitoredCLSIDs[i].name,
+                kMonitoredCLSIDs[i].category,
+                hostExe, dwClsContext,
+                isWebServer ? " — WEB SHELL EXECUTION" : "",
+                isDcom ? " — DCOM LATERAL MOVEMENT" : "");
+            SendHookEvent(sev, apiName, 0, det);
+            return &kMonitoredCLSIDs[i];
+        }
+    }
+    return nullptr;
+}
 
 static HRESULT WINAPI Hook_CoCreateInstance(
     REFCLSID rclsid, LPUNKNOWN pUnkOuter,
     DWORD dwClsContext, REFIID riid, LPVOID* ppv)
 {
-    for (int i = 0; i < ARRAYSIZE(kScriptEngines); i++) {
-        if (memcmp(&rclsid, kScriptEngines[i].clsid, sizeof(GUID)) == 0) {
-            // Determine hosting process context
-            char hostExe[MAX_PATH] = {};
-            GetModuleFileNameA(nullptr, hostExe, sizeof(hostExe));
-
-            // Legitimate hosts: wscript.exe, cscript.exe, mshta.exe, iexplore.exe
-            // Everything else (w3wp.exe, powershell, cmd, rundll32, etc.) is suspicious
-            const char* base = strrchr(hostExe, '\\');
-            base = base ? base + 1 : hostExe;
-
-            bool isLegitHost = false;
-            static const char* kLegitHosts[] = {
-                "wscript.exe", "cscript.exe", "mshta.exe", "iexplore.exe",
-                "msedge.exe", "excel.exe", "winword.exe",
-                nullptr
-            };
-            for (int j = 0; kLegitHosts[j]; j++) {
-                if (_stricmp(base, kLegitHosts[j]) == 0) {
-                    isLegitHost = true;
-                    break;
-                }
-            }
-
-            const char* sev = isLegitHost ? "Info" : "Critical";
-
-            char det[384];
-            _snprintf_s(det, sizeof(det), _TRUNCATE,
-                "Script engine COM instantiation: %s created in %s "
-                "(CLSCTX=0x%lX) — Weaver Ant / China Chopper eval() technique",
-                kScriptEngines[i].name, hostExe, dwClsContext);
-            SendHookEvent(sev, "CoCreateInstance[ScriptEngine]", 0, det);
-            break;
-        }
-    }
+    CheckMonitoredCLSID(rclsid, "CoCreateInstance", dwClsContext);
 
     return ((FnCoCreateInstance)GetCallThrough(IDX_COCREATEINSTANCE))(
         rclsid, pUnkOuter, dwClsContext, riid, ppv);
+}
+
+// ---------------------------------------------------------------------------
+// CoCreateInstanceEx — DCOM remote COM instantiation.
+// When dwClsContext includes CLSCTX_REMOTE_SERVER (0x10), the COM object is
+// created on a remote machine.  This is the execution path for:
+//   - impacket dcomexec.py (MMC20.Application, ShellWindows, ShellBrowserWindow)
+//   - CrackMapExec DCOM lateral movement
+//   - Evil-WinRM DCOM execution
+// Even local instantiation of DCOM objects is suspicious from non-admin tools.
+// ---------------------------------------------------------------------------
+static HRESULT WINAPI Hook_CoCreateInstanceEx(
+    REFCLSID rclsid, LPUNKNOWN pUnkOuter,
+    DWORD dwClsContext, PVOID pServerInfo, DWORD dwCount, PVOID pResults)
+{
+    const MonitoredCLSID* match = CheckMonitoredCLSID(
+        rclsid, "CoCreateInstanceEx", dwClsContext);
+
+    // Extra alert for remote server context — definitive lateral movement
+    if (pServerInfo && (dwClsContext & 0x10)) {  // CLSCTX_REMOTE_SERVER = 0x10
+        char hostExe[MAX_PATH] = {};
+        const char* base = GetHostBaseName(hostExe, sizeof(hostExe));
+
+        char det[384];
+        if (match) {
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "DCOM REMOTE EXEC: %s instantiated with CLSCTX_REMOTE_SERVER "
+                "from %s — confirmed lateral movement (impacket/CrackMapExec)",
+                match->name, hostExe);
+        } else {
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "DCOM REMOTE: unknown CLSID instantiated with CLSCTX_REMOTE_SERVER "
+                "from %s — possible lateral movement",
+                hostExe);
+        }
+        SendHookEvent("Critical", "CoCreateInstanceEx[Remote]", 0, det);
+    }
+
+    return ((FnCoCreateInstanceEx)GetCallThrough(IDX_COCREATEINSTANCEEX))(
+        rclsid, pUnkOuter, dwClsContext, pServerInfo, dwCount, pResults);
+}
+
+// ---------------------------------------------------------------------------
+// CLSIDFromProgID — attackers resolve ProgIDs to CLSIDs at runtime to avoid
+// hardcoding CLSIDs in tooling.  Common attack ProgIDs:
+//   "JScript", "VBScript", "WScript.Shell", "WScript.Shell.1",
+//   "Shell.Application", "MMC20.Application", "ScriptControl",
+//   "MSScriptControl.ScriptControl", "Scripting.FileSystemObject",
+//   "htmlfile" (used by some web shell downloaders)
+// ---------------------------------------------------------------------------
+
+struct MonitoredProgID {
+    const wchar_t*  progid;
+    const char*     name;
+    bool            critical;   // true = always critical, false = host-dependent
+};
+
+static const MonitoredProgID kMonitoredProgIDs[] = {
+    // Script engines
+    { L"JScript",                            "JScript engine",          false },
+    { L"VBScript",                           "VBScript engine",         false },
+    { L"MSScriptControl.ScriptControl",      "MSScriptControl",         false },
+    { L"ScriptControl",                      "ScriptControl",           false },
+    { L"Scripting.FileSystemObject",         "FSO (file access)",       false },
+    { L"Scripting.Dictionary",               "Scripting.Dictionary",    false },
+    // Shell execution
+    { L"WScript.Shell",                      "WScript.Shell (Run/Exec)", false },
+    { L"WScript.Shell.1",                    "WScript.Shell.1",         false },
+    { L"Shell.Application",                  "Shell.Application",       false },
+    { L"Shell.Application.1",               "Shell.Application.1",     false },
+    // DCOM lateral movement
+    { L"MMC20.Application",                  "MMC20.Application",       true },
+    { L"MMC20.Application.1",               "MMC20.Application.1",     true },
+    // Downloader / evasion
+    { L"MSXML2.ServerXMLHTTP",              "ServerXMLHTTP (C2 comms)", false },
+    { L"MSXML2.XMLHTTP",                    "XMLHTTP (C2 downloader)", false },
+    { L"Microsoft.XMLHTTP",                 "XMLHTTP (legacy)",        false },
+    { L"htmlfile",                           "htmlfile (web shell loader)", false },
+};
+
+static HRESULT WINAPI Hook_CLSIDFromProgID(LPCOLESTR lpszProgID, LPCLSID lpclsid)
+{
+    if (lpszProgID) {
+        for (int i = 0; i < ARRAYSIZE(kMonitoredProgIDs); i++) {
+            // Case-insensitive wide string compare
+            if (_wcsicmp(lpszProgID, kMonitoredProgIDs[i].progid) == 0) {
+                char hostExe[MAX_PATH] = {};
+                const char* base = GetHostBaseName(hostExe, sizeof(hostExe));
+
+                bool isWebServer = (_stricmp(base, "w3wp.exe") == 0 ||
+                                    _stricmp(base, "httpd.exe") == 0 ||
+                                    _stricmp(base, "nginx.exe") == 0 ||
+                                    _stricmp(base, "php-cgi.exe") == 0 ||
+                                    _stricmp(base, "java.exe") == 0);
+
+                const char* sev;
+                if (kMonitoredProgIDs[i].critical || isWebServer)
+                    sev = "Critical";
+                else if (IsScriptLegitHost(base))
+                    sev = "Info";
+                else
+                    sev = "High";
+
+                // Convert ProgID to narrow string for logging
+                char progidNarrow[128] = {};
+                for (int c = 0; c < 127 && lpszProgID[c]; c++)
+                    progidNarrow[c] = (lpszProgID[c] < 128) ? (char)lpszProgID[c] : '?';
+
+                char det[384];
+                _snprintf_s(det, sizeof(det), _TRUNCATE,
+                    "ProgID resolution: \"%s\" (%s) resolved in %s%s",
+                    progidNarrow, kMonitoredProgIDs[i].name, hostExe,
+                    isWebServer ? " — WEB SHELL ProgID RESOLUTION" : "");
+                SendHookEvent(sev, "CLSIDFromProgID", 0, det);
+                break;
+            }
+        }
+    }
+
+    return ((FnCLSIDFromProgID)GetCallThrough(IDX_CLSIDFROMPROGID))(
+        lpszProgID, lpclsid);
 }
 
 // ---------------------------------------------------------------------------

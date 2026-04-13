@@ -636,6 +636,96 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
     }
 
     // -----------------------------------------------------------------
+    // Weaver Ant: Web server outbound connection detection.
+    //
+    // Web server worker processes (w3wp.exe, httpd, nginx, tomcat, php)
+    // should only accept inbound connections — outbound connections from
+    // these processes indicate:
+    //   - Reverse shell callback from a web shell
+    //   - C2 beacon from an in-memory web shell
+    //   - Data exfiltration via HTTP/S to attacker infrastructure
+    //   - SSRF exploitation
+    //
+    // Exception: DNS (53), LDAP (389/636) for auth, and localhost (127.*)
+    // are legitimate from web servers.
+    // -----------------------------------------------------------------
+    if (!IsSystemProcess(pid) && queue) {
+        PEPROCESS webProc = nullptr;
+        char webProcName[16] = {};
+        if (NT_SUCCESS(PsLookupProcessByProcessId(
+                (HANDLE)(ULONG_PTR)pid, &webProc))) {
+            char* n = PsGetProcessImageFileName(webProc);
+            if (n) RtlCopyMemory(webProcName, n, 15);
+            ObDereferenceObject(webProc);
+        }
+
+        BOOLEAN isWebServer =
+            (strcmp(webProcName, "w3wp.exe") == 0 ||
+             strcmp(webProcName, "httpd.exe") == 0 ||
+             strcmp(webProcName, "nginx.exe") == 0 ||
+             strcmp(webProcName, "php-cgi.exe") == 0 ||
+             strcmp(webProcName, "php.exe") == 0 ||
+             strcmp(webProcName, "java.exe") == 0 ||
+             strcmp(webProcName, "tomcat9.exe") == 0 ||
+             strcmp(webProcName, "iisexpress.e") == 0);  // truncated to 15 chars
+
+        if (isWebServer) {
+            // Allowlist legitimate outbound ports for web servers
+            BOOLEAN isLegitOutbound =
+                remotePort == 53   ||   // DNS
+                remotePort == 389  ||   // LDAP
+                remotePort == 636  ||   // LDAPS
+                remotePort == 88   ||   // Kerberos auth
+                remotePort == 1433 ||   // SQL Server
+                remotePort == 3306 ||   // MySQL
+                remotePort == 5432 ||   // PostgreSQL
+                remotePort == 6379 ||   // Redis
+                remotePort == 27017;    // MongoDB
+
+            // Allow localhost connections (127.0.0.0/8)
+            if (!isV6 && ((remoteAddressV4 >> 24) & 0xFF) == 127)
+                isLegitOutbound = TRUE;
+
+            if (!isLegitOutbound) {
+                BOOLEAN tainted = InjectionTaintTracker::IsTainted(pid);
+
+                char webNetMsg[420] = {};
+                RtlStringCchPrintfA(webNetMsg, sizeof(webNetMsg),
+                    "Web shell C2: %s (pid=%llu) outbound connection to %s:%u "
+                    "— web server processes should not initiate outbound "
+                    "connections (reverse shell / C2 callback / exfil)%s",
+                    webProcName, pid, remoteAddrStr, remotePort,
+                    tainted ? " [INJECTION-TAINTED]" : "");
+
+                PKERNEL_STRUCTURED_NOTIFICATION webNetNotif =
+                    (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED,
+                        sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'wsnt');
+                if (webNetNotif) {
+                    RtlZeroMemory(webNetNotif, sizeof(*webNetNotif));
+                    SET_CRITICAL(*webNetNotif);
+                    SET_NETWORK_CHECK(*webNetNotif);
+                    webNetNotif->pid = (HANDLE)(ULONG_PTR)pid;
+                    webNetNotif->scoopedAddress = isV6 ? 0 : (ULONG64)remoteAddressV4;
+                    webNetNotif->isPath = FALSE;
+                    RtlCopyMemory(webNetNotif->procName, webProcName, 15);
+                    SIZE_T wLen = strlen(webNetMsg) + 1;
+                    webNetNotif->msg = (char*)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED, wLen, 'wsmg');
+                    webNetNotif->bufSize = (ULONG)wLen;
+                    if (webNetNotif->msg) {
+                        RtlCopyMemory(webNetNotif->msg, webNetMsg, wLen);
+                        if (!queue->Enqueue(webNetNotif)) {
+                            ExFreePool(webNetNotif->msg);
+                            ExFreePool(webNetNotif);
+                        }
+                    } else { ExFreePool(webNetNotif); }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Interactive C2 / beaconing session detection.
     //
     // When operators proxy through standard web ports with sleep~0 or

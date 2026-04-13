@@ -51,6 +51,49 @@ static const char* const kMaliciousKeywords[] = {
     "downloaddata(",
     "net.webclient",
     "wscript.shell",
+    // ---------------------------------------------------------------
+    // Web shell signatures — China Chopper, Godzilla, Behinder/Bingxie,
+    // AntSword, and generic ASPX/JSP/PHP web shell patterns.
+    // ---------------------------------------------------------------
+    // China Chopper (classic one-liner web shell)
+    "eval(request",                    // eval(Request.Item["..."])
+    "eval(request.item",               // exact China Chopper pattern
+    "execute(request(",                // ASP classic variant
+    "eval request(",                   // VBScript variant
+    "<%eval request",                  // raw ASP China Chopper
+    "response.write(eval(",            // response eval variant
+    // Godzilla web shell
+    "gaborone",                        // Godzilla default session key
+    "pass=",                           // Godzilla password parameter
+    "javax.crypto.cipher",             // Godzilla Java AES encryption
+    "aesencode",                       // Godzilla C# AES encryption helper
+    "createaescipher",                 // Godzilla AES cipher creation
+    // Behinder (Bingxie) web shell
+    "behinder",                        // tool name reference
+    "e45e329feb5d925b",                // Behinder default AES key MD5 prefix
+    "javax.crypto.spec.secretkeyspec", // Behinder Java AES key spec
+    "aes/ecb/pkcs5padding",            // Behinder AES mode (ECB is unusual)
+    "classloader.defineclass",         // Behinder runtime class loading
+    "assembly.load(convert.frombase64string", // Behinder .NET payload loading
+    // AntSword web shell
+    "antsword",                        // tool name reference
+    "ant_",                            // AntSword default parameter prefix
+    "asoutputstream",                  // AntSword Java output stream pattern
+    "@eval(base64_decode(",            // AntSword PHP base64 eval
+    "assert(base64_decode(",           // AntSword PHP assert variant
+    // Generic web shell patterns
+    "system.reflection.assembly.load", // .NET reflective assembly load (web shells)
+    "processbuilder(",                 // Java command execution
+    "runtime.getruntime().exec(",      // Java Runtime.exec
+    "unsafe.eval(",                    // unsafe eval wrapper
+    "frombase64string",                // base64 decode + assembly load combo
+    "thread_start(system.delegate",    // .NET thread-based execution
+    "httppostedfile",                  // file upload control (web shell dropper)
+    "file_put_contents(",              // PHP file write (web shell dropper)
+    "passthru(",                       // PHP command execution
+    "system(",                         // PHP/Python command execution (in script context)
+    "proc_open(",                      // PHP process execution
+    "pcntl_exec(",                     // PHP direct exec
     nullptr
 };
 
