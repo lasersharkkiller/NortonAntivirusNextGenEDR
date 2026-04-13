@@ -181,6 +181,17 @@ static const DefenseEvasionEntry kDefenseEvasionPaths[] = {
     // Sysmon, PowerShell, and other diagnostic logs are under this path
     { L"\\Microsoft\\Windows\\EventLog",    NULL,
       "Diagnostic event log configuration modified",                    FALSE },
+    // Classic event log source registration — HKLM\SYSTEM\CCS\Services\EventLog\<Log>\<Source>
+    // Attackers delete Source subkeys to suppress event generation, or modify
+    // EventMessageFile/CategoryMessageFile/TypesSupported to corrupt event rendering.
+    { L"\\Services\\EventLog\\",            L"EventMessageFile",
+      "Classic EventLog source EventMessageFile modified — message DLL redirect (T1562.002)", TRUE },
+    { L"\\Services\\EventLog\\",            L"CategoryMessageFile",
+      "Classic EventLog source CategoryMessageFile modified — category DLL tamper (T1562.002)", TRUE },
+    { L"\\Services\\EventLog\\",            L"TypesSupported",
+      "Classic EventLog source TypesSupported modified — event type suppression (T1562.002)", FALSE },
+    { L"\\Services\\EventLog\\",            L"CategoryCount",
+      "Classic EventLog source CategoryCount modified — event category tamper (T1562.002)", FALSE },
 
     // --- T1562.003: Disable PowerShell Logging ---
     { L"\\PowerShell\\ScriptBlockLogging",  L"EnableScriptBlockLogging",
@@ -278,6 +289,26 @@ static const DefenseEvasionEntry kDefenseEvasionPaths[] = {
     // ETW publisher GUID registry — redirects or disables specific ETW providers
     { L"\\WINEVT\\Publishers\\",            NULL,
       "ETW publisher registry modified — provider GUID tampering (T1562.002)", TRUE },
+    // ETW manifest provider DLL paths — attackers redirect MessageFileName to rogue
+    // DLL or empty it; events still fire but decode as raw IDs, blinding SIEM parsers.
+    { L"\\WINEVT\\Publishers\\",            L"MessageFileName",
+      "ETW provider MessageFileName modified — manifest DLL redirect/corrupt (T1562.002)", TRUE },
+    { L"\\WINEVT\\Publishers\\",            L"ResourceFileName",
+      "ETW provider ResourceFileName modified — resource DLL tampering (T1562.002)", TRUE },
+    { L"\\WINEVT\\Publishers\\",            L"ParameterFileName",
+      "ETW provider ParameterFileName modified — parameter DLL tampering (T1562.002)", TRUE },
+    // ETW channel configuration tampering — shrink MaxSize for rapid log rotation,
+    // change LogFilePath to redirect logs to null/temp, set Retention=0 for overwrite.
+    { L"\\WINEVT\\Channels\\",              L"MaxSize",
+      "Event channel MaxSize modified — log size shrinking for rapid rotation (T1562.002)", TRUE },
+    { L"\\WINEVT\\Channels\\",              L"Retention",
+      "Event channel Retention modified — enable overwrite to destroy old logs (T1562.002)", TRUE },
+    { L"\\WINEVT\\Channels\\",              L"LogFilePath",
+      "Event channel LogFilePath redirected — log diversion to null/temp (T1562.002)", TRUE },
+    { L"\\WINEVT\\Channels\\",              L"MaxSizeUpper",
+      "Event channel MaxSizeUpper modified — log capacity tampering (T1562.002)", FALSE },
+    { L"\\WINEVT\\Channels\\",              L"Type",
+      "Event channel Type modified — channel type subversion (T1562.002)", TRUE },
     // AutoLogger provider enable/disable at boot
     { L"\\WMI\\Autologger\\",              L"Enabled",
       "AutoLogger Enabled modified — persistent ETW session disable (T1562.002)", TRUE },

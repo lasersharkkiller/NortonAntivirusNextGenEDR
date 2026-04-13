@@ -1991,6 +1991,15 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"wevtutil sl ",              "wevtutil set-log — event channel config modification (T1562.002)",     TRUE  },
 				{ L"wevtutil set-log",          "wevtutil set-log — event channel disable/modify (T1562.002)",         TRUE  },
 				{ L"/e:false",                  "Event channel disable (/e:false) — ETW channel blinding (T1562.002)", TRUE  },
+				// wevtutil — manifest install/uninstall and provider enumeration
+				{ L"wevtutil im ",              "wevtutil install-manifest — register rogue ETW provider manifest (T1562.002)", TRUE },
+				{ L"wevtutil install-manifest", "wevtutil install-manifest — register rogue ETW provider manifest (T1562.002)", TRUE },
+				{ L"wevtutil um ",              "wevtutil uninstall-manifest — unregister ETW provider (T1562.002 blinding)", TRUE },
+				{ L"wevtutil uninstall-manifest", "wevtutil uninstall-manifest — remove ETW provider definition (T1562.002)", TRUE },
+				{ L"wevtutil ep",               "wevtutil enum-publishers — ETW provider enumeration (pre-manifest-tamper recon)", FALSE },
+				{ L"wevtutil enum-publishers",  "wevtutil enum-publishers — ETW provider enumeration (pre-manifest-tamper recon)", FALSE },
+				{ L"wevtutil gp ",              "wevtutil get-publisher — ETW provider detail dump (GUID, channels, message DLL)", FALSE },
+				{ L"wevtutil get-publisher",    "wevtutil get-publisher — ETW provider detail dump (GUID, channels, message DLL)", FALSE },
 				// PowerShell ETW provider/session manipulation
 				{ L"remove-etwtraceprovider",   "Remove-EtwTraceProvider — ETW provider removal (T1562.002)",          TRUE  },
 				{ L"set-etwtraceprovider",      "Set-EtwTraceProvider — ETW provider config tampering (T1562.002)",    TRUE  },

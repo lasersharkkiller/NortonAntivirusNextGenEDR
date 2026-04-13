@@ -3393,6 +3393,123 @@ rate_done:
             }
         }
 
+        // ---- .man manifest file write (T1562.002) ----
+        // ETW instrumentation manifests (.man) define provider events, channels,
+        // keywords, and templates.  Attackers stage rogue .man files before
+        // running wevtutil im to register malicious provider definitions.
+        // Legitimate manifests live inside system DLLs or Windows servicing dirs.
+        {
+            ACCESS_MASK daMan = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            BOOLEAN isManWrite = (daMan & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+
+            if (isManWrite && nameInfo->FinalComponent.Length >= 8) {
+                PWCHAR manExt = nameInfo->FinalComponent.Buffer;
+                USHORT manExtLen = nameInfo->FinalComponent.Length / sizeof(WCHAR);
+                BOOLEAN isManFile = FALSE;
+                if (manExtLen >= 4) {
+                    PWCHAR manTail = manExt + manExtLen - 4;
+                    isManFile = (manTail[0] == L'.' &&
+                                 (manTail[1] == L'm' || manTail[1] == L'M') &&
+                                 (manTail[2] == L'a' || manTail[2] == L'A') &&
+                                 (manTail[3] == L'n' || manTail[3] == L'N'));
+                }
+
+                if (isManFile) {
+                    // Allow OS servicing paths
+                    BOOLEAN insideServicing =
+                        WcsContainsLower(&nameInfo->Name, L"\\windows\\winsxs\\") ||
+                        WcsContainsLower(&nameInfo->Name, L"\\windows\\servicing\\") ||
+                        WcsContainsLower(&nameInfo->Name, L"\\system32\\") ||
+                        WcsContainsLower(&nameInfo->Name, L"\\syswow64\\");
+                    // Allow trusted servicing processes
+                    BOOLEAN isTrustedProc = FALSE;
+                    if (procName) {
+                        isTrustedProc = (strcmp(procName, "TiWorker.exe") == 0 ||
+                                         strcmp(procName, "TrustedInsta") == 0 ||  // truncated
+                                         strcmp(procName, "svchost.exe") == 0 ||
+                                         strcmp(procName, "msiexec.exe") == 0);
+                    }
+
+                    if (!insideServicing && !isTrustedProc) {
+                        char manBuf[80] = {};
+                        ANSI_STRING ansiMan;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiMan, &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiMan.Length < sizeof(manBuf) - 1 ? ansiMan.Length : sizeof(manBuf) - 1;
+                            RtlCopyMemory(manBuf, ansiMan.Buffer, n);
+                            RtlFreeAnsiString(&ansiMan);
+                        }
+                        char msg[280];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: ETW manifest file drop — '%s' written by '%s' (pid=%llu) "
+                            "— rogue provider manifest staging (T1562.002)",
+                            manBuf[0] ? manBuf : "?.man",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid);
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                    }
+                }
+            }
+        }
+
+        // ---- Instrumentation manifest DLL tampering (T1562.002) ----
+        // ETW provider resource/message DLLs live in System32 and are referenced
+        // by WINEVT\Publishers\{GUID}\MessageFileName.  Attackers replace these
+        // DLLs so events still fire but decode as raw IDs — blinding SIEM parsers.
+        // Monitor writes to known provider DLL directories for non-OS processes.
+        {
+            ACCESS_MASK daProv = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            BOOLEAN isProvWrite = (daProv & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+
+            if (isProvWrite) {
+                // Check for DLL writes inside winevt\ directories (provider message DLLs)
+                BOOLEAN isWinevtDll = FALSE;
+                if (WcsContainsLower(&nameInfo->Name, L"\\winevt\\") ||
+                    WcsContainsLower(&nameInfo->Name, L"\\wevtapi.dll") ||
+                    WcsContainsLower(&nameInfo->Name, L"\\microsoft-windows-")) {
+                    // Check if it's a DLL
+                    USHORT provExtLen = nameInfo->FinalComponent.Length / sizeof(WCHAR);
+                    if (provExtLen >= 4) {
+                        PWCHAR provTail = nameInfo->FinalComponent.Buffer + provExtLen - 4;
+                        isWinevtDll = (provTail[0] == L'.' &&
+                                       (provTail[1] == L'd' || provTail[1] == L'D') &&
+                                       (provTail[2] == L'l' || provTail[2] == L'L') &&
+                                       (provTail[3] == L'l' || provTail[3] == L'L'));
+                    }
+                }
+
+                if (isWinevtDll) {
+                    // Allow only trusted OS servicing processes
+                    BOOLEAN isTrustedWriter = FALSE;
+                    if ((ULONG_PTR)pid <= 4) isTrustedWriter = TRUE;
+                    else if (procName) {
+                        isTrustedWriter = (strcmp(procName, "TiWorker.exe") == 0 ||
+                                           strcmp(procName, "TrustedInsta") == 0 ||
+                                           strcmp(procName, "svchost.exe") == 0 ||
+                                           strcmp(procName, "msiexec.exe") == 0 ||
+                                           strcmp(procName, "wusa.exe") == 0);
+                    }
+
+                    if (!isTrustedWriter) {
+                        char provBuf[80] = {};
+                        ANSI_STRING ansiProv;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiProv, &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiProv.Length < sizeof(provBuf) - 1 ? ansiProv.Length : sizeof(provBuf) - 1;
+                            RtlCopyMemory(provBuf, ansiProv.Buffer, n);
+                            RtlFreeAnsiString(&ansiProv);
+                        }
+                        char msg[280];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: ETW provider DLL tamper — '%s' written by '%s' (pid=%llu) "
+                            "— manifest resource DLL replacement (T1562.002)",
+                            provBuf[0] ? provBuf : "?.dll",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid);
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                    }
+                }
+            }
+        }
+
         // ---- Pagefile / hiberfil.sys / swapfile.sys access ----
         // User-mode reads of pagefile.sys or hiberfil.sys enable offline credential
         // extraction (mimikatz sekurlsa::minidump against page file contents).
