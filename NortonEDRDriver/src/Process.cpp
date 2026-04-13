@@ -1797,6 +1797,27 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"wmic startup",              "wmic startup — persistence listing via WMI startup entries",         FALSE },
 				{ L"wmic /format:",             "wmic /format: — XSL stylesheet execution (Squiblytwo T1220)",        TRUE  },
 
+				// --- T1562.002: ETW session/provider tampering via command line ---
+				// logman — stops or deletes ETW trace sessions (bypasses prologue checks)
+				{ L"logman stop",               "logman stop — ETW trace session stop (T1562.002 telemetry blinding)",  TRUE  },
+				{ L"logman delete",             "logman delete — ETW trace session deletion (T1562.002 persistent blind)", TRUE },
+				{ L"logman update",             "logman update — ETW trace session modification (T1562.002)",           TRUE  },
+				// wevtutil — channel disable (we already catch 'cl' for clearing)
+				{ L"wevtutil sl ",              "wevtutil set-log — event channel config modification (T1562.002)",     TRUE  },
+				{ L"wevtutil set-log",          "wevtutil set-log — event channel disable/modify (T1562.002)",         TRUE  },
+				{ L"/e:false",                  "Event channel disable (/e:false) — ETW channel blinding (T1562.002)", TRUE  },
+				// PowerShell ETW provider/session manipulation
+				{ L"remove-etwtraceprovider",   "Remove-EtwTraceProvider — ETW provider removal (T1562.002)",          TRUE  },
+				{ L"set-etwtraceprovider",      "Set-EtwTraceProvider — ETW provider config tampering (T1562.002)",    TRUE  },
+				{ L"stop-etwtracesession",      "Stop-EtwTraceSession — ETW session stop via PowerShell (T1562.002)",  TRUE  },
+				{ L"remove-etwtracesession",    "Remove-EtwTraceSession — ETW session removal via PowerShell (T1562.002)", TRUE },
+				{ L"new-autologgerconfig",      "New-AutologgerConfig — AutoLogger creation/modification (T1562.002)", FALSE },
+				// ETW recon (pre-attack enumeration of active sessions/providers)
+				{ L"get-etwtracesession",       "Get-EtwTraceSession — ETW session enumeration (pre-attack recon)",    FALSE },
+				{ L"get-etwtraceprovider",      "Get-EtwTraceProvider — ETW provider enumeration (pre-attack recon)",  FALSE },
+				{ L"logman query",              "logman query — ETW trace session enumeration (pre-attack recon)",      FALSE },
+				{ L"trace-command",             "Trace-Command — PowerShell tracing/ETW recon",                        FALSE },
+
 				// --- T1518.001: Security software discovery ---
 				// Attackers enumerate installed EDR/AV before evasion attempts.
 				{ L"sc query windefend",        "sc query windefend — Defender service status recon",                   FALSE },

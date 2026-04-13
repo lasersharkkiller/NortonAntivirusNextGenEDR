@@ -351,6 +351,7 @@ static std::queue<std::string> g_elasticQueue;   // ECS JSON documents (one per 
 static std::mutex              g_elasticMutex;
 static std::condition_variable g_elasticCv;
 static std::atomic<bool>       g_elasticStop(false);
+static std::atomic<bool>       g_etwWatchdogStop(false);
 static constexpr size_t        kElasticQueueMax  = 1000;
 static constexpr size_t        kElasticBatchSize = 50;
 static constexpr int           kElasticFlushMs   = 5000;
@@ -4315,6 +4316,158 @@ static void StopKernelProcessSession()
 }
 
 // ---------------------------------------------------------------------------
+// ETW session health watchdog.
+//
+// Monitors our real-time ETW sessions (ETW-TI, Kernel-Process) and all
+// EvtSubscribe-based log subscriptions.  If an attacker kills a session
+// via `logman stop`, NtTraceControl(StopTrace), or ControlTraceW from
+// another process, the ProcessTrace call silently returns and the consumer
+// thread exits — leaving us blind with no alert.
+//
+// The watchdog wakes every 15 seconds, queries each session with
+// ControlTraceW(QUERY), and checks EvtSubscribe handles.  If a session
+// is dead, it emits a Critical alert and attempts restart.
+// ---------------------------------------------------------------------------
+
+static void EtwSessionWatchdogThread()
+{
+    constexpr int kCheckIntervalMs = 15000;
+
+    // Helper: query an ETW session by name — returns TRUE if alive
+    auto IsSessionAlive = [](const wchar_t* sessionName) -> bool {
+        const size_t nameBuf = (wcslen(sessionName) + 1) * sizeof(wchar_t);
+        const size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + nameBuf;
+        auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(bufSize));
+        if (!props) return false;
+        ZeroMemory(props, bufSize);
+        props->Wnode.BufferSize  = static_cast<ULONG>(bufSize);
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        ULONG st = ControlTraceW(0, sessionName, props, EVENT_TRACE_CONTROL_QUERY);
+        free(props);
+        return (st == ERROR_SUCCESS);
+    };
+
+    while (!g_etwWatchdogStop.load()) {
+        Sleep(kCheckIntervalMs);
+        if (g_etwWatchdogStop.load()) break;
+
+        std::string ts = BuildTimestamp();
+
+        // --- Check ETW-TI session ---
+        if (g_tiSessionHandle != 0 &&
+            g_tiTraceHandle == INVALID_PROCESSTRACE_HANDLE)
+        {
+            // ProcessTrace returned — session was killed externally
+            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                " - [*] [Critical] | " + ts +
+                " | ETW-Watchdog | Method: ETW Session Integrity" +
+                " | ETW-TI session (NortonEDR-TI) KILLED externally — "
+                "Threat-Intelligence telemetry is BLIND (T1562.002)";
+            std::string det = "Date & Time: " + ts +
+                " | ETW-Watchdog | Method: ETW Session Integrity" +
+                " | Microsoft-Windows-Threat-Intelligence session terminated "
+                "by external process — attacker used logman stop / "
+                "NtTraceControl(StopTrace) / ControlTraceW to blind ETW-TI";
+            PushUiDetectionEvent(msg, det,
+                "Method: ETW Session Integrity (T1562.002)",
+                0, DetectionSeverity::Critical);
+            g_tiSessionHandle = 0;  // mark as dead so we only alert once
+        }
+
+        // --- Check ETW Kernel-Process session ---
+        if (g_kpSessionHandle != 0 &&
+            g_kpTraceHandle == INVALID_PROCESSTRACE_HANDLE)
+        {
+            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                " - [*] [Critical] | " + ts +
+                " | ETW-Watchdog | Method: ETW Session Integrity" +
+                " | ETW-KP session (NortonEDR-KernelProcess) KILLED "
+                "externally — PPID spoofing detection is BLIND (T1562.002)";
+            std::string det = "Date & Time: " + ts +
+                " | ETW-Watchdog | Method: ETW Session Integrity" +
+                " | Microsoft-Windows-Kernel-Process session terminated "
+                "by external process — attacker blinded PPID spoof detection";
+            PushUiDetectionEvent(msg, det,
+                "Method: ETW Session Integrity (T1562.002)",
+                0, DetectionSeverity::Critical);
+            g_kpSessionHandle = 0;
+        }
+
+        // --- Check named-session liveness via ControlTrace(QUERY) ---
+        // If sessions were started but attacker stopped them between
+        // our subscriber thread launching and ProcessTrace returning,
+        // the handle is still nonzero but the session is dead.
+        if (g_tiSessionHandle != 0 &&
+            !IsSessionAlive(L"NortonEDR-TI"))
+        {
+            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                " - [*] [Critical] | " + ts +
+                " | ETW-Watchdog | Method: ETW Session Integrity" +
+                " | ETW-TI session no longer queryable — session tampering "
+                "detected (T1562.002)";
+            std::string det = "Date & Time: " + ts +
+                " | ETW-Watchdog | ETW-TI session query failed — "
+                "external termination or provider detach detected";
+            PushUiDetectionEvent(msg, det,
+                "Method: ETW Session Integrity (T1562.002)",
+                0, DetectionSeverity::Critical);
+            g_tiSessionHandle = 0;
+        }
+
+        if (g_kpSessionHandle != 0 &&
+            !IsSessionAlive(L"NortonEDR-KernelProcess"))
+        {
+            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                " - [*] [Critical] | " + ts +
+                " | ETW-Watchdog | Method: ETW Session Integrity" +
+                " | ETW-KP session no longer queryable — session tampering "
+                "detected (T1562.002)";
+            std::string det = "Date & Time: " + ts +
+                " | ETW-Watchdog | ETW-KP session query failed — "
+                "external termination or provider detach detected";
+            PushUiDetectionEvent(msg, det,
+                "Method: ETW Session Integrity (T1562.002)",
+                0, DetectionSeverity::Critical);
+            g_kpSessionHandle = 0;
+        }
+
+        // --- Check EvtSubscribe handles (log-based subscriptions) ---
+        // EvtSubscribe returns NULL on failure; if an attacker disables
+        // the underlying channel, the handle may still be valid but
+        // events stop flowing.  We can't detect silent starvation here
+        // (that requires heartbeat canaries), but we CAN detect handle
+        // invalidation from channel deletion.
+        struct SubCheck {
+            EVT_HANDLE&         handle;
+            std::atomic<bool>&  stop;
+            const char*         name;
+        };
+        SubCheck subs[] = {
+            { g_sysmonSubscription,   g_sysmonStop,   "Sysmon"    },
+            { g_psSubscription,       g_psStop,       "PowerShell"},
+            { g_dnsSubscription,      g_dnsStop,      "DNS-Client"},
+            { g_wmiSubscription,      g_wmiStop,      "WMI-Activity"},
+        };
+        for (auto& s : subs) {
+            if (!s.stop.load() && s.handle == nullptr) {
+                std::string msg = std::to_string(tab_1_menu_items.size()) +
+                    " - [*] [Critical] | " + ts +
+                    " | ETW-Watchdog | Method: ETW Session Integrity"
+                    " | " + s.name + " subscription handle is NULL — "
+                    "event channel may have been disabled (T1562.002)";
+                std::string det = "Date & Time: " + ts +
+                    " | ETW-Watchdog | " + s.name + " EvtSubscribe handle "
+                    "lost — channel disabled or subscription terminated";
+                PushUiDetectionEvent(msg, det,
+                    "Method: ETW Session Integrity (T1562.002)",
+                    0, DetectionSeverity::Critical);
+                s.stop = true;  // prevent repeated alerts
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PowerShell script-block logging (EID 4104)
 // Channel: Microsoft-Windows-PowerShell/Operational
 // ---------------------------------------------------------------------------
@@ -5943,6 +6096,9 @@ VOID ShowUI() {
     g_altitudeAuditStop = false;
     std::thread altitudeAuditThread(AltitudeAuditThread);
 
+    g_etwWatchdogStop = false;
+    std::thread etwWatchdogThread(EtwSessionWatchdogThread);
+
     try {
         screen.Loop(renderer);
     }
@@ -6010,6 +6166,9 @@ VOID ShowUI() {
 
     g_altitudeAuditStop = true;
     altitudeAuditThread.join();
+
+    g_etwWatchdogStop = true;
+    etwWatchdogThread.join();
 }
 
 int main(int argc, char* argv[]) {

@@ -3993,7 +3993,16 @@ VOID SyscallsUtils::NtImpersonateAnonymousTokenHandler(HANDLE ThreadHandle)
 // NtTraceControl — detect ETW provider/session manipulation.
 //
 // ETW can be disabled or manipulated via NtTraceControl without hooking any ETW functions.
-// Dangerous function codes: 5 (update/enable trace), 31 (disable provider).
+// Function codes (from EtwpControlTraceGuid dispatch table):
+//   1  = StopTrace           — kills a running ETW session (most dangerous)
+//   2  = QueryTrace          — enumerates session config (recon)
+//   5  = UpdateTrace         — modifies session parameters (can neuter providers)
+//  17  = FlushTrace          — forces buffer flush (can cause data loss / DoS)
+//  28  = StopTraceNoFlush    — kills session without flushing (data loss)
+//  31  = DisableProvider     — removes a provider from a session
+//
+// Code 1 (StopTrace) is the primary attack vector — it directly kills our
+// ETW-TI and Kernel-Process sessions without touching any function prologues.
 VOID SyscallsUtils::NtTraceControlHandler(ULONG FunctionCode)
 {
 	PEPROCESS caller = IoGetCurrentProcess();
@@ -4002,15 +4011,24 @@ VOID SyscallsUtils::NtTraceControlHandler(ULONG FunctionCode)
 	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
 	if (callerProt && callerProt->Level != 0) return;
 
-	// Flag update-trace and disable-provider operations
-	if (FunctionCode == 5 || FunctionCode == 31) {
-		const char* action = (FunctionCode == 5) ? "update/enable trace" : "disable provider";
-		char msg[128];
-		RtlStringCbPrintfA(msg, sizeof(msg),
-			"NtTraceControl: user-mode process calling ETW %s — possible ETW bypass",
-			action);
-		EmitSyscallNotif(0, msg, caller, nullptr, FALSE); // WARNING
+	const char* action = nullptr;
+	BOOLEAN isCritical = FALSE;
+
+	switch (FunctionCode) {
+	case 1:  action = "StopTrace — session kill";         isCritical = TRUE;  break;
+	case 5:  action = "UpdateTrace — session modify";     isCritical = FALSE; break;
+	case 17: action = "FlushTrace — forced buffer flush";  isCritical = FALSE; break;
+	case 28: action = "StopTraceNoFlush — session kill (no flush)"; isCritical = TRUE; break;
+	case 31: action = "DisableProvider — provider removal"; isCritical = TRUE;  break;
+	case 2:  action = "QueryTrace — session enumeration (recon)";   isCritical = FALSE; break;
+	default: return;
 	}
+
+	char msg[180];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"NtTraceControl(code=%lu): %s — possible ETW bypass (T1562.002)",
+		FunctionCode, action);
+	EmitSyscallNotif(0, msg, caller, nullptr, isCritical);
 }
 
 // NtCreateNamedPipeFile — detect named pipe C2 / lateral movement / squatting /

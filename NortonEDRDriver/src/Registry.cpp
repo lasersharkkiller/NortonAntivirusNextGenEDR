@@ -88,6 +88,11 @@ static const WCHAR* kPersistencePaths[] = {
     // DISABLEWINDOWFILTERING).  Can be abused for privilege/protection bypass.
     L"\\AppCompatFlags\\Layers",
 
+    // --- T1562.002: ETW AutoLogger persistence tampering ---
+    // AutoLoggers start ETW sessions at boot.  Deleting or modifying these keys
+    // prevents security-critical ETW sessions (Sysmon, Defender, EDR) from starting.
+    L"\\Control\\WMI\\Autologger",
+
     nullptr
 };
 
@@ -112,6 +117,7 @@ static const BOOLEAN kPersistenceCritical[] = {
     TRUE,                              // AppCompatFlags\Custom — Critical (T1546.011)
     TRUE,                              // AppCompatFlags\InstalledSDB — Critical (T1546.011)
     TRUE,                              // AppCompatFlags\Layers — Critical (T1546.011)
+    TRUE,                              // ETW AutoLogger — Critical (T1562.002)
 };
 
 // ---------------------------------------------------------------------------
@@ -261,6 +267,24 @@ static const DefenseEvasionEntry kDefenseEvasionPaths[] = {
     { L"\\AppCompatFlags",                   L"DisablePCA",
       "Program Compatibility Assistant disabled — may hide attacker "
       "compatibility flag modifications from UI", FALSE },
+
+    // --- T1562.002: ETW provider/channel registry tampering ---
+    // Attackers disable event channels via registry to blind specific telemetry sources.
+    // HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Channels\<channel>\Enabled=0
+    { L"\\WINEVT\\Channels\\",              L"Enabled",
+      "Event channel Enabled value modified — ETW channel blinding (T1562.002)", TRUE },
+    { L"\\WINEVT\\Channels\\",              L"ChannelAccess",
+      "Event channel ACL modified — ETW channel access restriction (T1562.002)", TRUE },
+    // ETW publisher GUID registry — redirects or disables specific ETW providers
+    { L"\\WINEVT\\Publishers\\",            NULL,
+      "ETW publisher registry modified — provider GUID tampering (T1562.002)", TRUE },
+    // AutoLogger provider enable/disable at boot
+    { L"\\WMI\\Autologger\\",              L"Enabled",
+      "AutoLogger Enabled modified — persistent ETW session disable (T1562.002)", TRUE },
+    { L"\\WMI\\Autologger\\",              L"Start",
+      "AutoLogger Start value modified — persistent ETW session disable (T1562.002)", TRUE },
+    { L"\\WMI\\Autologger\\",              L"EnableLevel",
+      "AutoLogger EnableLevel modified — ETW verbosity downgrade (T1562.002)", FALSE },
 
     // --- Misc defense evasion ---
     // AMSI provider unregistration (COM CLSID nuke)
