@@ -128,7 +128,9 @@ enum HookIdx : int {
     IDX_FWPMPROVIDERENUM0              = 62, // fwpuclnt.dll — provider enumeration (recon)
     IDX_FWPMENGINEGETSECINFOBYKEY0     = 63, // fwpuclnt.dll — engine security descriptor query
     IDX_FWPMFILTERGETSECINFOBYKEY0     = 64, // fwpuclnt.dll — filter security descriptor query
-    HOOK_COUNT                  = 65
+    // --- Weaver Ant: JScript/VBScript script engine instantiation ---
+    IDX_COCREATEINSTANCE               = 65, // ole32.dll — COM object creation (script engines)
+    HOOK_COUNT                  = 66
 };
 
 struct ApiHook {
@@ -249,6 +251,10 @@ static DWORD  WINAPI Hook_FwpmSubLayerEnum0(HANDLE, HANDLE, UINT32, PVOID*, UINT
 static DWORD  WINAPI Hook_FwpmProviderEnum0(HANDLE, HANDLE, UINT32, PVOID*, UINT32*);
 static DWORD  WINAPI Hook_FwpmEngineGetSecurityInfo0(HANDLE, SECURITY_INFORMATION, PSID*, PSID*, PACL*, PACL*, PSECURITY_DESCRIPTOR*);
 static DWORD  WINAPI Hook_FwpmFilterGetSecurityInfoByKey0(HANDLE, const GUID*, SECURITY_INFORMATION, PSID*, PSID*, PACL*, PACL*, PSECURITY_DESCRIPTOR*);
+// Weaver Ant: JScript/VBScript script engine COM instantiation detection
+typedef HRESULT (WINAPI *FnCoCreateInstance)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
+static HRESULT WINAPI Hook_CoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter,
+    DWORD dwClsContext, REFIID riid, LPVOID* ppv);
 
 static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "VirtualAlloc",         (FARPROC)Hook_VirtualAlloc,        nullptr, nullptr, {}, nullptr, false },
@@ -322,6 +328,8 @@ static ApiHook g_hooks[HOOK_COUNT] = {
     { "fwpuclnt.dll", "FwpmProviderEnum0",            (FARPROC)Hook_FwpmProviderEnum0,               nullptr, nullptr, {}, nullptr, false },
     { "fwpuclnt.dll", "FwpmEngineGetSecurityInfo0",   (FARPROC)Hook_FwpmEngineGetSecurityInfo0,       nullptr, nullptr, {}, nullptr, false },
     { "fwpuclnt.dll", "FwpmFilterGetSecurityInfoByKey0", (FARPROC)Hook_FwpmFilterGetSecurityInfoByKey0, nullptr, nullptr, {}, nullptr, false },
+    // Weaver Ant: script engine COM instantiation
+    { "ole32.dll",    "CoCreateInstance",               (FARPROC)Hook_CoCreateInstance,              nullptr, nullptr, {}, nullptr, false },
 };
 
 // Returns the correct call-through address.
@@ -597,6 +605,13 @@ static CriticalFuncGuard g_etwGuards[] = {
     { "ntdll.dll",  "EtwEventWrite",     nullptr, {}, false },
     { "ntdll.dll",  "EtwEventWriteFull", nullptr, {}, false },
     { "ntdll.dll",  "NtTraceEvent",      nullptr, {}, false },
+    // advapi32 user-mode ETW wrappers — distinct code path from ntdll ETW
+    { "advapi32.dll", "EventWrite",         nullptr, {}, false },
+    { "advapi32.dll", "EventWriteTransfer", nullptr, {}, false },
+    { "advapi32.dll", "EventRegister",      nullptr, {}, false },
+    // Classic Windows Event Log API — patching silences legacy event reporting
+    { "advapi32.dll", "ReportEventW",       nullptr, {}, false },
+    { "advapi32.dll", "ReportEventA",       nullptr, {}, false },
     { "amsi.dll",   "AmsiScanBuffer",    nullptr, {}, false },
     { "amsi.dll",   "AmsiOpenSession",   nullptr, {}, false },
     // Mimikatz crypto::capi / crypto::cng patches these to force-export
@@ -2352,6 +2367,94 @@ static DWORD WINAPI Hook_FwpmFilterGetSecurityInfoByKey0(
 
     return ((FnFwpmFilterGetSecurityInfoByKey0)GetCallThrough(IDX_FWPMFILTERGETSECINFOBYKEY0))(
         engineHandle, key, secInfo, sidOwner, sidGroup, dacl, sacl, sd);
+}
+
+// ---------------------------------------------------------------------------
+// Weaver Ant: JScript/VBScript script engine COM instantiation detection
+//
+// China Chopper and INMemory web shells use CoCreateInstance to instantiate
+// script engines (JScript, VBScript, ScriptControl, scrobj.dll scriptlets)
+// for in-memory payload execution via eval().  Detecting COM creation of
+// these CLSIDs catches the attack at the execution pivot point.
+//
+// Monitored CLSIDs:
+//   {F414C260-6AC0-11CF-B6D1-00AA00BBBB58} — JScript
+//   {B54F3741-5B07-11CF-A4B0-00AA004A55E8} — VBScript
+//   {0E59F1D5-1FBE-11D0-8FF2-00A0D10038BC} — MSScriptControl.ScriptControl
+//   {06290BD5-48AA-11D2-8432-006008C3FBFC} — scrobj.dll Scriptlet factory
+// ---------------------------------------------------------------------------
+
+// {F414C260-6AC0-11CF-B6D1-00AA00BBBB58}
+static const GUID CLSID_JScript = {
+    0xF414C260, 0x6AC0, 0x11CF, { 0xB6, 0xD1, 0x00, 0xAA, 0x00, 0xBB, 0xBB, 0x58 }
+};
+// {B54F3741-5B07-11CF-A4B0-00AA004A55E8}
+static const GUID CLSID_VBScript = {
+    0xB54F3741, 0x5B07, 0x11CF, { 0xA4, 0xB0, 0x00, 0xAA, 0x00, 0x4A, 0x55, 0xE8 }
+};
+// {0E59F1D5-1FBE-11D0-8FF2-00A0D10038BC}
+static const GUID CLSID_ScriptControl = {
+    0x0E59F1D5, 0x1FBE, 0x11D0, { 0x8F, 0xF2, 0x00, 0xA0, 0xD1, 0x00, 0x38, 0xBC }
+};
+// {06290BD5-48AA-11D2-8432-006008C3FBFC}
+static const GUID CLSID_Scriptlet = {
+    0x06290BD5, 0x48AA, 0x11D2, { 0x84, 0x32, 0x00, 0x60, 0x08, 0xC3, 0xFB, 0xFC }
+};
+
+struct ScriptEngineCLSID {
+    const GUID*  clsid;
+    const char*  name;
+};
+
+static const ScriptEngineCLSID kScriptEngines[] = {
+    { &CLSID_JScript,        "JScript (F414C260)" },
+    { &CLSID_VBScript,       "VBScript (B54F3741)" },
+    { &CLSID_ScriptControl,  "MSScriptControl (0E59F1D5)" },
+    { &CLSID_Scriptlet,      "scrobj Scriptlet (06290BD5)" },
+};
+
+static HRESULT WINAPI Hook_CoCreateInstance(
+    REFCLSID rclsid, LPUNKNOWN pUnkOuter,
+    DWORD dwClsContext, REFIID riid, LPVOID* ppv)
+{
+    for (int i = 0; i < ARRAYSIZE(kScriptEngines); i++) {
+        if (memcmp(&rclsid, kScriptEngines[i].clsid, sizeof(GUID)) == 0) {
+            // Determine hosting process context
+            char hostExe[MAX_PATH] = {};
+            GetModuleFileNameA(nullptr, hostExe, sizeof(hostExe));
+
+            // Legitimate hosts: wscript.exe, cscript.exe, mshta.exe, iexplore.exe
+            // Everything else (w3wp.exe, powershell, cmd, rundll32, etc.) is suspicious
+            const char* base = strrchr(hostExe, '\\');
+            base = base ? base + 1 : hostExe;
+
+            bool isLegitHost = false;
+            static const char* kLegitHosts[] = {
+                "wscript.exe", "cscript.exe", "mshta.exe", "iexplore.exe",
+                "msedge.exe", "excel.exe", "winword.exe",
+                nullptr
+            };
+            for (int j = 0; kLegitHosts[j]; j++) {
+                if (_stricmp(base, kLegitHosts[j]) == 0) {
+                    isLegitHost = true;
+                    break;
+                }
+            }
+
+            const char* sev = isLegitHost ? "Info" : "Critical";
+
+            char det[384];
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "Script engine COM instantiation: %s created in %s "
+                "(CLSCTX=0x%lX) — Weaver Ant / China Chopper eval() technique",
+                kScriptEngines[i].name, hostExe, dwClsContext);
+            SendHookEvent(sev, "CoCreateInstance[ScriptEngine]", 0, det);
+            break;
+        }
+    }
+
+    return ((FnCoCreateInstance)GetCallThrough(IDX_COCREATEINSTANCE))(
+        rclsid, pUnkOuter, dwClsContext, riid, ppv);
 }
 
 // ---------------------------------------------------------------------------

@@ -253,6 +253,12 @@ static EVT_HANDLE        g_bitsSubscription = nullptr;
 static std::atomic<bool> g_bitsStop(false);
 
 // ---------------------------------------------------------------------------
+// Weaver Ant: WMI event subscription persistence (T1546.003)
+// ---------------------------------------------------------------------------
+static EVT_HANDLE        g_wmiSubscription = nullptr;
+static std::atomic<bool> g_wmiStop(false);
+
+// ---------------------------------------------------------------------------
 // Minifilter altitude registry audit
 // ---------------------------------------------------------------------------
 static std::atomic<bool> g_altitudeAuditStop(false);
@@ -4406,6 +4412,97 @@ static DWORD WINAPI DnsEventCallback(
     // by routing through Sigma matching on the query name
     NotifySigmaMatches(pid, "dns-client", { queryName }, "DNS/3006");
 
+    // ---------------------------------------------------------------
+    // Weaver Ant: DNS tunneling detection via entropy + subdomain depth.
+    //
+    // Recursive DNS tunneling (iodine, dnscat2, Cobalt Strike DNS beacon)
+    // encodes data in subdomain labels, producing:
+    //   1. High label count (>4 subdomains: a.b.c.d.e.evil.com)
+    //   2. Long labels with high character entropy (hex/Base32/Base64 data)
+    //   3. Unusually long total query names (>80 chars)
+    //
+    // Heuristic thresholds (tuned to avoid false positives on CDNs):
+    //   - Label count >= 5  AND longest label >= 20 chars
+    //   - OR longest label >= 40 chars (single large encoded chunk)
+    //   - AND Shannon entropy of longest label > 3.5 bits/char
+    // ---------------------------------------------------------------
+    {
+        int labelCount = 1;
+        size_t longestLabel = 0;
+        size_t currentLabel = 0;
+        const char* longestLabelStart = queryName.c_str();
+        const char* currentLabelStart = queryName.c_str();
+
+        for (size_t ci = 0; ci < queryName.size(); ci++) {
+            if (queryName[ci] == '.') {
+                if (currentLabel > longestLabel) {
+                    longestLabel = currentLabel;
+                    longestLabelStart = currentLabelStart;
+                }
+                currentLabel = 0;
+                currentLabelStart = queryName.c_str() + ci + 1;
+                labelCount++;
+            } else {
+                currentLabel++;
+            }
+        }
+        if (currentLabel > longestLabel) {
+            longestLabel = currentLabel;
+            longestLabelStart = currentLabelStart;
+        }
+
+        bool suspiciousStructure =
+            (labelCount >= 5 && longestLabel >= 20) ||
+            (longestLabel >= 40) ||
+            (queryName.size() >= 100);
+
+        if (suspiciousStructure && longestLabel > 0) {
+            // Compute Shannon entropy of the longest label
+            int freq[256] = {};
+            for (size_t i = 0; i < longestLabel; i++)
+                freq[(unsigned char)longestLabelStart[i]]++;
+
+            double entropy = 0.0;
+            for (int i = 0; i < 256; i++) {
+                if (freq[i] == 0) continue;
+                double p = (double)freq[i] / (double)longestLabel;
+                entropy -= p * log2(p);
+            }
+
+            if (entropy > 3.5) {
+                std::string procName;
+                {
+                    std::lock_guard<std::mutex> lock(process_cache_mutex);
+                    auto it = g_processCache.find(pid);
+                    if (it != g_processCache.end()) procName = it->second.processName;
+                }
+                if (procName.empty()) procName = "dns-client";
+
+                std::string ts = BuildTimestamp();
+                std::string msg = std::to_string(tab_1_menu_items.size()) +
+                    " - [*] [Critical] | " + ts +
+                    " | " + procName +
+                    " | Method: DNS Tunnel Detection"
+                    " | query=" + queryName +
+                    " labels=" + std::to_string(labelCount) +
+                    " maxLabel=" + std::to_string(longestLabel) +
+                    " entropy=" + std::to_string(entropy).substr(0, 4);
+
+                std::string det = "Date & Time: " + ts +
+                    " | " + procName +
+                    " | PID: " + std::to_string(pid) +
+                    " | Method: DNS Tunnel Detection (Weaver Ant / iodine / dnscat2)" +
+                    " | Query: " + queryName +
+                    " | Labels: " + std::to_string(labelCount) +
+                    " | MaxLabelLen: " + std::to_string(longestLabel) +
+                    " | Entropy: " + std::to_string(entropy);
+
+                PushUiDetectionEvent(msg, det, "Method: DNS Tunnel Detection",
+                                     pid, DetectionSeverity::Critical);
+            }
+        }
+    }
+
     return ERROR_SUCCESS;
 }
 
@@ -5368,6 +5465,113 @@ static void BitsSubscriberThread() {
 }
 
 // ---------------------------------------------------------------------------
+// Weaver Ant: WMI event subscription persistence detection (T1546.003)
+//
+// Channel: Microsoft-Windows-WMI-Activity/Operational
+// EIDs:
+//   5857 — WMI provider loaded (can reveal rogue providers)
+//   5858 — WMI query error (may indicate probing)
+//   5859 — __EventFilter created (the trigger condition)
+//   5860 — __EventConsumer created (the action — CommandLine/Script)
+//   5861 — FilterToConsumerBinding (links filter → consumer = armed)
+//
+// Any creation of EventFilter + EventConsumer + Binding constitutes
+// fileless persistence — Weaver Ant, APT29, Turla, and others use this.
+// ---------------------------------------------------------------------------
+
+static DWORD WINAPI WmiEventCallback(
+    EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID /*ctx*/, EVT_HANDLE hEvent)
+{
+    if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
+
+    std::string xml = RenderEventXmlStr(hEvent);
+    if (xml.empty()) return ERROR_SUCCESS;
+
+    std::string eidStr = GetXmlField(xml, "EventID");
+    int eid = 0;
+    try { eid = std::stoi(eidStr); } catch (...) { return ERROR_SUCCESS; }
+
+    const char* description = nullptr;
+    DetectionSeverity sev = DetectionSeverity::High;
+
+    switch (eid) {
+    case 5857: description = "WMI provider loaded";              sev = DetectionSeverity::Medium; break;
+    case 5858: description = "WMI query error (probing)";        sev = DetectionSeverity::Low;    break;
+    case 5859: description = "__EventFilter created (trigger)";  sev = DetectionSeverity::Critical; break;
+    case 5860: description = "__EventConsumer created (action)";  sev = DetectionSeverity::Critical; break;
+    case 5861: description = "FilterToConsumerBinding (armed)";   sev = DetectionSeverity::Critical; break;
+    default: return ERROR_SUCCESS;
+    }
+
+    UINT32 pid = 0;
+    std::string pidStr = GetXmlField(xml, "ProcessID");
+    if (!pidStr.empty()) {
+        try { pid = static_cast<UINT32>(std::stoul(pidStr, nullptr, 0)); }
+        catch (...) {}
+    }
+
+    // Extract WMI namespace and operation details from event data
+    std::string namespaceName = GetXmlField(xml, "NamespaceName");
+    std::string operation     = GetXmlField(xml, "Operation");
+    std::string providerName  = GetXmlField(xml, "ProviderName");
+
+    std::string procName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(pid);
+        if (it != g_processCache.end()) procName = it->second.processName;
+    }
+    if (procName.empty()) procName = "wmi-activity";
+
+    std::string ts = BuildTimestamp();
+
+    std::string detail;
+    if (!namespaceName.empty()) detail += " NS=" + namespaceName;
+    if (!operation.empty())     detail += " Op=" + operation;
+    if (!providerName.empty())  detail += " Provider=" + providerName;
+
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [*] [" + (sev >= DetectionSeverity::High ? "Critical" : "Warning") +
+        "] | " + ts +
+        " | " + procName +
+        " | Method: WMI Persistence Detection (T1546.003)"
+        " | EID " + std::to_string(eid) + ": " + description + detail;
+
+    std::string det = "Date & Time: " + ts +
+        " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: WMI Event Subscription Persistence" +
+        " | EventID: " + std::to_string(eid) +
+        " | " + description + detail;
+
+    PushUiDetectionEvent(msg, det, "Method: WMI Persistence Detection (T1546.003)",
+                         pid, sev);
+    return ERROR_SUCCESS;
+}
+
+static void WmiSubscriberThread() {
+    g_wmiSubscription = EvtSubscribe(
+        nullptr, nullptr,
+        L"Microsoft-Windows-WMI-Activity/Operational",
+        L"*[System[(EventID=5857 or EventID=5858 or EventID=5859 or EventID=5860 or EventID=5861)]]",
+        nullptr, nullptr,
+        reinterpret_cast<EVT_SUBSCRIBE_CALLBACK>(WmiEventCallback),
+        EvtSubscribeToFutureEvents
+    );
+
+    if (!g_wmiSubscription) {
+        std::cerr << "[WMI] EvtSubscribe failed: " << GetLastError()
+                  << " (WMI-Activity channel may be unavailable)\n";
+        return;
+    }
+
+    std::cout << "[WMI] Event subscription persistence monitor active\n";
+    while (!g_wmiStop.load()) Sleep(500);
+    EvtClose(g_wmiSubscription);
+    g_wmiSubscription = nullptr;
+}
+
+// ---------------------------------------------------------------------------
 // AltitudeAuditThread — periodic registry scan for minifilter altitude theft.
 //
 // Every 30 seconds, this thread:
@@ -5677,6 +5881,9 @@ VOID ShowUI() {
     std::thread rdpThread(RdpSubscriberThread);
     std::thread bitsThread(BitsSubscriberThread);
 
+    g_wmiStop = false;
+    std::thread wmiThread(WmiSubscriberThread);
+
     g_capaStop = false;
     std::thread capaWorker(CapaScanWorker);
 
@@ -5717,6 +5924,7 @@ VOID ShowUI() {
     g_spoolerStop  = true;
     g_rdpStop      = true;
     g_bitsStop     = true;
+    g_wmiStop      = true;
     sysmonThread.join();
     saclThread.join();
     psThread.join();
@@ -5728,6 +5936,7 @@ VOID ShowUI() {
     spoolerThread.join();
     rdpThread.join();
     bitsThread.join();
+    wmiThread.join();
 
     // ETW-TI: unblock ProcessTrace then join
     StopEtwTiSession();

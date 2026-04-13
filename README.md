@@ -175,6 +175,20 @@ A four-layer deception stack that serves false data to attackers instead of bloc
 - `Hook_NtQuerySystemInformation` intercepts class 5 (`SystemProcessInformation`) calls; walks the `SYSTEM_PROCESS_INFORMATION` linked list and unlinks entries whose image names match known EDR process names (`NortonEDR.exe`, `nortonav.exe`, `MsMpEng.exe`, `SentinelAgent.exe`, `CSFalconService.exe`) by patching `NextEntryOffset`; first-entry removal uses `MoveMemory` to slide the buffer
 - A decoy `svchost_config.exe` entry is injected as a honeypot — any tool that specifically enumerates for and interacts with this process is immediately flagged
 
+### Weaver Ant / China Chopper APT Coverage
+
+Targeted detections for Sygnia-documented Weaver Ant (Chinese-nexus APT) techniques:
+
+- **JScript/VBScript engine hooking** — `CoCreateInstance` hook in HookDll monitors COM instantiation of JScript (`F414C260`), VBScript (`B54F3741`), MSScriptControl (`0E59F1D5`), and scrobj Scriptlet (`06290BD5`) CLSIDs; non-legitimate host processes flagged Critical
+- **Web shell child process detection** — kernel process creation callback flags `cmd.exe`, `powershell.exe`, `certutil.exe`, and 19 other LOLBins spawned from `w3wp.exe`, `httpd.exe`, `nginx.exe`, `tomcat9.exe`, `php-cgi.exe`, or `iisexpress.exe`
+- **IIS AppPool persistence** — FsFilter monitors write operations to `ApplicationHost.config`, `administration.config`, `web.config`, and `machine.config`; non-IIS-admin writers flagged Critical
+- **SMB tunnel pivot chain** — npfs PreCreate callback tracks per-PID random-name pipe open rate; >=8 high-entropy pipe names within 10 seconds triggers Critical alert (Cobalt Strike SMB beacon, Weaver Ant relay)
+- **NTFS ADS payload hiding** — enhanced ADS detection distinguishes write operations (payload staging) from reads; write-mode ADS access elevated to Critical with Weaver Ant attribution
+- **WMI event subscription persistence** — ETW subscriber on `Microsoft-Windows-WMI-Activity/Operational` monitors `__EventFilter` (EID 5859), `__EventConsumer` (EID 5860), and `FilterToConsumerBinding` (EID 5861) creation; fileless persistence via WMI flagged Critical
+- **DNS tunnel entropy analysis** — DNS client callback computes Shannon entropy and subdomain depth on query names; high-entropy labels (>3.5 bits/char) with >=5 labels or >=40-char labels flagged Critical (iodine, dnscat2, Cobalt Strike DNS)
+- **SOCKS/ORB relay detection** — WFP classify callback flags connections to SOCKS proxy ports (1080, 9050, 9150, 3128) with injection-taint cross-reference; tainted processes elevated to Critical
+- **ETW/AMSI prologue integrity** — `EtwEventWrite`, `EtwEventWriteFull`, `NtTraceEvent`, `advapi32!EventWrite`, `advapi32!EventWriteTransfer`, `advapi32!EventRegister`, `advapi32!ReportEventW`, `advapi32!ReportEventA` prologues baselined and periodically verified; tampered prologues auto-restored
+
 ### Sysmon & SACL Integration
 - Sysmon event ingestion for host-based telemetry enrichment
 - SACL (System Access Control List) auditing for object-level access visibility

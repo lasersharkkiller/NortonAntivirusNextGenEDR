@@ -269,7 +269,20 @@ static const UINT16 kSuspiciousPorts[] = {
     135,    // DCOM/RPC — WMI remote execution, DCOM lateral movement
     445,    // SMB — PsExec, remote service creation, pass-the-hash
     3389,   // RDP — RDP hijacking, pivoting
+    // Weaver Ant: SOCKS proxy / ORB relay network ports
+    1080,   // SOCKS5 default
+    1081,   // SOCKS5 alternate
+    9050,   // Tor SOCKS proxy
+    9150,   // Tor Browser SOCKS
+    8888,   // common proxy / C2
+    3128,   // Squid / HTTP proxy
+    1090,   // SOCKS alternate
 };
+
+// Weaver Ant: known SOCKS proxy / ORB relay ports for targeted alerting.
+static BOOLEAN IsSocksProxyPort(UINT16 port) {
+    return port == 1080 || port == 1081 || port == 9050 ||
+           port == 9150 || port == 1090 || port == 3128;
 
 static BOOLEAN IsPortBlocked(UINT16 port) {
     KIRQL oldIrql;
@@ -565,6 +578,60 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
                     }
                 } else { ExFreePool(dcNotif); }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Weaver Ant: SOCKS proxy / ORB relay network detection.
+    //
+    // ORB (Operational Relay Box) networks chain compromised hosts via
+    // SOCKS proxies for multi-hop C2 tunneling.  Non-system processes
+    // connecting to known SOCKS ports (1080, 9050, etc.) are flagged.
+    // The injection taint cross-reference elevates injected processes.
+    // -----------------------------------------------------------------
+    if (IsSocksProxyPort(remotePort) && !IsSystemProcess(pid) && queue) {
+        PEPROCESS socksProc = nullptr;
+        char socksProcName[16] = "<unknown>";
+        if (NT_SUCCESS(PsLookupProcessByProcessId(
+                (HANDLE)(ULONG_PTR)pid, &socksProc))) {
+            char* n = PsGetProcessImageFileName(socksProc);
+            if (n) RtlCopyMemory(socksProcName, n, 15);
+            ObDereferenceObject(socksProc);
+        }
+
+        BOOLEAN tainted = InjectionTaintTracker::IsTainted(pid);
+
+        char socksMsg[400] = {};
+        RtlStringCchPrintfA(socksMsg, sizeof(socksMsg),
+            "SOCKS/ORB: pid=%llu (%s) connecting to SOCKS port %u -> %s "
+            "— possible ORB relay / proxy tunnel (Weaver Ant, Chisel, "
+            "reGeorg, Neo-reGeorg)%s",
+            pid, socksProcName, remotePort, remoteAddrStr,
+            tainted ? " [INJECTION-TAINTED]" : "");
+
+        PKERNEL_STRUCTURED_NOTIFICATION socksNotif =
+            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'sknt');
+        if (socksNotif) {
+            RtlZeroMemory(socksNotif, sizeof(*socksNotif));
+            if (tainted) { SET_CRITICAL(*socksNotif); }
+            else         { SET_WARNING(*socksNotif);  }
+            SET_NETWORK_CHECK(*socksNotif);
+            socksNotif->pid = (HANDLE)(ULONG_PTR)pid;
+            socksNotif->scoopedAddress = isV6 ? 0 : (ULONG64)remoteAddressV4;
+            socksNotif->isPath = FALSE;
+            RtlCopyMemory(socksNotif->procName, socksProcName, 15);
+            SIZE_T sLen = strlen(socksMsg) + 1;
+            socksNotif->msg = (char*)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, sLen, 'skmg');
+            socksNotif->bufSize = (ULONG)sLen;
+            if (socksNotif->msg) {
+                RtlCopyMemory(socksNotif->msg, socksMsg, sLen);
+                if (!queue->Enqueue(socksNotif)) {
+                    ExFreePool(socksNotif->msg);
+                    ExFreePool(socksNotif);
+                }
+            } else { ExFreePool(socksNotif); }
         }
     }
 

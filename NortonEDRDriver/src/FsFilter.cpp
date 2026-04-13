@@ -266,6 +266,25 @@ static const PCWSTR kCredPaths[] = {
 };
 
 // ---------------------------------------------------------------------------
+// Weaver Ant: IIS AppPool persistence — ApplicationHost.config and web.config
+// modifications allow DLL injection into IIS worker processes (w3wp.exe).
+// Attackers modify:
+//   - ApplicationHost.config: global module registration, ISAPI filters,
+//     handler mappings, AppPool identity changes
+//   - web.config in wwwroot: per-application handler/module injection
+//   - machine.config: .NET assembly binding redirects for DLL side-loading
+// Any write from a non-IIS-admin process is highly suspicious.
+// ---------------------------------------------------------------------------
+static const PCWSTR kIisConfigPaths[] = {
+    L"\\inetsrv\\config\\applicationhost.config",
+    L"\\inetsrv\\config\\administration.config",
+    L"\\inetsrv\\config\\redirection.config",
+    L"\\inetpub\\wwwroot\\web.config",
+    L"\\config\\machine.config",
+    L"\\config\\web.config",      // .NET Framework global web.config
+};
+
+// ---------------------------------------------------------------------------
 // Ransomware-indicative rename target extensions (lowercase, with dot)
 // ---------------------------------------------------------------------------
 static const PCWSTR kRansomExts[] = {
@@ -2121,6 +2140,100 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreateNpfs(
                 (ULONG64)(ULONG_PTR)pid);
             EnqueueFsAlert(pid, procName, msg, FALSE);  // WARNING
         }
+
+        // ---- Weaver Ant: SMB tunnel pivot chain detection ----
+        // Attackers use web shells (w3wp.exe) to open SMB named pipes for
+        // lateral movement pivoting.  A single process rapidly opening many
+        // unique pipes with random/high-entropy names indicates an SMB relay
+        // or SOCKS-over-pipe tunnel chain (Weaver Ant, Cobalt Strike SMB beacon).
+        //
+        // Heuristic: if a non-system process opens >NPFS_PIVOT_THRESHOLD unique
+        // pipes within NPFS_PIVOT_WINDOW_100NS, alert as SMB tunnel pivot.
+        {
+            #define NPFS_PIVOT_SLOTS         32
+            #define NPFS_PIVOT_THRESHOLD     8     // unique pipes within window
+            #define NPFS_PIVOT_WINDOW_100NS  100000000LL  // 10 seconds
+
+            static struct {
+                HANDLE        Pid;
+                ULONG         Count;
+                LARGE_INTEGER WindowStart;
+                BOOLEAN       Alerted;
+            } s_pivotSlots[NPFS_PIVOT_SLOTS] = {};
+            static KSPIN_LOCK s_pivotLock;
+            static LONG s_pivotInit = 0;
+
+            if (InterlockedCompareExchange(&s_pivotInit, 1, 0) == 0)
+                KeInitializeSpinLock(&s_pivotLock);
+
+            // Check if the pipe name looks random (high consonant density, hex-like)
+            // Legitimate pipes: lsarpc, svcctl, spoolss — short, readable names.
+            // Attack pipes: random GUIDs, hex strings, Base64-like names.
+            USHORT nameChars = nameInfo->FinalComponent.Length / sizeof(WCHAR);
+            USHORT hexCount = 0, consonantCount = 0;
+            for (USHORT ci = 0; ci < nameChars; ci++) {
+                WCHAR c = nameInfo->FinalComponent.Buffer[ci];
+                if (c >= L'A' && c <= L'Z') c += 32;
+                if ((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))
+                    hexCount++;
+                if (c >= L'a' && c <= L'z' &&
+                    c != L'a' && c != L'e' && c != L'i' && c != L'o' && c != L'u')
+                    consonantCount++;
+            }
+            BOOLEAN looksRandom = (nameChars >= 8 &&
+                (hexCount * 100 / nameChars > 60 ||
+                 consonantCount * 100 / nameChars > 70));
+
+            if (looksRandom) {
+                LARGE_INTEGER now;
+                KeQuerySystemTime(&now);
+
+                KIRQL irql;
+                KeAcquireSpinLock(&s_pivotLock, &irql);
+
+                INT slot = -1, freeSlot = -1;
+                for (INT i = 0; i < NPFS_PIVOT_SLOTS; i++) {
+                    if (s_pivotSlots[i].Pid == pid) { slot = i; break; }
+                    if (s_pivotSlots[i].Pid == 0 && freeSlot < 0) freeSlot = i;
+                }
+
+                if (slot >= 0) {
+                    if ((now.QuadPart - s_pivotSlots[slot].WindowStart.QuadPart)
+                            > NPFS_PIVOT_WINDOW_100NS) {
+                        s_pivotSlots[slot].WindowStart = now;
+                        s_pivotSlots[slot].Count = 1;
+                        s_pivotSlots[slot].Alerted = FALSE;
+                    } else {
+                        s_pivotSlots[slot].Count++;
+                    }
+
+                    if (s_pivotSlots[slot].Count >= NPFS_PIVOT_THRESHOLD &&
+                        !s_pivotSlots[slot].Alerted)
+                    {
+                        s_pivotSlots[slot].Alerted = TRUE;
+                        KeReleaseSpinLock(&s_pivotLock, irql);
+
+                        char msg[256];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS-NPFS: SMB tunnel pivot — '%s' (pid=%llu) opened >=%d "
+                            "random-name pipes within 10s — Weaver Ant / Cobalt Strike "
+                            "SMB pivot chain",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid,
+                            NPFS_PIVOT_THRESHOLD);
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                        goto npfs_done;
+                    }
+                } else if (freeSlot >= 0) {
+                    s_pivotSlots[freeSlot].Pid = pid;
+                    s_pivotSlots[freeSlot].Count = 1;
+                    s_pivotSlots[freeSlot].WindowStart = now;
+                    s_pivotSlots[freeSlot].Alerted = FALSE;
+                }
+                KeReleaseSpinLock(&s_pivotLock, irql);
+            }
+        }
+npfs_done:;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 
@@ -2445,6 +2558,48 @@ rate_done:
             }
         }
 
+        // ---- Weaver Ant: IIS AppPool persistence via config modification ----
+        // Writing to ApplicationHost.config or web.config allows attackers to
+        // inject DLLs into w3wp.exe worker processes, add ISAPI filters, or
+        // register malicious HTTP handlers/modules for persistent web shell access.
+        for (SIZE_T i = 0; i < ARRAYSIZE(kIisConfigPaths); i++) {
+            if (WcsContainsLower(&nameInfo->Name, kIisConfigPaths[i])) {
+                ACCESS_MASK da = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+                if (da & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE |
+                          FILE_WRITE_ATTRIBUTES | WRITE_DAC | WRITE_OWNER))
+                {
+                    // IIS admin tools (appcmd.exe, InetMgr.exe, WAS) are legitimate
+                    BOOLEAN isIisAdmin = FALSE;
+                    if (procName) {
+                        isIisAdmin = (strcmp(procName, "appcmd.exe") == 0 ||
+                                      strcmp(procName, "InetMgr.exe") == 0 ||
+                                      strcmp(procName, "svchost.exe") == 0 ||
+                                      strcmp(procName, "WMSvc.exe") == 0 ||
+                                      strcmp(procName, "msdeploy.exe") == 0);
+                    }
+
+                    char cfgBuf[128] = {};
+                    ANSI_STRING ansiCfg;
+                    if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiCfg, &nameInfo->Name, TRUE))) {
+                        SIZE_T n = ansiCfg.Length < sizeof(cfgBuf) - 1 ? ansiCfg.Length : sizeof(cfgBuf) - 1;
+                        RtlCopyMemory(cfgBuf, ansiCfg.Buffer, n);
+                        RtlFreeAnsiString(&ansiCfg);
+                    }
+
+                    char msg[320];
+                    RtlStringCchPrintfA(msg, sizeof(msg),
+                        "FS: IIS config write — %s by '%s' (pid=%llu) — "
+                        "Weaver Ant AppPool persistence / handler injection%s",
+                        cfgBuf[0] ? cfgBuf : "?",
+                        procName ? procName : "?",
+                        (ULONG64)(ULONG_PTR)pid,
+                        isIisAdmin ? " [IIS-ADMIN]" : "");
+                    EnqueueFsAlert(pid, procName, msg, !isIisAdmin);  // CRITICAL if non-admin
+                }
+                break;
+            }
+        }
+
         // ---- NTFS metadata stream direct access (anti-forensics / ACL bypass) ----
         // Tools like RawCopy, Invoke-NinjaCopy, and forensic utilities directly open
         // NTFS metadata files ($MFT, $UsnJrnl, $LogFile, $Boot) to:
@@ -2639,13 +2794,30 @@ rate_done:
                     RtlCopyMemory(fileBuf, ansiF.Buffer, n);
                     RtlFreeAnsiString(&ansiF);
                 }
-                char msg[224];
+
+                // Weaver Ant enhancement: elevate severity for ADS write operations
+                // (hiding executable payloads in alternate streams for later extraction).
+                // Write to ADS = likely payload staging; read = possible execution.
+                ACCESS_MASK adsAccess =
+                    Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+                BOOLEAN isAdsWrite = (adsAccess &
+                    (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+                ULONG adsCDisp = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
+                BOOLEAN isAdsCreate = (adsCDisp == FILE_CREATE ||
+                    adsCDisp == FILE_OVERWRITE || adsCDisp == FILE_OVERWRITE_IF ||
+                    adsCDisp == FILE_SUPERSEDE);
+                BOOLEAN isCritical = isAdsWrite || isAdsCreate;
+
+                char msg[288];
                 RtlStringCchPrintfA(msg, sizeof(msg),
-                    "FS: NTFS ADS access — stream=%s file=%s (pid=%llu)",
+                    "FS: NTFS ADS %s — stream=%s file=%s by '%s' (pid=%llu)%s",
+                    isCritical ? "WRITE (payload hiding)" : "access",
                     streamBuf[0] ? streamBuf : "?",
                     fileBuf[0]   ? fileBuf   : "?",
-                    (ULONG64)(ULONG_PTR)pid);
-                EnqueueFsAlert(pid, procName, msg, FALSE);
+                    procName ? procName : "?",
+                    (ULONG64)(ULONG_PTR)pid,
+                    isCritical ? " — Weaver Ant ADS evasion technique" : "");
+                EnqueueFsAlert(pid, procName, msg, isCritical);
             }
         }
 

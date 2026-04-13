@@ -1005,6 +1005,92 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 			}
 		}
 
+		// -----------------------------------------------------------------------
+		// Weaver Ant: Web shell child process detection (China Chopper, INMemory)
+		//
+		// Web shells execute OS commands by spawning child processes from the web
+		// server worker process.  China Chopper uses JScript eval() to spawn cmd.exe;
+		// INMemory web shells use in-memory .NET Assembly.Load to spawn arbitrary
+		// processes.  Detect cmd/powershell/certutil/etc. spawned from IIS, Apache,
+		// nginx, Tomcat, or PHP worker processes.
+		// -----------------------------------------------------------------------
+		{
+			PEPROCESS webParent = NULL;
+			if (NT_SUCCESS(PsLookupProcessByProcessId(CreateInfo->ParentProcessId, &webParent))) {
+
+				char* webParentName = PsGetProcessImageFileName(webParent);
+
+				if (webParentName != NULL &&
+					(strcmp(webParentName, "w3wp.exe")     == 0 ||
+					 strcmp(webParentName, "httpd.exe")    == 0 ||
+					 strcmp(webParentName, "nginx.exe")    == 0 ||
+					 strcmp(webParentName, "tomcat9.exe")  == 0 ||
+					 strcmp(webParentName, "java.exe")     == 0 ||
+					 strcmp(webParentName, "php-cgi.exe")  == 0 ||
+					 strcmp(webParentName, "php.exe")      == 0 ||
+					 strcmp(webParentName, "iisexpress.exe") == 0)) {
+
+					// Any child process from a web server is suspicious;
+					// interactive shells and LOLBins are critical.
+					BOOLEAN isCriticalChild = FALSE;
+					if (CreateInfo->ImageFileName != NULL) {
+						static const WCHAR* kWebShellChildren[] = {
+							L"cmd.exe", L"powershell.exe", L"pwsh.exe",
+							L"wscript.exe", L"cscript.exe", L"mshta.exe",
+							L"certutil.exe", L"bitsadmin.exe", L"rundll32.exe",
+							L"regsvr32.exe", L"msbuild.exe", L"installutil.exe",
+							L"net.exe", L"net1.exe", L"whoami.exe", L"ipconfig.exe",
+							L"systeminfo.exe", L"tasklist.exe", L"arp.exe",
+							L"nslookup.exe", L"ping.exe", L"curl.exe",
+							nullptr
+						};
+						for (int i = 0; kWebShellChildren[i]; i++) {
+							if (UnicodeStringContains(CreateInfo->ImageFileName, kWebShellChildren[i])) {
+								isCriticalChild = TRUE;
+								break;
+							}
+						}
+					}
+
+					char* childName = PsGetProcessImageFileName(Process);
+					char webMsg[320];
+					RtlStringCbPrintfA(webMsg, sizeof(webMsg),
+						"Web shell: %s (pid=%llu) spawned child '%s' (pid=%llu) — "
+						"China Chopper / Weaver Ant / ASPX web shell%s",
+						webParentName,
+						(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+						childName ? childName : "?",
+						(ULONG64)PsGetProcessId(Process),
+						isCriticalChild ? " [SHELL/LOLBIN]" : "");
+
+					PKERNEL_STRUCTURED_NOTIFICATION webNotif =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'wshl');
+					if (webNotif) {
+						RtlZeroMemory(webNotif, sizeof(*webNotif));
+						SET_CRITICAL(*webNotif);
+						SET_CALLING_PROC_PID_CHECK(*webNotif);
+						webNotif->isPath = FALSE;
+						webNotif->pid = PsGetProcessId(Process);
+						RtlCopyMemory(webNotif->procName, webParentName, 15);
+						SIZE_T wLen = strlen(webMsg) + 1;
+						webNotif->msg = (char*)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, wLen, 'wsmg');
+						if (webNotif->msg) {
+							RtlCopyMemory(webNotif->msg, webMsg, wLen);
+							webNotif->bufSize = (ULONG)wLen;
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(webNotif)) {
+								ExFreePool(webNotif->msg);
+								ExFreePool(webNotif);
+							}
+						} else { ExFreePool(webNotif); }
+					}
+				}
+
+				ObDereferenceObject(webParent);
+			}
+		}
+
 		// --- System binary masquerade detection ---
 		// Attacker copies cmd.exe (or accessibility tool) to a non-standard path
 		// and executes from there to avoid name-based detection.
