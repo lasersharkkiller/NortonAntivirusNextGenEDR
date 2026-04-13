@@ -53,6 +53,10 @@ VOID EtwProvider::Init() {
     }
 }
 
+REGHANDLE EtwProvider::GetRegHandle() {
+    return g_EtwHandle;
+}
+
 VOID EtwProvider::Cleanup() {
     if (g_EtwHandle) {
         EtwUnregister(g_EtwHandle);

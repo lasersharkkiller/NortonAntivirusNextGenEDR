@@ -63,6 +63,8 @@ ULONG SyscallsUtils::NtDuplicateObjectId = 0x003C;     // Stable across Win10 15
 ULONG SyscallsUtils::NtDebugActiveProcessId = 0;       // Resolve dynamically
 ULONG SyscallsUtils::NtSetInformationThreadId = 0;     // Resolve dynamically
 ULONG SyscallsUtils::NtTraceControlId = 0;             // Resolve dynamically
+ULONG SyscallsUtils::NtTerminateThreadId = 0;          // Resolve dynamically — Phant0m detection
+ULONG SyscallsUtils::NtSetSystemInformationId = 0;     // Resolve dynamically — ETW debug control
 ULONG SyscallsUtils::NtCreateNamedPipeFileId = 0;      // Resolve dynamically
 ULONG SyscallsUtils::NtCreateMailslotFileId = 0;       // Resolve dynamically
 ULONG SyscallsUtils::NtOpenThreadId = 0;               // Resolve dynamically
@@ -818,6 +820,16 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		// RCX=thread
 		NtImpersonateAnonymousTokenHandler((HANDLE)trapFrame->Rcx);
 	}
+	else if (NtTerminateThreadId != 0 && id == NtTerminateThreadId) {
+		// NtTerminateThread(ThreadHandle, ExitStatus)
+		// RCX=thread  RDX=exitStatus
+		NtTerminateThreadHandler((HANDLE)trapFrame->Rcx, (NTSTATUS)trapFrame->Rdx);
+	}
+	else if (NtSetSystemInformationId != 0 && id == NtSetSystemInformationId) {
+		// NtSetSystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength)
+		// RCX=class  RDX=buffer  R8=length
+		NtSetSystemInformationHandler((ULONG)trapFrame->Rcx);
+	}
 
 	return TRUE;
 }
@@ -1443,6 +1455,14 @@ VOID SyscallsUtils::InitIds() {
 	UNICODE_STRING usNtImpersonateAnon;
 	RtlInitUnicodeString(&usNtImpersonateAnon, L"NtImpersonateAnonymousToken");
 	NtImpersonateAnonymousTokenId = getSSNByName(ssdtTable, &usNtImpersonateAnon, exportsMap);
+
+	UNICODE_STRING usNtTerminateThread;
+	RtlInitUnicodeString(&usNtTerminateThread, L"NtTerminateThread");
+	NtTerminateThreadId = getSSNByName(ssdtTable, &usNtTerminateThread, exportsMap);
+
+	UNICODE_STRING usNtSetSystemInfo;
+	RtlInitUnicodeString(&usNtSetSystemInfo, L"NtSetSystemInformation");
+	NtSetSystemInformationId = getSSNByName(ssdtTable, &usNtSetSystemInfo, exportsMap);
 
 	// Resolve MmGetFileNameForSection for ntdll-remap detection in NtMapViewOfSectionHandler.
 	// This is an ntoskrnl export (undocumented but stable; returns allocated OBJECT_NAME_INFORMATION
@@ -4028,6 +4048,128 @@ VOID SyscallsUtils::NtTraceControlHandler(ULONG FunctionCode)
 	RtlStringCbPrintfA(msg, sizeof(msg),
 		"NtTraceControl(code=%lu): %s — possible ETW bypass (T1562.002)",
 		FunctionCode, action);
+	EmitSyscallNotif(0, msg, caller, nullptr, isCritical);
+}
+
+// NtTerminateThread — Phant0m technique (T1562.002).
+//
+// The Phant0m tool enumerates threads of the Windows Event Log service
+// (svchost.exe hosting eventlog), identifies the ETW consumer thread, and
+// kills it with NtTerminateThread.  With the consumer thread dead, events
+// accumulate in kernel buffers but are never written to .evtx files.
+//
+// Detection: flag NtTerminateThread when the target thread belongs to a
+// security-critical service process (Event Log, Sysmon, Defender, our EDR).
+VOID SyscallsUtils::NtTerminateThreadHandler(HANDLE ThreadHandle, NTSTATUS ExitStatus)
+{
+	PEPROCESS caller = IoGetCurrentProcess();
+
+	// Skip PPL/system callers
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	// Self-termination (ThreadHandle == -2 or same process) is benign
+	if (ThreadHandle == (HANDLE)(LONG_PTR)-2) return;
+
+	// Resolve the target thread's owning process
+	PETHREAD targetThread = nullptr;
+	if (!NT_SUCCESS(ObReferenceObjectByHandle(
+		ThreadHandle, THREAD_TERMINATE, *PsThreadType,
+		UserMode, (PVOID*)&targetThread, nullptr)))
+		return;
+
+	PEPROCESS targetProc = IoThreadToProcess(targetThread);
+	ObDereferenceObject(targetThread);
+
+	// If caller is terminating its own process's thread, skip
+	if (targetProc == caller) return;
+
+	// Check if target is a security-critical service process
+	char* targetName = PsGetProcessImageFileName(targetProc);
+	if (!targetName) return;
+
+	// Security-critical process names (15-char EPROCESS truncation)
+	BOOLEAN isCriticalTarget =
+		(strcmp(targetName, "svchost.exe") == 0 ||    // hosts eventlog, Defender, etc.
+		 strcmp(targetName, "MsMpEng.exe") == 0 ||    // Defender AV engine
+		 strcmp(targetName, "Sysmon64.exe") == 0 ||   // Sysmon 64-bit
+		 strcmp(targetName, "Sysmon.exe") == 0 ||     // Sysmon 32-bit
+		 strcmp(targetName, "NortonEDR.ex") == 0 ||   // Our EDR (truncated)
+		 strcmp(targetName, "lsass.exe") == 0 ||      // LSA (credential guard)
+		 strcmp(targetName, "csrss.exe") == 0 ||      // Session manager
+		 strcmp(targetName, "services.exe") == 0);    // Service control manager
+
+	if (!isCriticalTarget) return;
+
+	char* callerName = PsGetProcessImageFileName(caller);
+
+	char msg[256];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"PHANT0M: %s calling NtTerminateThread on %s thread "
+		"(ExitStatus=0x%lX) — Event Log / security service thread kill "
+		"attack (T1562.002)",
+		callerName ? callerName : "unknown",
+		targetName,
+		(ULONG)ExitStatus);
+	EmitSyscallNotif(0, msg, caller, nullptr, TRUE);  // CRITICAL
+}
+
+// NtSetSystemInformation — detect dangerous information classes.
+//
+// Several undocumented/semi-documented NtSetSystemInformation classes can be
+// abused to tamper with kernel ETW state, load arbitrary code, or disable
+// security features:
+//   0x49 (73)  = SystemDebugControl — EtwpSendDebugControlNotification:
+//                can disable ETW debug sessions
+//   0xC5 (197) = SystemKernelDebuggerInformationEx — toggle kernel debugger
+//   0xB4 (180) = SystemCodeIntegrityInformation — CI policy manipulation
+//   0x9D (157) = SystemSecureBootInformation — SecureBoot state
+VOID SyscallsUtils::NtSetSystemInformationHandler(ULONG SystemInformationClass)
+{
+	PEPROCESS caller = IoGetCurrentProcess();
+
+	PPS_PROTECTION callerProt = PsGetProcessProtection(caller);
+	if (callerProt && callerProt->Level != 0) return;
+
+	const char* desc = nullptr;
+	BOOLEAN isCritical = FALSE;
+
+	switch (SystemInformationClass) {
+	case 0x49:  // SystemDebugControl
+		desc = "SystemDebugControl (0x49) — ETW debug session manipulation";
+		isCritical = TRUE;
+		break;
+	case 0xC5:  // SystemKernelDebuggerInformationEx
+		desc = "SystemKernelDebuggerInformationEx (0xC5) — kernel debugger toggle";
+		isCritical = TRUE;
+		break;
+	case 0xB4:  // SystemCodeIntegrityInformation
+		desc = "SystemCodeIntegrityInformation (0xB4) — CI policy manipulation";
+		isCritical = TRUE;
+		break;
+	case 0x9D:  // SystemSecureBootInformation
+		desc = "SystemSecureBootInformation (0x9D) — SecureBoot state modification";
+		isCritical = TRUE;
+		break;
+	case 0x98:  // SystemBootEnvironmentInformation
+		desc = "SystemBootEnvironmentInformation (0x98) — boot config modification";
+		isCritical = FALSE;
+		break;
+	default:
+		return;
+	}
+
+	char* procName = PsGetProcessImageFileName(caller);
+	char msg[200];
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"NtSetSystemInformation: %s called class %s from %s",
+		desc,
+		desc,
+		procName ? procName : "unknown");
+	// Fix double-desc — use proper format:
+	RtlStringCbPrintfA(msg, sizeof(msg),
+		"NtSetSystemInformation(%s) by %s — possible kernel tampering",
+		desc, procName ? procName : "unknown");
 	EmitSyscallNotif(0, msg, caller, nullptr, isCritical);
 }
 

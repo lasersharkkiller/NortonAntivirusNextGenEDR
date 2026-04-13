@@ -450,6 +450,11 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 	// being invoked even though the entries are intact.
 	HookDetector::TakePspNotifyEnableMaskBaseline();
 
+	// ETW kernel structure baseline — _ETW_REG_ENTRY EnableMask,
+	// _ETW_GUID_ENTRY ProviderEnableInfo/RegList, EtwpDebuggerData.
+	// Must run after EtwProvider::Init() so REGHANDLE is available.
+	HookDetector::TakeEtwStructureBaseline();
+
 	SsdtUtils ssdtUtils;
 	PVOID moduleBase = ssdtUtils.GetKernelBaseAddress();
 	if (moduleBase) {

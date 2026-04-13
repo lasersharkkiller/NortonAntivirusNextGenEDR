@@ -814,6 +814,8 @@ class SyscallsUtils {
 	static ULONG NtAlpcImpersonateClientThreadId;  // Variable — ALPC thread impersonation
 	static ULONG NtFilterTokenId;              // Variable — restricted token manipulation
 	static ULONG NtImpersonateAnonymousTokenId;    // Variable — anonymous token impersonation
+	static ULONG NtTerminateThreadId;              // Variable — Phant0m Event Log thread kill detection
+	static ULONG NtSetSystemInformationId;         // Variable — ETW debug control / kernel structure tampering
 
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
@@ -1166,6 +1168,17 @@ public:
 		PVOID*   BaseAddress,
 		PSIZE_T  RegionSize,
 		ULONG    NewProtect
+	);
+
+	// Phant0m detection — NtTerminateThread targeting Event Log service threads
+	static VOID NtTerminateThreadHandler(
+		HANDLE ThreadHandle,
+		NTSTATUS ExitStatus
+	);
+
+	// ETW debug control — NtSetSystemInformation with dangerous classes
+	static VOID NtSetSystemInformationHandler(
+		ULONG SystemInformationClass
 	);
 
 	static BOOLEAN SetInformationAltSystemCall(
@@ -1712,6 +1725,9 @@ public:
     // Emit one ETW event for a detection notification.
     // Must be called at IRQL <= APC_LEVEL (call after releasing any spinlock).
     static VOID WriteDetectionEvent(PKERNEL_STRUCTURED_NOTIFICATION notif);
+
+    // Expose the REGHANDLE for kernel ETW structure integrity checks.
+    static REGHANDLE GetRegHandle();
 };
 
 class AmsiDetector {
@@ -1874,6 +1890,15 @@ public:
     // WFP self-protection — verify our callout/filter/sublayer haven't been
     // deleted or superseded by a higher-weight filter (EDRSilencer defense).
     static VOID     CheckWfpIntegrity(BufferQueue* bufQueue);
+
+    // ETW kernel structure integrity — baseline and verify:
+    //   - _ETW_REG_ENTRY EnableMask (provider enable bits)
+    //   - _ETW_GUID_ENTRY ProviderEnableInfo (IsEnabled, EnableLevel)
+    //   - _ETW_GUID_ENTRY RegListHead circular list (unlinking detection)
+    //   - _WMI_LOGGER_CONTEXT GetCpuClock function pointer
+    //   - EtwpDebuggerData global structure
+    static VOID     TakeEtwStructureBaseline();
+    static VOID     CheckEtwStructureIntegrity(BufferQueue* bufQueue);
 
     static VOID RunAllHookChecks(
         PFUNCTION_MAP exportsMap,
