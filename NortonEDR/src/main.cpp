@@ -5530,19 +5530,66 @@ static DWORD WINAPI WmiEventCallback(
     if (!operation.empty())     detail += " Op=" + operation;
     if (!providerName.empty())  detail += " Provider=" + providerName;
 
+    // EID 5860: Parse __EventConsumer payload for CommandLineTemplate,
+    // ScriptText, and ExecutablePath.  The Operation field contains the
+    // full MOF consumer representation.  Extract attacker payload content
+    // so analysts see exactly what code/command will execute.
+    std::string consumerPayload;
+    if (eid == 5860 && !operation.empty()) {
+        // CommandLineEventConsumer — contains CommandLineTemplate
+        auto extractMof = [&](const std::string& field) -> std::string {
+            // MOF format: FieldName = "value"; or FieldName = \"value\"
+            std::string needle = field + " = ";
+            auto pos = operation.find(needle);
+            if (pos == std::string::npos) {
+                // Try case-insensitive by lowering
+                std::string opLower = operation;
+                std::string needleLower = field;
+                for (auto& c : opLower) c = (char)tolower((unsigned char)c);
+                for (auto& c : needleLower) c = (char)tolower((unsigned char)c);
+                needle = needleLower + " = ";
+                pos = opLower.find(needle);
+                if (pos == std::string::npos) return {};
+            }
+            pos += needle.size();
+            // Skip opening quote
+            if (pos < operation.size() && (operation[pos] == '"' || operation[pos] == '\\'))
+                pos++;
+            if (pos < operation.size() && operation[pos] == '"') pos++;
+            auto end = operation.find('"', pos);
+            if (end == std::string::npos) end = operation.find(';', pos);
+            if (end == std::string::npos) end = operation.size();
+            std::string val = operation.substr(pos, end - pos);
+            if (val.size() > 200) val = val.substr(0, 200) + "...(truncated)";
+            return val;
+        };
+
+        std::string cmdTemplate = extractMof("CommandLineTemplate");
+        std::string scriptText  = extractMof("ScriptText");
+        std::string execPath    = extractMof("ExecutablePath");
+        std::string scriptEng   = extractMof("ScriptingEngine");
+        std::string consName    = extractMof("Name");
+
+        if (!consName.empty())    consumerPayload += " ConsumerName=" + consName;
+        if (!cmdTemplate.empty()) consumerPayload += " CmdTemplate=[" + cmdTemplate + "]";
+        if (!scriptText.empty())  consumerPayload += " Script=[" + scriptText + "]";
+        if (!execPath.empty())    consumerPayload += " ExePath=[" + execPath + "]";
+        if (!scriptEng.empty())   consumerPayload += " Engine=" + scriptEng;
+    }
+
     std::string msg = std::to_string(tab_1_menu_items.size()) +
         " - [*] [" + (sev >= DetectionSeverity::High ? "Critical" : "Warning") +
         "] | " + ts +
         " | " + procName +
         " | Method: WMI Persistence Detection (T1546.003)"
-        " | EID " + std::to_string(eid) + ": " + description + detail;
+        " | EID " + std::to_string(eid) + ": " + description + detail + consumerPayload;
 
     std::string det = "Date & Time: " + ts +
         " | " + procName +
         " | PID: " + std::to_string(pid) +
         " | Method: WMI Event Subscription Persistence" +
         " | EventID: " + std::to_string(eid) +
-        " | " + description + detail;
+        " | " + description + detail + consumerPayload;
 
     PushUiDetectionEvent(msg, det, "Method: WMI Persistence Detection (T1546.003)",
                          pid, sev);

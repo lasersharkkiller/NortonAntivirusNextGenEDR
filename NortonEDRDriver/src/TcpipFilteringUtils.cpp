@@ -726,6 +726,86 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
     }
 
     // -----------------------------------------------------------------
+    // T1047: wmiprvse.exe outbound network connection detection.
+    //
+    // WMI provider host (wmiprvse.exe) legitimately talks to local/domain
+    // infrastructure but should NOT make outbound connections to arbitrary
+    // remote hosts on uncommon ports.  Outbound from wmiprvse indicates:
+    //   - Attacker-controlled WMI provider DLL with C2 callback
+    //   - Lateral movement relay via WMI
+    //   - Data exfiltration through rogue WMI provider
+    //
+    // Allowlist: DNS(53), LDAP(389/636), Kerberos(88), RPC endpoint
+    // mapper(135), WMI dynamic RPC(49152-65535 to localhost only),
+    // and localhost (127.*/::1).
+    // -----------------------------------------------------------------
+    if (!IsSystemProcess(pid) && queue) {
+        PEPROCESS wmiProc = nullptr;
+        char wmiProcName[16] = {};
+        if (NT_SUCCESS(PsLookupProcessByProcessId(
+                (HANDLE)(ULONG_PTR)pid, &wmiProc))) {
+            char* wn = PsGetProcessImageFileName(wmiProc);
+            if (wn) RtlCopyMemory(wmiProcName, wn, 15);
+            ObDereferenceObject(wmiProc);
+        }
+
+        if (strcmp(wmiProcName, "WmiPrvSE.exe") == 0 ||
+            strcmp(wmiProcName, "wmiprvse.exe") == 0) {
+            BOOLEAN isLegitWmi =
+                remotePort == 53   ||   // DNS
+                remotePort == 88   ||   // Kerberos
+                remotePort == 135  ||   // RPC endpoint mapper
+                remotePort == 389  ||   // LDAP
+                remotePort == 636  ||   // LDAPS
+                remotePort == 445  ||   // SMB (WMI remote results)
+                remotePort == 5985 ||   // WinRM HTTP
+                remotePort == 5986;     // WinRM HTTPS
+
+            // Allow localhost connections (127.0.0.0/8 or ::1)
+            if (!isV6 && ((remoteAddressV4 >> 24) & 0xFF) == 127)
+                isLegitWmi = TRUE;
+
+            if (!isLegitWmi) {
+                BOOLEAN tainted = InjectionTaintTracker::IsTainted(pid);
+
+                char wmiNetMsg[420] = {};
+                RtlStringCchPrintfA(wmiNetMsg, sizeof(wmiNetMsg),
+                    "Rogue WMI provider C2: wmiprvse.exe (pid=%llu) outbound "
+                    "connection to %s:%u — WMI provider host should not "
+                    "initiate arbitrary outbound connections (T1047: rogue "
+                    "provider DLL / lateral movement relay)%s",
+                    pid, remoteAddrStr, remotePort,
+                    tainted ? " [INJECTION-TAINTED]" : "");
+
+                PKERNEL_STRUCTURED_NOTIFICATION wmiNetNotif =
+                    (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED,
+                        sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'wmnt');
+                if (wmiNetNotif) {
+                    RtlZeroMemory(wmiNetNotif, sizeof(*wmiNetNotif));
+                    SET_CRITICAL(*wmiNetNotif);
+                    SET_NETWORK_CHECK(*wmiNetNotif);
+                    wmiNetNotif->pid = (HANDLE)(ULONG_PTR)pid;
+                    wmiNetNotif->scoopedAddress = isV6 ? 0 : (ULONG64)remoteAddressV4;
+                    wmiNetNotif->isPath = FALSE;
+                    RtlCopyMemory(wmiNetNotif->procName, wmiProcName, 15);
+                    SIZE_T wmLen = strlen(wmiNetMsg) + 1;
+                    wmiNetNotif->msg = (char*)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED, wmLen, 'wmmg');
+                    wmiNetNotif->bufSize = (ULONG)wmLen;
+                    if (wmiNetNotif->msg) {
+                        RtlCopyMemory(wmiNetNotif->msg, wmiNetMsg, wmLen);
+                        if (!queue->Enqueue(wmiNetNotif)) {
+                            ExFreePool(wmiNetNotif->msg);
+                            ExFreePool(wmiNetNotif);
+                        }
+                    } else { ExFreePool(wmiNetNotif); }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Interactive C2 / beaconing session detection.
     //
     // When operators proxy through standard web ports with sleep~0 or

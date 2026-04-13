@@ -102,7 +102,7 @@ static const BOOLEAN kPersistenceCritical[] = {
     TRUE,  TRUE,  TRUE,               // Winlogon — Critical
     TRUE,  TRUE,                       // SecureBoot / EFI — Critical
     FALSE,                             // Scheduled tasks — Warning
-    FALSE,                             // WMI — Warning
+    TRUE,                              // WMI — Critical (rogue provider registration)
     TRUE,                              // LSA Authentication Packages — Critical
     TRUE,                              // LSA Security Packages (SSP) — Critical
     TRUE,                              // LSA Notification Packages — Critical
@@ -266,6 +266,20 @@ static const DefenseEvasionEntry kDefenseEvasionPaths[] = {
     // AMSI provider unregistration (COM CLSID nuke)
     { L"\\AMSI\\Providers",                 NULL,
       "AMSI provider registry modification — potential AMSI bypass",    TRUE  },
+
+    // --- T1047: Rogue WMI provider DLL registration ---
+    // Attackers register malicious WMI provider DLLs that wmiprvse.exe loads.
+    // WBEM provider CLSIDs are stored under:
+    //   HKLM\SOFTWARE\Microsoft\WBEM\Transports  (transport providers)
+    //   HKLM\SOFTWARE\Microsoft\WBEM\CIMOM       (core config, repository paths)
+    //   Any CLSID\{...}\InprocServer32 registered via WMI provider setup
+    { L"\\Microsoft\\WBEM\\Transports",     NULL,
+      "WMI transport provider registration modified — rogue WMI provider (T1047)", TRUE },
+    { L"\\Microsoft\\WBEM\\CIMOM",          NULL,
+      "WMI CIMOM configuration modified — potential WMI persistence/provider hijack (T1047)", TRUE },
+    // WMI provider ProgID/CLSID namespace registrations
+    { L"\\Microsoft\\WBEM\\Scripting",      NULL,
+      "WMI Scripting host registration modified — potential WMI script provider hijack", TRUE },
 
     { nullptr, nullptr, nullptr, FALSE }
 };

@@ -1782,6 +1782,21 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				// WFP diagnostic tool
 				{ L"wfpdiag",                   "wfpdiag — Microsoft WFP diagnostic tool (reveals all WFP state)",     FALSE },
 
+				// --- T1047: WMI abuse (wmic.exe suspicious command lines) ---
+				{ L"wmic process call create",  "wmic process call create — remote/local process spawn via WMI",       TRUE  },
+				{ L"wmic /node:",               "wmic /node: — remote WMI execution against target host",             TRUE  },
+				{ L"wmic shadowcopy list",      "wmic shadowcopy list — VSS recon (pre-ransomware)",                  FALSE },
+				{ L"wmic useraccount",          "wmic useraccount — user account enumeration via WMI",                FALSE },
+				{ L"wmic group",                "wmic group — group enumeration via WMI",                             FALSE },
+				{ L"wmic service call",         "wmic service call — WMI service manipulation",                       TRUE  },
+				{ L"wmic os get",               "wmic os get — OS version/architecture recon via WMI",                FALSE },
+				{ L"wmic qfe",                  "wmic qfe — installed patch enumeration (vuln recon)",                FALSE },
+				{ L"wmic product call",         "wmic product call — MSI uninstall/repair via WMI",                   TRUE  },
+				{ L"wmic logicaldisk",          "wmic logicaldisk — disk enumeration (ransomware target recon)",      FALSE },
+				{ L"wmic nicconfig",            "wmic nicconfig — network adapter recon via WMI",                     FALSE },
+				{ L"wmic startup",              "wmic startup — persistence listing via WMI startup entries",         FALSE },
+				{ L"wmic /format:",             "wmic /format: — XSL stylesheet execution (Squiblytwo T1220)",        TRUE  },
+
 				// --- T1518.001: Security software discovery ---
 				// Attackers enumerate installed EDR/AV before evasion attempts.
 				{ L"sc query windefend",        "sc query windefend — Defender service status recon",                   FALSE },
