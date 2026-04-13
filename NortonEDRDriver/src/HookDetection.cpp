@@ -2246,7 +2246,7 @@ VOID HookDetector::CheckMajorFunctionIntegrity(BufferQueue* bufQueue)
 // ---------------------------------------------------------------------------
 
 #define CB_PROLOGUE_SIZE 16
-#define MAX_CB_PROLOGUE_ENTRIES 10
+#define MAX_CB_PROLOGUE_ENTRIES 16
 
 struct CbPrologueEntry {
     PVOID       address;              // function entry point
@@ -2297,6 +2297,36 @@ VOID HookDetector::TakeCallbackPrologueBaseline()
     extern NTSTATUS DriverIoControl(PDEVICE_OBJECT, PIRP);
     RecordCbPrologue((PVOID)DriverIoControl,
                      "DriverIoControl");
+
+    // WPP/ETW kernel APIs — malicious drivers (BYOVD) hook these to intercept
+    // or block WPP provider registration/deregistration calls (T1562.002).
+    // IoWMIRegistrationControl is the kernel API for WPP provider reg/dereg;
+    // EtwRegister/EtwUnregister manage ETW provider lifecycle.
+    // WmiTraceMessage is the core WPP trace emission function.
+    {
+        UNICODE_STRING fnNames[] = {
+            RTL_CONSTANT_STRING(L"IoWMIRegistrationControl"),
+            RTL_CONSTANT_STRING(L"EtwRegister"),
+            RTL_CONSTANT_STRING(L"EtwUnregister"),
+            RTL_CONSTANT_STRING(L"WmiTraceMessage"),
+            RTL_CONSTANT_STRING(L"EtwWrite"),
+            RTL_CONSTANT_STRING(L"EtwWriteEx"),
+        };
+        const char* fnLabels[] = {
+            "IoWMIRegistrationControl",
+            "EtwRegister",
+            "EtwUnregister",
+            "WmiTraceMessage",
+            "EtwWrite",
+            "EtwWriteEx",
+        };
+        for (ULONG fi = 0; fi < ARRAYSIZE(fnNames); fi++) {
+            PVOID addr = MmGetSystemRoutineAddress(&fnNames[fi]);
+            if (addr) {
+                RecordCbPrologue(addr, fnLabels[fi]);
+            }
+        }
+    }
 
     DbgPrint("[+] HookDetector: callback prologue baseline captured (%lu entries)\n",
         s_CbPrologueCount);

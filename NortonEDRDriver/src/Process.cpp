@@ -1270,6 +1270,98 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 		}
 
 		// -----------------------------------------------------------------------
+		// WPP / ETW trace tool execution detection (T1562.002 / T1005).
+		//
+		// Windows Software Trace Preprocessor (WPP) tools from WDK/ADK can
+		// start/stop/decode WPP and ETW trace sessions.  Attackers use these
+		// to blind telemetry or exfiltrate sensitive WPP trace data (.etl).
+		// Also covers infdefaultinstall.exe (T1218 LOLBIN).
+		// -----------------------------------------------------------------------
+		if (CreateInfo->ImageFileName) {
+			struct WppToolEntry {
+				const WCHAR* imageName;
+				const char*  alertMsg;
+				BOOLEAN      isCritical;
+			};
+			static const WppToolEntry kWppTools[] = {
+				{ L"tracelog.exe",
+				  "WPP Session Control (T1562.002): tracelog.exe — can start/stop/flush WPP trace sessions",
+				  TRUE },
+				{ L"tracefmt.exe",
+				  "WPP Trace Decode (T1005): tracefmt.exe — decodes binary .etl WPP traces to plaintext (recon/exfil)",
+				  FALSE },
+				{ L"tracepdb.exe",
+				  "WPP Symbol Extraction (T1005): tracepdb.exe — extracts TMF format files from PDBs for trace decoding",
+				  FALSE },
+				{ L"traceview.exe",
+				  "WPP Session Control (T1562.002): traceview.exe — GUI WPP session controller",
+				  TRUE },
+				{ L"tracerpt.exe",
+				  "ETW/WPP Trace Export (T1005): tracerpt.exe — converts .etl to XML/CSV (exfil preparation)",
+				  FALSE },
+				{ L"xperf.exe",
+				  "ETW/WPP Session Control (T1562.002): xperf.exe — WPA/WPT trace session capture and control",
+				  TRUE },
+				{ L"infdefaultinstall.exe",
+				  "LOLBIN Execution (T1218): infdefaultinstall.exe — signed INF installer, can install WPP drivers or run setup commands",
+				  TRUE },
+			};
+
+			for (ULONG wt = 0; wt < ARRAYSIZE(kWppTools); wt++) {
+				if (UnicodeStringContains(CreateInfo->ImageFileName, kWppTools[wt].imageName)) {
+					char* creatorName = PsGetProcessImageFileName(IoGetCurrentProcess());
+
+					// Extract command line for context
+					char wppCmd[200] = {};
+					if (CreateInfo->CommandLine && CreateInfo->CommandLine->Buffer &&
+						CreateInfo->CommandLine->Length > 0)
+					{
+						USHORT copyChars = min(
+							(USHORT)(CreateInfo->CommandLine->Length / sizeof(WCHAR)),
+							(USHORT)(sizeof(wppCmd) - 1));
+						for (USHORT ci = 0; ci < copyChars; ci++) {
+							WCHAR wc = CreateInfo->CommandLine->Buffer[ci];
+							wppCmd[ci] = (wc < 128) ? (char)wc : '?';
+						}
+					}
+
+					char wppMsg[480];
+					RtlStringCbPrintfA(wppMsg, sizeof(wppMsg),
+						"%s — spawned by '%s' (pid=%llu) — cmd: %.180s",
+						kWppTools[wt].alertMsg,
+						creatorName ? creatorName : "?",
+						(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+						wppCmd[0] ? wppCmd : "<empty>");
+
+					PKERNEL_STRUCTURED_NOTIFICATION wppNotif =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'wpnt');
+					if (wppNotif) {
+						RtlZeroMemory(wppNotif, sizeof(*wppNotif));
+						if (kWppTools[wt].isCritical) { SET_CRITICAL(*wppNotif); }
+						else { SET_WARNING(*wppNotif); }
+						SET_CALLING_PROC_PID_CHECK(*wppNotif);
+						wppNotif->isPath = FALSE;
+						wppNotif->pid = PsGetProcessId(Process);
+						if (creatorName) RtlCopyMemory(wppNotif->procName, creatorName, 14);
+						SIZE_T wLen = strlen(wppMsg) + 1;
+						wppNotif->msg = (char*)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, wLen, 'wpmg');
+						if (wppNotif->msg) {
+							RtlCopyMemory(wppNotif->msg, wppMsg, wLen);
+							wppNotif->bufSize = (ULONG)wLen;
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(wppNotif)) {
+								ExFreePool(wppNotif->msg);
+								ExFreePool(wppNotif);
+							}
+						} else { ExFreePool(wppNotif); }
+					}
+					break;  // one tool match is enough
+				}
+			}
+		}
+
+		// -----------------------------------------------------------------------
 		// Weaver Ant: Web shell child process detection (China Chopper, INMemory)
 		//
 		// Web shells execute OS commands by spawning child processes from the web
@@ -1909,6 +2001,8 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"get-etwtracesession",       "Get-EtwTraceSession — ETW session enumeration (pre-attack recon)",    FALSE },
 				{ L"get-etwtraceprovider",      "Get-EtwTraceProvider — ETW provider enumeration (pre-attack recon)",  FALSE },
 				{ L"logman query",              "logman query — ETW trace session enumeration (pre-attack recon)",      FALSE },
+				{ L"logman -ets",               "logman -ets — real-time ETW/WPP session manipulation (T1562.002)",   TRUE  },
+				{ L"logman start",              "logman start — ETW/WPP trace session creation (T1562.002)",          FALSE },
 				{ L"trace-command",             "Trace-Command — PowerShell tracing/ETW recon",                        FALSE },
 
 				// --- T1518.001: Security software discovery ---

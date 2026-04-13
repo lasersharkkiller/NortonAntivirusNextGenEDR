@@ -285,6 +285,19 @@ static const DefenseEvasionEntry kDefenseEvasionPaths[] = {
       "AutoLogger Start value modified — persistent ETW session disable (T1562.002)", TRUE },
     { L"\\WMI\\Autologger\\",              L"EnableLevel",
       "AutoLogger EnableLevel modified — ETW verbosity downgrade (T1562.002)", FALSE },
+    // WPP/ETW AutoLogger per-provider GUID subkeys — attackers delete or modify
+    // individual {GUID} subkeys under Autologger\<session>\ to selectively blind
+    // specific WPP/ETW providers while leaving the session running (T1562.002).
+    { L"\\WMI\\Autologger\\",              L"EnableProperty",
+      "AutoLogger EnableProperty modified — WPP/ETW provider config tamper (T1562.002)", TRUE },
+    { L"\\WMI\\Autologger\\",              L"EnableFlags",
+      "AutoLogger EnableFlags modified — WPP/ETW keyword mask downgrade (T1562.002)", TRUE },
+    { L"\\WMI\\Autologger\\",              L"MatchAnyKeyword",
+      "AutoLogger MatchAnyKeyword modified — WPP/ETW provider scope narrowing (T1562.002)", FALSE },
+    { L"\\WMI\\Autologger\\",              L"MatchAllKeyword",
+      "AutoLogger MatchAllKeyword modified — WPP/ETW provider filtering change (T1562.002)", FALSE },
+    { L"\\WMI\\Autologger\\",              L"Status",
+      "AutoLogger Status modified — WPP/ETW provider status tamper (T1562.002)", TRUE },
 
     // --- Misc defense evasion ---
     // AMSI provider unregistration (COM CLSID nuke)

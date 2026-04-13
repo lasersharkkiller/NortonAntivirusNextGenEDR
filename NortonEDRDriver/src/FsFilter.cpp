@@ -3325,6 +3325,74 @@ rate_done:
             }
         }
 
+        // ---- .etl file access by non-system processes (T1005 / T1562.002) ----
+        // WPP/ETW binary trace logs (.etl) can contain sensitive data: debug
+        // strings with credentials, crypto keys, session tokens, and internal
+        // telemetry.  Attackers read .etl files to harvest this data or to
+        // understand what an EDR's WPP tracing captures before blinding it.
+        // Only System, svchost, tracelog, and performance monitor tools should
+        // access .etl files outside normal log directories.
+        {
+            if (nameInfo->FinalComponent.Length >= 8) {
+                PWCHAR etlExt = nameInfo->FinalComponent.Buffer;
+                USHORT etlExtLen = nameInfo->FinalComponent.Length / sizeof(WCHAR);
+                BOOLEAN isEtlFile = FALSE;
+                if (etlExtLen >= 4) {
+                    PWCHAR etlTail = etlExt + etlExtLen - 4;
+                    isEtlFile = (etlTail[0] == L'.' &&
+                                 (etlTail[1] == L'e' || etlTail[1] == L'E') &&
+                                 (etlTail[2] == L't' || etlTail[2] == L'T') &&
+                                 (etlTail[3] == L'l' || etlTail[3] == L'L'));
+                }
+
+                if (isEtlFile) {
+                    // Allow known legitimate ETL consumers
+                    BOOLEAN isEtlAllowed = FALSE;
+                    if ((ULONG_PTR)pid <= 4) isEtlAllowed = TRUE;  // System
+                    else if (procName) {
+                        isEtlAllowed = (strcmp(procName, "svchost.exe") == 0 ||
+                                        strcmp(procName, "perfmon.exe") == 0 ||
+                                        strcmp(procName, "mmc.exe") == 0 ||
+                                        strcmp(procName, "tracelog.exe") == 0 ||
+                                        strcmp(procName, "tracefmt.exe") == 0 ||
+                                        strcmp(procName, "tracerpt.exe") == 0 ||
+                                        strcmp(procName, "traceview.ex") == 0 ||  // truncated 15
+                                        strcmp(procName, "xperf.exe") == 0 ||
+                                        strcmp(procName, "wpr.exe") == 0 ||
+                                        strcmp(procName, "wpa.exe") == 0 ||
+                                        strcmp(procName, "TiWorker.exe") == 0 ||
+                                        strcmp(procName, "WmiPrvSE.exe") == 0 ||
+                                        strcmp(procName, "MsMpEng.exe") == 0 ||
+                                        strcmp(procName, "SecurityHeal") == 0);  // truncated
+                    }
+                    // Also allow reads from standard log directories
+                    if (!isEtlAllowed) {
+                        isEtlAllowed = WcsContainsLower(&nameInfo->Name, L"\\winevt\\logs\\") ||
+                                       WcsContainsLower(&nameInfo->Name, L"\\logfiles\\wmi\\") ||
+                                       WcsContainsLower(&nameInfo->Name, L"\\windows\\performance\\");
+                    }
+
+                    if (!isEtlAllowed) {
+                        char etlBuf[80] = {};
+                        ANSI_STRING ansiEtl;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiEtl, &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiEtl.Length < sizeof(etlBuf) - 1 ? ansiEtl.Length : sizeof(etlBuf) - 1;
+                            RtlCopyMemory(etlBuf, ansiEtl.Buffer, n);
+                            RtlFreeAnsiString(&ansiEtl);
+                        }
+                        char msg[280];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: ETL trace file access — '%s' by '%s' (pid=%llu) "
+                            "— possible WPP/ETW trace data harvesting (T1005)",
+                            etlBuf[0] ? etlBuf : "?.etl",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid);
+                        EnqueueFsAlert(pid, procName, msg, FALSE);  // WARNING
+                    }
+                }
+            }
+        }
+
         // ---- Pagefile / hiberfil.sys / swapfile.sys access ----
         // User-mode reads of pagefile.sys or hiberfil.sys enable offline credential
         // extraction (mimikatz sekurlsa::minidump against page file contents).
