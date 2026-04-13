@@ -338,17 +338,66 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
     UNREFERENCED_PARAMETER(filter);
     UNREFERENCED_PARAMETER(flowContext);
 
-    // Correct field indices for FWPM_LAYER_OUTBOUND_TRANSPORT_V4.
-    UINT32 localAddress  = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_LOCAL_ADDRESS].value.uint32;
-    UINT32 remoteAddress = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_REMOTE_ADDRESS].value.uint32;
-    UINT16 localPort     = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_LOCAL_PORT].value.uint16;
-    UINT16 remotePort    = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_REMOTE_PORT].value.uint16;
+    // ---------------------------------------------------------------
+    // Detect whether we are on the V4 or V6 layer and extract the
+    // correct field indices.  Both layers route to this single callback.
+    // ---------------------------------------------------------------
+    BOOLEAN isV6 = (values->layerId == FWPS_LAYER_OUTBOUND_TRANSPORT_V6);
+
+    UINT32 localAddressV4  = 0;
+    UINT32 remoteAddressV4 = 0;
+    UINT8  localAddressV6[16]  = {};
+    UINT8  remoteAddressV6[16] = {};
+    UINT16 localPort  = 0;
+    UINT16 remotePort = 0;
+
+    if (isV6) {
+        // V6: addresses are FWP_BYTE_ARRAY16_TYPE (16 bytes).
+        if (values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V6_IP_LOCAL_ADDRESS].value.byteArray16)
+            RtlCopyMemory(localAddressV6,
+                values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V6_IP_LOCAL_ADDRESS].value.byteArray16->byteArray16, 16);
+        if (values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V6_IP_REMOTE_ADDRESS].value.byteArray16)
+            RtlCopyMemory(remoteAddressV6,
+                values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V6_IP_REMOTE_ADDRESS].value.byteArray16->byteArray16, 16);
+        localPort  = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V6_IP_LOCAL_PORT].value.uint16;
+        remotePort = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V6_IP_REMOTE_PORT].value.uint16;
+    } else {
+        // V4: addresses are UINT32.
+        localAddressV4  = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_LOCAL_ADDRESS].value.uint32;
+        remoteAddressV4 = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_REMOTE_ADDRESS].value.uint32;
+        localPort       = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_LOCAL_PORT].value.uint16;
+        remotePort      = values->incomingValue[FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_REMOTE_PORT].value.uint16;
+    }
+
+    // Pre-format address strings for alert messages.
+    // V4: "a.b.c.d"   V6: "xxxx:xxxx:...:xxxx" (abbreviated)
+    char localAddrStr[48]  = {};
+    char remoteAddrStr[48] = {};
+    if (isV6) {
+        RtlStringCchPrintfA(localAddrStr, sizeof(localAddrStr),
+            "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+            localAddressV6[0],  localAddressV6[1],  localAddressV6[2],  localAddressV6[3],
+            localAddressV6[4],  localAddressV6[5],  localAddressV6[6],  localAddressV6[7],
+            localAddressV6[8],  localAddressV6[9],  localAddressV6[10], localAddressV6[11],
+            localAddressV6[12], localAddressV6[13], localAddressV6[14], localAddressV6[15]);
+        RtlStringCchPrintfA(remoteAddrStr, sizeof(remoteAddrStr),
+            "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+            remoteAddressV6[0],  remoteAddressV6[1],  remoteAddressV6[2],  remoteAddressV6[3],
+            remoteAddressV6[4],  remoteAddressV6[5],  remoteAddressV6[6],  remoteAddressV6[7],
+            remoteAddressV6[8],  remoteAddressV6[9],  remoteAddressV6[10], remoteAddressV6[11],
+            remoteAddressV6[12], remoteAddressV6[13], remoteAddressV6[14], remoteAddressV6[15]);
+    } else {
+        RtlStringCchPrintfA(localAddrStr,  sizeof(localAddrStr),
+            "%u.%u.%u.%u", FORMAT_ADDR(localAddressV4));
+        RtlStringCchPrintfA(remoteAddrStr, sizeof(remoteAddrStr),
+            "%u.%u.%u.%u", FORMAT_ADDR(remoteAddressV4));
+    }
 
     // ---------------------------------------------------------------
     // Metadata extraction — use FWPS_IS_METADATA_FIELD_PRESENT macro
     // for each field as per Microsoft documentation.
     //
-    // Available metadata at OUTBOUND_TRANSPORT_V4:
+    // Available metadata at OUTBOUND_TRANSPORT V4/V6:
     //   PROCESS_ID         — PID of owning process
     //   PROCESS_PATH       — full NT path of owning executable
     //   TOKEN              — process token (privilege/impersonation)
@@ -435,7 +484,7 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
                 SET_CRITICAL(*kNotif);
                 SET_NETWORK_CHECK(*kNotif);
                 kNotif->pid            = (HANDLE)(ULONG_PTR)pid;
-                kNotif->scoopedAddress = (ULONG64)(ULONG_PTR)remoteAddress;
+                kNotif->scoopedAddress = isV6 ? 0 : (ULONG64)remoteAddressV4;
                 kNotif->isPath         = FALSE;
                 SIZE_T kLen = strlen(kMsg) + 1;
                 kNotif->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, kLen, 'krbm');
@@ -483,15 +532,15 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
             if (hasProcessPath) {
                 RtlStringCchPrintfA(dcMsg, sizeof(dcMsg),
                     "DCSync/LDAP: pid=%llu (%s, path='%S') connecting to LDAP port %u "
-                    "-> %u.%u.%u.%u — possible DCSync/secretsdump replication",
+                    "-> %s — possible DCSync/secretsdump replication",
                     pid, ldapProcName, processPath, remotePort,
-                    FORMAT_ADDR(remoteAddress));
+                    remoteAddrStr);
             } else {
                 RtlStringCchPrintfA(dcMsg, sizeof(dcMsg),
                     "DCSync/LDAP: pid=%llu (%s) connecting to LDAP port %u "
-                    "-> %u.%u.%u.%u — possible DCSync/secretsdump replication",
+                    "-> %s — possible DCSync/secretsdump replication",
                     pid, ldapProcName, remotePort,
-                    FORMAT_ADDR(remoteAddress));
+                    remoteAddrStr);
             }
 
             PKERNEL_STRUCTURED_NOTIFICATION dcNotif =
@@ -502,7 +551,7 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
                 SET_CRITICAL(*dcNotif);
                 SET_NETWORK_CHECK(*dcNotif);
                 dcNotif->pid            = (HANDLE)(ULONG_PTR)pid;
-                dcNotif->scoopedAddress = (ULONG64)(ULONG_PTR)remoteAddress;
+                dcNotif->scoopedAddress = isV6 ? 0 : (ULONG64)remoteAddressV4;
                 dcNotif->isPath         = FALSE;
                 RtlCopyMemory(dcNotif->procName, ldapProcName, 15);
                 SIZE_T dcLen = strlen(dcMsg) + 1;
@@ -533,7 +582,11 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
     // 53). Browsers and known high-talkers are allowlisted.
     // -----------------------------------------------------------------
     if (IsC2BlendPort(remotePort) && !IsSystemProcess(pid) && queue) {
-        if (!IsC2AllowedProcess(pid) && C2CheckAndCount(pid, remoteAddress, remotePort)) {
+        // For V6, hash the 128-bit address into a UINT32 key for the C2 tracker.
+        UINT32 c2AddrKey = isV6
+            ? (UINT32)(*(UINT64*)remoteAddressV6 ^ *(UINT64*)(remoteAddressV6 + 8))
+            : remoteAddressV4;
+        if (!IsC2AllowedProcess(pid) && C2CheckAndCount(pid, c2AddrKey, remotePort)) {
             // Resolve process name for the alert
             PEPROCESS c2Proc = nullptr;
             char c2ProcName[16] = "<unknown>";
@@ -550,20 +603,20 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
             if (hasProcessPath) {
                 RtlStringCchPrintfA(c2Msg, sizeof(c2Msg),
                     "Interactive C2 session: pid=%llu (%s, path='%S') made >=%d "
-                    "connections to %u.%u.%u.%u:%u within 60s — possible sleep~0 "
+                    "connections to %s:%u within 60s — possible sleep~0 "
                     "beacon / SOCKS proxy (Cobalt Strike, Sliver, Mythic)%s",
                     pid, c2ProcName, processPath, C2_ALERT_THRESHOLD,
-                    FORMAT_ADDR(remoteAddress), remotePort,
+                    remoteAddrStr, remotePort,
                     tainted
                         ? " [INJECTION-TAINTED]"
                         : "");
             } else {
                 RtlStringCchPrintfA(c2Msg, sizeof(c2Msg),
                     "Interactive C2 session: pid=%llu (%s) made >=%d connections "
-                    "to %u.%u.%u.%u:%u within 60s — possible sleep~0 beacon / "
+                    "to %s:%u within 60s — possible sleep~0 beacon / "
                     "SOCKS proxy (Cobalt Strike, Sliver, Mythic)%s",
                     pid, c2ProcName, C2_ALERT_THRESHOLD,
-                    FORMAT_ADDR(remoteAddress), remotePort,
+                    remoteAddrStr, remotePort,
                     tainted
                         ? " [INJECTION-TAINTED]"
                         : "");
@@ -581,7 +634,7 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
                 else         { SET_WARNING(*c2Notif);  }
                 SET_NETWORK_CHECK(*c2Notif);
                 c2Notif->pid            = (HANDLE)(ULONG_PTR)pid;
-                c2Notif->scoopedAddress = (ULONG64)(ULONG_PTR)remoteAddress;
+                c2Notif->scoopedAddress = isV6 ? 0 : (ULONG64)remoteAddressV4;
                 c2Notif->isPath         = FALSE;
                 RtlCopyMemory(c2Notif->procName, c2ProcName, 15);
                 SIZE_T c2Len = strlen(c2Msg) + 1;
@@ -602,9 +655,9 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
     // Skip enqueueing routine Info-level connections to avoid queue saturation.
     // Always surface blocked and suspicious connections.
     if (!blocked && !suspicious) {
-        DbgPrint("Net: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u pid=%llu\n",
-            FORMAT_ADDR(localAddress),  localPort,
-            FORMAT_ADDR(remoteAddress), remotePort, pid);
+        DbgPrint("Net: %s:%u -> %s:%u pid=%llu%s\n",
+            localAddrStr, localPort, remoteAddrStr, remotePort, pid,
+            isV6 ? " [IPv6]" : "");
         return;
     }
 
@@ -612,19 +665,17 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
 
     const char* tag = blocked ? " [BLOCKED]" : " [SUSPICIOUS PORT]";
 
-    char msg[350] = {};
+    char msg[450] = {};
     if (hasProcessPath) {
         RtlStringCchPrintfA(msg, sizeof(msg),
-            "Net: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (pid=%llu, '%S')%s",
-            FORMAT_ADDR(localAddress),  localPort,
-            FORMAT_ADDR(remoteAddress), remotePort,
-            pid, processPath, tag);
+            "Net: %s:%u -> %s:%u (pid=%llu, '%S')%s%s",
+            localAddrStr, localPort, remoteAddrStr, remotePort,
+            pid, processPath, isV6 ? " [IPv6]" : "", tag);
     } else {
         RtlStringCchPrintfA(msg, sizeof(msg),
-            "Net: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (pid=%llu)%s",
-            FORMAT_ADDR(localAddress),  localPort,
-            FORMAT_ADDR(remoteAddress), remotePort,
-            pid, tag);
+            "Net: %s:%u -> %s:%u (pid=%llu)%s%s",
+            localAddrStr, localPort, remoteAddrStr, remotePort,
+            pid, isV6 ? " [IPv6]" : "", tag);
     }
 
     PKERNEL_STRUCTURED_NOTIFICATION notif =
@@ -642,7 +693,7 @@ VOID WdfTcpipUtils::TcpipFilteringCallback(
     SET_NETWORK_CHECK(*notif);
 
     notif->pid            = (HANDLE)(ULONG_PTR)pid;
-    notif->scoopedAddress = (ULONG64)(ULONG_PTR)remoteAddress;
+    notif->scoopedAddress = isV6 ? 0 : (ULONG64)remoteAddressV4;
     notif->isPath         = FALSE;
 
     SIZE_T msgLen = strlen(msg) + 1;
@@ -730,6 +781,64 @@ NTSTATUS WdfTcpipUtils::WfpAddFilter() {
     return status;
 }
 
+// ---------------------------------------------------------------------------
+// IPv6 callout + filter — mirrors V4 on FWPM_LAYER_OUTBOUND_TRANSPORT_V6.
+// Uses a separate GUID so both callouts coexist.  The same classify callback
+// handles both; it checks values->layerId to extract V4 or V6 fields.
+// ---------------------------------------------------------------------------
+
+NTSTATUS WdfTcpipUtils::WfpRegisterCalloutV6() {
+
+    FWPS_CALLOUT s_callout = { 0 };
+    FWPM_CALLOUT m_callout = { 0 };
+    FWPM_DISPLAY_DATA display_data = { 0 };
+
+    display_data.name        = L"NortonEDRWdfCalloutV6";
+    display_data.description = L"NortonEDR IPv6 outbound transport callout";
+
+    s_callout.calloutKey  = NORTONAV_CALLOUT_V6_GUID;
+    s_callout.classifyFn  = (FWPS_CALLOUT_CLASSIFY_FN3)WdfTcpipUtils::TcpipFilteringCallback;
+    s_callout.notifyFn    = (FWPS_CALLOUT_NOTIFY_FN3)WdfTcpipUtils::TcpipNotifyCallback;
+    s_callout.flowDeleteFn = (FWPS_CALLOUT_FLOW_DELETE_NOTIFY_FN0)WdfTcpipUtils::TcpipFlowDeleteCallback;
+
+    NTSTATUS status = FwpsCalloutRegister((void*)DeviceObject, &s_callout, &RegCalloutIdV6);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("FwpsCalloutRegister V6 failed: 0x%x\n", status);
+        return status;
+    }
+
+    m_callout.calloutKey       = NORTONAV_CALLOUT_V6_GUID;
+    m_callout.displayData      = display_data;
+    m_callout.applicableLayer  = FWPM_LAYER_OUTBOUND_TRANSPORT_V6;
+    m_callout.flags            = 0;
+
+    status = FwpmCalloutAdd(EngineHandle, &m_callout, NULL, &AddCalloutIdV6);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("FwpmCalloutAdd V6 failed: 0x%x\n", status);
+    }
+    return status;
+}
+
+NTSTATUS WdfTcpipUtils::WfpAddFilterV6() {
+
+    FWPM_FILTER filter = { 0 };
+    filter.displayData.name        = L"NortonEDRDefaultFilterV6";
+    filter.displayData.description = L"NortonEDR IPv6 outbound transport filter";
+    filter.action.type             = FWP_ACTION_CALLOUT_TERMINATING;
+    filter.subLayerKey             = NORTONAV_SUBLAYER_GUID;
+    filter.weight.type             = FWP_UINT8;
+    filter.weight.uint8            = 0xf;
+    filter.numFilterConditions     = 0;
+    filter.layerKey                = FWPM_LAYER_OUTBOUND_TRANSPORT_V6;
+    filter.action.calloutKey       = NORTONAV_CALLOUT_V6_GUID;
+
+    NTSTATUS status = FwpmFilterAdd(EngineHandle, &filter, NULL, &FilterIdV6);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[X] FwpmFilterAdd V6 failed: 0x%x\n", status);
+    }
+    return status;
+}
+
 NTSTATUS WdfTcpipUtils::AddSubLayer() {
     FWPM_SUBLAYER sublayer = { 0 };
     sublayer.displayData.name        = L"OutboundConnectionSubLayer";
@@ -760,6 +869,18 @@ VOID WdfTcpipUtils::UnitializeWfp() {
         // firing during teardown (use-after-free risk).
         UnsubscribeWfpChangeNotifications();
 
+        // Remove V6 filter/callout first (sublayer is shared).
+        if (FilterIdV6 != 0) {
+            FwpmFilterDeleteById(EngineHandle, FilterIdV6);
+        }
+        if (AddCalloutIdV6 != 0) {
+            FwpmCalloutDeleteById(EngineHandle, AddCalloutIdV6);
+        }
+        if (RegCalloutIdV6 != 0) {
+            FwpsCalloutUnregisterById(RegCalloutIdV6);
+        }
+
+        // Remove V4 filter/callout and the shared sublayer.
         if (FilterId != 0) {
             FwpmFilterDeleteById(EngineHandle, FilterId);
             FwpmSubLayerDeleteByKey(EngineHandle, &NORTONAV_SUBLAYER_GUID);
@@ -791,6 +912,13 @@ NTSTATUS WdfTcpipUtils::InitWfp() {
     if (!NT_SUCCESS(status)) goto failure;
 
     status = WfpAddFilter();
+    if (!NT_SUCCESS(status)) goto failure;
+
+    // IPv6 — register callout + filter on OUTBOUND_TRANSPORT_V6.
+    status = WfpRegisterCalloutV6();
+    if (!NT_SUCCESS(status)) goto failure;
+
+    status = WfpAddFilterV6();
     if (!NT_SUCCESS(status)) goto failure;
 
     // Harden WFP object security descriptors — restrict admin to read-only,
@@ -1571,7 +1699,9 @@ static BOOLEAN CheckLayerForForeignBlocks(
         // Rogue callout drops packets before ours fires.
         if (action == FWP_ACTION_CALLOUT_TERMINATING) {
             if (RtlCompareMemory(&entries[i]->action.calloutKey,
-                    &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID)) {
+                    &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID) &&
+                RtlCompareMemory(&entries[i]->action.calloutKey,
+                    &NORTONAV_CALLOUT_V6_GUID, sizeof(GUID)) != sizeof(GUID)) {
                 suspicious = TRUE;
                 foreignCallout = TRUE;
                 threatDesc = "rogue terminating callout may drop packets "
@@ -1585,7 +1715,9 @@ static BOOLEAN CheckLayerForForeignBlocks(
         // covert exfil channel injection.
         if (action == FWP_ACTION_CALLOUT_INSPECTION) {
             if (RtlCompareMemory(&entries[i]->action.calloutKey,
-                    &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID)) {
+                    &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID) &&
+                RtlCompareMemory(&entries[i]->action.calloutKey,
+                    &NORTONAV_CALLOUT_V6_GUID, sizeof(GUID)) != sizeof(GUID)) {
                 suspicious = TRUE;
                 foreignCallout = TRUE;
                 threatDesc = "silent inspection callout — may MITM, tamper "
@@ -1598,7 +1730,9 @@ static BOOLEAN CheckLayerForForeignBlocks(
         // block, permit, or continue.  Effectively a wildcard.
         if (action == FWP_ACTION_CALLOUT_UNKNOWN) {
             if (RtlCompareMemory(&entries[i]->action.calloutKey,
-                    &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID)) {
+                    &NORTONAV_CALLOUT_GUID, sizeof(GUID)) != sizeof(GUID) &&
+                RtlCompareMemory(&entries[i]->action.calloutKey,
+                    &NORTONAV_CALLOUT_V6_GUID, sizeof(GUID)) != sizeof(GUID)) {
                 suspicious = TRUE;
                 foreignCallout = TRUE;
                 threatDesc = "unknown-action callout — runtime decision to "
@@ -1896,6 +2030,48 @@ BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
         if (filterObj) FwpmFreeMemory((void**)&filterObj);
     }
 
+    // Check 1b: Verify IPv6 filter integrity (mirrors V4 checks above).
+    if (FilterIdV6 != 0) {
+        FWPM_FILTER* filterObj = nullptr;
+        NTSTATUS st = FwpmFilterGetById(EngineHandle, FilterIdV6, &filterObj);
+        if (!NT_SUCCESS(st) || !filterObj) {
+            EmitWfpAlert(bufQueue,
+                "WFP TAMPER: NortonEDR IPv6 WFP filter DELETED — "
+                "IPv6 network telemetry and blocking disabled!");
+            ok = FALSE;
+        } else {
+            if (filterObj->action.type != FWP_ACTION_CALLOUT_TERMINATING) {
+                char msg[256];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "WFP TAMPER: NortonEDR IPv6 filter action type CHANGED from "
+                    "CALLOUT_TERMINATING to %s",
+                    ActionTypeName(filterObj->action.type));
+                EmitWfpAlert(bufQueue, msg);
+                ok = FALSE;
+            }
+            if (RtlCompareMemory(&filterObj->action.calloutKey,
+                    &NORTONAV_CALLOUT_V6_GUID, sizeof(GUID)) != sizeof(GUID)) {
+                EmitWfpAlert(bufQueue,
+                    "WFP TAMPER: NortonEDR IPv6 filter callout key REDIRECTED "
+                    "to foreign GUID!");
+                ok = FALSE;
+            }
+            if (RtlCompareMemory(&filterObj->layerKey,
+                    &FWPM_LAYER_OUTBOUND_TRANSPORT_V6, sizeof(GUID)) != sizeof(GUID)) {
+                EmitWfpAlert(bufQueue,
+                    "WFP TAMPER: NortonEDR IPv6 filter MOVED to different layer");
+                ok = FALSE;
+            }
+            if (filterObj->numFilterConditions != 0) {
+                EmitWfpAlert(bufQueue,
+                    "WFP TAMPER: NortonEDR IPv6 filter has CONDITIONS INJECTED "
+                    "(registered with 0)");
+                ok = FALSE;
+            }
+        }
+        if (filterObj) FwpmFreeMemory((void**)&filterObj);
+    }
+
     // -----------------------------------------------------------------------
     // Check 2: verify our callout is still registered AND on the correct layer.
     // Attack: FwpmCalloutDeleteById — removes our callout from the WFP engine.
@@ -1918,6 +2094,26 @@ BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
                 EmitWfpAlert(bufQueue,
                     "WFP TAMPER: NortonEDR callout MOVED to different layer "
                     "— classifyFn no longer fires for outbound transport");
+                ok = FALSE;
+            }
+        }
+        if (calloutObj) FwpmFreeMemory((void**)&calloutObj);
+    }
+
+    // Check 2b: Verify IPv6 callout registration.
+    if (AddCalloutIdV6 != 0) {
+        FWPM_CALLOUT* calloutObj = nullptr;
+        NTSTATUS st = FwpmCalloutGetById(EngineHandle, AddCalloutIdV6, &calloutObj);
+        if (!NT_SUCCESS(st) || !calloutObj) {
+            EmitWfpAlert(bufQueue,
+                "WFP TAMPER: NortonEDR IPv6 callout DELETED — "
+                "IPv6 classifyFn will not be invoked");
+            ok = FALSE;
+        } else {
+            if (RtlCompareMemory(&calloutObj->applicableLayer,
+                    &FWPM_LAYER_OUTBOUND_TRANSPORT_V6, sizeof(GUID)) != sizeof(GUID)) {
+                EmitWfpAlert(bufQueue,
+                    "WFP TAMPER: NortonEDR IPv6 callout MOVED to different layer");
                 ok = FALSE;
             }
         }
@@ -2090,9 +2286,11 @@ BOOLEAN WdfTcpipUtils::CheckIntegrity(BufferQueue* bufQueue)
             if (NT_SUCCESS(st) && callouts) {
                 for (UINT32 i = 0; i < numCallouts; i++) {
                     if (!callouts[i]) continue;
-                    // Skip our own callout
+                    // Skip our own callouts (V4 and V6)
                     if (RtlCompareMemory(&callouts[i]->calloutKey,
-                            &NORTONAV_CALLOUT_GUID, sizeof(GUID)) == sizeof(GUID))
+                            &NORTONAV_CALLOUT_GUID, sizeof(GUID)) == sizeof(GUID) ||
+                        RtlCompareMemory(&callouts[i]->calloutKey,
+                            &NORTONAV_CALLOUT_V6_GUID, sizeof(GUID)) == sizeof(GUID))
                         continue;
 
                     // Non-persistent foreign callouts are suspicious.

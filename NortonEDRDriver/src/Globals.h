@@ -93,6 +93,10 @@ DEFINE_GUID(NORTONAV_CALLOUT_GUID,
 DEFINE_GUID(NORTONAV_SUBLAYER_GUID,
 	0xe1d364e8, 0xcd84, 0x4a48, 0xab, 0xa4, 0x60, 0x8c, 0xe8, 0x3e, 0x31, 0xee);
 
+// IPv6 callout — separate GUID so V4 and V6 callouts coexist.
+DEFINE_GUID(NORTONAV_CALLOUT_V6_GUID,
+	0x1cf67549, 0xa23d, 0x4f91, 0x8e, 0x02, 0x3b, 0xd7, 0xc6, 0x5a, 0x9f, 0x17);
+
 BOOLEAN isCpuVTxEptSupported();
 
 size_t SafeStringLength(
@@ -355,6 +359,10 @@ class WdfTcpipUtils {
 	UINT32 RegCalloutId = 0, AddCalloutId = 0;
 	UINT64 FilterId = 0;
 
+	// IPv6 callout/filter — mirrors V4 on OUTBOUND_TRANSPORT_V6.
+	UINT32 RegCalloutIdV6 = 0, AddCalloutIdV6 = 0;
+	UINT64 FilterIdV6 = 0;
+
 	// WFP change subscription handles — real-time notification when
 	// filters/sublayers are added, deleted, or modified.
 	HANDLE FilterChangeHandle = NULL;
@@ -370,6 +378,8 @@ public:
 	NTSTATUS WfpAddSubLayer();
 	NTSTATUS WfpAddFilter();
 	NTSTATUS WfpRegisterCallout();
+	NTSTATUS WfpRegisterCalloutV6();
+	NTSTATUS WfpAddFilterV6();
 	VOID UnitializeWfp();
 	NTSTATUS AddSubLayer();
 
