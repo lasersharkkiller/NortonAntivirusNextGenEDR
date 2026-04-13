@@ -1305,6 +1305,25 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"infdefaultinstall.exe",
 				  "LOLBIN Execution (T1218): infdefaultinstall.exe — signed INF installer, can install WPP drivers or run setup commands",
 				  TRUE },
+				// ETW provider recon tools (FindETWProviderImage attack chain)
+				{ L"FindETWProviderI",
+				  "ETW Provider Recon (T1518.001): FindETWProviderImage — scans binaries for provider GUIDs (pre-attack recon)",
+				  TRUE },
+				{ L"EtwExplorer.exe",
+				  "ETW Provider Recon (T1518.001): EtwExplorer — GUI ETW manifest/provider explorer (zodiacon)",
+				  TRUE },
+				{ L"ETWListicle.exe",
+				  "ETW Provider Recon (T1518.001): ETWListicle — lists ETW providers in process registration table",
+				  TRUE },
+				{ L"ETWInspector.exe",
+				  "ETW Provider Recon (T1518.001): ETWInspector — ETW provider inspection tool",
+				  TRUE },
+				{ L"EtwProviderBrow",
+				  "ETW Provider Recon (T1518.001): EtwProviderBrowser — ETW provider enumeration tool",
+				  TRUE },
+				{ L"logman.exe",
+				  "ETW Session Tool (T1562.002): logman.exe — ETW/WPP trace session management",
+				  FALSE },
 			};
 
 			for (ULONG wt = 0; wt < ARRAYSIZE(kWppTools); wt++) {

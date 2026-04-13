@@ -428,6 +428,29 @@ static FS_DIR_SLOT g_DirSlots[FS_TRACKER_SLOTS];
 static KSPIN_LOCK  g_DirSlotLock;
 
 // ---------------------------------------------------------------------------
+// Per-process system binary read tracker (FindETWProviderImage GUID scan)
+//
+// FindETWProviderImage and similar tools recursively read hundreds of
+// .dll/.exe/.sys files in System32 looking for embedded GUID byte patterns.
+// Normal processes rarely read more than a handful of system binaries in
+// a short window.  Track reads of PE files in system directories and alert
+// when a single process reads too many in a burst.
+// ---------------------------------------------------------------------------
+#define FS_BINARY_READ_WINDOW_100NS  100000000LL  // 10 seconds
+#define FS_BINARY_READ_THRESHOLD     50           // distinct binary reads per window
+
+typedef struct _FS_BINREAD_SLOT {
+    HANDLE        Pid;
+    ULONG         Count;
+    LARGE_INTEGER WindowStart;
+    BOOLEAN       Alerted;
+} FS_BINREAD_SLOT;
+
+#define FS_BINREAD_SLOTS 32
+static FS_BINREAD_SLOT g_BinReadSlots[FS_BINREAD_SLOTS];
+static KSPIN_LOCK      g_BinReadSlotLock;
+
+// ---------------------------------------------------------------------------
 // Helper: case-insensitive substring search in a UNICODE_STRING
 // needle must already be lowercase.
 // ---------------------------------------------------------------------------
@@ -713,6 +736,8 @@ NTSTATUS FsFilter::Init(PDRIVER_OBJECT DriverObject, NotifQueue* queue) {
     KeInitializeSpinLock(&g_WriteSlotLock);
     RtlZeroMemory(g_DirSlots, sizeof(g_DirSlots));
     KeInitializeSpinLock(&g_DirSlotLock);
+    RtlZeroMemory(g_BinReadSlots, sizeof(g_BinReadSlots));
+    KeInitializeSpinLock(&g_BinReadSlotLock);
     RtlZeroMemory(g_HerpSlots, sizeof(g_HerpSlots));
     KeInitializeSpinLock(&g_HerpLock);
     RtlZeroMemory(g_IoRateSlots, sizeof(g_IoRateSlots));
@@ -3393,6 +3418,75 @@ rate_done:
             }
         }
 
+        // ---- Mass system binary read detection (FindETWProviderImage T1518.001) ----
+        // FindETWProviderImage and similar tools recursively read .dll/.exe/.sys
+        // files in System32 searching for embedded provider GUIDs via Boyer-Moore.
+        // Normal processes don't read 50+ distinct system binaries in 10 seconds.
+        {
+            BOOLEAN isSysBinaryRead = FALSE;
+            if (WcsContainsLower(&nameInfo->Name, L"\\system32\\") ||
+                WcsContainsLower(&nameInfo->Name, L"\\syswow64\\")) {
+                USHORT fcLen = nameInfo->FinalComponent.Length / sizeof(WCHAR);
+                if (fcLen >= 4) {
+                    PWCHAR fcTail = nameInfo->FinalComponent.Buffer + fcLen - 4;
+                    WCHAR c1 = fcTail[1] | 0x20, c2 = fcTail[2] | 0x20, c3 = fcTail[3] | 0x20;
+                    if (fcTail[0] == L'.') {
+                        isSysBinaryRead = ((c1 == L'd' && c2 == L'l' && c3 == L'l') ||
+                                           (c1 == L'e' && c2 == L'x' && c3 == L'e') ||
+                                           (c1 == L's' && c2 == L'y' && c3 == L's'));
+                    }
+                }
+            }
+
+            if (isSysBinaryRead && (ULONG_PTR)pid > 4) {
+                LARGE_INTEGER now;
+                KeQuerySystemTimePrecise(&now);
+                KIRQL oldIrql;
+                KeAcquireSpinLock(&g_BinReadSlotLock, &oldIrql);
+
+                // Find or allocate slot
+                FS_BINREAD_SLOT* slot = NULL;
+                FS_BINREAD_SLOT* freeSlot = NULL;
+                for (ULONG s = 0; s < FS_BINREAD_SLOTS; s++) {
+                    if (g_BinReadSlots[s].Pid == pid) { slot = &g_BinReadSlots[s]; break; }
+                    if (!freeSlot && g_BinReadSlots[s].Pid == 0) freeSlot = &g_BinReadSlots[s];
+                }
+                if (!slot && freeSlot) {
+                    slot = freeSlot;
+                    slot->Pid = pid;
+                    slot->Count = 0;
+                    slot->WindowStart = now;
+                    slot->Alerted = FALSE;
+                }
+                if (slot) {
+                    if ((now.QuadPart - slot->WindowStart.QuadPart) > FS_BINARY_READ_WINDOW_100NS) {
+                        slot->Count = 0;
+                        slot->WindowStart = now;
+                        slot->Alerted = FALSE;
+                    }
+                    slot->Count++;
+                    if (!slot->Alerted && slot->Count >= FS_BINARY_READ_THRESHOLD) {
+                        slot->Alerted = TRUE;
+                        KeReleaseSpinLock(&g_BinReadSlotLock, oldIrql);
+
+                        char msg[280];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: Mass system binary read — '%s' (pid=%llu) read %lu+ "
+                            "DLL/EXE/SYS files in System32 within 10s — possible "
+                            "ETW provider GUID scan (FindETWProviderImage T1518.001)",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid,
+                            FS_BINARY_READ_THRESHOLD);
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                    } else {
+                        KeReleaseSpinLock(&g_BinReadSlotLock, oldIrql);
+                    }
+                } else {
+                    KeReleaseSpinLock(&g_BinReadSlotLock, oldIrql);
+                }
+            }
+        }
+
         // ---- .man manifest file write (T1562.002) ----
         // ETW instrumentation manifests (.man) define provider events, channels,
         // keywords, and templates.  Attackers stage rogue .man files before
@@ -3451,33 +3545,66 @@ rate_done:
             }
         }
 
-        // ---- Instrumentation manifest DLL tampering (T1562.002) ----
+        // ---- ETW provider image DLL tampering (T1562.002) ----
         // ETW provider resource/message DLLs live in System32 and are referenced
-        // by WINEVT\Publishers\{GUID}\MessageFileName.  Attackers replace these
-        // DLLs so events still fire but decode as raw IDs — blinding SIEM parsers.
-        // Monitor writes to known provider DLL directories for non-OS processes.
+        // by WINEVT\Publishers\{GUID}\MessageFileName.  Attackers can:
+        //   - Replace the DLL (events fire but decode as garbage — SIEM blinding)
+        //   - Corrupt the WEVT_TEMPLATE PE resource section (schema corruption)
+        //   - Patch the embedded provider GUID bytes (EventRegister fails silently)
+        // Monitor writes to provider DLLs in system directories and winevt\.
         {
             ACCESS_MASK daProv = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
             BOOLEAN isProvWrite = (daProv & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
 
             if (isProvWrite) {
-                // Check for DLL writes inside winevt\ directories (provider message DLLs)
-                BOOLEAN isWinevtDll = FALSE;
+                BOOLEAN isProviderDll = FALSE;
+                const char* provAttack = "manifest resource DLL replacement";
+
+                // Check 1: DLL writes inside winevt\ directories
                 if (WcsContainsLower(&nameInfo->Name, L"\\winevt\\") ||
                     WcsContainsLower(&nameInfo->Name, L"\\wevtapi.dll") ||
                     WcsContainsLower(&nameInfo->Name, L"\\microsoft-windows-")) {
-                    // Check if it's a DLL
                     USHORT provExtLen = nameInfo->FinalComponent.Length / sizeof(WCHAR);
                     if (provExtLen >= 4) {
                         PWCHAR provTail = nameInfo->FinalComponent.Buffer + provExtLen - 4;
-                        isWinevtDll = (provTail[0] == L'.' &&
+                        isProviderDll = (provTail[0] == L'.' &&
                                        (provTail[1] == L'd' || provTail[1] == L'D') &&
                                        (provTail[2] == L'l' || provTail[2] == L'L') &&
                                        (provTail[3] == L'l' || provTail[3] == L'L'));
                     }
                 }
 
-                if (isWinevtDll) {
+                // Check 2: DLL writes in System32 matching provider image patterns
+                // Many provider images follow naming: *-client.dll, *events.dll,
+                // *prov*.dll, *trace*.dll, *etw*.dll, *evt*.dll
+                if (!isProviderDll &&
+                    (WcsContainsLower(&nameInfo->Name, L"\\system32\\") ||
+                     WcsContainsLower(&nameInfo->Name, L"\\syswow64\\"))) {
+                    USHORT provExtLen2 = nameInfo->FinalComponent.Length / sizeof(WCHAR);
+                    if (provExtLen2 >= 4) {
+                        PWCHAR provTail2 = nameInfo->FinalComponent.Buffer + provExtLen2 - 4;
+                        BOOLEAN isDll2 = (provTail2[0] == L'.' &&
+                                         (provTail2[1] == L'd' || provTail2[1] == L'D') &&
+                                         (provTail2[2] == L'l' || provTail2[2] == L'L') &&
+                                         (provTail2[3] == L'l' || provTail2[3] == L'L'));
+                        if (isDll2) {
+                            // Check for provider-pattern names
+                            if (WcsContainsLower(&nameInfo->FinalComponent, L"prov") ||
+                                WcsContainsLower(&nameInfo->FinalComponent, L"trace") ||
+                                WcsContainsLower(&nameInfo->FinalComponent, L"etw") ||
+                                WcsContainsLower(&nameInfo->FinalComponent, L"evt") ||
+                                WcsContainsLower(&nameInfo->FinalComponent, L"event") ||
+                                WcsContainsLower(&nameInfo->FinalComponent, L"diag") ||
+                                WcsContainsLower(&nameInfo->FinalComponent, L"wevt") ||
+                                WcsContainsLower(&nameInfo->FinalComponent, L"tdh")) {
+                                isProviderDll = TRUE;
+                                provAttack = "provider image DLL replacement/GUID corruption";
+                            }
+                        }
+                    }
+                }
+
+                if (isProviderDll) {
                     // Allow only trusted OS servicing processes
                     BOOLEAN isTrustedWriter = FALSE;
                     if ((ULONG_PTR)pid <= 4) isTrustedWriter = TRUE;
@@ -3497,13 +3624,14 @@ rate_done:
                             RtlCopyMemory(provBuf, ansiProv.Buffer, n);
                             RtlFreeAnsiString(&ansiProv);
                         }
-                        char msg[280];
+                        char msg[320];
                         RtlStringCchPrintfA(msg, sizeof(msg),
                             "FS: ETW provider DLL tamper — '%s' written by '%s' (pid=%llu) "
-                            "— manifest resource DLL replacement (T1562.002)",
+                            "— %s (T1562.002)",
                             provBuf[0] ? provBuf : "?.dll",
                             procName ? procName : "?",
-                            (ULONG64)(ULONG_PTR)pid);
+                            (ULONG64)(ULONG_PTR)pid,
+                            provAttack);
                         EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
                     }
                 }

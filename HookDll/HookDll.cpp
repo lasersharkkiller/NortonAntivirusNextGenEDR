@@ -628,6 +628,16 @@ static CriticalFuncGuard g_etwGuards[] = {
     { "advapi32.dll", "ReportEventA",       nullptr, {}, false },
     { "amsi.dll",   "AmsiScanBuffer",    nullptr, {}, false },
     { "amsi.dll",   "AmsiOpenSession",   nullptr, {}, false },
+    // Provider-specific EventRegister call-site protection (FindETWProviderImage chain).
+    // Attackers locate the exact RVA where a provider DLL calls EventRegister
+    // and NOP/redirect it.  Monitor EventUnregister (disabling providers) and
+    // TraceLogging API entry points (self-describing provider lifecycle).
+    { "advapi32.dll", "EventUnregister",    nullptr, {}, false },
+    { "advapi32.dll", "EventWriteEx",       nullptr, {}, false },
+    { "ntdll.dll",    "EtwEventRegister",   nullptr, {}, false },
+    { "ntdll.dll",    "EtwEventUnregister", nullptr, {}, false },
+    { "ntdll.dll",    "EtwEventWriteTransfer", nullptr, {}, false },
+    { "ntdll.dll",    "EtwEventWriteNoRegistration", nullptr, {}, false },
     // Mimikatz crypto::capi / crypto::cng patches these to force-export
     // non-exportable private keys (CRYPT_EXPORTABLE flag bypass).
     { "ncrypt.dll", "NCryptOpenStorageProvider", nullptr, {}, false },

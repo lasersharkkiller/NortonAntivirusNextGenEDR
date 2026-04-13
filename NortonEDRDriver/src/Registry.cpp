@@ -743,92 +743,170 @@ skip_persistence_alert:
 			!MmIsAddressValid(qvInfo->ValueName->Buffer))
 			break;
 
-		// Only care about minifilter-related value names
-		static const WCHAR* kFilterValues[] = {
-			L"Altitude", L"DefaultInstance", L"Flags", nullptr
-		};
-		BOOLEAN isFilterValue = FALSE;
-		for (int i = 0; kFilterValues[i]; i++) {
-			UNICODE_STRING target;
-			RtlInitUnicodeString(&target, kFilterValues[i]);
-			if (RtlEqualUnicodeString(qvInfo->ValueName, &target, TRUE)) {
-				isFilterValue = TRUE;
-				break;
-			}
-		}
-		if (!isFilterValue) break;
-
 		status = CmCallbackGetKeyObjectIDEx(
 			&cookie, qvInfo->Object, NULL, &regPath, 0);
 		if (!NT_SUCCESS(status) || !regPath || !regPath->Length ||
 			!MmIsAddressValid(regPath->Buffer))
 			break;
 
-		// Must be under a Services\<driver>\Instances path
-		if (!UnicodeStringContains((PUNICODE_STRING)regPath, L"\\Services\\") ||
-			!UnicodeStringContains((PUNICODE_STRING)regPath, L"\\Instances"))
-			break;
-
-		// Allowlist system processes that legitimately enumerate filters
 		char* procName = PsGetProcessImageFileName(IoGetCurrentProcess());
-		if (procName) {
-			if (strcmp(procName, "services.exe") == 0 ||
-				strcmp(procName, "svchost.exe")  == 0 ||
-				strcmp(procName, "TrustedInsta") == 0 ||
-				strcmp(procName, "msiexec.exe")  == 0 ||
-				strcmp(procName, "System")       == 0 ||
-				strcmp(procName, "MsMpEng.exe")  == 0 ||
-				strcmp(procName, "lsass.exe")    == 0 ||
-				strcmp(procName, "csrss.exe")    == 0 ||
-				strcmp(procName, "smss.exe")     == 0 ||
-				strcmp(procName, "wininit.exe")  == 0 ||
-				strcmp(procName, "fltMC.exe")    == 0 ||  // fltmc itself — caught by cmdline detection
-				strcmp(procName, "NortonEDR.ex") == 0)
-				break;
-		}
 
-		// Convert path to narrow for alert
-		char pathBuf[160] = {};
-		USHORT copyLen = min(regPath->Length / sizeof(WCHAR), (USHORT)(sizeof(pathBuf) - 1));
-		for (USHORT i = 0; i < copyLen; i++) {
-			WCHAR wc = regPath->Buffer[i];
-			pathBuf[i] = (wc < 128) ? (char)wc : '?';
-		}
-
-		// Convert value name to narrow
-		char valBuf[64] = {};
-		USHORT valLen = min(qvInfo->ValueName->Length / sizeof(WCHAR), (USHORT)(sizeof(valBuf) - 1));
-		for (USHORT i = 0; i < valLen; i++) {
-			WCHAR wc = qvInfo->ValueName->Buffer[i];
-			valBuf[i] = (wc < 128) ? (char)wc : '?';
-		}
-
-		char msg[350];
-		RtlStringCbPrintfA(msg, sizeof(msg),
-			"Minifilter altitude recon (T1518.001): %s queried '%s' at %s "
-			"— mapping minifilter driver altitudes for evasion/sandwiching",
-			procName ? procName : "unknown", valBuf, pathBuf);
-		SIZE_T msgLen = strlen(msg) + 1;
-
-		PKERNEL_STRUCTURED_NOTIFICATION n =
-			(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
-				POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
-		if (n) {
-			RtlZeroMemory(n, sizeof(*n));
-			SET_WARNING(*n);
-			SET_SYSCALL_CHECK(*n);
-			n->bufSize = (ULONG)msgLen;
-			n->isPath  = FALSE;
-			n->pid     = PsGetProcessId(IoGetCurrentProcess());
-			if (procName) RtlCopyMemory(n->procName, procName, 14);
-			n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
-			if (n->msg) {
-				RtlCopyMemory(n->msg, msg, msgLen);
-				if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
-					ExFreePool(n->msg); ExFreePool(n);
+		// --- Check 1: Minifilter altitude recon ---
+		{
+			static const WCHAR* kFilterValues[] = {
+				L"Altitude", L"DefaultInstance", L"Flags", nullptr
+			};
+			BOOLEAN isFilterValue = FALSE;
+			for (int i = 0; kFilterValues[i]; i++) {
+				UNICODE_STRING target;
+				RtlInitUnicodeString(&target, kFilterValues[i]);
+				if (RtlEqualUnicodeString(qvInfo->ValueName, &target, TRUE)) {
+					isFilterValue = TRUE;
+					break;
 				}
-			} else {
-				ExFreePool(n);
+			}
+
+			if (isFilterValue &&
+				UnicodeStringContains((PUNICODE_STRING)regPath, L"\\Services\\") &&
+				UnicodeStringContains((PUNICODE_STRING)regPath, L"\\Instances"))
+			{
+				// Allowlist system processes
+				BOOLEAN allowed = FALSE;
+				if (procName) {
+					allowed = (strcmp(procName, "services.exe") == 0 ||
+						strcmp(procName, "svchost.exe")  == 0 ||
+						strcmp(procName, "TrustedInsta") == 0 ||
+						strcmp(procName, "msiexec.exe")  == 0 ||
+						strcmp(procName, "System")       == 0 ||
+						strcmp(procName, "MsMpEng.exe")  == 0 ||
+						strcmp(procName, "lsass.exe")    == 0 ||
+						strcmp(procName, "csrss.exe")    == 0 ||
+						strcmp(procName, "smss.exe")     == 0 ||
+						strcmp(procName, "wininit.exe")  == 0 ||
+						strcmp(procName, "fltMC.exe")    == 0 ||
+						strcmp(procName, "NortonEDR.ex") == 0);
+				}
+
+				if (!allowed) {
+					char pathBuf[160] = {};
+					USHORT copyLen = min(regPath->Length / sizeof(WCHAR), (USHORT)(sizeof(pathBuf) - 1));
+					for (USHORT i = 0; i < copyLen; i++) {
+						WCHAR wc = regPath->Buffer[i];
+						pathBuf[i] = (wc < 128) ? (char)wc : '?';
+					}
+					char valBuf[64] = {};
+					USHORT valLen = min(qvInfo->ValueName->Length / sizeof(WCHAR), (USHORT)(sizeof(valBuf) - 1));
+					for (USHORT i = 0; i < valLen; i++) {
+						WCHAR wc = qvInfo->ValueName->Buffer[i];
+						valBuf[i] = (wc < 128) ? (char)wc : '?';
+					}
+
+					char msg[350];
+					RtlStringCbPrintfA(msg, sizeof(msg),
+						"Minifilter altitude recon (T1518.001): %s queried '%s' at %s "
+						"— mapping minifilter driver altitudes for evasion/sandwiching",
+						procName ? procName : "unknown", valBuf, pathBuf);
+					SIZE_T msgLen = strlen(msg) + 1;
+
+					PKERNEL_STRUCTURED_NOTIFICATION n =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+					if (n) {
+						RtlZeroMemory(n, sizeof(*n));
+						SET_WARNING(*n);
+						SET_SYSCALL_CHECK(*n);
+						n->bufSize = (ULONG)msgLen;
+						n->isPath  = FALSE;
+						n->pid     = PsGetProcessId(IoGetCurrentProcess());
+						if (procName) RtlCopyMemory(n->procName, procName, 14);
+						n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen, 'msg');
+						if (n->msg) {
+							RtlCopyMemory(n->msg, msg, msgLen);
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+								ExFreePool(n->msg); ExFreePool(n);
+							}
+						} else { ExFreePool(n); }
+					}
+				}
+			}
+		}
+
+		// --- Check 2: WINEVT\Publishers ResourceFileName read recon ---
+		// FindETWProviderImage resolves provider GUID → image path by reading
+		// HKLM\...\WINEVT\Publishers\{GUID}\ResourceFileName.  This is the
+		// first step in the GUID-to-binary attack chain.  Only svchost (EventLog
+		// service) and wevtutil should read these values.
+		{
+			if (UnicodeStringContains((PUNICODE_STRING)regPath, L"\\WINEVT\\Publishers\\")) {
+				static const WCHAR* kProviderDllValues[] = {
+					L"ResourceFileName", L"MessageFileName", L"ParameterFileName", nullptr
+				};
+				BOOLEAN isProvDllRead = FALSE;
+				for (int i = 0; kProviderDllValues[i]; i++) {
+					UNICODE_STRING target2;
+					RtlInitUnicodeString(&target2, kProviderDllValues[i]);
+					if (RtlEqualUnicodeString(qvInfo->ValueName, &target2, TRUE)) {
+						isProvDllRead = TRUE;
+						break;
+					}
+				}
+
+				if (isProvDllRead) {
+					BOOLEAN allowed2 = FALSE;
+					if (procName) {
+						allowed2 = (strcmp(procName, "svchost.exe") == 0 ||
+							strcmp(procName, "wevtutil.exe") == 0 ||
+							strcmp(procName, "mmc.exe") == 0 ||
+							strcmp(procName, "MsMpEng.exe") == 0 ||
+							strcmp(procName, "System") == 0 ||
+							strcmp(procName, "TiWorker.exe") == 0 ||
+							strcmp(procName, "TrustedInsta") == 0 ||
+							strcmp(procName, "NortonEDR.ex") == 0);
+					}
+
+					if (!allowed2) {
+						char pathBuf2[160] = {};
+						USHORT copyLen2 = min(regPath->Length / sizeof(WCHAR), (USHORT)(sizeof(pathBuf2) - 1));
+						for (USHORT i = 0; i < copyLen2; i++) {
+							WCHAR wc = regPath->Buffer[i];
+							pathBuf2[i] = (wc < 128) ? (char)wc : '?';
+						}
+						char valBuf2[64] = {};
+						USHORT valLen2 = min(qvInfo->ValueName->Length / sizeof(WCHAR), (USHORT)(sizeof(valBuf2) - 1));
+						for (USHORT i = 0; i < valLen2; i++) {
+							WCHAR wc = qvInfo->ValueName->Buffer[i];
+							valBuf2[i] = (wc < 128) ? (char)wc : '?';
+						}
+
+						char msg2[380];
+						RtlStringCbPrintfA(msg2, sizeof(msg2),
+							"ETW provider image recon (T1518.001): '%s' queried '%s' at "
+							"%.160s — resolving provider GUID to image path "
+							"(FindETWProviderImage attack chain)",
+							procName ? procName : "?", valBuf2, pathBuf2);
+						SIZE_T msgLen2 = strlen(msg2) + 1;
+
+						PKERNEL_STRUCTURED_NOTIFICATION n2 =
+							(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+								POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'eprc');
+						if (n2) {
+							RtlZeroMemory(n2, sizeof(*n2));
+							SET_WARNING(*n2);
+							SET_SYSCALL_CHECK(*n2);
+							n2->bufSize = (ULONG)msgLen2;
+							n2->isPath  = FALSE;
+							n2->pid     = PsGetProcessId(IoGetCurrentProcess());
+							if (procName) RtlCopyMemory(n2->procName, procName, 14);
+							n2->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, msgLen2, 'epmg');
+							if (n2->msg) {
+								RtlCopyMemory(n2->msg, msg2, msgLen2);
+								if (!CallbackObjects::GetNotifQueue()->Enqueue(n2)) {
+									ExFreePool(n2->msg); ExFreePool(n2);
+								}
+							} else { ExFreePool(n2); }
+						}
+					}
+				}
 			}
 		}
 		break;
