@@ -418,11 +418,13 @@ BOOLEAN HookDetector::CheckEtwHooks(BufferQueue* bufQueue) {
         L"EtwWriteEx",
         L"EtwWriteTransfer",
         L"EtwRegister",
+        L"EtwEventWriteTransfer",       // TraceLogging primary write path
+        L"EtwEventWriteNoRegistration", // TraceLogging unregistered provider write
     };
 
     BOOLEAN anyFound = FALSE;
 
-    for (ULONG i = 0; i < 4; i++) {
+    for (ULONG i = 0; i < ARRAYSIZE(etwExports); i++) {
 
         UNICODE_STRING name;
         RtlInitUnicodeString(&name, etwExports[i]);
@@ -497,6 +499,16 @@ static BOOLEAN  s_EtwpDebuggerValid    = FALSE;
 static PVOID    s_LoggerContext       = nullptr;
 static PVOID    s_GetCpuClockBaseline = nullptr;
 static BOOLEAN  s_LoggerContextValid  = FALSE;
+
+// TraceLogging metadata integrity baseline.
+// _ETW_REG_ENTRY contains a Callback pointer (offset ~0x38-0x48) that for
+// TraceLogging providers points to the _TlgProvider_t structure in the
+// driver's .rdata section.  This structure starts with a signature magic
+// "ETW0" (0x30575445).  Zeroing or redirecting this pointer disables
+// self-describing event emission without touching ETW structures.
+static PVOID    s_TlgCallbackAddr    = nullptr;  // address of Callback field
+static PVOID    s_TlgCallbackBaseline = nullptr; // original Callback value
+static BOOLEAN  s_TlgCallbackValid   = FALSE;
 
 // Helper: emit an ETW structure tampering alert
 static VOID EmitEtwStructureAlert(BufferQueue* bufQueue, const char* msg)
@@ -637,12 +649,49 @@ VOID HookDetector::TakeEtwStructureBaseline()
                 s_RegListCountBaseline = CountListEntries(regList, 64);
         }
 
+        // TraceLogging metadata pointer — the Callback field in _ETW_REG_ENTRY
+        // (offset ~0x38, 0x40, 0x48) for TraceLogging providers points to
+        // _TlgProvider_t which starts with signature 0x30575445 ("ETW0").
+        // Scanning multiple offsets to find a pointer whose target starts with
+        // the ETW0 magic.
+        {
+            static const ULONG kCallbackOffsets[] = { 0x38, 0x40, 0x48, 0x30 };
+            for (int ci = 0; ci < 4; ci++) {
+                PVOID addr = (PVOID)((ULONG_PTR)regEntry + kCallbackOffsets[ci]);
+                if (!MmIsAddressValid(addr)) continue;
+                PVOID cbVal = *(PVOID*)addr;
+                if (!cbVal || !MmIsAddressValid(cbVal)) continue;
+                // Check for ETW0 magic (0x30575445) at the candidate pointer
+                ULONG magic = *(PULONG)cbVal;
+                if (magic == 0x30575445) {
+                    s_TlgCallbackAddr = addr;
+                    s_TlgCallbackBaseline = cbVal;
+                    s_TlgCallbackValid = TRUE;
+                    DbgPrint("[+] EtwStructure: TraceLogging metadata at %p "
+                        "(Callback offset +0x%lX, _TlgProvider_t=%p)\n",
+                        addr, kCallbackOffsets[ci], cbVal);
+                    break;
+                }
+                // Also accept any non-null kernel-mode pointer as a generic
+                // callback baseline even if not TraceLogging
+                if ((ULONG_PTR)cbVal > 0xFFFF800000000000ULL && !s_TlgCallbackValid) {
+                    s_TlgCallbackAddr = addr;
+                    s_TlgCallbackBaseline = cbVal;
+                    s_TlgCallbackValid = TRUE;
+                    DbgPrint("[+] EtwStructure: REG_ENTRY Callback at %p "
+                        "(offset +0x%lX, target=%p, non-TLG)\n",
+                        addr, kCallbackOffsets[ci], cbVal);
+                }
+            }
+        }
+
         s_EtwStructureValid = TRUE;
         DbgPrint("[+] EtwStructure: baseline taken — RegEntry=%p GuidEntry=%p "
-            "EnableMask=0x%02X ProviderEnable=0x%lX RegListCount=%lu\n",
+            "EnableMask=0x%02X ProviderEnable=0x%lX RegListCount=%lu TlgCb=%s\n",
             s_EtwRegEntry, s_EtwGuidEntry,
             s_EnableMaskBaseline, s_ProviderEnableBaseline,
-            s_RegListCountBaseline);
+            s_RegListCountBaseline,
+            s_TlgCallbackValid ? "yes" : "no");
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         DbgPrint("[-] EtwStructure: exception during baseline capture\n");
@@ -772,6 +821,30 @@ VOID HookDetector::CheckEtwStructureIntegrity(BufferQueue* bufQueue)
                         // Update baseline (can't relink easily)
                         s_RegListCountBaseline = currentCount;
                     }
+                }
+            }
+            // TraceLogging metadata pointer check — detect zeroing or redirection
+            // of the _ETW_REG_ENTRY Callback pointer that targets _TlgProvider_t.
+            if (s_TlgCallbackValid && s_TlgCallbackAddr) {
+                PVOID currentCb = *(PVOID*)s_TlgCallbackAddr;
+                if (currentCb != s_TlgCallbackBaseline) {
+                    const char* attackType = "redirected";
+                    if (currentCb == nullptr)
+                        attackType = "ZEROED (TraceLogging provider silently disabled)";
+
+                    char msg[300];
+                    RtlStringCbPrintfA(msg, sizeof(msg),
+                        "ETW BYPASS CRITICAL: _ETW_REG_ENTRY Callback/TraceLogging "
+                        "metadata pointer %s at %p (was %p, now %p) — "
+                        "self-describing event emission disabled (T1562.002)",
+                        attackType, s_TlgCallbackAddr,
+                        s_TlgCallbackBaseline, currentCb);
+                    EmitEtwStructureAlert(bufQueue, msg);
+
+                    // Restore original pointer
+                    *(PVOID*)s_TlgCallbackAddr = s_TlgCallbackBaseline;
+                    DbgPrint("[!] EtwStructure: TraceLogging Callback RESTORED to %p\n",
+                        s_TlgCallbackBaseline);
                 }
             }
         }
@@ -2246,7 +2319,7 @@ VOID HookDetector::CheckMajorFunctionIntegrity(BufferQueue* bufQueue)
 // ---------------------------------------------------------------------------
 
 #define CB_PROLOGUE_SIZE 16
-#define MAX_CB_PROLOGUE_ENTRIES 16
+#define MAX_CB_PROLOGUE_ENTRIES 24
 
 struct CbPrologueEntry {
     PVOID       address;              // function entry point
@@ -2311,6 +2384,16 @@ VOID HookDetector::TakeCallbackPrologueBaseline()
             RTL_CONSTANT_STRING(L"WmiTraceMessage"),
             RTL_CONSTANT_STRING(L"EtwWrite"),
             RTL_CONSTANT_STRING(L"EtwWriteEx"),
+            // TraceLogging-specific: EtwEventWriteTransfer is the primary
+            // write API for self-describing TraceLogging providers.
+            RTL_CONSTANT_STRING(L"EtwEventWriteTransfer"),
+            // EtwEventWriteNoRegistration allows events without prior
+            // EtwRegister — TraceLogging fallback path.
+            RTL_CONSTANT_STRING(L"EtwEventWriteNoRegistration"),
+            // TraceLoggingRegister/Unregister are thin wrappers over
+            // EtwRegister that target only TraceLogging providers.
+            RTL_CONSTANT_STRING(L"TraceLoggingRegister"),
+            RTL_CONSTANT_STRING(L"TraceLoggingUnregister"),
         };
         const char* fnLabels[] = {
             "IoWMIRegistrationControl",
@@ -2319,6 +2402,10 @@ VOID HookDetector::TakeCallbackPrologueBaseline()
             "WmiTraceMessage",
             "EtwWrite",
             "EtwWriteEx",
+            "EtwEventWriteTransfer",
+            "EtwEventWriteNoRegistration",
+            "TraceLoggingRegister",
+            "TraceLoggingUnregister",
         };
         for (ULONG fi = 0; fi < ARRAYSIZE(fnNames); fi++) {
             PVOID addr = MmGetSystemRoutineAddress(&fnNames[fi]);

@@ -2013,6 +2013,14 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"logman -ets",               "logman -ets — real-time ETW/WPP session manipulation (T1562.002)",   TRUE  },
 				{ L"logman start",              "logman start — ETW/WPP trace session creation (T1562.002)",          FALSE },
 				{ L"trace-command",             "Trace-Command — PowerShell tracing/ETW recon",                        FALSE },
+				// TraceLogging / TDH provider enumeration — pre-attack recon
+				{ L"logman query providers",    "logman query providers — enumerate all ETW/TraceLogging provider GUIDs (recon)", FALSE },
+				{ L"logman query -ets",         "logman query -ets — enumerate running ETW/TraceLogging sessions (recon)",       FALSE },
+				// TdhEnumerateProviders is a user-mode API — no cmd pattern, but tools that
+				// wrap it are detectable via process name (covered in WPP tool table).
+				// PowerShell .NET wrapper for TDH enumeration
+				{ L"tdhenumerateproviders",     "TdhEnumerateProviders — .NET/P-Invoke ETW provider enumeration (recon)", FALSE },
+				{ L"get-tracelogging",          "Get-TraceLogging* — TraceLogging provider enumeration (recon)",          FALSE },
 
 				// --- T1518.001: Security software discovery ---
 				// Attackers enumerate installed EDR/AV before evasion attempts.
