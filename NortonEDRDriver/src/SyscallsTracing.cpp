@@ -12,6 +12,9 @@
 // Process information classes
 #define PROCESS_PROTECTION_LEVEL_CLASS  0x3Du   // ProcessProtectionLevel (61)
 #define PROCESS_MITIGATION_POLICY_CLASS 0x34u   // ProcessMitigationPolicy (52) — SetProcessMitigationPolicy
+#define PROCESS_DEBUG_PORT_CLASS        0x07u   // ProcessDebugPort (7) — debug port detach
+#define PROCESS_DEBUG_OBJECT_HANDLE_CLASS 0x1Eu // ProcessDebugObjectHandle (30) — debug object manipulation
+#define PROCESS_INSTRUMENTATION_CALLBACK_CLASS 0x28u // ProcessInstrumentationCallback (40) — WdToggle/Backstab/ScareCrow
 #define PROCESS_ACCESS_TOKEN_CLASS      0x09u   // ProcessAccessToken — primary token replacement
 
 PSSDT_TABLE SyscallsUtils::ssdtTable = nullptr;
@@ -3080,7 +3083,10 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 {
 	if (ProcessInformationClass != PROCESS_PROTECTION_LEVEL_CLASS &&
 		ProcessInformationClass != PROCESS_MITIGATION_POLICY_CLASS &&
-		ProcessInformationClass != PROCESS_ACCESS_TOKEN_CLASS)
+		ProcessInformationClass != PROCESS_ACCESS_TOKEN_CLASS &&
+		ProcessInformationClass != PROCESS_INSTRUMENTATION_CALLBACK_CLASS &&
+		ProcessInformationClass != PROCESS_DEBUG_PORT_CLASS &&
+		ProcessInformationClass != PROCESS_DEBUG_OBJECT_HANDLE_CLASS)
 		return;
 
 	PEPROCESS caller = IoGetCurrentProcess();
@@ -3197,6 +3203,107 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 			targetName[0] ? targetName : "?",
 			isCrossProcess ? " (cross-process)" : "");
 		EmitSyscallNotif(0, msg, caller, target, TRUE /* critical */);
+	}
+
+	else if (ProcessInformationClass == PROCESS_INSTRUMENTATION_CALLBACK_CLASS) {
+		// ProcessInstrumentationCallback (class 0x28/40): registers a callback
+		// that intercepts ALL kernel → user-mode transitions for the target process.
+		//
+		// ScareCrow WdToggle: sets this on MsMpEng.exe to hijack Defender's ETW
+		// consumer return path, effectively silencing Defender without killing it.
+		// Also used by: Backstab, Nighthawk, Brute Ratel, Cobalt Strike BOFs.
+		//
+		// Layout: PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION {
+		//   ULONG  Version;   // must be 0
+		//   ULONG  Reserved;
+		//   PVOID  Callback;  // function pointer — NULL = unset
+		// }
+		//
+		// Setting Callback to a controlled address gives the attacker code execution
+		// on every syscall return.  Setting it to NULL on a security process removes
+		// its instrumentation.  Both are dangerous.
+
+		char targetName[15] = {};
+		if (target) {
+			PUCHAR imgName = PsGetProcessImageFileName(target);
+			if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
+		}
+
+		// Read the callback pointer for context
+		PVOID callbackAddr = nullptr;
+		if (ProcessInformation && MmIsAddressValid(ProcessInformation) &&
+			ProcessInformationLength >= 16) {
+			__try {
+				// Callback is at offset +0x10 (after Version and Reserved)
+				callbackAddr = *(PVOID*)((ULONG_PTR)ProcessInformation + 0x10);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+		}
+
+		BOOLEAN isCrossProcess = (target != caller);
+		BOOLEAN targetIsDefender = targetName[0] &&
+			(strcmp(targetName, "MsMpEng.exe") == 0 ||
+			 strcmp(targetName, "MsSense.exe") == 0 ||
+			 strcmp(targetName, "SecurityHeal") == 0);
+		BOOLEAN targetIsEdr = targetName[0] &&
+			(strcmp(targetName, "NortonEDR.ex") == 0 ||
+			 strcmp(targetName, "Sysmon64.exe") == 0 ||
+			 strcmp(targetName, "Sysmon.exe") == 0);
+
+		if (targetIsDefender || targetIsEdr) {
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"SCARECROW WdToggle: NtSetInformationProcess"
+				"(ProcessInstrumentationCallback) targeting '%s' "
+				"callback=%p — hijacking security process syscall returns "
+				"to silence ETW consumer (T1562.001)",
+				targetName, callbackAddr);
+		} else {
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"ProcessInstrumentationCallback set on '%s'%s "
+				"callback=%p — kernel→usermode transition hook "
+				"(ScareCrow/Backstab/Nighthawk technique T1562.001)",
+				targetName[0] ? targetName : "?",
+				isCrossProcess ? " (cross-process)" : "",
+				callbackAddr);
+		}
+		EmitSyscallNotif(0, msg, caller, target, TRUE /* critical */);
+	}
+
+	else if (ProcessInformationClass == PROCESS_DEBUG_PORT_CLASS) {
+		// ProcessDebugPort (class 0x07): detach a debugger from a process.
+		// Attackers use NtSetInformationProcess(ProcessDebugPort) with a zero
+		// handle to detach debuggers, or probe debug port presence for anti-debug.
+		// ScareCrow uses this for anti-analysis evasion.
+		char targetName[15] = {};
+		if (target) {
+			PUCHAR imgName = PsGetProcessImageFileName(target);
+			if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
+		}
+
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtSetInformationProcess(ProcessDebugPort) on '%s'%s "
+			"— debug port manipulation / anti-debug evasion "
+			"(ScareCrow anti-analysis)",
+			targetName[0] ? targetName : "?",
+			(target != caller) ? " (cross-process)" : "");
+		EmitSyscallNotif(0, msg, caller, target, FALSE /* warning */);
+	}
+
+	else if (ProcessInformationClass == PROCESS_DEBUG_OBJECT_HANDLE_CLASS) {
+		// ProcessDebugObjectHandle (class 0x1E/30): manipulate debug object.
+		// Attackers clear the debug object handle to evade debugger detection
+		// or to detach a debugger from a protected process.
+		char targetName[15] = {};
+		if (target) {
+			PUCHAR imgName = PsGetProcessImageFileName(target);
+			if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
+		}
+
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtSetInformationProcess(ProcessDebugObjectHandle) on '%s'%s "
+			"— debug object manipulation / debugger detach (anti-analysis)",
+			targetName[0] ? targetName : "?",
+			(target != caller) ? " (cross-process)" : "");
+		EmitSyscallNotif(0, msg, caller, target, FALSE /* warning */);
 	}
 
 	if (ownedRef && target) ObDereferenceObject(target);
@@ -5033,12 +5140,60 @@ VOID SyscallsUtils::NtFlushInstructionCacheHandler(
 	PVOID  BaseAddress,
 	SIZE_T Length)
 {
-	// Only flag cross-process flushes (NtCurrentProcess() == (HANDLE)-1)
-	if (ProcessHandle == NtCurrentProcess()) return;
-	if ((LONG_PTR)ProcessHandle == -1) return;
-
 	PPS_PROTECTION prot = PsGetProcessProtection(IoGetCurrentProcess());
 	if (prot && prot->Level != 0) return;
+
+	BOOLEAN isSameProcess = (ProcessHandle == NtCurrentProcess() ||
+	                          (LONG_PTR)ProcessHandle == -1);
+
+	// Same-process flush: check if the target address falls within
+	// ntdll.dll or amsi.dll image range — ScareCrow flushes after patching
+	// EtwEventWrite/AmsiScanBuffer to ensure the CPU picks up the ret (0xC3).
+	if (isSameProcess && BaseAddress != nullptr && Length > 0 && Length < 0x1000) {
+		__try {
+			MEMORY_BASIC_INFORMATION mbi = {};
+			NTSTATUS s = ZwQueryVirtualMemory(
+				NtCurrentProcess(), BaseAddress,
+				(MEMORY_INFORMATION_CLASS)0, &mbi, sizeof(mbi), nullptr);
+			if (NT_SUCCESS(s) && mbi.Type == 0x1000000 /* MEM_IMAGE */) {
+				// Query section name to identify ntdll/amsi
+				BYTE nameBuffer[512] = {};
+				s = ZwQueryVirtualMemory(
+					NtCurrentProcess(), BaseAddress,
+					(MEMORY_INFORMATION_CLASS)2, nameBuffer,
+					sizeof(nameBuffer), nullptr);
+				if (NT_SUCCESS(s)) {
+					PUNICODE_STRING fn = (PUNICODE_STRING)nameBuffer;
+					BOOLEAN isEtwAmsi = FALSE;
+					const char* target = "unknown module";
+					if (fn->Buffer && fn->Length > 0) {
+						if (UnicodeStringContains(fn, L"ntdll.dll")) {
+							isEtwAmsi = TRUE;
+							target = "ntdll.dll";
+						} else if (UnicodeStringContains(fn, L"amsi.dll")) {
+							isEtwAmsi = TRUE;
+							target = "amsi.dll";
+						}
+					}
+					if (isEtwAmsi) {
+						char msgBuf[300];
+						RtlStringCbPrintfA(msgBuf, sizeof(msgBuf),
+							"SCARECROW: NtFlushInstructionCache on %s "
+							"addr=0x%llX len=0x%llX — post-patch cache flush "
+							"after ETW/AMSI prologue modification "
+							"(T1562.002: ScareCrow/Backstab technique)",
+							target, (ULONG64)BaseAddress, (ULONG64)Length);
+						EmitSyscallNotif((ULONG64)BaseAddress, msgBuf,
+							IoGetCurrentProcess(), nullptr, TRUE);
+					}
+				}
+			}
+		} __except (EXCEPTION_EXECUTE_HANDLER) {}
+		return;  // same-process handled
+	}
+
+	// Cross-process flush — existing detection
+	if (isSameProcess) return;
 
 	PEPROCESS targetProc = nullptr;
 	NTSTATUS  st = ObReferenceObjectByHandle(ProcessHandle, PROCESS_QUERY_INFORMATION,
@@ -5130,12 +5285,79 @@ VOID SyscallsUtils::NtProtectVirtualMemoryHandler(
 		if (NT_SUCCESS(s)) {
 			// ntdll/DLL stomp: write grant on image-backed memory
 			if ((NewProtect & kWriteMask) && mbi.Type == 0x1000000 /* MEM_IMAGE */) {
-				char msg[240];
-				RtlStringCbPrintfA(msg, sizeof(msg),
-					"NtProtectVirtualMemory: write permission on image-mapped region "
-					"addr=0x%llX size=0x%llX prot=0x%lX — ntdll/DLL stomp attempt",
-					(ULONG64)base, (ULONG64)size, NewProtect);
-				EmitSyscallNotif((ULONG64)base, msg, callerProcess, nullptr, TRUE);
+				// Cross-reference: check if the target address falls within a
+				// known ETW/AMSI critical function.  ScareCrow, Backstab, and
+				// most modern loaders use direct NtProtectVirtualMemory syscalls
+				// to make EtwEventWrite/AmsiScanBuffer writable before patching.
+				// This bypasses user-mode VirtualProtect hooks entirely.
+				//
+				// Resolve ETW/AMSI function addresses and check if base falls
+				// within their range.
+				BOOLEAN isEtwAmsiTarget = FALSE;
+				const char* targetFunc = nullptr;
+
+				static const struct {
+					const WCHAR* modName;
+					const WCHAR* funcName;
+					const char*  desc;
+				} kCriticalFuncs[] = {
+					{ L"EtwEventWrite",     nullptr, "ntdll!EtwEventWrite"     },
+					{ L"EtwEventWriteFull",  nullptr, "ntdll!EtwEventWriteFull" },
+					{ L"NtTraceEvent",       nullptr, "ntdll!NtTraceEvent"      },
+					{ nullptr, nullptr, nullptr }
+				};
+
+				// Quick check: resolve via MmGetSystemRoutineAddress for kernel funcs
+				// For user-mode ntdll funcs, check if base is in the ntdll image range
+				// by comparing with the mbi.AllocationBase (should be ntdll base).
+				// If the MEM_IMAGE region's allocation maps to ntdll.dll, any write
+				// grant is already flagged — but we enrich the alert if we can
+				// identify the specific function.
+
+				// Use the ntdll base heuristic: typical ntdll!EtwEventWrite is at a
+				// known relative offset.  Instead, just check module name from
+				// allocation base and flag ntdll + amsi targeting specifically.
+				__try {
+					// Query the file name backing this image section
+					MEMORY_SECTION_NAME sectionName;
+					BYTE nameBuffer[512] = {};
+					NTSTATUS ns = ZwQueryVirtualMemory(
+						NtCurrentProcess(), base,
+						(MEMORY_INFORMATION_CLASS)2,  // MemorySectionName
+						nameBuffer, sizeof(nameBuffer), nullptr);
+					if (NT_SUCCESS(ns)) {
+						PUNICODE_STRING fn =
+							(PUNICODE_STRING)nameBuffer;
+						if (fn->Buffer && fn->Length > 0) {
+							if (UnicodeStringContains(fn, L"ntdll.dll")) {
+								isEtwAmsiTarget = TRUE;
+								targetFunc = "ntdll.dll (ETW functions)";
+							} else if (UnicodeStringContains(fn, L"amsi.dll")) {
+								isEtwAmsiTarget = TRUE;
+								targetFunc = "amsi.dll (AMSI functions)";
+							}
+						}
+					}
+				} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+				if (isEtwAmsiTarget) {
+					char msg[300];
+					RtlStringCbPrintfA(msg, sizeof(msg),
+						"SCARECROW ETW/AMSI BYPASS: NtProtectVirtualMemory "
+						"write-enabling %s at addr=0x%llX size=0x%llX prot=0x%lX "
+						"— direct syscall ETW/AMSI prologue patch staging "
+						"(T1562.002: ScareCrow/Backstab technique)",
+						targetFunc, (ULONG64)base, (ULONG64)size, NewProtect);
+					EmitSyscallNotif((ULONG64)base, msg, callerProcess, nullptr, TRUE);
+				} else {
+					char msg[240];
+					RtlStringCbPrintfA(msg, sizeof(msg),
+						"NtProtectVirtualMemory: write permission on image-mapped "
+						"region addr=0x%llX size=0x%llX prot=0x%lX — "
+						"ntdll/DLL stomp attempt",
+						(ULONG64)base, (ULONG64)size, NewProtect);
+					EmitSyscallNotif((ULONG64)base, msg, callerProcess, nullptr, TRUE);
+				}
 			}
 
 			// W->X flip on private memory: shellcode/BOF staging pattern.
