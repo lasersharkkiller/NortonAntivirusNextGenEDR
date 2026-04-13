@@ -5683,6 +5683,54 @@ static DWORD WINAPI WmiEventCallback(
     if (!operation.empty())     detail += " Op=" + operation;
     if (!providerName.empty())  detail += " Provider=" + providerName;
 
+    // EID 5857: Validate WMI provider DLL path — rogue providers load DLLs
+    // from outside %SystemRoot%\System32\wbem\.  Attackers register custom WMI
+    // providers via MOF or direct WMI class creation to get code execution
+    // inside wmiprvse.exe (DCOM provider DLL hijack, T1546.003).
+    std::string providerDllAlert;
+    if (eid == 5857 && !operation.empty()) {
+        // Operation field typically contains the provider DLL path
+        // Look for .dll path references in the operation string
+        std::string opLower = operation;
+        for (auto& c : opLower) c = (char)tolower((unsigned char)c);
+
+        // Extract DLL path — look for path ending in .dll
+        std::string dllPath;
+        auto dllPos = opLower.find(".dll");
+        if (dllPos != std::string::npos) {
+            // Walk backwards to find start of path
+            size_t start = dllPos;
+            while (start > 0 && opLower[start - 1] != ' ' &&
+                   opLower[start - 1] != '"' && opLower[start - 1] != '=' &&
+                   opLower[start - 1] != '\t')
+                start--;
+            dllPath = operation.substr(start, dllPos + 4 - start);
+        }
+
+        if (!dllPath.empty()) {
+            std::string dllLower = dllPath;
+            for (auto& c : dllLower) c = (char)tolower((unsigned char)c);
+
+            // Legitimate WMI provider DLLs live in system32\wbem or system32
+            bool isSystemPath =
+                dllLower.find("system32\\wbem\\") != std::string::npos ||
+                dllLower.find("system32/wbem/") != std::string::npos ||
+                dllLower.find("syswow64\\wbem\\") != std::string::npos ||
+                dllLower.find("\\system32\\") != std::string::npos ||
+                dllLower.find("\\syswow64\\") != std::string::npos ||
+                dllLower.find("%systemroot%\\system32") != std::string::npos;
+
+            providerDllAlert = " DLL=[" + dllPath + "]";
+
+            if (!isSystemPath) {
+                // Non-system DLL loaded as WMI provider — escalate to Critical
+                sev = DetectionSeverity::Critical;
+                description = "ROGUE WMI provider DLL loaded (hijack)";
+                providerDllAlert += " [NON-SYSTEM PATH — SUSPICIOUS]";
+            }
+        }
+    }
+
     // EID 5860: Parse __EventConsumer payload for CommandLineTemplate,
     // ScriptText, and ExecutablePath.  The Operation field contains the
     // full MOF consumer representation.  Extract attacker payload content
@@ -5735,14 +5783,14 @@ static DWORD WINAPI WmiEventCallback(
         "] | " + ts +
         " | " + procName +
         " | Method: WMI Persistence Detection (T1546.003)"
-        " | EID " + std::to_string(eid) + ": " + description + detail + consumerPayload;
+        " | EID " + std::to_string(eid) + ": " + description + detail + consumerPayload + providerDllAlert;
 
     std::string det = "Date & Time: " + ts +
         " | " + procName +
         " | PID: " + std::to_string(pid) +
         " | Method: WMI Event Subscription Persistence" +
         " | EventID: " + std::to_string(eid) +
-        " | " + description + detail + consumerPayload;
+        " | " + description + detail + consumerPayload + providerDllAlert;
 
     PushUiDetectionEvent(msg, det, "Method: WMI Persistence Detection (T1546.003)",
                          pid, sev);

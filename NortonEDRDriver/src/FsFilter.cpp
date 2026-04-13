@@ -3240,6 +3240,91 @@ rate_done:
             }
         }
 
+        // ---- .mof file drop outside WBEM directory (T1546.003) ----
+        // Attackers drop .mof files to temp/user directories before compiling them
+        // with mofcomp.exe to install WMI persistence.  Legitimate .mof creation
+        // only happens inside %SystemRoot%\System32\wbem\ during OS servicing.
+        // Flag any .mof file creation outside the wbem tree.
+        {
+            ACCESS_MASK daMof = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            BOOLEAN isMofWrite = (daMof & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+
+            if (isMofWrite && nameInfo->Name.Length >= 8) {
+                // Check if filename ends with .mof (case-insensitive)
+                PWCHAR ext = nameInfo->FinalComponent.Buffer;
+                USHORT extLen = nameInfo->FinalComponent.Length / sizeof(WCHAR);
+                BOOLEAN isMofExt = FALSE;
+                if (extLen >= 4) {
+                    PWCHAR tail = ext + extLen - 4;
+                    isMofExt = (tail[0] == L'.' &&
+                                (tail[1] == L'm' || tail[1] == L'M') &&
+                                (tail[2] == L'o' || tail[2] == L'O') &&
+                                (tail[3] == L'f' || tail[3] == L'F'));
+                }
+
+                if (isMofExt) {
+                    // Allow writes inside wbem directory (OS servicing)
+                    BOOLEAN insideWbem = WcsContainsLower(&nameInfo->Name, L"\\system32\\wbem\\");
+
+                    if (!insideWbem) {
+                        char fBuf[80] = {};
+                        ANSI_STRING ansiMof;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiMof, &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiMof.Length < sizeof(fBuf) - 1 ? ansiMof.Length : sizeof(fBuf) - 1;
+                            RtlCopyMemory(fBuf, ansiMof.Buffer, n);
+                            RtlFreeAnsiString(&ansiMof);
+                        }
+                        char msg[280];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: MOF file drop — '%s' written by '%s' (pid=%llu) outside wbem dir "
+                            "— possible WMI persistence staging (T1546.003)",
+                            fBuf[0] ? fBuf : "?.mof",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid);
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                    }
+                }
+            }
+        }
+
+        // ---- AutoRecover MOF directory write (T1546.003) ----
+        // %SystemRoot%\System32\wbem\AutoRecover\ stores .mof files that are
+        // automatically recompiled when the WMI repository is rebuilt.  Attackers
+        // place malicious .mof files here so persistence survives WMI repository
+        // corruption/repair.  Only WMI service processes should write here.
+        {
+            ACCESS_MASK daAr = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            BOOLEAN isArWrite = (daAr & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+
+            if (isArWrite && WcsContainsLower(&nameInfo->Name, L"\\wbem\\autorecover\\")) {
+                BOOLEAN isWmiProc2 = FALSE;
+                if (procName) {
+                    isWmiProc2 = (strcmp(procName, "svchost.exe") == 0 ||
+                                  strcmp(procName, "WmiPrvSE.exe") == 0 ||
+                                  strcmp(procName, "WmiApSrv.exe") == 0 ||
+                                  strcmp(procName, "mofcomp.exe") == 0 ||
+                                  strcmp(procName, "TiWorker.exe") == 0);
+                }
+                if (!isWmiProc2) {
+                    char fBuf2[80] = {};
+                    ANSI_STRING ansiAr;
+                    if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiAr, &nameInfo->FinalComponent, TRUE))) {
+                        SIZE_T n = ansiAr.Length < sizeof(fBuf2) - 1 ? ansiAr.Length : sizeof(fBuf2) - 1;
+                        RtlCopyMemory(fBuf2, ansiAr.Buffer, n);
+                        RtlFreeAnsiString(&ansiAr);
+                    }
+                    char msg[280];
+                    RtlStringCchPrintfA(msg, sizeof(msg),
+                        "FS: AutoRecover MOF write — '%s' by '%s' (pid=%llu) "
+                        "— persistence survives WMI repository rebuild (T1546.003)",
+                        fBuf2[0] ? fBuf2 : "?",
+                        procName ? procName : "?",
+                        (ULONG64)(ULONG_PTR)pid);
+                    EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                }
+            }
+        }
+
         // ---- Pagefile / hiberfil.sys / swapfile.sys access ----
         // User-mode reads of pagefile.sys or hiberfil.sys enable offline credential
         // extraction (mimikatz sekurlsa::minidump against page file contents).

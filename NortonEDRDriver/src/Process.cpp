@@ -1102,13 +1102,62 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				}
 			}
 
-			char mofMsg[400];
-			RtlStringCbPrintfA(mofMsg, sizeof(mofMsg),
-				"WMI MOF Compilation (T1546.003): mofcomp.exe spawned by '%s' "
-				"(pid=%llu) — cmd: %.180s",
-				creatorName ? creatorName : "?",
-				(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
-				cmdBuf[0] ? cmdBuf : "<empty>");
+			// Parse dangerous mofcomp flags and UNC paths from command line
+			const char* mofFlags = "";
+			BOOLEAN hasAutoRecover = FALSE;
+			BOOLEAN hasUncPath = FALSE;
+			BOOLEAN hasNamespace = FALSE;
+			BOOLEAN hasCheckFlag = FALSE;
+
+			if (cmdBuf[0]) {
+				// Case-insensitive scan of the command line buffer
+				char cmdLower[200];
+				for (int li = 0; li < 200; li++) {
+					cmdLower[li] = (cmdBuf[li] >= 'A' && cmdBuf[li] <= 'Z')
+						? (char)(cmdBuf[li] + 32) : cmdBuf[li];
+					if (cmdBuf[li] == 0) break;
+				}
+
+				if (strstr(cmdLower, "-autorecover") || strstr(cmdLower, "/autorecover"))
+					hasAutoRecover = TRUE;
+				if (strstr(cmdLower, "-check") || strstr(cmdLower, "/check"))
+					hasCheckFlag = TRUE;
+				if (strstr(cmdLower, "-n:") || strstr(cmdLower, "/n:") ||
+					strstr(cmdLower, "-namespace:") || strstr(cmdLower, "/namespace:") ||
+					strstr(cmdLower, "#pragma namespace"))
+					hasNamespace = TRUE;
+				if (strstr(cmdLower, "\\\\"))
+					hasUncPath = TRUE;
+
+				if (hasAutoRecover) mofFlags = " [AUTORECOVER]";
+				else if (hasUncPath) mofFlags = " [UNC_PATH]";
+				else if (hasNamespace) mofFlags = " [NAMESPACE]";
+			}
+
+			char mofMsg[512];
+			if (hasUncPath) {
+				RtlStringCbPrintfA(mofMsg, sizeof(mofMsg),
+					"Remote MOF Compilation (T1546.003+T1021.002): mofcomp.exe "
+					"referencing UNC path — spawned by '%s' (pid=%llu) — cmd: %.180s",
+					creatorName ? creatorName : "?",
+					(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+					cmdBuf);
+			} else if (hasAutoRecover) {
+				RtlStringCbPrintfA(mofMsg, sizeof(mofMsg),
+					"MOF AutoRecover Persistence (T1546.003): mofcomp.exe -autorecover "
+					"— survives WMI rebuild — spawned by '%s' (pid=%llu) — cmd: %.180s",
+					creatorName ? creatorName : "?",
+					(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+					cmdBuf);
+			} else {
+				RtlStringCbPrintfA(mofMsg, sizeof(mofMsg),
+					"WMI MOF Compilation (T1546.003): mofcomp.exe spawned by '%s' "
+					"(pid=%llu)%s — cmd: %.180s",
+					creatorName ? creatorName : "?",
+					(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+					mofFlags,
+					cmdBuf[0] ? cmdBuf : "<empty>");
+			}
 
 			PKERNEL_STRUCTURED_NOTIFICATION mofNotif =
 				(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
@@ -1174,6 +1223,49 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 						ExFreePool(scrNotif);
 					}
 				} else { ExFreePool(scrNotif); }
+			}
+		}
+
+		// -----------------------------------------------------------------------
+		// wbemtest.exe execution detection — alternative MOF compilation tool.
+		//
+		// wbemtest.exe is a graphical WMI testing tool that can compile MOF,
+		// create WMI class instances, and execute arbitrary WQL queries.
+		// Rarely used legitimately — flag any invocation (T1546.003 / T1047).
+		// -----------------------------------------------------------------------
+		if (CreateInfo->ImageFileName &&
+			UnicodeStringContains(CreateInfo->ImageFileName, L"wbemtest.exe"))
+		{
+			char* creatorName = PsGetProcessImageFileName(IoGetCurrentProcess());
+
+			char wbtMsg[280];
+			RtlStringCbPrintfA(wbtMsg, sizeof(wbtMsg),
+				"WMI Tool Execution (T1546.003): wbemtest.exe launched by '%s' "
+				"(pid=%llu) — can compile MOF / create WMI persistence",
+				creatorName ? creatorName : "?",
+				(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId);
+
+			PKERNEL_STRUCTURED_NOTIFICATION wbtNotif =
+				(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'wbnt');
+			if (wbtNotif) {
+				RtlZeroMemory(wbtNotif, sizeof(*wbtNotif));
+				SET_CRITICAL(*wbtNotif);
+				SET_CALLING_PROC_PID_CHECK(*wbtNotif);
+				wbtNotif->isPath = FALSE;
+				wbtNotif->pid = PsGetProcessId(Process);
+				if (creatorName) RtlCopyMemory(wbtNotif->procName, creatorName, 14);
+				SIZE_T wLen = strlen(wbtMsg) + 1;
+				wbtNotif->msg = (char*)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, wLen, 'wbmg');
+				if (wbtNotif->msg) {
+					RtlCopyMemory(wbtNotif->msg, wbtMsg, wLen);
+					wbtNotif->bufSize = (ULONG)wLen;
+					if (!CallbackObjects::GetNotifQueue()->Enqueue(wbtNotif)) {
+						ExFreePool(wbtNotif->msg);
+						ExFreePool(wbtNotif);
+					}
+				} else { ExFreePool(wbtNotif); }
 			}
 		}
 
@@ -1796,6 +1888,7 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"wmic nicconfig",            "wmic nicconfig — network adapter recon via WMI",                     FALSE },
 				{ L"wmic startup",              "wmic startup — persistence listing via WMI startup entries",         FALSE },
 				{ L"wmic /format:",             "wmic /format: — XSL stylesheet execution (Squiblytwo T1220)",        TRUE  },
+				{ L"wmic /compile:",            "wmic /compile: — MOF compilation via wmic (T1546.003)",              TRUE  },
 
 				// --- T1562.002: ETW session/provider tampering via command line ---
 				// logman — stops or deletes ETW trace sessions (bypasses prologue checks)
