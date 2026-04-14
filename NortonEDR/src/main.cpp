@@ -274,6 +274,48 @@ static TRACEHANDLE       g_clrRundownTraceHandle    = INVALID_PROCESSTRACE_HANDL
 static std::atomic<bool> g_clrRundownStop(false);
 
 // ---------------------------------------------------------------------------
+// Microsoft-Antimalware-Scan-Interface (AMSI) ETW session
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_amsiSessionHandle  = 0;
+static TRACEHANDLE       g_amsiTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+static std::atomic<bool> g_amsiStop(false);
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-LDAP-Client ETW session
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_ldapSessionHandle  = 0;
+static TRACEHANDLE       g_ldapTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+static std::atomic<bool> g_ldapStop(false);
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-RPC ETW session
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_rpcSessionHandle  = 0;
+static TRACEHANDLE       g_rpcTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+static std::atomic<bool> g_rpcStop(false);
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-NTLM ETW session
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_ntlmSessionHandle  = 0;
+static TRACEHANDLE       g_ntlmTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+static std::atomic<bool> g_ntlmStop(false);
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-Kernel-Audit-API-Calls ETW session
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_apiAuditSessionHandle  = 0;
+static TRACEHANDLE       g_apiAuditTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+static std::atomic<bool> g_apiAuditStop(false);
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-CodeIntegrity ETW session
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_ciSessionHandle  = 0;
+static TRACEHANDLE       g_ciTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+static std::atomic<bool> g_ciStop(false);
+
+// ---------------------------------------------------------------------------
 // Minifilter altitude registry audit
 // ---------------------------------------------------------------------------
 static std::atomic<bool> g_altitudeAuditStop(false);
@@ -4799,6 +4841,1387 @@ static void StopClrRundownSession() {
 
 
 // ---------------------------------------------------------------------------
+// Microsoft-Antimalware-Scan-Interface (AMSI) ETW consumer
+// Provider GUID: {2A576B87-09A7-520E-C21A-4942F0271D67}
+//
+// AMSI captures post-deobfuscation script content from all integrated hosts:
+// PowerShell, VBScript, JScript, .NET 4.8+, WMI, Office VBA macros.
+// This is broader than PowerShell EID 4104 alone — catches VBScript/JScript
+// content that no event log exposes.
+//
+// Key event ID:
+//   11 — AMSI scan result (contains buffer content, app name, result)
+//
+// Buffer layout (manifest-based, TDH parseable):
+//   session (UINT64), scanStatus (UINT32), scanResult (INT32),
+//   appname (UnicodeString), contentname (UnicodeString),
+//   contentsize (UINT32), content (Binary/HexBinary), hash (Binary)
+// ---------------------------------------------------------------------------
+
+static const GUID kAmsiProviderGuid = {
+    0x2A576B87, 0x09A7, 0x520E,
+    {0xC2, 0x1A, 0x49, 0x42, 0xF0, 0x27, 0x1D, 0x67}
+};
+
+static void WINAPI AmsiEventCallback(PEVENT_RECORD pEvent) {
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kAmsiProviderGuid)) return;
+
+    // EID 11 = AMSI scan event containing buffer content
+    USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
+    if (eventId != 11) return;
+
+    UINT32 pid = pEvent->EventHeader.ProcessId;
+    if (pid == 0 || pid == curPid) return;
+
+    // Parse UserData: the AMSI ETW manifest encodes fields sequentially.
+    // Layout: session(8) + scanStatus(4) + scanResult(4) + appname(len+wstr)
+    //         + contentname(len+wstr) + contentsize(4) + content(len+bytes) + hash
+    // We use a simplified extraction: scan for readable content after fixed fields.
+    if (!pEvent->UserData || pEvent->UserDataLength < 20) return;
+
+    const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+    USHORT dataLen = pEvent->UserDataLength;
+
+    // Skip session(8) + scanStatus(4) + scanResult(4) = 16 bytes
+    INT32 scanResult = 0;
+    if (dataLen >= 16) {
+        memcpy(&scanResult, data + 12, 4);
+    }
+
+    // Extract app name (length-prefixed Unicode string after offset 16)
+    std::string appName;
+    size_t offset = 16;
+    if (offset + 2 <= dataLen) {
+        USHORT appNameLen = *reinterpret_cast<const USHORT*>(data + offset);
+        offset += 2;
+        if (appNameLen > 0 && offset + appNameLen <= dataLen) {
+            const wchar_t* wstr = reinterpret_cast<const wchar_t*>(data + offset);
+            size_t chars = appNameLen / sizeof(wchar_t);
+            for (size_t i = 0; i < chars && wstr[i]; i++)
+                appName += (wstr[i] < 128) ? static_cast<char>(wstr[i]) : '?';
+            offset += appNameLen;
+        }
+    }
+
+    // Extract content name
+    std::string contentName;
+    if (offset + 2 <= dataLen) {
+        USHORT cnLen = *reinterpret_cast<const USHORT*>(data + offset);
+        offset += 2;
+        if (cnLen > 0 && offset + cnLen <= dataLen) {
+            const wchar_t* wstr = reinterpret_cast<const wchar_t*>(data + offset);
+            size_t chars = cnLen / sizeof(wchar_t);
+            for (size_t i = 0; i < chars && wstr[i]; i++)
+                contentName += (wstr[i] < 128) ? static_cast<char>(wstr[i]) : '?';
+            offset += cnLen;
+        }
+    }
+
+    // Extract content size and buffer
+    std::string contentPreview;
+    UINT32 contentSize = 0;
+    if (offset + 4 <= dataLen) {
+        memcpy(&contentSize, data + offset, 4);
+        offset += 4;
+    }
+    if (offset + 2 <= dataLen) {
+        USHORT bufLen = *reinterpret_cast<const USHORT*>(data + offset);
+        offset += 2;
+        if (bufLen > 0 && offset + bufLen <= dataLen) {
+            size_t previewLen = (bufLen < 200) ? bufLen : 200;
+            for (size_t i = 0; i < previewLen; i++) {
+                char c = static_cast<char>(data[offset + i]);
+                contentPreview += (c >= 32 && c < 127) ? c : '.';
+            }
+            if (bufLen > 200) contentPreview += "...(truncated)";
+        }
+    }
+
+    // AMSI scan result interpretation:
+    // 1 = AMSI_RESULT_CLEAN, 32768 = AMSI_RESULT_DETECTED
+    // We want to see all scans from suspicious hosts, but elevate detections
+    bool isMalicious = (scanResult >= 32768);
+
+    // Determine process name from cache
+    std::string procName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(pid);
+        if (it != g_processCache.end()) procName = it->second.processName;
+    }
+    if (procName.empty()) procName = appName.empty() ? "amsi-host" : appName;
+
+    // Keyword scanning for suspicious AMSI content
+    static const char* kSuspiciousAmsiKeywords[] = {
+        "invoke-mimikatz", "invoke-expression", "downloadstring",
+        "invoke-shellcode", "invoke-reflectivepeinjection",
+        "get-credential", "invoke-kerberoast", "invoke-bloodhound",
+        "new-object net.webclient", "bitstransfer", "invoke-webrequest",
+        "start-process", "invoke-wmimethod", "invoke-command",
+        "set-mppreference", "add-mppreference",
+        "amsiutils", "amsiscanbuffer", "amsicontext",
+        "virtualalloc", "virtualprotect", "createthread",
+        "wscript.shell", "shellexecute",
+        nullptr
+    };
+
+    std::string contentLower = contentPreview;
+    for (auto& c : contentLower) c = (char)tolower((unsigned char)c);
+
+    std::string keywordHits;
+    for (int i = 0; kSuspiciousAmsiKeywords[i]; i++) {
+        if (contentLower.find(kSuspiciousAmsiKeywords[i]) != std::string::npos) {
+            if (!keywordHits.empty()) keywordHits += ",";
+            keywordHits += kSuspiciousAmsiKeywords[i];
+        }
+    }
+
+    DetectionSeverity sev = DetectionSeverity::Low;
+    const char* description = "AMSI content scan";
+
+    if (isMalicious) {
+        sev = DetectionSeverity::Critical;
+        description = "AMSI flagged MALICIOUS content";
+    } else if (!keywordHits.empty()) {
+        sev = DetectionSeverity::High;
+        description = "AMSI suspicious content keywords";
+    }
+
+    // Only emit alerts for malicious results or suspicious keywords
+    // to avoid flooding with benign PowerShell module loads
+    if (!isMalicious && keywordHits.empty()) return;
+
+    std::string ts = BuildTimestamp();
+    std::string detail;
+    if (!appName.empty())     detail += " App=" + appName;
+    if (!contentName.empty()) detail += " Content=" + contentName;
+    if (!keywordHits.empty()) detail += " Keywords=[" + keywordHits + "]";
+    if (!contentPreview.empty()) {
+        std::string preview = contentPreview.size() > 120
+            ? contentPreview.substr(0, 120) + "..." : contentPreview;
+        detail += " Preview=[" + preview + "]";
+    }
+
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [*] [" + (sev >= DetectionSeverity::High ? "Critical" : "Warning") +
+        "] | " + ts +
+        " | " + procName +
+        " | Method: AMSI Content Inspection (T1059)" +
+        " | " + description + detail;
+
+    std::string det = "Date & Time: " + ts +
+        " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: AMSI ETW Content Capture" +
+        " | ScanResult: " + std::to_string(scanResult) +
+        " | " + description + detail;
+
+    PushUiDetectionEvent(msg, det, "Method: AMSI Content Inspection (T1059)",
+                         pid, sev);
+}
+
+static void AmsiSubscriberThread() {
+    const wchar_t* kSessionName = L"NortonEDR-AMSI";
+    const size_t nameBufBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize  = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize  = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_amsiSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_amsiSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-AMSI] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_amsiSessionHandle, &kAmsiProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_VERBOSE,
+        0xFFFFFFFFFFFFFFFF, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-AMSI] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_amsiSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_amsiSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-AMSI] Session started — consuming AMSI scan events\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName       = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                               PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = AmsiEventCallback;
+
+    g_amsiTraceHandle = OpenTraceW(&logFile);
+    if (g_amsiTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-AMSI] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_amsiTraceHandle, 1, nullptr, nullptr);
+    g_amsiTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopAmsiSession() {
+    if (g_amsiTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_amsiTraceHandle);
+        g_amsiTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_amsiSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_amsiSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_amsiSessionHandle = 0;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-LDAP-Client ETW consumer
+// Provider GUID: {099614A5-5DD7-4788-8BC9-E29F43DB28FC}
+//
+// Captures every LDAP search/bind/modify operation.  Key detection targets:
+//   - BloodHound / SharpHound AD enumeration (large base-scope queries
+//     for trustedDomain, samAccountType, servicePrincipalName)
+//   - DCSync indicator: LDAP search with replication OID 1.2.840.113556.1.4.941
+//   - Credential harvesting: searches targeting userPassword, unicodePwd
+//
+// Key event IDs:
+//   30 — LDAP search request (contains filter, base DN, scope)
+//   31 — LDAP search response
+// ---------------------------------------------------------------------------
+
+static const GUID kLdapProviderGuid = {
+    0x099614A5, 0x5DD7, 0x4788,
+    {0xBC, 0x9E, 0x29, 0xF4, 0x3D, 0xB2, 0x8F, 0xC}
+};
+
+static void WINAPI LdapEventCallback(PEVENT_RECORD pEvent) {
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kLdapProviderGuid)) return;
+
+    USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
+    // EID 30 = search request
+    if (eventId != 30) return;
+
+    UINT32 pid = pEvent->EventHeader.ProcessId;
+    if (pid == 0 || pid == curPid) return;
+
+    if (!pEvent->UserData || pEvent->UserDataLength < 4) return;
+
+    // Extract readable strings from the event data.
+    // The LDAP-Client provider embeds the search filter and base DN as
+    // Unicode strings in the UserData blob.  Layout varies by OS version,
+    // so we do a permissive scan for readable Unicode content.
+    const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+    USHORT dataLen = pEvent->UserDataLength;
+
+    // Collect all readable Unicode strings from the blob
+    std::vector<std::string> strings;
+    size_t pos = 0;
+    while (pos + 2 <= dataLen) {
+        // Look for start of a Unicode string (printable wchar sequence)
+        if (data[pos] >= 0x20 && data[pos] < 0x7F && data[pos + 1] == 0) {
+            std::string s;
+            while (pos + 2 <= dataLen && data[pos] >= 0x20 &&
+                   data[pos] < 0x7F && data[pos + 1] == 0) {
+                s += static_cast<char>(data[pos]);
+                pos += 2;
+            }
+            if (s.size() >= 3) strings.push_back(s);
+            continue;
+        }
+        pos++;
+    }
+
+    if (strings.empty()) return;
+
+    // Build a combined lowercase search corpus
+    std::string combined;
+    for (auto& s : strings) {
+        combined += s + " ";
+    }
+    std::string combinedLower = combined;
+    for (auto& c : combinedLower) c = (char)tolower((unsigned char)c);
+
+    // Detection patterns
+    static const struct { const char* pattern; const char* tag; DetectionSeverity sev; } kLdapDetections[] = {
+        // BloodHound / SharpHound enumeration
+        {"(samaccounttype=805306368)",   "BLOODHOUND_USER_ENUM",    DetectionSeverity::Critical},
+        {"(samaccounttype=805306369)",   "BLOODHOUND_COMPUTER_ENUM", DetectionSeverity::Critical},
+        {"trusteddomain",                "AD_TRUST_ENUM",           DetectionSeverity::High},
+        {"serviceprincipalname=*",       "KERBEROAST_SPN_ENUM",     DetectionSeverity::Critical},
+        {"serviceprincipalname",         "SPN_QUERY",               DetectionSeverity::High},
+        {"msds-allowedtodelegateto",     "DELEGATION_ENUM",         DetectionSeverity::High},
+        {"msds-allowedtoactonbehalfof",  "RBCD_ENUM",              DetectionSeverity::Critical},
+        {"useraccountcontrol:1.2.840.113556.1.4.803:=524288", "UNCONSTRAINED_DELEG", DetectionSeverity::Critical},
+        // DCSync indicators
+        {"1.2.840.113556.1.4.941",       "DCSYNC_REPL_OID",        DetectionSeverity::Critical},
+        {"1.2.840.113556.1.4.529",       "DCSYNC_REPL_OID",        DetectionSeverity::Critical},
+        // Credential harvesting
+        {"userpassword",                 "CRED_HARVEST",            DetectionSeverity::Critical},
+        {"unicodepwd",                   "CRED_HARVEST",            DetectionSeverity::Critical},
+        {"supplementalcredentials",      "CRED_HARVEST",            DetectionSeverity::Critical},
+        {"msds-managedpassword",         "GMSA_PASSWORD_READ",      DetectionSeverity::High},
+        // Large enumeration indicators
+        {"(objectclass=*)",              "FULL_AD_DUMP",            DetectionSeverity::High},
+        {"(objectcategory=computer)",    "COMPUTER_ENUM",           DetectionSeverity::Warning},
+        {"(objectcategory=person)",      "USER_ENUM",               DetectionSeverity::Warning},
+        {"admincount=1",                 "PRIV_USER_ENUM",          DetectionSeverity::High},
+        {nullptr, nullptr, DetectionSeverity::Low}
+    };
+
+    DetectionSeverity bestSev = DetectionSeverity::Low;
+    std::string tags;
+    for (int i = 0; kLdapDetections[i].pattern; i++) {
+        if (combinedLower.find(kLdapDetections[i].pattern) != std::string::npos) {
+            if (!tags.empty()) tags += ",";
+            tags += kLdapDetections[i].tag;
+            if (kLdapDetections[i].sev > bestSev) bestSev = kLdapDetections[i].sev;
+        }
+    }
+
+    // Only alert on suspicious queries, not routine AD lookups
+    if (tags.empty()) return;
+
+    std::string procName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(pid);
+        if (it != g_processCache.end()) procName = it->second.processName;
+    }
+    if (procName.empty()) procName = "ldap-client";
+
+    std::string ts = BuildTimestamp();
+    std::string filterPreview = combined.size() > 150
+        ? combined.substr(0, 150) + "..." : combined;
+
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [*] [" + (bestSev >= DetectionSeverity::High ? "Critical" : "Warning") +
+        "] | " + ts +
+        " | " + procName +
+        " | Method: LDAP Query Inspection (T1087/T1482)" +
+        " | [" + tags + "] Filter=[" + filterPreview + "]";
+
+    std::string det = "Date & Time: " + ts +
+        " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: LDAP-Client ETW Query Analysis" +
+        " | Tags: " + tags +
+        " | Query: " + combined;
+
+    PushUiDetectionEvent(msg, det, "Method: LDAP Query Inspection (T1087/T1482)",
+                         pid, bestSev);
+}
+
+static void LdapSubscriberThread() {
+    const wchar_t* kSessionName = L"NortonEDR-LDAP";
+    const size_t nameBufBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize  = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize  = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_ldapSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_ldapSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-LDAP] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_ldapSessionHandle, &kLdapProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_INFORMATIONAL,
+        0xFFFFFFFFFFFFFFFF, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-LDAP] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_ldapSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_ldapSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-LDAP] Session started — consuming LDAP client queries\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName       = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                               PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = LdapEventCallback;
+
+    g_ldapTraceHandle = OpenTraceW(&logFile);
+    if (g_ldapTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-LDAP] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_ldapTraceHandle, 1, nullptr, nullptr);
+    g_ldapTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopLdapSession() {
+    if (g_ldapTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_ldapTraceHandle);
+        g_ldapTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_ldapSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_ldapSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_ldapSessionHandle = 0;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-RPC ETW consumer
+// Provider GUID: {6AD52B32-D609-4BE9-AE07-CE8DAE937E39}
+//
+// Captures RPC call metadata.  Key detection targets:
+//   - DCSync: DRS replication interface {E3514235-4B06-11D1-AB04-00C04FC2DCD2}
+//   - PsExec / remote service: MS-SCMR {367ABB81-9844-35F1-AD32-98F038001003}
+//   - Remote task: MS-TSCH {86D35949-83C9-4044-B424-DB363231FD0C}
+//   - DCOM lateral movement: IRemUnknown2, IActivation
+//   - Remote registry: MS-RRP {338CD001-2244-31F1-AAAA-900038001003}
+//   - WMI remote exec: IWbemServices {9556DC99-828C-11CF-A37E-00AA003240C7}
+//
+// Keywords: 0x1 (RpcClientCall), 0x2 (RpcServerCall)
+// EID 5 = RpcClientCallStart, EID 7 = RpcServerCallStart
+// ---------------------------------------------------------------------------
+
+static const GUID kRpcProviderGuid = {
+    0x6AD52B32, 0xD609, 0x4BE9,
+    {0xAE, 0x07, 0xCE, 0x8D, 0xAE, 0x93, 0x7E, 0x39}
+};
+
+static void WINAPI RpcEventCallback(PEVENT_RECORD pEvent) {
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kRpcProviderGuid)) return;
+
+    USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
+    // EID 5 = RpcClientCallStart, EID 7 = RpcServerCallStart
+    if (eventId != 5 && eventId != 7) return;
+
+    UINT32 pid = pEvent->EventHeader.ProcessId;
+    if (pid == 0 || pid == curPid) return;
+
+    if (!pEvent->UserData || pEvent->UserDataLength < 16) return;
+
+    // UserData for RpcClientCallStart: InterfaceUuid (16 bytes GUID),
+    // ProcNum (4 bytes), Protocol (UnicodeString), Endpoint (UnicodeString)
+    const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+    USHORT dataLen = pEvent->UserDataLength;
+
+    GUID interfaceId{};
+    memcpy(&interfaceId, data, 16);
+
+    UINT32 procNum = 0;
+    if (dataLen >= 20) memcpy(&procNum, data + 16, 4);
+
+    // Known dangerous RPC interfaces
+    static const struct {
+        GUID guid;
+        const char* name;
+        const char* tag;
+        DetectionSeverity sev;
+    } kDangerousInterfaces[] = {
+        // DCSync — Directory Replication Service
+        {{0xE3514235, 0x4B06, 0x11D1, {0xAB, 0x04, 0x00, 0xC0, 0x4F, 0xC2, 0xDC, 0xD2}},
+         "MS-DRSR (DRS Replication)", "DCSYNC", DetectionSeverity::Critical},
+        // PsExec / Remote Service Control
+        {{0x367ABB81, 0x9844, 0x35F1, {0xAD, 0x32, 0x98, 0xF0, 0x38, 0x00, 0x10, 0x03}},
+         "MS-SCMR (Service Control)", "REMOTE_SERVICE", DetectionSeverity::High},
+        // Remote Task Scheduler
+        {{0x86D35949, 0x83C9, 0x4044, {0xB4, 0x24, 0xDB, 0x36, 0x32, 0x31, 0xFD, 0x0C}},
+         "MS-TSCH (Task Scheduler)", "REMOTE_TASK", DetectionSeverity::High},
+        // Remote Registry
+        {{0x338CD001, 0x2244, 0x31F1, {0xAA, 0xAA, 0x90, 0x00, 0x38, 0x00, 0x10, 0x03}},
+         "MS-RRP (Remote Registry)", "REMOTE_REGISTRY", DetectionSeverity::High},
+        // WMI Remote
+        {{0x9556DC99, 0x828C, 0x11CF, {0xA3, 0x7E, 0x00, 0xAA, 0x00, 0x32, 0x40, 0xC7}},
+         "IWbemServices (WMI Remote)", "WMI_REMOTE_EXEC", DetectionSeverity::Critical},
+        // DCOM Activation
+        {{0x4D9F4AB8, 0x7D1C, 0x11CF, {0x86, 0x1E, 0x00, 0x20, 0xAF, 0x6E, 0x7C, 0x57}},
+         "IActivation (DCOM)", "DCOM_ACTIVATION", DetectionSeverity::High},
+        // SAM Remote Protocol (user enum)
+        {{0x12345778, 0x1234, 0xABCD, {0xEF, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB}},
+         "MS-SAMR (SAM Remote)", "SAM_REMOTE_ENUM", DetectionSeverity::High},
+        // LSARPC (policy/credential access)
+        {{0x12345778, 0x1234, 0xABCD, {0xEF, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAC}},
+         "MS-LSAD (LSA Remote)", "LSARPC", DetectionSeverity::High},
+    };
+
+    const char* ifaceName = nullptr;
+    const char* tag = nullptr;
+    DetectionSeverity sev = DetectionSeverity::Low;
+
+    for (const auto& entry : kDangerousInterfaces) {
+        if (IsEqualGUID(interfaceId, entry.guid)) {
+            ifaceName = entry.name;
+            tag = entry.tag;
+            sev = entry.sev;
+            break;
+        }
+    }
+
+    // Only alert on known dangerous interfaces
+    if (!tag) return;
+
+    // DCSync specific: DRSGetNCChanges = opnum 3
+    if (sev == DetectionSeverity::Critical &&
+        strcmp(tag, "DCSYNC") == 0 && procNum == 3) {
+        // This is the actual replication call — highest confidence
+        tag = "DCSYNC_REPLICATION";
+    }
+
+    std::string procName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(pid);
+        if (it != g_processCache.end()) procName = it->second.processName;
+    }
+    if (procName.empty()) procName = "rpc-caller";
+
+    std::string ts = BuildTimestamp();
+    bool isClient = (eventId == 5);
+
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [*] [" + (sev >= DetectionSeverity::High ? "Critical" : "Warning") +
+        "] | " + ts +
+        " | " + procName +
+        " | Method: RPC Call Inspection (T1021)" +
+        " | [" + tag + "] " + (isClient ? "Client" : "Server") +
+        " call to " + ifaceName +
+        " OpNum=" + std::to_string(procNum);
+
+    std::string det = "Date & Time: " + ts +
+        " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: RPC ETW Interface Monitor" +
+        " | Interface: " + ifaceName +
+        " | Tag: " + tag +
+        " | OpNum: " + std::to_string(procNum) +
+        " | Direction: " + (isClient ? "Client" : "Server");
+
+    PushUiDetectionEvent(msg, det, "Method: RPC Call Inspection (T1021)",
+                         pid, sev);
+}
+
+static void RpcSubscriberThread() {
+    const wchar_t* kSessionName = L"NortonEDR-RPC";
+    const size_t nameBufBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize  = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize  = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_rpcSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_rpcSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-RPC] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    // Keywords: 0x1 (RpcClientCall) | 0x2 (RpcServerCall)
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_rpcSessionHandle, &kRpcProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_INFORMATIONAL,
+        0x3, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-RPC] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_rpcSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_rpcSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-RPC] Session started — monitoring RPC interface calls\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName       = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                               PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = RpcEventCallback;
+
+    g_rpcTraceHandle = OpenTraceW(&logFile);
+    if (g_rpcTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-RPC] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_rpcTraceHandle, 1, nullptr, nullptr);
+    g_rpcTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopRpcSession() {
+    if (g_rpcTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_rpcTraceHandle);
+        g_rpcTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_rpcSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_rpcSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_rpcSessionHandle = 0;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-NTLM ETW consumer
+// Provider GUID: {AC43300D-5FCC-4800-8E99-1BD3F85F0320}
+//
+// Captures NTLM authentication events.  Key detection targets:
+//   - Pass-the-hash (T1550.002): NTLM auth from unexpected process
+//   - NTLM relay: authentication to unexpected targets
+//   - NTLM downgrade: Kerberos-capable host using NTLM
+//
+// Keywords: 0x1 (InboundAuth), 0x2 (OutboundAuth)
+// Key EIDs:
+//   4001 — NTLM client credential authentication (outbound)
+//   4003 — NTLM server authentication (inbound)
+//   8001 — NTLM authentication in the LSA
+// ---------------------------------------------------------------------------
+
+static const GUID kNtlmProviderGuid = {
+    0xAC43300D, 0x5FCC, 0x4800,
+    {0x8E, 0x99, 0x1B, 0xD3, 0xF8, 0x5F, 0x03, 0x20}
+};
+
+static void WINAPI NtlmEventCallback(PEVENT_RECORD pEvent) {
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kNtlmProviderGuid)) return;
+
+    USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
+    UINT32 pid = pEvent->EventHeader.ProcessId;
+
+    if (!pEvent->UserData || pEvent->UserDataLength < 4) return;
+
+    const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+    USHORT dataLen = pEvent->UserDataLength;
+
+    // Extract readable Unicode strings from the event blob
+    std::vector<std::string> strings;
+    size_t pos = 0;
+    while (pos + 2 <= dataLen) {
+        if (data[pos] >= 0x20 && data[pos] < 0x7F && data[pos + 1] == 0) {
+            std::string s;
+            while (pos + 2 <= dataLen && data[pos] >= 0x20 &&
+                   data[pos] < 0x7F && data[pos + 1] == 0) {
+                s += static_cast<char>(data[pos]);
+                pos += 2;
+            }
+            if (s.size() >= 2) strings.push_back(s);
+            continue;
+        }
+        pos++;
+    }
+
+    std::string combined;
+    for (auto& s : strings) combined += s + " ";
+
+    std::string combinedLower = combined;
+    for (auto& c : combinedLower) c = (char)tolower((unsigned char)c);
+
+    const char* description = nullptr;
+    DetectionSeverity sev = DetectionSeverity::Low;
+
+    switch (eventId) {
+    case 4001:
+        description = "NTLM outbound authentication";
+        sev = DetectionSeverity::Warning;
+        break;
+    case 4003:
+        description = "NTLM inbound authentication";
+        sev = DetectionSeverity::Warning;
+        break;
+    case 8001:
+        description = "NTLM auth via LSA";
+        sev = DetectionSeverity::Warning;
+        break;
+    default:
+        return;
+    }
+
+    // Elevate severity for suspicious NTLM usage patterns
+    std::string flags;
+
+    // NTLM auth from suspicious processes (pass-the-hash indicators)
+    std::string procName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(pid);
+        if (it != g_processCache.end()) procName = it->second.processName;
+    }
+
+    if (!procName.empty()) {
+        std::string pLower = procName;
+        for (auto& c : pLower) c = (char)tolower((unsigned char)c);
+        // Processes that should rarely do NTLM auth
+        if (pLower.find("powershell") != std::string::npos ||
+            pLower.find("cmd.exe") != std::string::npos ||
+            pLower.find("wscript") != std::string::npos ||
+            pLower.find("cscript") != std::string::npos ||
+            pLower.find("mshta") != std::string::npos ||
+            pLower.find("rundll32") != std::string::npos) {
+            flags += " [SUSPICIOUS NTLM SOURCE — T1550.002]";
+            sev = DetectionSeverity::High;
+        }
+    }
+
+    if (procName.empty()) procName = "ntlm-auth";
+
+    // Check for machine account NTLM ($ suffix) — unusual for user auth
+    if (combinedLower.find("$@") != std::string::npos ||
+        combinedLower.find("$ ") != std::string::npos) {
+        flags += " [MACHINE_ACCOUNT]";
+    }
+
+    // Inbound NTLM from non-domain source could indicate relay
+    if (eventId == 4003) {
+        flags += " [INBOUND — RELAY RISK]";
+        if (sev < DetectionSeverity::Warning) sev = DetectionSeverity::Warning;
+    }
+
+    // Only emit Warning+ to avoid flooding on normal NTLM traffic
+    if (sev < DetectionSeverity::Warning) return;
+
+    std::string ts = BuildTimestamp();
+    std::string context = combined.size() > 150
+        ? combined.substr(0, 150) + "..." : combined;
+
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [*] [" + (sev >= DetectionSeverity::High ? "Critical" : "Warning") +
+        "] | " + ts +
+        " | " + procName +
+        " | Method: NTLM Authentication Monitor (T1550.002)" +
+        " | EID " + std::to_string(eventId) + ": " + description +
+        flags + " " + context;
+
+    std::string det = "Date & Time: " + ts +
+        " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: NTLM ETW Authentication Inspection" +
+        " | EventID: " + std::to_string(eventId) +
+        " | " + description + flags +
+        " | Context: " + combined;
+
+    PushUiDetectionEvent(msg, det, "Method: NTLM Authentication Monitor (T1550.002)",
+                         pid, sev);
+}
+
+static void NtlmSubscriberThread() {
+    const wchar_t* kSessionName = L"NortonEDR-NTLM";
+    const size_t nameBufBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize  = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize  = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_ntlmSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_ntlmSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-NTLM] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_ntlmSessionHandle, &kNtlmProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_INFORMATIONAL,
+        0xFFFFFFFFFFFFFFFF, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-NTLM] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_ntlmSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_ntlmSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-NTLM] Session started — monitoring NTLM authentication\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName       = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                               PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = NtlmEventCallback;
+
+    g_ntlmTraceHandle = OpenTraceW(&logFile);
+    if (g_ntlmTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-NTLM] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_ntlmTraceHandle, 1, nullptr, nullptr);
+    g_ntlmTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopNtlmSession() {
+    if (g_ntlmTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_ntlmTraceHandle);
+        g_ntlmTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_ntlmSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_ntlmSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_ntlmSessionHandle = 0;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-Kernel-Audit-API-Calls ETW consumer
+// Provider GUID: {E02A841C-75A3-4FA7-AFC8-AE09CF9B7F23}
+//
+// Audits security-sensitive kernel API calls.  Key detection targets:
+//   - OpenProcess with PROCESS_VM_READ/WRITE (credential dumping, injection)
+//   - DuplicateHandle stealing (handle duplication from LSASS, etc.)
+//   - Suspicious access rights combinations (PROCESS_ALL_ACCESS)
+//
+// Key EIDs:
+//   1 — OpenProcess call
+//   2 — DuplicateHandle call (undocumented but present in Win10+)
+//   3 — OpenThread call
+// ---------------------------------------------------------------------------
+
+static const GUID kApiAuditProviderGuid = {
+    0xE02A841C, 0x75A3, 0x4FA7,
+    {0xAF, 0xC8, 0xAE, 0x09, 0xCF, 0x9B, 0x7F, 0x23}
+};
+
+static void WINAPI ApiAuditEventCallback(PEVENT_RECORD pEvent) {
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kApiAuditProviderGuid)) return;
+
+    USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
+    UINT32 callerPid = pEvent->EventHeader.ProcessId;
+    if (callerPid == 0 || callerPid == curPid) return;
+
+    if (!pEvent->UserData || pEvent->UserDataLength < 12) return;
+
+    const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+    USHORT dataLen = pEvent->UserDataLength;
+
+    // EID 1 (OpenProcess): TargetPID (4), DesiredAccess (4), ReturnCode (4)
+    if (eventId != 1) return;
+
+    UINT32 targetPid = 0, desiredAccess = 0, returnCode = 0;
+    memcpy(&targetPid, data, 4);
+    if (dataLen >= 8) memcpy(&desiredAccess, data + 4, 4);
+    if (dataLen >= 12) memcpy(&returnCode, data + 8, 4);
+
+    // Only care about successful calls
+    if (returnCode != 0) return;
+
+    // Ignore self-opens
+    if (targetPid == callerPid) return;
+
+    // Suspicious access rights
+    constexpr UINT32 PROCESS_VM_READ      = 0x0010;
+    constexpr UINT32 PROCESS_VM_WRITE     = 0x0020;
+    constexpr UINT32 PROCESS_VM_OPERATION = 0x0008;
+    constexpr UINT32 PROCESS_ALL_ACCESS   = 0x001FFFFF;
+    constexpr UINT32 PROCESS_CREATE_THREAD = 0x0002;
+    constexpr UINT32 PROCESS_DUP_HANDLE   = 0x0040;
+
+    // Check if target is a high-value process
+    std::string targetName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(targetPid);
+        if (it != g_processCache.end()) targetName = it->second.processName;
+    }
+
+    std::string targetLower = targetName;
+    for (auto& c : targetLower) c = (char)tolower((unsigned char)c);
+
+    bool isHighValueTarget =
+        targetLower.find("lsass") != std::string::npos ||
+        targetLower.find("csrss") != std::string::npos ||
+        targetLower.find("winlogon") != std::string::npos ||
+        targetLower.find("services") != std::string::npos ||
+        targetLower.find("svchost") != std::string::npos ||
+        targetLower.find("msmpsvc") != std::string::npos ||
+        targetLower.find("msmpeng") != std::string::npos;
+
+    bool hasSuspiciousAccess =
+        (desiredAccess & PROCESS_ALL_ACCESS) == PROCESS_ALL_ACCESS ||
+        ((desiredAccess & PROCESS_VM_READ) && (desiredAccess & PROCESS_VM_OPERATION)) ||
+        ((desiredAccess & PROCESS_VM_WRITE) && (desiredAccess & PROCESS_CREATE_THREAD)) ||
+        (desiredAccess & PROCESS_DUP_HANDLE);
+
+    // Only alert on high-value targets with suspicious access
+    if (!isHighValueTarget || !hasSuspiciousAccess) return;
+
+    std::string callerName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(callerPid);
+        if (it != g_processCache.end()) callerName = it->second.processName;
+    }
+    if (callerName.empty()) callerName = "unknown";
+
+    // Allowlist legitimate callers
+    std::string callerLower = callerName;
+    for (auto& c : callerLower) c = (char)tolower((unsigned char)c);
+    if (callerLower.find("msmpeng") != std::string::npos ||
+        callerLower.find("msmpsvc") != std::string::npos ||
+        callerLower.find("csrss") != std::string::npos ||
+        callerLower.find("svchost") != std::string::npos ||
+        callerLower.find("nortonedr") != std::string::npos ||
+        callerLower.find("lsass") != std::string::npos ||
+        callerLower.find("services") != std::string::npos ||
+        callerLower.find("wininit") != std::string::npos ||
+        callerLower.find("taskmgr") != std::string::npos ||
+        callerLower.find("procmon") != std::string::npos ||
+        callerLower.find("procexp") != std::string::npos)
+        return;
+
+    DetectionSeverity sev = DetectionSeverity::High;
+    std::string flags;
+
+    // LSASS targeting = credential dump (T1003.001)
+    if (targetLower.find("lsass") != std::string::npos) {
+        sev = DetectionSeverity::Critical;
+        flags = " [LSASS CREDENTIAL ACCESS — T1003.001]";
+    }
+
+    // PROCESS_ALL_ACCESS is the laziest/most common attack pattern
+    if ((desiredAccess & PROCESS_ALL_ACCESS) == PROCESS_ALL_ACCESS) {
+        flags += " [PROCESS_ALL_ACCESS]";
+    }
+
+    char accessHex[16];
+    snprintf(accessHex, sizeof(accessHex), "0x%08X", desiredAccess);
+
+    std::string ts = BuildTimestamp();
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [*] [" + (sev >= DetectionSeverity::High ? "Critical" : "Warning") +
+        "] | " + ts +
+        " | " + callerName +
+        " | Method: Kernel API Audit (T1003)" +
+        " | OpenProcess(" + targetName + " PID=" + std::to_string(targetPid) +
+        ", Access=" + accessHex + ")" + flags;
+
+    std::string det = "Date & Time: " + ts +
+        " | Caller: " + callerName + " (PID " + std::to_string(callerPid) + ")" +
+        " | Target: " + targetName + " (PID " + std::to_string(targetPid) + ")" +
+        " | Method: Kernel-Audit-API-Calls ETW" +
+        " | DesiredAccess: " + accessHex + flags;
+
+    PushUiDetectionEvent(msg, det, "Method: Kernel API Audit (T1003)",
+                         callerPid, sev);
+}
+
+static void ApiAuditSubscriberThread() {
+    const wchar_t* kSessionName = L"NortonEDR-ApiAudit";
+    const size_t nameBufBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize  = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize  = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_apiAuditSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_apiAuditSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-ApiAudit] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_apiAuditSessionHandle, &kApiAuditProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_INFORMATIONAL,
+        0xFFFFFFFFFFFFFFFF, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-ApiAudit] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_apiAuditSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_apiAuditSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-ApiAudit] Session started — auditing kernel API calls\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName       = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                               PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = ApiAuditEventCallback;
+
+    g_apiAuditTraceHandle = OpenTraceW(&logFile);
+    if (g_apiAuditTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-ApiAudit] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_apiAuditTraceHandle, 1, nullptr, nullptr);
+    g_apiAuditTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopApiAuditSession() {
+    if (g_apiAuditTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_apiAuditTraceHandle);
+        g_apiAuditTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_apiAuditSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_apiAuditSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_apiAuditSessionHandle = 0;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-CodeIntegrity ETW consumer
+// Provider GUID: {4EE76BD8-3CF4-44A0-A0AC-3937643E37A3}
+//
+// Captures code integrity policy violations at load time.  Detects:
+//   - Unsigned driver loads (BYOVD preparation, T1068)
+//   - Revoked certificate driver loads
+//   - WHQL signature failures
+//   - User-mode DLL code integrity violations
+//   - HVCI enforcement events
+//
+// Key EIDs:
+//   3001 — Code integrity check failed (unsigned/bad signature)
+//   3002 — Code integrity unable to verify image (can't validate)
+//   3003 — Code integrity audit: would be blocked under enforced policy
+//   3004 — File under validation did not meet signing level (Win10+)
+//   3023 — WHQL unsigned driver tried to load
+//   3033 — Code integrity found unsigned kernel module
+// ---------------------------------------------------------------------------
+
+static const GUID kCiProviderGuid = {
+    0x4EE76BD8, 0x3CF4, 0x44A0,
+    {0xA0, 0xAC, 0x39, 0x37, 0x64, 0x3E, 0x37, 0xA3}
+};
+
+static void WINAPI CodeIntegrityEventCallback(PEVENT_RECORD pEvent) {
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kCiProviderGuid)) return;
+
+    USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
+    UINT32 pid = pEvent->EventHeader.ProcessId;
+
+    if (!pEvent->UserData || pEvent->UserDataLength < 4) return;
+
+    const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+    USHORT dataLen = pEvent->UserDataLength;
+
+    const char* description = nullptr;
+    DetectionSeverity sev = DetectionSeverity::Warning;
+
+    switch (eventId) {
+    case 3001:
+        description = "Code integrity check FAILED — unsigned or invalid signature";
+        sev = DetectionSeverity::High;
+        break;
+    case 3002:
+        description = "Code integrity unable to verify image integrity";
+        sev = DetectionSeverity::Warning;
+        break;
+    case 3003:
+        description = "Code integrity AUDIT — would be blocked under enforced policy";
+        sev = DetectionSeverity::Warning;
+        break;
+    case 3004:
+        description = "Image did not meet signing level requirements";
+        sev = DetectionSeverity::High;
+        break;
+    case 3023:
+        description = "WHQL unsigned driver attempted to load";
+        sev = DetectionSeverity::Critical;
+        break;
+    case 3033:
+        description = "Unsigned KERNEL MODULE attempted to load";
+        sev = DetectionSeverity::Critical;
+        break;
+    default:
+        return;
+    }
+
+    // Extract file path from UserData — typically first Unicode string
+    std::string filePath;
+    size_t pos = 0;
+    // Skip any leading fixed fields and find the first Unicode string
+    while (pos + 2 <= dataLen) {
+        if (data[pos] >= 0x20 && data[pos] < 0x7F && data[pos + 1] == 0) {
+            while (pos + 2 <= dataLen && data[pos] >= 0x20 &&
+                   data[pos] < 0x7F && data[pos + 1] == 0) {
+                filePath += static_cast<char>(data[pos]);
+                pos += 2;
+            }
+            break;
+        }
+        pos++;
+    }
+
+    // Elevate to Critical for kernel drivers from non-system paths
+    std::string flags;
+    if (!filePath.empty()) {
+        std::string pathLower = filePath;
+        for (auto& c : pathLower) c = (char)tolower((unsigned char)c);
+
+        bool isDriver = pathLower.find(".sys") != std::string::npos;
+        bool isNonSystemPath =
+            pathLower.find("\\temp\\") != std::string::npos ||
+            pathLower.find("\\appdata\\") != std::string::npos ||
+            pathLower.find("\\users\\public\\") != std::string::npos ||
+            pathLower.find("\\downloads\\") != std::string::npos ||
+            pathLower.find("\\desktop\\") != std::string::npos ||
+            pathLower.find("\\programdata\\") != std::string::npos;
+
+        if (isDriver) {
+            flags += " [KERNEL DRIVER]";
+            sev = DetectionSeverity::Critical;
+        }
+        if (isNonSystemPath) {
+            flags += " [NON-SYSTEM PATH — BYOVD RISK T1068]";
+            sev = DetectionSeverity::Critical;
+        }
+
+        // Known vulnerable driver names used in BYOVD attacks
+        static const char* kByovdDrivers[] = {
+            "dbutil_2_3.sys", "rtcore64.sys", "gdrv.sys",
+            "msio64.sys", "aswarpot.sys", "procexp152.sys",
+            "cpuz141.sys", "ene.sys", "asio.sys",
+            "bs_def64.sys", "zemana.sys", "echo_driver.sys",
+            "viragt64.sys", "amifldrv64.sys", "physmem.sys",
+            "inpoutx64.sys", "winio64.sys", "elrawdsk.sys",
+            "rw.sys", "hwrwdrv.sys",
+            nullptr
+        };
+
+        for (int i = 0; kByovdDrivers[i]; i++) {
+            if (pathLower.find(kByovdDrivers[i]) != std::string::npos) {
+                flags += " [KNOWN BYOVD: " + std::string(kByovdDrivers[i]) + "]";
+                sev = DetectionSeverity::Critical;
+                break;
+            }
+        }
+    }
+
+    std::string procName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(pid);
+        if (it != g_processCache.end()) procName = it->second.processName;
+    }
+    if (procName.empty()) procName = "code-integrity";
+
+    std::string ts = BuildTimestamp();
+    std::string pathInfo = filePath.empty() ? "" : " File=[" + filePath + "]";
+
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [*] [" + (sev >= DetectionSeverity::High ? "Critical" : "Warning") +
+        "] | " + ts +
+        " | " + procName +
+        " | Method: Code Integrity Violation (T1068)" +
+        " | EID " + std::to_string(eventId) + ": " + description +
+        pathInfo + flags;
+
+    std::string det = "Date & Time: " + ts +
+        " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: CodeIntegrity ETW Monitor" +
+        " | EventID: " + std::to_string(eventId) +
+        " | " + description + pathInfo + flags;
+
+    PushUiDetectionEvent(msg, det, "Method: Code Integrity Violation (T1068)",
+                         pid, sev);
+}
+
+static void CodeIntegritySubscriberThread() {
+    const wchar_t* kSessionName = L"NortonEDR-CodeIntegrity";
+    const size_t nameBufBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize  = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize  = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_ciSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_ciSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-CI] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_ciSessionHandle, &kCiProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_VERBOSE,
+        0xFFFFFFFFFFFFFFFF, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-CI] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_ciSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_ciSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-CI] Session started — monitoring code integrity violations\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName       = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                               PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = CodeIntegrityEventCallback;
+
+    g_ciTraceHandle = OpenTraceW(&logFile);
+    if (g_ciTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-CI] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_ciTraceHandle, 1, nullptr, nullptr);
+    g_ciTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopCodeIntegritySession() {
+    if (g_ciTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_ciTraceHandle);
+        g_ciTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_ciSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_ciSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_ciSessionHandle = 0;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // ETW session health watchdog.
 //
 // Monitors our real-time ETW sessions (ETW-TI, Kernel-Process) and all
@@ -4974,6 +6397,8 @@ static void EtwSessionWatchdogThread()
     // if attacker keeps killing sessions faster than we can restart)
     int tiRestarts  = 0, kpRestarts  = 0;
     int clrRestarts = 0, clrRdRestarts = 0;
+    int amsiRestarts = 0, ldapRestarts = 0, rpcRestarts = 0;
+    int ntlmRestarts = 0, apiAuditRestarts = 0, ciRestarts = 0;
 
     while (!g_etwWatchdogStop.load()) {
         Sleep(kCheckIntervalMs);
@@ -5068,6 +6493,36 @@ static void EtwSessionWatchdogThread()
             clrRdRestarts, L"NortonEDR-DotNETRundown", "ETW-CLR-Rundown",
             "pre-loaded assembly enumeration is BLIND",
             ClrRundownSubscriberThread);
+
+        CheckAndRestart(g_amsiSessionHandle, g_amsiTraceHandle,
+            amsiRestarts, L"NortonEDR-AMSI", "ETW-AMSI",
+            "AMSI script content capture is BLIND",
+            AmsiSubscriberThread);
+
+        CheckAndRestart(g_ldapSessionHandle, g_ldapTraceHandle,
+            ldapRestarts, L"NortonEDR-LDAP", "ETW-LDAP",
+            "LDAP query monitoring is BLIND",
+            LdapSubscriberThread);
+
+        CheckAndRestart(g_rpcSessionHandle, g_rpcTraceHandle,
+            rpcRestarts, L"NortonEDR-RPC", "ETW-RPC",
+            "RPC lateral movement detection is BLIND",
+            RpcSubscriberThread);
+
+        CheckAndRestart(g_ntlmSessionHandle, g_ntlmTraceHandle,
+            ntlmRestarts, L"NortonEDR-NTLM", "ETW-NTLM",
+            "NTLM authentication monitoring is BLIND",
+            NtlmSubscriberThread);
+
+        CheckAndRestart(g_apiAuditSessionHandle, g_apiAuditTraceHandle,
+            apiAuditRestarts, L"NortonEDR-ApiAudit", "ETW-ApiAudit",
+            "kernel API audit (OpenProcess) is BLIND",
+            ApiAuditSubscriberThread);
+
+        CheckAndRestart(g_ciSessionHandle, g_ciTraceHandle,
+            ciRestarts, L"NortonEDR-CodeIntegrity", "ETW-CI",
+            "code integrity/BYOVD detection is BLIND",
+            CodeIntegritySubscriberThread);
 
         // --- Coordinated kill correlation ---
         // 3+ session kills within 5 seconds = coordinated blinding attack
@@ -7109,6 +8564,12 @@ VOID ShowUI() {
     g_bitsStop      = false;
     g_clrStop       = false;
     g_clrRundownStop = false;
+    g_amsiStop      = false;
+    g_ldapStop      = false;
+    g_rpcStop       = false;
+    g_ntlmStop      = false;
+    g_apiAuditStop  = false;
+    g_ciStop        = false;
     std::thread sysmonThread(SysmonSubscriberThread);
     std::thread saclThread(SecurityAuditSubscriberThread);
     std::thread tiThread(EtwTiSubscriberThread);
@@ -7128,6 +8589,13 @@ VOID ShowUI() {
 
     std::thread clrThread(ClrSubscriberThread);
     std::thread clrRundownThread(ClrRundownSubscriberThread);
+
+    std::thread amsiThread(AmsiSubscriberThread);
+    std::thread ldapThread(LdapSubscriberThread);
+    std::thread rpcThread(RpcSubscriberThread);
+    std::thread ntlmThread(NtlmSubscriberThread);
+    std::thread apiAuditThread(ApiAuditSubscriberThread);
+    std::thread ciThread(CodeIntegritySubscriberThread);
 
     g_capaStop = false;
     std::thread capaWorker(CapaScanWorker);
@@ -7175,6 +8643,12 @@ VOID ShowUI() {
     g_wmiStop      = true;
     g_clrStop      = true;
     g_clrRundownStop = true;
+    g_amsiStop     = true;
+    g_ldapStop     = true;
+    g_rpcStop      = true;
+    g_ntlmStop     = true;
+    g_apiAuditStop = true;
+    g_ciStop       = true;
     sysmonThread.join();
     saclThread.join();
     psThread.join();
@@ -7194,6 +8668,24 @@ VOID ShowUI() {
 
     StopClrRundownSession();
     clrRundownThread.join();
+
+    StopAmsiSession();
+    amsiThread.join();
+
+    StopLdapSession();
+    ldapThread.join();
+
+    StopRpcSession();
+    rpcThread.join();
+
+    StopNtlmSession();
+    ntlmThread.join();
+
+    StopApiAuditSession();
+    apiAuditThread.join();
+
+    StopCodeIntegritySession();
+    ciThread.join();
 
     // ETW-TI: unblock ProcessTrace then join
     StopEtwTiSession();
