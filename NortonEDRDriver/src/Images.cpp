@@ -2754,10 +2754,11 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             // Inner try-except: exception during image processing
         }
+    }  // Close the outer __try block
 
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            DbgPrint("[-] Exception in ImageLoadNotifyRoutine\n");
-        }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] Exception in ImageLoadNotifyRoutine\n");
+    }
 
         // --- Phantom DLL detection: hash critical images for deferred re-verification ---
         if (ImageInfo->ImageBase && ImageInfo->ImageSize > 0 &&

@@ -1727,7 +1727,7 @@ VOID HookDetector::TakeCiBaseline() {
             if (!MmIsAddressValid(&sec[i])) break;
             if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
                 s_CiTextBase = (PVOID)((PUCHAR)ciBase + sec[i].VirtualAddress);
-                s_CiTextSize = sec[i].Misc.VirtualSize;
+                s_CiTextSize = *(PULONG)&sec[i].Misc;  // Access Misc union as VirtualSize
                 break;
             }
         }

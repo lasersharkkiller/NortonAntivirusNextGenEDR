@@ -4965,7 +4965,8 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreFsControl(
 
         // Determine reparse tag from the buffer if accessible
         const char* rpType = "reparse point";
-        PVOID sysBuf = Data->Iopb->Parameters.FileSystemControl.Common.SystemBuffer;
+        PVOID sysBuf = Data->Iopb->Parameters.FileSystemControl.Common.OutputBuffer;
+        if (!sysBuf) sysBuf = Data->Iopb->Parameters.FileSystemControl.Common.InputBuffer;
         if (sysBuf && MmIsAddressValid(sysBuf)) {
             REPARSE_DATA_BUFFER* rpBuf = (REPARSE_DATA_BUFFER*)sysBuf;
             if (rpBuf->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT)
