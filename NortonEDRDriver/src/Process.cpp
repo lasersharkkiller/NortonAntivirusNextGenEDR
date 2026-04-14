@@ -1325,6 +1325,84 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 		}
 
 		// -----------------------------------------------------------------------
+		// msxsl.exe execution detection — XSL script processing LOLBin (T1220).
+		//
+		// msxsl.exe is a legitimate Microsoft XML/XSL transform tool that can
+		// execute embedded JScript/VBScript via <msxsl:script>.  Attackers use
+		// it to run arbitrary code from local or remote XSL stylesheets, often
+		// to bypass application whitelisting (e.g. wmic /format:evil.xsl).
+		//
+		// msxsl.exe is almost never present on modern systems — any execution
+		// is highly suspicious.  Detect at process creation for coverage
+		// beyond command-line pattern matching (catches renamed binaries if
+		// ImageFileName still resolves to msxsl.exe).
+		// -----------------------------------------------------------------------
+		if (CreateInfo->ImageFileName &&
+			UnicodeStringContains(CreateInfo->ImageFileName, L"msxsl.exe"))
+		{
+			char* creatorName = PsGetProcessImageFileName(IoGetCurrentProcess());
+
+			char cmdBuf[200] = {};
+			if (CreateInfo->CommandLine && CreateInfo->CommandLine->Buffer &&
+				CreateInfo->CommandLine->Length > 0)
+			{
+				USHORT copyChars = min(
+					(USHORT)(CreateInfo->CommandLine->Length / sizeof(WCHAR)),
+					(USHORT)(sizeof(cmdBuf) - 1));
+				for (USHORT ci = 0; ci < copyChars; ci++) {
+					WCHAR wc = CreateInfo->CommandLine->Buffer[ci];
+					cmdBuf[ci] = (wc < 128) ? (char)wc : '?';
+				}
+			}
+
+			// Check for remote XSL (http/https/UNC) — extra dangerous
+			BOOLEAN hasRemote = FALSE;
+			if (cmdBuf[0]) {
+				char cmdLower[200];
+				for (int li = 0; li < 200; li++) {
+					cmdLower[li] = (cmdBuf[li] >= 'A' && cmdBuf[li] <= 'Z')
+						? (char)(cmdBuf[li] + 32) : cmdBuf[li];
+					if (cmdBuf[li] == 0) break;
+				}
+				if (strstr(cmdLower, "http://") || strstr(cmdLower, "https://") ||
+					strstr(cmdLower, "\\\\"))
+					hasRemote = TRUE;
+			}
+
+			char xslMsg[350];
+			RtlStringCbPrintfA(xslMsg, sizeof(xslMsg),
+				"XSL Script Processing LOLBin (T1220): msxsl.exe spawned by '%s' "
+				"(pid=%llu)%s — cmd: %.180s",
+				creatorName ? creatorName : "?",
+				(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+				hasRemote ? " [REMOTE XSL]" : "",
+				cmdBuf[0] ? cmdBuf : "<empty>");
+
+			PKERNEL_STRUCTURED_NOTIFICATION xslNotif =
+				(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'xsnt');
+			if (xslNotif) {
+				RtlZeroMemory(xslNotif, sizeof(*xslNotif));
+				SET_CRITICAL(*xslNotif);
+				SET_CALLING_PROC_PID_CHECK(*xslNotif);
+				xslNotif->isPath = FALSE;
+				xslNotif->pid = PsGetProcessId(Process);
+				if (creatorName) RtlCopyMemory(xslNotif->procName, creatorName, 14);
+				SIZE_T mLen = strlen(xslMsg) + 1;
+				xslNotif->msg = (char*)ExAllocatePool2(
+					POOL_FLAG_NON_PAGED, mLen, 'xsmg');
+				if (xslNotif->msg) {
+					RtlCopyMemory(xslNotif->msg, xslMsg, mLen);
+					xslNotif->bufSize = (ULONG)mLen;
+					if (!CallbackObjects::GetNotifQueue()->Enqueue(xslNotif)) {
+						ExFreePool(xslNotif->msg);
+						ExFreePool(xslNotif);
+					}
+				} else { ExFreePool(xslNotif); }
+			}
+		}
+
+		// -----------------------------------------------------------------------
 		// wbemtest.exe execution detection — alternative MOF compilation tool.
 		//
 		// wbemtest.exe is a graphical WMI testing tool that can compile MOF,
