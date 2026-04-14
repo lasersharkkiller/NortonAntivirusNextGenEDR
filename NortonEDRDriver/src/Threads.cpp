@@ -1,5 +1,21 @@
 #include "Globals.h"
 
+// PsGetThreadWin32StartAddress is undocumented; resolve dynamically
+typedef PVOID (*PsGetThreadWin32StartAddress_t)(PETHREAD Thread);
+static PsGetThreadWin32StartAddress_t g_pfnPsGetThreadWin32StartAddress = nullptr;
+
+static PVOID SafePsGetThreadWin32StartAddress(PETHREAD Thread) {
+    if (!g_pfnPsGetThreadWin32StartAddress) {
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&name, L"PsGetThreadWin32StartAddress");
+        g_pfnPsGetThreadWin32StartAddress =
+            (PsGetThreadWin32StartAddress_t)MmGetSystemRoutineAddress(&name);
+    }
+    if (g_pfnPsGetThreadWin32StartAddress)
+        return g_pfnPsGetThreadWin32StartAddress(Thread);
+    return nullptr;
+}
+
 BOOLEAN ThreadUtils::isThreadRemotelyCreated(HANDLE procId) {
 
 	if (PsGetCurrentProcessId() != procId) {
@@ -91,7 +107,7 @@ VOID ThreadUtils::CreateThreadNotifyRoutine(
 		// -----------------------------------------------------------------------
 		PEPROCESS creatorProcess = IoGetCurrentProcess();
 		if (eProcess != creatorProcess) {
-			PVOID startAddr = PsGetThreadWin32StartAddress(eThread);
+			PVOID startAddr = SafePsGetThreadWin32StartAddress(eThread);
 
 			char msg[220];
 			RtlStringCbPrintfA(msg, sizeof(msg),

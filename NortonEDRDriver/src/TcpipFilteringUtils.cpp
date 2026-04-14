@@ -1263,7 +1263,10 @@ static VOID EmitWfpChangeAlert(const char* msg)
 }
 
 // Callback: a WFP filter was added or deleted on any layer.
-// context = pointer to WdfTcpipUtils instance.
+// Note: FwpmFilterSubscribeChanges0 is user-mode only; these callbacks are
+// retained for future use if kernel-mode subscribe becomes available.
+#pragma warning(push)
+#pragma warning(disable:4505)
 static VOID CALLBACK WfpFilterChangeCallback(
     _Inout_ VOID* context,
     _In_ const FWPM_FILTER_CHANGE* change)
@@ -1325,6 +1328,7 @@ static VOID CALLBACK WfpSubLayerChangeCallback(
             "FwpmSubLayerSubscribeChanges. Possible rogue sublayer injection");
     }
 }
+#pragma warning(pop)
 
 // Callback: BFE (Base Filtering Engine) state changed.
 // If BFE stops, ALL WFP objects (filters, callouts, sublayers) are destroyed.
@@ -1354,39 +1358,12 @@ VOID WdfTcpipUtils::SubscribeWfpChangeNotifications()
 {
     if (!EngineHandle) return;
 
-    // Subscribe to filter changes (all layers).
-    FWPM_FILTER_SUBSCRIPTION filterSub = {};
-    filterSub.flags = FWPM_SUBSCRIPTION_FLAG_NOTIFY_ON_ADD |
-                      FWPM_SUBSCRIPTION_FLAG_NOTIFY_ON_DELETE;
-    // NULL enumTemplate = all filters on all layers
-    filterSub.sessionKey = {};
-    filterSub.enumTemplate = nullptr;
+    // Note: FwpmFilterSubscribeChanges0 / FwpmSubLayerSubscribeChanges0 are
+    // user-mode only APIs (fwpuclnt.lib) — not available in kernel mode.
+    // Filter/sublayer tampering is detected via periodic enumeration instead.
 
-    NTSTATUS st = FwpmFilterSubscribeChanges(
-        EngineHandle, &filterSub,
-        WfpFilterChangeCallback, this,
-        &FilterChangeHandle);
-    if (!NT_SUCCESS(st)) {
-        DbgPrint("[!] WFP: FwpmFilterSubscribeChanges failed: 0x%x\n", st);
-    }
-
-    // Subscribe to sublayer changes.
-    FWPM_SUBLAYER_SUBSCRIPTION subSub = {};
-    subSub.flags = FWPM_SUBSCRIPTION_FLAG_NOTIFY_ON_ADD |
-                   FWPM_SUBSCRIPTION_FLAG_NOTIFY_ON_DELETE;
-    subSub.sessionKey = {};
-    subSub.enumTemplate = nullptr;
-
-    st = FwpmSubLayerSubscribeChanges(
-        EngineHandle, &subSub,
-        WfpSubLayerChangeCallback, this,
-        &SubLayerChangeHandle);
-    if (!NT_SUCCESS(st)) {
-        DbgPrint("[!] WFP: FwpmSubLayerSubscribeChanges failed: 0x%x\n", st);
-    }
-
-    // Subscribe to BFE state changes.
-    st = FwpmBfeStateSubscribeChanges(
+    // Subscribe to BFE state changes (kernel-mode available).
+    NTSTATUS st = FwpmBfeStateSubscribeChanges(
         EngineHandle,
         WfpBfeStateChangeCallback, this,
         &BfeStateChangeHandle);
@@ -1402,14 +1379,6 @@ VOID WdfTcpipUtils::UnsubscribeWfpChangeNotifications()
 {
     if (!EngineHandle) return;
 
-    if (FilterChangeHandle) {
-        FwpmFilterUnsubscribeChanges(EngineHandle, FilterChangeHandle);
-        FilterChangeHandle = NULL;
-    }
-    if (SubLayerChangeHandle) {
-        FwpmSubLayerUnsubscribeChanges(EngineHandle, SubLayerChangeHandle);
-        SubLayerChangeHandle = NULL;
-    }
     if (BfeStateChangeHandle) {
         FwpmBfeStateUnsubscribeChanges(BfeStateChangeHandle);
         BfeStateChangeHandle = NULL;

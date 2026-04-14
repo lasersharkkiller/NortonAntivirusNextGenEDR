@@ -14,6 +14,9 @@
 #include <wdf.h>
 #include <wdmsec.h>    // IoCreateDeviceSecure, SDDL_DEVOBJ_SYS_ALL_ADM_ALL
 
+// Required when floating-point code is used in kernel mode
+extern "C" int _fltused = 0;
+
 PDEVICE_OBJECT DeviceObject = NULL;
 PDEVICE_OBJECT g_DeviceObject = nullptr;  // exposed for IoAllocateWorkItem (phantom DLL, inject timer)
 

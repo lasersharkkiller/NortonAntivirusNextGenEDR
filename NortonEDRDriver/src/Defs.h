@@ -80,9 +80,8 @@ extern "C" HANDLE PsGetProcessInheritedFromUniqueProcessId(
 	PEPROCESS Process
 );
 
-extern "C" PVOID PsGetThreadWin32StartAddress(
-	PETHREAD Thread
-);
+// PsGetThreadWin32StartAddress — undocumented, resolved dynamically
+// via MmGetSystemRoutineAddress in Threads.cpp
 
 extern "C" NTKERNELAPI POBJECT_TYPE MmSectionObjectType;
 
@@ -181,24 +180,6 @@ DEFINE_GUID(GUID_DEVINTERFACE_1394_LOCAL,
 // WFP (Windows Filtering Platform) kernel-mode function declarations
 // ---------------------------------------------------------------------------
 
-extern "C" NTSTATUS FwpmFilterSubscribeChanges(
-    HANDLE engineHandle,
-    const FWPM_FILTER_SUBSCRIPTION0* subscription,
-    void* callback,
-    void* context,
-    HANDLE* changeHandle);
-
-extern "C" NTSTATUS FwpmSubLayerSubscribeChanges(
-    HANDLE engineHandle,
-    const FWPM_SUBLAYER_SUBSCRIPTION0* subscription,
-    void* callback,
-    void* context,
-    HANDLE* changeHandle);
-
-extern "C" NTSTATUS FwpmFilterUnsubscribeChanges(
-    HANDLE engineHandle,
-    HANDLE changeHandle);
-
-extern "C" NTSTATUS FwpmSubLayerUnsubscribeChanges(
-    HANDLE engineHandle,
-    HANDLE changeHandle);
+// Note: FwpmFilterSubscribeChanges0 and FwpmSubLayerSubscribeChanges0 are
+// user-mode only (fwpuclnt.lib). Not available in kernel-mode fwpmk.
+// Use FwpmBfeStateSubscribeChanges0 for kernel-mode state monitoring.

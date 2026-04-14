@@ -37,6 +37,14 @@
 */
 
 #include "Globals.h"
+#include <initguid.h>  // Required before wdmguid.h for DEFINE_GUID to emit storage
+#include <wdmguid.h>   // GUID_DEVICE_INTERFACE_ARRIVAL
+
+// Use DevicePropertyRemovalPolicy (0x13) to check if device is removable.
+// CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL = 1 means non-removable.
+#ifndef CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL
+#define CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL 1
+#endif
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -136,16 +144,16 @@ static BOOLEAN IsRemovableDisk(const UNICODE_STRING* symLink)
     PDEVICE_OBJECT pdo = IoGetDeviceAttachmentBaseRef(devObj);
     if (!pdo) return FALSE;
 
-    ULONG removable = 0;
+    ULONG removalPolicy = 0;
     ULONG resultLen = 0;
     s = IoGetDeviceProperty(pdo,
-        DevicePropertyRemovable,
-        sizeof(removable), &removable, &resultLen);
+        DevicePropertyRemovalPolicy,
+        sizeof(removalPolicy), &removalPolicy, &resultLen);
 
     ObDereferenceObject(pdo);
 
     if (!NT_SUCCESS(s)) return FALSE;
-    return (removable != 0);
+    return (removalPolicy != CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL);
 }
 
 // ---------------------------------------------------------------------------

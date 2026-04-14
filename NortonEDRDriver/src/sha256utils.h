@@ -8,10 +8,11 @@ typedef unsigned long DWORD;
 
 #define SHA256_BLOCK_SIZE 32
 
-void SHA256Transform(UINT32 state[8], const BYTE buffer[64]);
-void SHA256Init(SHA256_CTX* context);
-void SHA256Update(SHA256_CTX* context, const BYTE* data, size_t len);
-void SHA256Final(BYTE digest[SHA256_BLOCK_SIZE], SHA256_CTX* context);
+static void SHA256Transform(UINT32 state[8], const BYTE buffer[64]);
+static void SHA256Init(SHA256_CTX* context);
+static void SHA256Update(SHA256_CTX* context, const BYTE* data, size_t len);
+static void SHA256Final(BYTE digest[SHA256_BLOCK_SIZE], SHA256_CTX* context);
+static bool IsSHA256Hash(const char* str);
 
 #define ROTATE_RIGHT(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 #define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
@@ -40,7 +41,7 @@ static const UINT32 k[64] = {
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 };
 
-void SHA256Transform(UINT32 state[8], const BYTE buffer[64]) {
+static void SHA256Transform(UINT32 state[8], const BYTE buffer[64]) {
     UINT32 a, b, c, d, e, f, g, h, t1, t2, m[64];
     int i, j;
 
@@ -81,7 +82,7 @@ void SHA256Transform(UINT32 state[8], const BYTE buffer[64]) {
     state[7] += h;
 }
 
-void SHA256Init(SHA256_CTX* context) {
+static void SHA256Init(SHA256_CTX* context) {
     context->count[0] = context->count[1] = 0;
     context->state[0] = 0x6a09e667;
     context->state[1] = 0xbb67ae85;
@@ -93,7 +94,7 @@ void SHA256Init(SHA256_CTX* context) {
     context->state[7] = 0x5be0cd19;
 }
 
-void SHA256Update(SHA256_CTX* context, const BYTE* data, size_t len) {
+static void SHA256Update(SHA256_CTX* context, const BYTE* data, size_t len) {
     UINT32 i, index, partLen;
 
     index = (UINT32)((context->count[1] >> 3) & 0x3F);
@@ -121,7 +122,7 @@ void SHA256Update(SHA256_CTX* context, const BYTE* data, size_t len) {
 
 static const BYTE PADDING[64] = { 0x80 };
 
-void SHA256Final(BYTE digest[SHA256_BLOCK_SIZE], SHA256_CTX* context) {
+static void SHA256Final(BYTE digest[SHA256_BLOCK_SIZE], SHA256_CTX* context) {
     BYTE bits[8];
     UINT32 index, padLen;
 
@@ -147,7 +148,9 @@ void SHA256Final(BYTE digest[SHA256_BLOCK_SIZE], SHA256_CTX* context) {
     }
 }
 
-bool IsSHA256Hash(const char* str) {
+#pragma warning(push)
+#pragma warning(disable:4505)
+static bool IsSHA256Hash(const char* str) {
 
     if (str == NULL) {
         return false;
@@ -166,3 +169,4 @@ bool IsSHA256Hash(const char* str) {
 
     return true;
 }
+#pragma warning(pop)

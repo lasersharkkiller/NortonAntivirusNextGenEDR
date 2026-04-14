@@ -28,6 +28,11 @@
 
 #include "Globals.h"
 
+// SYSTEM_INFORMATION_CLASS enum values used by ZwQuerySystemInformation
+#ifndef SystemProcessInformation
+#define SystemProcessInformation 5
+#endif
+
 // ---------------------------------------------------------------------------
 // Module-level state
 // ---------------------------------------------------------------------------
@@ -596,7 +601,7 @@ static VOID CheckEprocessTokenIntegrity()
         if (!buf) return;
 
         NTSTATUS s = ZwQuerySystemInformation(
-            (SYSTEM_INFORMATION_CLASS)5, buf, bufSize, &bufSize);
+            SystemProcessInformation, buf, bufSize, &bufSize);
         if (!NT_SUCCESS(s)) {
             ExFreePool(buf);
             return;

@@ -38,16 +38,12 @@
 
 #include "Globals.h"
 
-// PsReferenceImpersonationToken — ntoskrnl export.
-// Returns the impersonation token for a thread (or NULL if not impersonating).
-// Caller must dereference via PsDereferenceImpersonationToken.
-extern "C" PACCESS_TOKEN PsReferenceImpersonationToken(
-    _In_  PETHREAD                      Thread,
-    _Out_ PBOOLEAN                      CopyOnOpen,
-    _Out_ PBOOLEAN                      EffectiveOnly,
-    _Out_ PSECURITY_IMPERSONATION_LEVEL ImpersonationLevel);
+// PsReferenceImpersonationToken and PsDereferenceImpersonationToken are
+// already declared in ntifs.h (included via Globals.h).
 
-extern "C" VOID PsDereferenceImpersonationToken(_In_ PACCESS_TOKEN ImpersonationToken);
+#ifndef SystemProcessInformation
+#define SystemProcessInformation 5
+#endif
 
 // ---------------------------------------------------------------------------
 // Notification helper
@@ -194,7 +190,7 @@ static NTSTATUS NTAPI LogonSessionTerminatedCallback(_In_ PLUID LogonId)
     if (!buf) return STATUS_SUCCESS;
 
     NTSTATUS s = ZwQuerySystemInformation(
-        (SYSTEM_INFORMATION_CLASS)5,   // SystemProcessInformation
+        SystemProcessInformation,
         buf, bufSize, &bufSize);
 
     if (!NT_SUCCESS(s)) {
