@@ -457,7 +457,8 @@ typedef struct _PEB {
     BYTE                          Reserved1[2];
     BYTE                          BeingDebugged;
     BYTE                          Reserved2[1];
-    PVOID                         Reserved3[2];
+    HANDLE                        Mutant;
+    PVOID                         ImageBaseAddress;
     PPEB_LDR_DATA                 Ldr;
     PRTL_USER_PROCESS_PARAMETERS  ProcessParameters;
     PVOID                         Reserved4[3];

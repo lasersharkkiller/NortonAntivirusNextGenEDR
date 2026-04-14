@@ -298,17 +298,17 @@ static const char* IdToName(ULONG id) {
 	if (id == 0x0050) return "NtProtectVirtualMemory";
 	if (id == 0x0054) return "NtReadVirtualMemory";
 	if (id == 0x0045) return "NtQueueApcThread";
-	if (id == NtQueueApcThreadExId) return "NtQueueApcThreadEx";
-	if (id == NtSetContextThreadId) return "NtSetContextThread";
-	if (id == NtOpenProcessId) return "NtOpenProcess";
-	if (id == NtMapViewOfSectionId) return "NtMapViewOfSection";
-	if (id == NtDuplicateObjectId) return "NtDuplicateObject";
-	if (id == NtDebugActiveProcessId) return "NtDebugActiveProcess";
-	if (id == NtResumeThreadId) return "NtResumeThread";
-	if (id == NtContinueId) return "NtContinue";
-	if (NtContinueEx != 0 && id == NtContinueEx) return "NtContinueEx";
-	if (id == NtCreateThreadExId) return "NtCreateThreadEx";
-	if (id == NtOpenThreadId) return "NtOpenThread";
+	if (id == SyscallsUtils::NtQueueApcThreadExId) return "NtQueueApcThreadEx";
+	if (id == SyscallsUtils::NtSetContextThreadId) return "NtSetContextThread";
+	if (id == SyscallsUtils::NtOpenProcessId) return "NtOpenProcess";
+	if (id == SyscallsUtils::NtMapViewOfSectionId) return "NtMapViewOfSection";
+	if (id == SyscallsUtils::NtDuplicateObjectId) return "NtDuplicateObject";
+	if (id == SyscallsUtils::NtDebugActiveProcessId) return "NtDebugActiveProcess";
+	if (id == SyscallsUtils::NtResumeThreadId) return "NtResumeThread";
+	if (id == SyscallsUtils::NtContinueId) return "NtContinue";
+	if (SyscallsUtils::NtContinueEx != 0 && id == SyscallsUtils::NtContinueEx) return "NtContinueEx";
+	if (id == SyscallsUtils::NtCreateThreadExId) return "NtCreateThreadEx";
+	if (id == SyscallsUtils::NtOpenThreadId) return "NtOpenThread";
 	return "Unknown";
 }
 
@@ -1309,6 +1309,11 @@ VOID SyscallsUtils::InitSsdtTable(PSSDT_TABLE table) {
 	ssdtTable = table;
 }
 
+// Function pointer for MmGetFileNameForSection — resolved once in InitIds().
+// Signature: returns allocated OBJECT_NAME_INFORMATION; caller frees with ExFreePool.
+typedef NTSTATUS (*pfnMmGetFileNameForSection)(PVOID Section, POBJECT_NAME_INFORMATION* FileName);
+static pfnMmGetFileNameForSection g_MmGetFileNameForSection = nullptr;
+
 VOID SyscallsUtils::InitIds() {
 
 	UNICODE_STRING usNtAllocateVirtualMemory;
@@ -1476,11 +1481,6 @@ VOID SyscallsUtils::InitIds() {
 	g_MmGetFileNameForSection = (pfnMmGetFileNameForSection)
 	    MmGetSystemRoutineAddress(&usMmGetFileName);
 }
-
-// Function pointer for MmGetFileNameForSection — resolved once in InitIds().
-// Signature: returns allocated OBJECT_NAME_INFORMATION; caller frees with ExFreePool.
-typedef NTSTATUS (*pfnMmGetFileNameForSection)(PVOID Section, POBJECT_NAME_INFORMATION* FileName);
-static pfnMmGetFileNameForSection g_MmGetFileNameForSection = nullptr;
 
 // ---------------------------------------------------------------------------
 // Private helper — allocates and enqueues a KERNEL_STRUCTURED_NOTIFICATION
@@ -3122,7 +3122,7 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 		// PPL-strip detection
 		if (target) {
 			char targetName[15] = {};
-			PUCHAR imgName = PsGetProcessImageFileName(target);
+			char* imgName = PsGetProcessImageFileName(target);
 			if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
 
 			RtlStringCbPrintfA(msg, sizeof(msg),
@@ -3161,7 +3161,7 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 		if (isSigPolicy || isDynPolicy) {
 			char targetName[15] = {};
 			if (target) {
-				PUCHAR imgName = PsGetProcessImageFileName(target);
+				char* imgName = PsGetProcessImageFileName(target);
 				if (imgName) RtlCopyMemory(targetName, imgName,
 					min(strlen((char*)imgName), 14u));
 			}
@@ -3191,7 +3191,7 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 		// Any non-SYSTEM, non-PPL caller doing this is highly suspicious.
 		char targetName[15] = {};
 		if (target) {
-			PUCHAR imgName = PsGetProcessImageFileName(target);
+			char* imgName = PsGetProcessImageFileName(target);
 			if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
 		}
 
@@ -3226,7 +3226,7 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 
 		char targetName[15] = {};
 		if (target) {
-			PUCHAR imgName = PsGetProcessImageFileName(target);
+			char* imgName = PsGetProcessImageFileName(target);
 			if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
 		}
 
@@ -3276,7 +3276,7 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 		// ScareCrow uses this for anti-analysis evasion.
 		char targetName[15] = {};
 		if (target) {
-			PUCHAR imgName = PsGetProcessImageFileName(target);
+			char* imgName = PsGetProcessImageFileName(target);
 			if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
 		}
 
@@ -3295,7 +3295,7 @@ VOID SyscallsUtils::NtSetInformationProcessHandler(
 		// or to detach a debugger from a protected process.
 		char targetName[15] = {};
 		if (target) {
-			PUCHAR imgName = PsGetProcessImageFileName(target);
+			char* imgName = PsGetProcessImageFileName(target);
 			if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
 		}
 
@@ -3504,7 +3504,7 @@ VOID SyscallsUtils::NtSetInformationThreadHandler(
 	ULONG privSize = 0;
 
 	__try {
-		st = SeQueryInformationToken(token, TokenPrivileges, &privs);
+		st = SeQueryInformationToken(token, TokenPrivileges, (PVOID*)&privs);
 		if (NT_SUCCESS(st) && privs) {
 			BOOLEAN hasDebugPriv = FALSE, hasTcbPriv = FALSE, hasImpersonatePriv = FALSE;
 
@@ -3607,7 +3607,7 @@ VOID SyscallsUtils::NtOpenProcessTokenExHandler(
 
 	if (isSensitive || isLsass || isSystem) {
 		char targetName[15] = {};
-		PUCHAR imgName = PsGetProcessImageFileName(target);
+		char* imgName = PsGetProcessImageFileName(target);
 		if (imgName) RtlCopyMemory(targetName, imgName, min(strlen((char*)imgName), 14u));
 
 		char msg[256];
@@ -5417,7 +5417,6 @@ VOID SyscallsUtils::NtProtectVirtualMemoryHandler(
 				// allocation base and flag ntdll + amsi targeting specifically.
 				__try {
 					// Query the file name backing this image section
-					MEMORY_SECTION_NAME sectionName;
 					BYTE nameBuffer[512] = {};
 					NTSTATUS ns = ZwQueryVirtualMemory(
 						NtCurrentProcess(), base,

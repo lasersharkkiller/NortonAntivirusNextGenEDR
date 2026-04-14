@@ -1,5 +1,8 @@
 #include "Globals.h"
 
+// Forward declarations
+static VOID EmitWfpChangeAlert(const char* msg);
+
 // ---------------------------------------------------------------------------
 // Kerberoasting / DCSync rate-tracking table.
 //
@@ -1271,7 +1274,7 @@ static VOID CALLBACK WfpFilterChangeCallback(
     // If it's our own filter being deleted (caught more precisely in CheckIntegrity),
     // emit an immediate alert — don't wait for the 30s poll.
     if (change->changeType == FWPM_CHANGE_DELETE &&
-        change->filterId == wfp->FilterId) {
+        change->filterId == wfp->GetFilterId()) {
         EmitWfpChangeAlert(
             "WFP TAMPER REALTIME: NortonEDR filter DELETED — immediate "
             "detection via FwpmFilterSubscribeChanges (attacker used "
@@ -1284,7 +1287,7 @@ static VOID CALLBACK WfpFilterChangeCallback(
     // weight, action type, EDR targeting).  This callback provides the
     // real-time alert so the attacker can't add-and-remove within the gap.
     if (change->changeType == FWPM_CHANGE_ADD &&
-        change->filterId != wfp->FilterId) {
+        change->filterId != wfp->GetFilterId()) {
         char msg[300];
         RtlStringCbPrintfA(msg, sizeof(msg),
             "WFP CHANGE: new filter added (id=%llu) — real-time detection. "

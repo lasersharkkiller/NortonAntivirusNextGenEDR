@@ -377,6 +377,10 @@ class WdfTcpipUtils {
 
 public:
 
+	// Public accessor for FilterId — used in change notification
+	UINT64 GetFilterId() const { return FilterId; }
+	UINT64 GetFilterIdV6() const { return FilterIdV6; }
+
 	NTSTATUS InitWfp();
 	NTSTATUS WfpAddSubLayer();
 	NTSTATUS WfpAddFilter();
@@ -861,12 +865,12 @@ public:
 		char*
 	);
 
-	BOOLEAN isSyscallIndirect(
+	static BOOLEAN isSyscallIndirect(
 		ULONG64
 	);
 
 	// Call stack spoofing detection — non-CET frame chain validation
-	BOOLEAN isCallStackSpoofed(
+	static BOOLEAN isCallStackSpoofed(
 		ULONG64
 	);
 

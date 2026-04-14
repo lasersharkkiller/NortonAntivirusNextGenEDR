@@ -80,6 +80,12 @@ extern "C" HANDLE PsGetProcessInheritedFromUniqueProcessId(
 	PEPROCESS Process
 );
 
+extern "C" PVOID PsGetThreadWin32StartAddress(
+	PETHREAD Thread
+);
+
+extern "C" NTKERNELAPI POBJECT_TYPE MmSectionObjectType;
+
 // ---------------------------------------------------------------------------
 // Token / logon-session APIs (used by TokenMonitor)
 // ---------------------------------------------------------------------------

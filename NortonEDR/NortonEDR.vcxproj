@@ -83,7 +83,7 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <LibraryPath>$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64);D:\NortonEDR\NortonEDR\vcpkg\installed\x64-windows\lib</LibraryPath>
+    <LibraryPath>$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64);D:\githubProjects\NortonEDR\NortonEDR\vcpkg\installed\x64-windows\lib</LibraryPath>
     <TargetName>nortonav</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
@@ -121,12 +121,12 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\10.0.26100.0\km;$(WindowsSdkDir)Include\10.0.26100.0\um;$(WindowsSdkDir)Include\10.0.26100.0\ucrt;$(WindowsSdkDir)Include\10.0.26100.0\winrt;$(WindowsSdkDir)Include\10.0.26100.0\shared;D:\NortonEDR\NortonEDR\vcpkg\installed\x64-windows\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\10.0.26100.0\km;$(WindowsSdkDir)Include\10.0.26100.0\um;$(WindowsSdkDir)Include\10.0.26100.0\ucrt;$(WindowsSdkDir)Include\10.0.26100.0\winrt;$(WindowsSdkDir)Include\10.0.26100.0\shared;D:\githubProjects\NortonEDR\NortonEDR\vcpkg\installed\x64-windows\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(WindowsSdkDir)Lib\10.0.26100.0\um\x64;$(WindowsSdkDir)Lib\10.0.26100.0\km\x64;$(WindowsSdkDir)Lib\10.0.26100.0\ucrt\x64;D:\NortonEDR\NortonEDR\vcpkg\installed\x64-windows\debug\lib</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(WindowsSdkDir)Lib\10.0.26100.0\um\x64;$(WindowsSdkDir)Lib\10.0.26100.0\km\x64;$(WindowsSdkDir)Lib\10.0.26100.0\ucrt\x64;D:\githubProjects\NortonEDR\NortonEDR\vcpkg\installed\x64-windows\debug\lib</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -137,7 +137,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\10.0.26100.0\um;$(WindowsSdkDir)Include\10.0.26100.0\ucrt;$(WindowsSdkDir)Include\10.0.26100.0\shared;D:\NortonEDR\NortonEDR\vcpkg\installed\x64-windows\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\10.0.26100.0\um;$(WindowsSdkDir)Include\10.0.26100.0\ucrt;$(WindowsSdkDir)Include\10.0.26100.0\shared;D:\githubProjects\NortonEDR\NortonEDR\vcpkg\installed\x64-windows\include</AdditionalIncludeDirectories>
       <BufferSecurityCheck>false</BufferSecurityCheck>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
@@ -146,7 +146,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(WindowsSdkDir)Lib\10.0.26100.0\um\x64;$(WindowsSdkDir)Lib\10.0.26100.0\ucrt\x64;D:\NortonEDR\NortonEDR\vcpkg\installed\x64-windows\lib</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(WindowsSdkDir)Lib\10.0.26100.0\um\x64;$(WindowsSdkDir)Lib\10.0.26100.0\ucrt\x64;D:\githubProjects\NortonEDR\NortonEDR\vcpkg\installed\x64-windows\lib</AdditionalLibraryDirectories>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
     <PreBuildEvent>
