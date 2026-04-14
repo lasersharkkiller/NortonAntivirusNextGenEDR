@@ -741,6 +741,7 @@ static VOID IntegrityDpc(
 
     // Use compare-exchange so we never queue two concurrent work items.
     if (InterlockedCompareExchange(&s_WorkPending, 1, 0) == 0) {
+#pragma warning(suppress:4996) // ExQueueWorkItem deprecated but IoQueueWorkItem needs DEVICE_OBJECT
         ExQueueWorkItem(&s_IntegrityWork, DelayedWorkQueue);
     }
 }
@@ -763,6 +764,7 @@ VOID AntiTamper::Init(PDRIVER_OBJECT driverObject, BufferQueue* queue)
     ObReferenceObject(driverObject);
 
     // Set up the periodic work machinery.
+#pragma warning(suppress:4996) // ExInitializeWorkItem deprecated but IoAllocateWorkItem needs DEVICE_OBJECT
     ExInitializeWorkItem(&s_IntegrityWork, IntegrityWorkRoutine, nullptr);
     KeInitializeDpc(&s_IntegrityDpc, IntegrityDpc, nullptr);
     KeInitializeTimer(&s_IntegrityTimer);
