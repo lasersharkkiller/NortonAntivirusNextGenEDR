@@ -88,6 +88,14 @@ static const WCHAR* kPersistencePaths[] = {
     // DISABLEWINDOWFILTERING).  Can be abused for privilege/protection bypass.
     L"\\AppCompatFlags\\Layers",
 
+    // --- T1546.002: Screensaver hijack persistence ---
+    // Adversaries set SCRNSAVE.EXE to a malicious binary in
+    // HKCU\Control Panel\Desktop.  The screensaver runs automatically after
+    // the idle timeout, executing the payload with user-level privileges.
+    L"\\Control Panel\\Desktop\\SCRNSAVE.EXE",
+    L"\\Control Panel\\Desktop\\ScreenSaveActive",
+    L"\\Control Panel\\Desktop\\ScreenSaveTimeOut",
+
     // --- T1562.002: ETW AutoLogger persistence tampering ---
     // AutoLoggers start ETW sessions at boot.  Deleting or modifying these keys
     // prevents security-critical ETW sessions (Sysmon, Defender, EDR) from starting.
@@ -117,6 +125,9 @@ static const BOOLEAN kPersistenceCritical[] = {
     TRUE,                              // AppCompatFlags\Custom — Critical (T1546.011)
     TRUE,                              // AppCompatFlags\InstalledSDB — Critical (T1546.011)
     TRUE,                              // AppCompatFlags\Layers — Critical (T1546.011)
+    TRUE,                              // Screensaver SCRNSAVE.EXE — Critical (T1546.002)
+    FALSE,                             // ScreenSaveActive — Warning (T1546.002)
+    FALSE,                             // ScreenSaveTimeOut — Warning (T1546.002)
     TRUE,                              // ETW AutoLogger — Critical (T1562.002)
 };
 

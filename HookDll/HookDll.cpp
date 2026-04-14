@@ -638,6 +638,28 @@ static CriticalFuncGuard g_etwGuards[] = {
     { "ntdll.dll",    "EtwEventUnregister", nullptr, {}, false },
     { "ntdll.dll",    "EtwEventWriteTransfer", nullptr, {}, false },
     { "ntdll.dll",    "EtwEventWriteNoRegistration", nullptr, {}, false },
+    // ETW controller APIs — patching these prevents session management.
+    // advapi32.dll exports (forwarded to sechost.dll on Win10 1709+)
+    { "advapi32.dll", "StartTraceW",           nullptr, {}, false },
+    { "advapi32.dll", "ControlTraceW",         nullptr, {}, false },
+    { "advapi32.dll", "EnableTraceEx2",        nullptr, {}, false },
+    { "advapi32.dll", "OpenTraceW",            nullptr, {}, false },
+    { "advapi32.dll", "ProcessTrace",          nullptr, {}, false },
+    { "advapi32.dll", "CloseTrace",            nullptr, {}, false },
+    { "advapi32.dll", "QueryAllTracesW",       nullptr, {}, false },
+    { "advapi32.dll", "EnumerateTraceGuidsEx", nullptr, {}, false },
+    { "advapi32.dll", "StopTraceW",            nullptr, {}, false },
+    // sechost.dll — Win10 1709+ real implementation (advapi32 forwards here).
+    // Monitor both layers so patching either is detected.
+    { "sechost.dll",  "StartTraceW",           nullptr, {}, false },
+    { "sechost.dll",  "ControlTraceW",         nullptr, {}, false },
+    { "sechost.dll",  "EnableTraceEx2",        nullptr, {}, false },
+    { "sechost.dll",  "OpenTraceW",            nullptr, {}, false },
+    { "sechost.dll",  "ProcessTrace",          nullptr, {}, false },
+    { "sechost.dll",  "CloseTrace",            nullptr, {}, false },
+    { "sechost.dll",  "QueryAllTracesW",       nullptr, {}, false },
+    { "sechost.dll",  "EnumerateTraceGuidsEx", nullptr, {}, false },
+    { "sechost.dll",  "StopTraceW",            nullptr, {}, false },
     // Mimikatz crypto::capi / crypto::cng patches these to force-export
     // non-exportable private keys (CRYPT_EXPORTABLE flag bypass).
     { "ncrypt.dll", "NCryptOpenStorageProvider", nullptr, {}, false },

@@ -3739,7 +3739,7 @@ static DWORD WINAPI SysmonEventCallback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
                              pid, DetectionSeverity::Critical);
     }
     else if (eid == 22) {
-        // DNS Query — flag suspiciously long first labels (DGA heuristic)
+        // DNS Query — DGA detection via label length + Shannon entropy (T1568.002)
         std::string image  = XmlFieldValue(xml, L"Image");
         std::string query  = XmlFieldValue(xml, L"QueryName");
         std::string pidStr = XmlFieldValue(xml, L"ProcessId");
@@ -3747,7 +3747,34 @@ static DWORD WINAPI SysmonEventCallback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
         try { pid = static_cast<UINT32>(std::stoul(pidStr)); } catch (...) {}
 
         std::string firstLabel = query.substr(0, query.find('.'));
-        if (firstLabel.size() <= 20) return ERROR_SUCCESS;
+        if (firstLabel.size() <= 12) return ERROR_SUCCESS;
+
+        // Compute Shannon entropy of the first label to distinguish DGA
+        // from legitimate long subdomains (CDNs, Azure, etc.)
+        int freq[256] = {};
+        for (char c : firstLabel) freq[(unsigned char)c]++;
+        double entropy = 0.0;
+        for (int i = 0; i < 256; i++) {
+            if (freq[i] == 0) continue;
+            double p = (double)freq[i] / (double)firstLabel.size();
+            entropy -= p * log2(p);
+        }
+
+        // DGA domains typically have entropy > 3.0 bits/char with long labels
+        // Legitimate domains (e.g., "microsoftedge-update") have lower entropy
+        DetectionSeverity sev = DetectionSeverity::Low;
+        std::string dgaNote = "long label";
+        if (firstLabel.size() > 20 && entropy > 3.0) {
+            sev = DetectionSeverity::Warning;
+            dgaNote = "possible DGA (T1568.002)";
+        }
+        if (firstLabel.size() > 30 && entropy > 3.5) {
+            sev = DetectionSeverity::Critical;
+            dgaNote = "likely DGA / DNS tunnel (T1568.002)";
+        }
+
+        if (sev == DetectionSeverity::Low && firstLabel.size() <= 20)
+            return ERROR_SUCCESS;
 
         std::string ts  = BuildTimestamp();
         std::string img = image.substr(image.rfind('\\') + 1);
@@ -3757,10 +3784,13 @@ static DWORD WINAPI SysmonEventCallback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
         std::string det = "Date & Time: " + ts +
             " | PID: " + pidStr +
             " | Image: " + image +
-            " | DNS query: " + query + " (long label - possible DGA)";
+            " | DNS query: " + query +
+            " | FirstLabel: " + std::to_string(firstLabel.size()) + " chars"
+            " | Entropy: " + std::to_string(entropy).substr(0, 4) +
+            " | " + dgaNote;
 
-        PushUiDetectionEvent(msg, det, "Method: Sysmon EID 22 (Suspicious DNS Query)",
-                             pid, DetectionSeverity::Low);
+        PushUiDetectionEvent(msg, det, "Method: Sysmon EID 22 (DGA/DNS Query)",
+                             pid, sev);
     }
 
     return ERROR_SUCCESS;
@@ -4464,6 +4494,79 @@ static void EtwSessionWatchdogThread()
                 s.stop = true;  // prevent repeated alerts
             }
         }
+
+        // --- Check for rogue ETW sessions / session count anomaly ---
+        // Attackers create rogue sessions targeting our provider GUIDs to
+        // exhaust the 8-session-per-provider limit, or create sessions with
+        // our session names to hijack control.  QueryAllTracesW enumerates
+        // all running sessions; a sudden spike suggests session flooding.
+        {
+            static ULONG s_lastSessionCount = 0;
+            static bool  s_baselineTaken = false;
+
+            PEVENT_TRACE_PROPERTIES propArr[64] = {};
+            ULONG sessionCount = 0;
+            // Allocate minimal props for each slot
+            char propBufs[64][sizeof(EVENT_TRACE_PROPERTIES) + 256] = {};
+            for (int i = 0; i < 64; i++) {
+                propArr[i] = reinterpret_cast<PEVENT_TRACE_PROPERTIES>(&propBufs[i]);
+                propArr[i]->Wnode.BufferSize = sizeof(EVENT_TRACE_PROPERTIES) + 256;
+                propArr[i]->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+            }
+
+            ULONG st = QueryAllTracesW(propArr, 64, &sessionCount);
+            if (st == ERROR_SUCCESS) {
+                if (!s_baselineTaken) {
+                    s_lastSessionCount = sessionCount;
+                    s_baselineTaken = true;
+                } else if (sessionCount > s_lastSessionCount + 4) {
+                    // 4+ new sessions since last check — possible session flood
+                    std::string msg = std::to_string(tab_1_menu_items.size()) +
+                        " - [*] [Critical] | " + ts +
+                        " | ETW-Watchdog | Method: ETW Session Integrity"
+                        " | ETW session count spike: " +
+                        std::to_string(s_lastSessionCount) + " -> " +
+                        std::to_string(sessionCount) +
+                        " — possible rogue session flooding / provider slot "
+                        "exhaustion attack (T1562.002)";
+                    std::string det = "Date & Time: " + ts +
+                        " | ETW-Watchdog | " +
+                        std::to_string(sessionCount - s_lastSessionCount) +
+                        " new ETW sessions created in 15s window — "
+                        "attacker may be exhausting provider session limit";
+                    PushUiDetectionEvent(msg, det,
+                        "Method: ETW Session Integrity (T1562.002)",
+                        0, DetectionSeverity::Critical);
+                }
+                s_lastSessionCount = sessionCount;
+
+                // Check for session name collision with our sessions
+                for (ULONG si = 0; si < sessionCount && si < 64; si++) {
+                    wchar_t* sName = reinterpret_cast<wchar_t*>(
+                        reinterpret_cast<char*>(propArr[si]) +
+                        propArr[si]->LoggerNameOffset);
+                    if (!sName) continue;
+
+                    // Check if the LogFileMode has PRIVATE_LOGGER_MODE (0x800)
+                    if (propArr[si]->LogFileMode & 0x00000800) {
+                        // Private logger detected — invisible to normal queries
+                        // This is unusual and often used for covert session attacks
+                        std::string privName(sName, sName + wcslen(sName));
+                        std::string msg = std::to_string(tab_1_menu_items.size()) +
+                            " - [*] [Warning] | " + ts +
+                            " | ETW-Watchdog | Method: ETW Session Integrity"
+                            " | Private ETW session detected: '" + privName +
+                            "' — EVENT_TRACE_PRIVATE_LOGGER_MODE (T1562.002)";
+                        std::string det = "Date & Time: " + ts +
+                            " | ETW-Watchdog | Private session '" + privName +
+                            "' may be used for covert provider slot exhaustion";
+                        PushUiDetectionEvent(msg, det,
+                            "Method: ETW Session Integrity (T1562.002)",
+                            0, DetectionSeverity::High);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -4564,6 +4667,134 @@ static DWORD WINAPI DnsEventCallback(
     // Reuse the existing Sysmon EID-22 DGA heuristic (long label detection)
     // by routing through Sigma matching on the query name
     NotifySigmaMatches(pid, "dns-client", { queryName }, "DNS/3006");
+
+    // ---------------------------------------------------------------
+    // Domain watchlist — detect DNS queries to known-abused services.
+    //
+    // T1567.001: Exfiltration to Code Repository (GitHub, GitLab, Bitbucket)
+    // T1567.002: Exfiltration to Cloud Storage (Dropbox, OneDrive, MEGA, GDrive)
+    // T1102:     Web Service C2 (Pastebin, Discord webhooks, Telegram, Notion)
+    // T1614:     System Location Discovery (External IP lookup services)
+    // ---------------------------------------------------------------
+    {
+        struct DomainWatch {
+            const char* domain;
+            const char* category;
+            const char* technique;
+            bool        isCritical;
+        };
+        static const DomainWatch kWatchDomains[] = {
+            // T1567.001: Code repository exfiltration
+            { "raw.githubusercontent.com", "Code Repo Exfil/Staging", "T1567.001", true },
+            { "gist.githubusercontent.com","Code Repo Exfil/Staging", "T1567.001", true },
+            { "api.github.com",            "Code Repo API",           "T1567.001", false },
+            { "gitlab.com",                "Code Repo Exfil/Staging", "T1567.001", false },
+            { "bitbucket.org",             "Code Repo Exfil/Staging", "T1567.001", false },
+            // T1567.002: Cloud storage exfiltration
+            { "content.dropboxapi.com",    "Cloud Storage Exfil",     "T1567.002", true },
+            { "api.dropboxapi.com",        "Cloud Storage Exfil",     "T1567.002", true },
+            { "dl.dropboxusercontent.com", "Cloud Storage Download",  "T1567.002", true },
+            { "mega.nz",                   "Cloud Storage Exfil",     "T1567.002", true },
+            { "g.api.mega.co.nz",          "Cloud Storage Exfil",     "T1567.002", true },
+            { "transfer.sh",              "Cloud File Transfer",      "T1567.002", true },
+            { "file.io",                  "Cloud File Transfer",      "T1567.002", true },
+            { "gofile.io",                "Cloud File Transfer",      "T1567.002", true },
+            { "anonfiles.com",            "Cloud File Transfer",      "T1567.002", true },
+            // T1102: Web service C2
+            { "pastebin.com",             "Paste Site C2/Staging",    "T1102",     true },
+            { "paste.ee",                 "Paste Site C2/Staging",    "T1102",     true },
+            { "hastebin.com",             "Paste Site C2/Staging",    "T1102",     true },
+            { "discord.com",              "Discord C2/Webhook",       "T1102",     false },
+            { "discordapp.com",           "Discord C2/Webhook",       "T1102",     false },
+            { "cdn.discordapp.com",       "Discord CDN Staging",      "T1102",     true },
+            { "api.telegram.org",         "Telegram Bot C2",          "T1102",     true },
+            { "hooks.slack.com",          "Slack Webhook C2",         "T1102",     true },
+            { "notion.so",               "Notion C2/Exfil",          "T1102",     false },
+            { "api.notion.com",           "Notion API C2",            "T1102",     true },
+            { "trello.com",              "Trello C2/Staging",        "T1102",     false },
+            { "ngrok.io",                "ngrok Tunnel C2",           "T1102",     true },
+            { "ngrok-free.app",          "ngrok Tunnel C2",           "T1102",     true },
+            { "*.trycloudflare.com",     "Cloudflare Tunnel C2",     "T1102",     true },
+            { "interactsh.com",          "Interactsh OOB C2",        "T1102",     true },
+            { "oast.fun",               "OOB Interaction C2",        "T1102",     true },
+            { "interact.sh",            "Interact.sh OOB C2",        "T1102",     true },
+            // T1614: External IP lookup services (geo/location discovery)
+            { "ifconfig.me",             "External IP Lookup",        "T1614",     false },
+            { "ipinfo.io",              "External IP Lookup",         "T1614",     false },
+            { "checkip.amazonaws.com",  "External IP Lookup",         "T1614",     false },
+            { "api.ipify.org",          "External IP Lookup",         "T1614",     false },
+            { "ipecho.net",             "External IP Lookup",         "T1614",     false },
+            { "icanhazip.com",          "External IP Lookup",         "T1614",     false },
+            { "ip-api.com",             "External IP/Geo Lookup",     "T1614",     false },
+            { "freegeoip.app",          "Geolocation Lookup",         "T1614",     false },
+            { "myexternalip.com",       "External IP Lookup",         "T1614",     false },
+            { "wtfismyip.com",          "External IP Lookup",         "T1614",     false },
+        };
+
+        // Build lowercase query for matching
+        std::string qLower = queryName;
+        for (auto& c : qLower) c = (char)tolower((unsigned char)c);
+
+        for (const auto& wd : kWatchDomains) {
+            // Check if query ends with the watched domain
+            size_t dlen = strlen(wd.domain);
+            if (qLower.size() < dlen) continue;
+            size_t offset = qLower.size() - dlen;
+            // Must match at domain boundary (start of string or preceded by '.')
+            if (qLower.compare(offset, dlen, wd.domain) == 0 &&
+                (offset == 0 || qLower[offset - 1] == '.')) {
+
+                std::string procName;
+                {
+                    std::lock_guard<std::mutex> lock(process_cache_mutex);
+                    auto it = g_processCache.find(pid);
+                    if (it != g_processCache.end()) procName = it->second.processName;
+                }
+                if (procName.empty()) procName = "unknown";
+
+                // Skip browser processes for non-critical domains to reduce noise
+                if (!wd.isCritical) {
+                    static const char* kBrowsers[] = {
+                        "chrome", "firefox", "msedge", "brave", "opera",
+                        "iexplore", "vivaldi", "safari"
+                    };
+                    std::string pLower = procName;
+                    for (auto& c : pLower) c = (char)tolower((unsigned char)c);
+                    bool isBrowser = false;
+                    for (const auto& b : kBrowsers) {
+                        if (pLower.find(b) != std::string::npos) {
+                            isBrowser = true;
+                            break;
+                        }
+                    }
+                    if (isBrowser) continue;
+                }
+
+                std::string ts = BuildTimestamp();
+                DetectionSeverity sev = wd.isCritical ?
+                    DetectionSeverity::Critical : DetectionSeverity::Warning;
+
+                std::string sevStr = wd.isCritical ? "Critical" : "Warning";
+                std::string msg = std::to_string(tab_1_menu_items.size()) +
+                    " - [*] [" + sevStr + "] | " + ts +
+                    " | " + procName +
+                    " | " + wd.category +
+                    " | " + queryName;
+
+                std::string det = "Date & Time: " + ts +
+                    " | Process: " + procName +
+                    " | PID: " + std::to_string(pid) +
+                    " | DNS Query: " + queryName +
+                    " | Category: " + wd.category +
+                    " | MITRE: " + wd.technique;
+
+                PushUiDetectionEvent(msg, det,
+                    std::string("Method: DNS Domain Watchlist (") + wd.technique + ")",
+                    pid, sev);
+                break;  // one match per query is enough
+            }
+        }
+    }
 
     // ---------------------------------------------------------------
     // Weaver Ant: DNS tunneling detection via entropy + subdomain depth.

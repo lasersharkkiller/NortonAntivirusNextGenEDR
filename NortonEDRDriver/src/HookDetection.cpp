@@ -460,8 +460,9 @@ BOOLEAN HookDetector::CheckEtwHooks(BufferQueue* bufQueue) {
 //   1. _ETW_REG_ENTRY EnableMask zeroing (Backstab, PPLdump)
 //   2. _ETW_GUID_ENTRY ProviderEnableInfo zeroing (Phant0m, SyscallDumper)
 //   3. _ETW_GUID_ENTRY RegList unlinking (_ETL_ENTRY disconnection)
-//   4. _WMI_LOGGER_CONTEXT GetCpuClock pointer nulling (InfinityHook variant)
+//   4. TraceLogging _ETW_REG_ENTRY Callback pointer zeroing/redirection
 //   5. EtwpDebuggerData global tampering
+//   6. _WMI_LOGGER_CONTEXT.GetCpuClock pointer swap (InfinityHook)
 //
 // Strategy: use our own REGHANDLE from EtwRegister to derive the
 // _ETW_REG_ENTRY pointer.  REGHANDLE is defined as:
@@ -728,24 +729,86 @@ VOID HookDetector::TakeEtwStructureBaseline()
         DbgPrint("[-] EtwpDebuggerData: exception during resolve\n");
     }
 
-    // Resolve _WMI_LOGGER_CONTEXT.GetCpuClock
-    // The logger context is accessible from the ETW session handle.
-    // For now, we resolve it by scanning near EtwpGetCpuClock.
+    // Resolve _WMI_LOGGER_CONTEXT.GetCpuClock for InfinityHook detection.
+    // InfinityHook swaps GetCpuClock (+0x28) in the CKCL session (logger ID 2)
+    // to redirect every ETW event through an attacker callback.
+    // Strategy: find EtwpLoggerContext[] array by scanning near NtTraceControl
+    // for a LEA to the logger context pointer array, then read slot [2] (CKCL).
     __try {
+        // Resolve known clock targets for validation
         UNICODE_STRING nameHalPerf;
         RtlInitUnicodeString(&nameHalPerf, L"KeQueryPerformanceCounter");
         PVOID halPerf = MmGetSystemRoutineAddress(&nameHalPerf);
-        // GetCpuClock in _WMI_LOGGER_CONTEXT typically points to
-        // EtwpGetSystemTime or KeQueryPerformanceCounter.
-        // We'll check this in the integrity pass by verifying the pointer
-        // hasn't been nulled.  Full resolution requires session handle walking
-        // which is too fragile for a first pass — mark as N/A for now.
-        if (halPerf) {
-            DbgPrint("[+] EtwStructure: KeQueryPerformanceCounter at %p "
-                "(GetCpuClock reference target)\n", halPerf);
+        UNICODE_STRING nameGetSysTime;
+        RtlInitUnicodeString(&nameGetSysTime, L"KeQuerySystemTimePrecise");
+        PVOID sysTime = MmGetSystemRoutineAddress(&nameGetSysTime);
+
+        // Scan from EtwpDebuggerData if available — the logger context array
+        // pointer is typically stored as a field in EtwpDebuggerData.
+        // Alternatively, scan near NtTraceControl for LEA referencing the
+        // EtwpLoggerContext array.  We try both approaches.
+        PVOID ckclContext = nullptr;
+
+        // Approach 1: Scan NtTraceControl body for LEA to logger context array.
+        // NtTraceControl references EtwpLoggerContext[] within its first ~0x600
+        // bytes via a LEA with RIP-relative addressing (48 8D xx xx xx xx xx)
+        // followed shortly by indexed access [rcx*8] for logger ID lookup.
+        UNICODE_STRING nameNtTraceControl;
+        RtlInitUnicodeString(&nameNtTraceControl, L"NtTraceControl");
+        PVOID ntTraceCtl = MmGetSystemRoutineAddress(&nameNtTraceControl);
+        if (ntTraceCtl) {
+            PUCHAR scan = (PUCHAR)ntTraceCtl;
+            for (int i = 0; i < 0x600; i++) {
+                // Look for LEA reg, [rip+disp32] patterns:
+                // 48 8D 0D/15/05/35 xx xx xx xx  (LEA rcx/rdx/rax/rsi, [rip+xx])
+                // 4C 8D 25/2D/35    xx xx xx xx  (LEA r12/r13/r14, [rip+xx])
+                if ((scan[i] == 0x48 || scan[i] == 0x4C) &&
+                    scan[i+1] == 0x8D) {
+                    LONG rDisp = *(PLONG)(&scan[i+3]);
+                    PVOID target = (PVOID)(&scan[i+7] + rDisp);
+                    if (!MmIsAddressValid(target)) continue;
+
+                    // The logger context array is an array of pointers.
+                    // Slot [2] is the CKCL session. Validate that reading
+                    // slot [2] gives a plausible kernel pointer.
+                    PVOID* arr = (PVOID*)target;
+                    if (!MmIsAddressValid(&arr[2])) continue;
+                    PVOID slot2 = arr[2];
+                    if (slot2 == nullptr) continue;
+                    if (!MmIsAddressValid(slot2)) continue;
+
+                    // Validate: _WMI_LOGGER_CONTEXT starts with a known
+                    // signature — check that GetCpuClock at +0x28 points
+                    // to a kernel-mode address (above 0xFFFF800000000000).
+                    PVOID* pGetCpuClock = (PVOID*)((ULONG_PTR)slot2 + 0x28);
+                    if (!MmIsAddressValid(pGetCpuClock)) continue;
+                    PVOID clockFn = *pGetCpuClock;
+                    if ((ULONG_PTR)clockFn < 0xFFFF800000000000ULL) continue;
+
+                    // Additional validation: GetCpuClock should point to one
+                    // of the known clock functions or at least valid code.
+                    if (!MmIsAddressValid(clockFn)) continue;
+
+                    ckclContext = slot2;
+                    s_LoggerContext = slot2;
+                    s_GetCpuClockBaseline = clockFn;
+                    s_LoggerContextValid = TRUE;
+                    DbgPrint("[+] EtwStructure: CKCL _WMI_LOGGER_CONTEXT at %p, "
+                        "GetCpuClock=%p (KeQueryPerf=%p, SysTime=%p)\n",
+                        slot2, clockFn, halPerf, sysTime);
+                    break;
+                }
+            }
+        }
+
+        if (!ckclContext && halPerf) {
+            DbgPrint("[*] EtwStructure: CKCL logger context not resolved, "
+                "KeQueryPerformanceCounter at %p (reference only)\n", halPerf);
         }
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] EtwStructure: exception resolving GetCpuClock\n");
+    }
 }
 
 VOID HookDetector::CheckEtwStructureIntegrity(BufferQueue* bufQueue)
@@ -898,6 +961,42 @@ VOID HookDetector::CheckEtwStructureIntegrity(BufferQueue* bufQueue)
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             DbgPrint("[-] EtwpDebuggerData: exception in integrity check\n");
+        }
+    }
+
+    // --- Check 6: _WMI_LOGGER_CONTEXT.GetCpuClock integrity (InfinityHook) ---
+    // InfinityHook swaps GetCpuClock in the CKCL session to hijack every ETW
+    // event call.  The pointer at +0x28 should remain the same kernel clock
+    // function we baselined.
+    if (s_LoggerContextValid && s_LoggerContext) {
+        __try {
+            PVOID* pGetCpuClock = (PVOID*)((ULONG_PTR)s_LoggerContext + 0x28);
+            if (MmIsAddressValid(pGetCpuClock)) {
+                PVOID currentClock = *pGetCpuClock;
+                if (currentClock != s_GetCpuClockBaseline) {
+                    const char* attackType = "SWAPPED (InfinityHook)";
+                    if (currentClock == nullptr)
+                        attackType = "ZEROED (CKCL clock disabled)";
+
+                    char msg[350];
+                    RtlStringCbPrintfA(msg, sizeof(msg),
+                        "ETW BYPASS CRITICAL: _WMI_LOGGER_CONTEXT.GetCpuClock "
+                        "%s at CKCL session %p+0x28 (was %p, now %p) — "
+                        "attacker redirected ETW clock callback to intercept "
+                        "all kernel ETW events (T1562.002: InfinityHook)",
+                        attackType, s_LoggerContext,
+                        s_GetCpuClockBaseline, currentClock);
+                    EmitEtwStructureAlert(bufQueue, msg);
+
+                    // Restore original clock pointer
+                    *pGetCpuClock = s_GetCpuClockBaseline;
+                    DbgPrint("[!] EtwStructure: GetCpuClock RESTORED to %p "
+                        "(InfinityHook remediated)\n", s_GetCpuClockBaseline);
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrint("[-] EtwStructure: exception in GetCpuClock check\n");
         }
     }
 }

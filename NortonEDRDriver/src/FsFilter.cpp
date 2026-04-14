@@ -3013,6 +3013,95 @@ rate_done:
             }
         }
 
+        // ---- T1547.009: .lnk write outside Startup folder (shortcut hijack) ----
+        // Malware modifies .lnk shortcuts on Desktop, SendTo, Quick Launch to
+        // redirect commonly-clicked shortcuts to a malicious payload.
+        // Exclude explorer.exe (normal shell shortcut management).
+        if (ExtMatch(&nameInfo->Extension, L"lnk")) {
+            ULONG lnkDisp = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
+            ACCESS_MASK lnkAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            BOOLEAN isLnkWrite =
+                (lnkDisp == FILE_CREATE || lnkDisp == FILE_OVERWRITE_IF ||
+                 lnkDisp == FILE_SUPERSEDE) ||
+                ((lnkDisp == FILE_OPEN || lnkDisp == FILE_OPEN_IF) &&
+                 (lnkAccess & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0);
+
+            if (isLnkWrite && procName && strcmp(procName, "explorer.e") != 0) {
+                // Flag .lnk modifications in user profile shell folders
+                static const PCWSTR kShellLnkPaths[] = {
+                    L"\\desktop\\",
+                    L"\\sendto\\",
+                    L"\\recent\\",
+                    L"\\quick launch\\",
+                    L"\\appdata\\roaming\\microsoft\\internet explorer\\quick launch\\",
+                    nullptr
+                };
+                for (SIZE_T li = 0; kShellLnkPaths[li]; li++) {
+                    if (WcsContainsLower(&nameInfo->Name, kShellLnkPaths[li])) {
+                        char lnkBuf[96] = {};
+                        ANSI_STRING ansiLnk;
+                        if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansiLnk,
+                            &nameInfo->FinalComponent, TRUE))) {
+                            SIZE_T n = ansiLnk.Length < sizeof(lnkBuf) - 1 ?
+                                ansiLnk.Length : sizeof(lnkBuf) - 1;
+                            RtlCopyMemory(lnkBuf, ansiLnk.Buffer, n);
+                            RtlFreeAnsiString(&ansiLnk);
+                        }
+                        char msg[256];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: Shortcut (.lnk) modified in shell folder — "
+                            "shortcut hijack persistence (T1547.009) "
+                            "file=%s by=%s pid=%llu",
+                            lnkBuf[0] ? lnkBuf : "?",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid);
+                        EnqueueFsAlert(pid, procName, msg, FALSE);  // Warning
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---- T1039: Data from Network Shared Drive (UNC path access) ----
+        // Detect non-system processes reading files via UNC paths (\\server\share).
+        // Ransomware and exfiltration tools enumerate and read from network shares.
+        // Allowlist explorer.exe, System, and common backup/sync tools.
+        if (nameInfo->Name.Length > 4 &&
+            nameInfo->Name.Buffer[0] == L'\\' &&
+            nameInfo->Name.Buffer[1] == L'\\') {
+            // This is a UNC path access
+            ULONG uncDisp = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
+            ACCESS_MASK uncAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+            BOOLEAN isUncRead = (uncAccess & (FILE_READ_DATA | FILE_LIST_DIRECTORY)) != 0;
+            BOOLEAN isUncWrite = (uncAccess & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+
+            if ((isUncRead || isUncWrite) && procName) {
+                // Allowlist normal network access processes
+                BOOLEAN allowed =
+                    strcmp(procName, "explorer.e") == 0 ||
+                    strcmp(procName, "System") == 0 ||
+                    strcmp(procName, "svchost.ex") == 0 ||
+                    strcmp(procName, "SearchProt") == 0 ||
+                    strcmp(procName, "OneDrive.e") == 0 ||
+                    strcmp(procName, "Teams.exe") == 0 ||
+                    strcmp(procName, "outlook.ex") == 0 ||
+                    strcmp(procName, "NortonEDR.") == 0;
+
+                if (!allowed) {
+                    char uncMsg[280];
+                    RtlStringCchPrintfA(uncMsg, sizeof(uncMsg),
+                        "FS: UNC path %s by non-standard process — "
+                        "possible network share %s (T1039/T1021.002) "
+                        "by=%s pid=%llu",
+                        isUncWrite ? "write" : "read",
+                        isUncWrite ? "lateral movement" : "data collection",
+                        procName,
+                        (ULONG64)(ULONG_PTR)pid);
+                    EnqueueFsAlert(pid, procName, uncMsg, isUncWrite);
+                }
+            }
+        }
+
         // ---- Executable drop in suspicious directory ----
         BOOLEAN isExec = FALSE;
         for (SIZE_T i = 0; i < ARRAYSIZE(kExecExts); i++) {

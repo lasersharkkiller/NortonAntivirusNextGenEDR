@@ -1072,7 +1072,9 @@ public:
 
 	// ETW provider/session manipulation bypass
 	static VOID NtTraceControlHandler(
-		ULONG FunctionCode
+		ULONG FunctionCode,
+		PVOID InBuffer,
+		ULONG InBufferLen
 	);
 
 	// Physical memory / raw device access detection (IOMMU bypass)

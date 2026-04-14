@@ -708,7 +708,8 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 	else if (NtTraceControlId != 0 && id == NtTraceControlId) {
 		// NtTraceControl(TraceHandle, FunctionCode, InBuffer, InBufferLen, OutBuffer, OutBufferLen, ReturnLength)
 		// RCX=handle  RDX=funcCode  R8=inBuf  R9=inLen  [RSP+0x28]=outBuf  [RSP+0x30]=outLen  [RSP+0x38]=retLen
-		NtTraceControlHandler((ULONG)trapFrame->Rdx);
+		NtTraceControlHandler((ULONG)trapFrame->Rdx,
+			(PVOID)trapFrame->R8, (ULONG)trapFrame->R9);
 	}
 	else if (NtCreateNamedPipeFileId != 0 && id == NtCreateNamedPipeFileId) {
 		// NtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
@@ -4121,16 +4122,30 @@ VOID SyscallsUtils::NtImpersonateAnonymousTokenHandler(HANDLE ThreadHandle)
 //
 // ETW can be disabled or manipulated via NtTraceControl without hooking any ETW functions.
 // Function codes (from EtwpControlTraceGuid dispatch table):
+//   0  = StartTrace          — creates a new ETW session (rogue session / slot exhaustion)
 //   1  = StopTrace           — kills a running ETW session (most dangerous)
 //   2  = QueryTrace          — enumerates session config (recon)
-//   5  = UpdateTrace         — modifies session parameters (can neuter providers)
+//   3  = EnumerateTraceGuids — enumerate all registered providers (recon)
+//   4  = GetTraceGuidInfo    — detailed provider info dump (recon)
+//   5  = UpdateTrace         — modifies session params (buffer/keyword downgrade)
+//   6  = RealTimeConnect     — attach consumer to session
+//   7  = CreateRealTimeConn  — new consumer link
+//  14  = QueryAllTraces      — enumerate all running sessions (recon)
+//  16  = QueryDefaults       — query default session config (recon)
 //  17  = FlushTrace          — forces buffer flush (can cause data loss / DoS)
 //  28  = StopTraceNoFlush    — kills session without flushing (data loss)
+//  30  = EnableProvider      — re-enable provider with altered keywords/level
 //  31  = DisableProvider     — removes a provider from a session
 //
-// Code 1 (StopTrace) is the primary attack vector — it directly kills our
-// ETW-TI and Kernel-Process sessions without touching any function prologues.
-VOID SyscallsUtils::NtTraceControlHandler(ULONG FunctionCode)
+// Key attack vectors:
+//   Code 0: rogue session creation — floods provider's 8-session limit,
+//           private logger mode hides session from QueryAllTraces
+//   Code 1: directly kills our ETW-TI / Kernel-Process sessions
+//   Code 5: UpdateTrace with MinBuf=MaxBuf=1 causes buffer exhaustion
+//   Code 30: re-enable with MatchAnyKeyword=0 silently filters all events
+//   Code 31: removes provider from session without stopping it
+VOID SyscallsUtils::NtTraceControlHandler(ULONG FunctionCode,
+	PVOID InBuffer, ULONG InBufferLen)
 {
 	PEPROCESS caller = IoGetCurrentProcess();
 
@@ -4142,20 +4157,103 @@ VOID SyscallsUtils::NtTraceControlHandler(ULONG FunctionCode)
 	BOOLEAN isCritical = FALSE;
 
 	switch (FunctionCode) {
+	// Session lifecycle
+	case 0:  action = "StartTrace — rogue session creation (provider slot exhaustion)"; isCritical = TRUE; break;
 	case 1:  action = "StopTrace — session kill";         isCritical = TRUE;  break;
-	case 5:  action = "UpdateTrace — session modify";     isCritical = FALSE; break;
+	case 5:  action = "UpdateTrace — session modify (buffer/keyword downgrade)"; isCritical = TRUE; break;
 	case 17: action = "FlushTrace — forced buffer flush";  isCritical = FALSE; break;
 	case 28: action = "StopTraceNoFlush — session kill (no flush)"; isCritical = TRUE; break;
+	// Provider manipulation
+	case 30: action = "EnableProvider — provider re-enable (keyword/level filter downgrade)"; isCritical = TRUE; break;
 	case 31: action = "DisableProvider — provider removal"; isCritical = TRUE;  break;
+	// Recon
 	case 2:  action = "QueryTrace — session enumeration (recon)";   isCritical = FALSE; break;
+	case 3:  action = "EnumerateTraceGuids — provider enumeration (recon)"; isCritical = FALSE; break;
+	case 4:  action = "GetTraceGuidInfo — provider detail dump (recon)"; isCritical = FALSE; break;
+	// Additional session operations
+	case 6:  action = "RealTimeConnect — attach consumer to session"; isCritical = FALSE; break;
+	case 7:  action = "CreateRealTimeConnection — new consumer link"; isCritical = FALSE; break;
+	case 14: action = "QueryAllTraces — enumerate all running sessions (recon)"; isCritical = FALSE; break;
+	case 16: action = "QueryDefaults — enumerate default session config (recon)"; isCritical = FALSE; break;
 	default: return;
 	}
 
-	char msg[180];
+	char msg[350];
 	RtlStringCbPrintfA(msg, sizeof(msg),
 		"NtTraceControl(code=%lu): %s — possible ETW bypass (T1562.002)",
 		FunctionCode, action);
 	EmitSyscallNotif(0, msg, caller, nullptr, isCritical);
+
+	// Deep inspection of InBuffer for specific attack signatures.
+	// The InBuffer for StartTrace (0) and UpdateTrace (5) contains an
+	// EVENT_TRACE_PROPERTIES structure when called via ControlTraceW/StartTraceW.
+	// Layout (relevant fields):
+	//   +0x00 WNODE_HEADER (72 bytes)
+	//     +0x00 ULONG BufferSize
+	//     +0x04 ...
+	//     +0x30 ULONG ClientContext (clock resolution: 1=QPC, 2=SysTime, 3=CpuCycle)
+	//     +0x34 ULONG Flags
+	//   +0x48 ULONG LogFileMode
+	//   +0x4C ULONG MaximumBuffers
+	//   +0x50 ULONG MinimumBuffers  (on some versions, offsets may vary)
+	//
+	// We probe the user-mode InBuffer carefully with __try/__except.
+
+	if ((FunctionCode == 0 || FunctionCode == 5) &&
+		InBuffer != nullptr && InBufferLen >= 0x58) {
+		__try {
+			// Probe: ensure the buffer is readable user-mode memory
+			ProbeForRead(InBuffer, InBufferLen, 1);
+
+			// EVENT_TRACE_PROPERTIES layout offsets
+			PUCHAR buf = (PUCHAR)InBuffer;
+			ULONG logFileMode   = *(PULONG)(buf + 0x48);
+			ULONG maxBuffers    = *(PULONG)(buf + 0x4C);
+			ULONG minBuffers    = *(PULONG)(buf + 0x50);
+
+			// --- Check: Private logger mode (code 0 StartTrace) ---
+			// EVENT_TRACE_PRIVATE_LOGGER_MODE (0x800) makes the session
+			// invisible to QueryAllTraces — used to hide rogue sessions.
+			if (FunctionCode == 0 && (logFileMode & 0x800)) {
+				char privMsg[300];
+				RtlStringCbPrintfA(privMsg, sizeof(privMsg),
+					"NtTraceControl StartTrace: PRIVATE_LOGGER_MODE (0x%08lX) "
+					"— session will be invisible to QueryAllTraces, possible "
+					"covert ETW session (T1562.002)",
+					logFileMode);
+				EmitSyscallNotif(0, privMsg, caller, nullptr, TRUE);
+			}
+
+			// --- Check: Buffer exhaustion (code 5 UpdateTrace) ---
+			// Setting MinimumBuffers = MaximumBuffers = 1 (or very small)
+			// starves the session, causing event drops without stopping it.
+			if (FunctionCode == 5 && maxBuffers > 0 && maxBuffers <= 2 &&
+				minBuffers <= maxBuffers) {
+				char bufMsg[300];
+				RtlStringCbPrintfA(bufMsg, sizeof(bufMsg),
+					"NtTraceControl UpdateTrace: BUFFER EXHAUSTION — "
+					"MinBuf=%lu MaxBuf=%lu — session starved, events will "
+					"be silently dropped (T1562.002)",
+					minBuffers, maxBuffers);
+				EmitSyscallNotif(0, bufMsg, caller, nullptr, TRUE);
+			}
+
+			// --- Check: Rogue session with buffer exhaustion at creation ---
+			if (FunctionCode == 0 && maxBuffers > 0 && maxBuffers <= 2 &&
+				minBuffers <= maxBuffers) {
+				char bufMsg[300];
+				RtlStringCbPrintfA(bufMsg, sizeof(bufMsg),
+					"NtTraceControl StartTrace: session created with minimal "
+					"buffers (Min=%lu Max=%lu) — possible slot-exhaustion "
+					"attack with starved sessions (T1562.002)",
+					minBuffers, maxBuffers);
+				EmitSyscallNotif(0, bufMsg, caller, nullptr, TRUE);
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			// InBuffer is user-mode — probe failure is expected for bad pointers
+		}
+	}
 }
 
 // NtTerminateThread — Phant0m technique (T1562.002).

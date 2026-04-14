@@ -1344,20 +1344,82 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 						}
 					}
 
+					// Determine effective severity — start with table value,
+					// then escalate based on command-line context.
+					BOOLEAN effectiveCritical = kWppTools[wt].isCritical;
+					const char* escalationReason = nullptr;
+
+					// Gap 15: logman severity escalation — if logman.exe is
+					// launched with dangerous arguments, upgrade to Critical.
+					if (UnicodeStringContains(CreateInfo->ImageFileName, L"logman.exe") &&
+						!effectiveCritical && wppCmd[0]) {
+						// Build lowercase copy for flag scanning
+						char wppLower[200];
+						for (int li = 0; li < sizeof(wppLower) - 1 && wppCmd[li]; li++) {
+							wppLower[li] = (wppCmd[li] >= 'A' && wppCmd[li] <= 'Z')
+								? (char)(wppCmd[li] + 32) : wppCmd[li];
+							wppLower[li + 1] = '\0';
+						}
+						// Dangerous logman subcommands that weren't already Critical
+						if (strstr(wppLower, "logman start") ||
+							strstr(wppLower, "logman query")) {
+							// Check for dangerous flags that upgrade these to Critical
+							if (strstr(wppLower, " -nb ") ||
+								strstr(wppLower, " -ct ") ||
+								strstr(wppLower, " -p {") ||
+								strstr(wppLower, " -p \"")) {
+								effectiveCritical = TRUE;
+								escalationReason = "dangerous flags (-nb/-ct/-p) detected";
+							}
+						}
+					}
+
+					// Gap 16: xperf parent-process suspicion — xperf spawned
+					// by cmd.exe, powershell, or conhost is highly suspicious
+					// vs WPA/WPRUI launching it as part of normal WPT workflow.
+					if (UnicodeStringContains(CreateInfo->ImageFileName, L"xperf.exe") &&
+						creatorName) {
+						static const char* kSusParents[] = {
+							"cmd.exe", "powershel", "pwsh.exe",
+							"conhost.e", "wscript.e", "cscript.e",
+							"mshta.exe", "rundll32.", "regsvr32.",
+							"explorer.", "svchost.e"
+						};
+						for (int sp = 0; sp < ARRAYSIZE(kSusParents); sp++) {
+							if (_strnicmp(creatorName, kSusParents[sp],
+								strlen(kSusParents[sp])) == 0) {
+								effectiveCritical = TRUE;
+								escalationReason = "suspicious parent (non-WPT)";
+								break;
+							}
+						}
+					}
+
 					char wppMsg[480];
-					RtlStringCbPrintfA(wppMsg, sizeof(wppMsg),
-						"%s — spawned by '%s' (pid=%llu) — cmd: %.180s",
-						kWppTools[wt].alertMsg,
-						creatorName ? creatorName : "?",
-						(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
-						wppCmd[0] ? wppCmd : "<empty>");
+					if (escalationReason) {
+						RtlStringCbPrintfA(wppMsg, sizeof(wppMsg),
+							"%s — ESCALATED (%s) — spawned by '%s' "
+							"(pid=%llu) — cmd: %.150s",
+							kWppTools[wt].alertMsg,
+							escalationReason,
+							creatorName ? creatorName : "?",
+							(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+							wppCmd[0] ? wppCmd : "<empty>");
+					} else {
+						RtlStringCbPrintfA(wppMsg, sizeof(wppMsg),
+							"%s — spawned by '%s' (pid=%llu) — cmd: %.180s",
+							kWppTools[wt].alertMsg,
+							creatorName ? creatorName : "?",
+							(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+							wppCmd[0] ? wppCmd : "<empty>");
+					}
 
 					PKERNEL_STRUCTURED_NOTIFICATION wppNotif =
 						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
 							POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'wpnt');
 					if (wppNotif) {
 						RtlZeroMemory(wppNotif, sizeof(*wppNotif));
-						if (kWppTools[wt].isCritical) { SET_CRITICAL(*wppNotif); }
+						if (effectiveCritical) { SET_CRITICAL(*wppNotif); }
 						else { SET_WARNING(*wppNotif); }
 						SET_CALLING_PROC_PID_CHECK(*wppNotif);
 						wppNotif->isPath = FALSE;
@@ -2002,6 +2064,19 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"wmic /compile:",            "wmic /compile: — MOF compilation via wmic (T1546.003)",              TRUE  },
 
 				// --- T1562.002: ETW session/provider tampering via command line ---
+				// xperf — WPA/WPT trace session control (Windows Performance Toolkit)
+				{ L"xperf -stop",               "xperf -stop — ETW session stop (T1562.002 telemetry blinding)",        TRUE  },
+				{ L"xperf -cancel",             "xperf -cancel — ETW session cancel/abort (T1562.002)",                 TRUE  },
+				{ L"xperf -on",                 "xperf -on — ETW session start with provider capture (T1562.002)",      TRUE  },
+				{ L"xperf -d ",                 "xperf -d — merge/dump and stop trace session (T1562.002)",             TRUE  },
+				{ L"xperf -flush",              "xperf -flush — force-flush session buffers (data loss vector T1562.002)", TRUE },
+				{ L"xperf -setprofinterval",    "xperf -setprofinterval — alter CPU profiling timer (PMC telemetry degradation T1562.002)", TRUE },
+				{ L"xperf -buffering",          "xperf -buffering — set session buffer count (buffer exhaustion T1562.002)", TRUE },
+				{ L"xperf -minbuffers",         "xperf -minbuffers — set minimum buffer count (starvation T1562.002)", TRUE },
+				{ L"xperf -maxbuffers",         "xperf -maxbuffers — set maximum buffer count (starvation T1562.002)", TRUE },
+				{ L"xperf -providers",          "xperf -providers — enumerate all registered ETW providers (recon T1518.001)", FALSE },
+				{ L"xperf -loggers",            "xperf -loggers — list all active ETW sessions (recon T1518.001)",     FALSE },
+				{ L"xperf -dumper",             "xperf -dumper — dump ETW session data in real time (recon T1005)",    FALSE },
 				// logman — stops or deletes ETW trace sessions (bypasses prologue checks)
 				{ L"logman stop",               "logman stop — ETW trace session stop (T1562.002 telemetry blinding)",  TRUE  },
 				{ L"logman delete",             "logman delete — ETW trace session deletion (T1562.002 persistent blind)", TRUE },
@@ -2031,6 +2106,16 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"logman query",              "logman query — ETW trace session enumeration (pre-attack recon)",      FALSE },
 				{ L"logman -ets",               "logman -ets — real-time ETW/WPP session manipulation (T1562.002)",   TRUE  },
 				{ L"logman start",              "logman start — ETW/WPP trace session creation (T1562.002)",          FALSE },
+				{ L"logman create",             "logman create — persistent ETW/WPP data collector creation (T1562.002 rogue session persistence)", TRUE },
+				{ L"logman import",             "logman import — import ETW session config from XML (T1562.002 portable session attack)", TRUE },
+				{ L"logman export",             "logman export — export ETW session config to XML (recon/portability)", FALSE },
+				// logman dangerous flags — these are combined with create/start/update
+				{ L" -nb ",                     "logman -nb — custom min/max buffer count (buffer exhaustion T1562.002)", TRUE },
+				{ L" -bs ",                     "logman -bs — custom buffer size (buffer manipulation T1562.002)",       FALSE },
+				{ L" -rt",                      "logman -rt — real-time session mode (consumer attachment T1562.002)",   FALSE },
+				{ L" -ct ",                     "logman -ct — clock type override (InfinityHook-adjacent T1562.002)",   TRUE  },
+				{ L" -p {",                     "logman -p {GUID} — explicit provider GUID targeting (T1562.002)",     TRUE  },
+				{ L" -p \"",                    "logman -p \"GUID\" — explicit provider GUID targeting (T1562.002)",   TRUE  },
 				{ L"trace-command",             "Trace-Command — PowerShell tracing/ETW recon",                        FALSE },
 				// TraceLogging / TDH provider enumeration — pre-attack recon
 				{ L"logman query providers",    "logman query providers — enumerate all ETW/TraceLogging provider GUIDs (recon)", FALSE },
@@ -2049,6 +2134,61 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"fltmc",                     "fltmc — bare minifilter enumeration (EDR discovery)",                 FALSE },
 				{ L"driverquery",               "driverquery — kernel driver enumeration (EDR/AV driver discovery)",   FALSE },
 				{ L"tasklist /svc",             "tasklist /svc — service-to-process mapping (EDR process discovery)",  FALSE },
+
+				// --- T1136.001: Local Account Creation ---
+				{ L"net user /add",             "net user /add — local account creation (T1136.001)",                 TRUE  },
+				{ L"net1 user /add",            "net1 user /add — local account creation via net1 (T1136.001)",      TRUE  },
+				{ L"net user /ad",              "net user /ad — local account creation (abbreviated T1136.001)",      TRUE  },
+				{ L"new-localuser",             "New-LocalUser — PowerShell local account creation (T1136.001)",     TRUE  },
+				{ L"new-localgroup",            "New-LocalGroup — PowerShell local group creation (T1136.001)",      TRUE  },
+				{ L"add-localgroupmember",      "Add-LocalGroupMember — PowerShell group membership add (T1136.001)", TRUE },
+				{ L"net localgroup administrators", "net localgroup administrators /add — admin group add (T1136.001)", TRUE },
+				// Hidden account creation ($ suffix hides from net user listing)
+				{ L"net user /add $",           "net user /add $ — hidden account creation (T1136.001 evasion)",     TRUE  },
+
+				// --- T1078.003: Valid Accounts / Lateral Movement via local creds ---
+				{ L"runas /user:",              "runas /user: — execution as alternate local account (T1078.003)",    TRUE  },
+				{ L"runas /netonly",            "runas /netonly — network-only impersonation (T1078.003)",            TRUE  },
+				{ L"runas /savecred",           "runas /savecred — cached credential reuse (T1078.003)",             TRUE  },
+
+				// --- T1124: System Time Discovery ---
+				{ L"w32tm /query",              "w32tm /query — time service query (T1124 time discovery)",          FALSE },
+				{ L"w32tm /stripchart",         "w32tm /stripchart — time offset measurement (T1124)",              FALSE },
+				{ L"net time",                  "net time — domain/remote time query (T1124 time discovery)",        FALSE },
+				{ L"get-date",                  "Get-Date — PowerShell time query (T1124 time discovery)",          FALSE },
+
+				// --- T1087.001: Local Account Discovery ---
+				{ L"net user",                  "net user — local account enumeration (T1087.001)",                  FALSE },
+				{ L"net1 user",                 "net1 user — local account enumeration via net1 (T1087.001)",       FALSE },
+				{ L"get-localuser",             "Get-LocalUser — PowerShell local account enumeration (T1087.001)", FALSE },
+				{ L"get-localgroupmember",      "Get-LocalGroupMember — local group member enum (T1087.001)",       FALSE },
+				{ L"wmic useraccount",          "wmic useraccount — WMI local account enumeration (T1087.001)",    FALSE },
+				{ L"get-wmiobject win32_useraccount", "Get-WmiObject Win32_UserAccount — WMI user enum (T1087.001)", FALSE },
+
+				// --- T1560.001: Archive via Utility (data staging/exfil prep) ---
+				{ L"7z.exe a ",                 "7z archive creation — data staging for exfiltration (T1560.001)",   TRUE  },
+				{ L"7za.exe a ",                "7za standalone archive creation (T1560.001)",                       TRUE  },
+				{ L"rar.exe a ",                "rar archive creation — data staging (T1560.001)",                   TRUE  },
+				{ L"winrar.exe a ",             "WinRAR archive creation (T1560.001)",                              TRUE  },
+				{ L"makecab ",                  "makecab — Cabinet archive creation (T1560.001 staging)",           FALSE },
+				{ L"compact /c",                "compact /c — NTFS compression (T1560.001 evasion variant)",       FALSE },
+				{ L"tar -c",                    "tar -cf — tar archive creation (T1560.001 staging)",               FALSE },
+				{ L"compress-archive",          "Compress-Archive — PowerShell ZIP creation (T1560.001)",           TRUE  },
+				{ L"io.compression.zipfile",    "[IO.Compression.ZipFile] — .NET ZIP creation (T1560.001)",        TRUE  },
+
+				// --- T1027: Obfuscated Files / Encoding (partial gap) ---
+				{ L"certutil -encode",          "certutil -encode — Base64 file encoding (T1027 obfuscation)",      TRUE  },
+				{ L"certutil /encode",          "certutil /encode — Base64 file encoding variant (T1027)",          TRUE  },
+				{ L"certutil -decodehex",       "certutil -decodehex — hex decoding (T1027/T1140)",                TRUE  },
+				{ L"certutil /decodehex",       "certutil /decodehex — hex decoding variant (T1027)",              TRUE  },
+				{ L"-nop -w hidden -e",         "PowerShell -nop -w hidden -e — obfuscated stager (T1027)",        TRUE  },
+				{ L"[convert]::tobase64",       "[Convert]::ToBase64String — PS Base64 encoding (T1027)",          FALSE },
+				{ L"[convert]::frombase64",     "[Convert]::FromBase64String — PS Base64 decoding (T1027/T1140)",  FALSE },
+
+				// --- T1614: System Location Discovery ---
+				{ L"get-winhomelocation",       "Get-WinHomeLocation — geographic location query (T1614)",          FALSE },
+				{ L"get-timezone",              "Get-TimeZone — timezone query (T1614 location discovery)",         FALSE },
+				{ L"tzutil /g",                 "tzutil /g — timezone query (T1614 location discovery)",            FALSE },
 
 				{ nullptr, nullptr, FALSE }
 			};
