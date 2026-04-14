@@ -4927,7 +4927,13 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreFsControl(
         Data->Iopb->MinorFunction != IRP_MN_KERNEL_CALL)
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
-    ULONG fsctl = Data->Iopb->Parameters.FileSystemControl.Common.FsControlCode;
+    // For FileSystemControl, get the FSCTL code - may vary by WDK version
+    ULONG fsctl = 0;
+    __try {
+        fsctl = Data->Iopb->Parameters.FileSystemControl.Common.FsControlCode;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
 
     // ---- Reparse point creation (junction / symlink / mount point) ----
     if (fsctl == FSCTL_SET_REPARSE_POINT) {
@@ -4965,8 +4971,17 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreFsControl(
 
         // Determine reparse tag from the buffer if accessible
         const char* rpType = "reparse point";
-        PVOID sysBuf = Data->Iopb->Parameters.FileSystemControl.Common.OutputBuffer;
-        if (!sysBuf) sysBuf = Data->Iopb->Parameters.FileSystemControl.Common.InputBuffer;
+        PVOID sysBuf = nullptr;
+        // For FileSystemControl, buffers depend on the FSCTL method
+        // Try to access through the union - may be in different locations per WDK version
+        __try {
+            // First try Method3Other if available, otherwise use generic system buffer access
+            if (Data->Iopb->Parameters.FileSystemControl.SystemBuffer) {
+                sysBuf = Data->Iopb->Parameters.FileSystemControl.SystemBuffer;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            sysBuf = nullptr;
+        }
         if (sysBuf && MmIsAddressValid(sysBuf)) {
             REPARSE_DATA_BUFFER* rpBuf = (REPARSE_DATA_BUFFER*)sysBuf;
             if (rpBuf->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT)

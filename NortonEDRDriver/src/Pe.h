@@ -86,6 +86,8 @@ typedef struct _IMAGE_DATA_DIRECTORY {
     DWORD Size;
 } IMAGE_DATA_DIRECTORY, * PIMAGE_DATA_DIRECTORY;
 
+// Forward declare PE header types for use in kernel code
+// These match WDK structures from ntddk.h
 typedef struct _IMAGE_OPTIONAL_HEADER64 {
     WORD        Magic;
     BYTE        MajorLinkerVersion;
@@ -124,6 +126,10 @@ typedef struct _IMAGE_NT_HEADERS64 {
     IMAGE_FILE_HEADER FileHeader;
     IMAGE_OPTIONAL_HEADER64 OptionalHeader;
 } IMAGE_NT_HEADERS64, * PIMAGE_NT_HEADERS64;
+
+// Generic IMAGE_NT_HEADERS for x64 kernel
+typedef IMAGE_NT_HEADERS64 IMAGE_NT_HEADERS;
+typedef PIMAGE_NT_HEADERS64 PIMAGE_NT_HEADERS;
 
 typedef struct _IMAGE_SECTION_HEADER
 {

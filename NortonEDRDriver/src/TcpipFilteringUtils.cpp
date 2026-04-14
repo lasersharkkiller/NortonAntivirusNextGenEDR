@@ -1411,7 +1411,7 @@ VOID WdfTcpipUtils::UnsubscribeWfpChangeNotifications()
         SubLayerChangeHandle = NULL;
     }
     if (BfeStateChangeHandle) {
-        FwpmBfeStateUnsubscribeChanges(EngineHandle, BfeStateChangeHandle);
+        FwpmBfeStateUnsubscribeChanges(BfeStateChangeHandle);
         BfeStateChangeHandle = NULL;
     }
 }

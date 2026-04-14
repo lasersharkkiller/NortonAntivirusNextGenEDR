@@ -5808,13 +5808,7 @@ static void WINAPI ApiAuditEventCallback(PEVENT_RECORD pEvent) {
     // Ignore self-opens
     if (targetPid == callerPid) return;
 
-    // Suspicious access rights
-    constexpr UINT32 PROCESS_VM_READ      = 0x0010;
-    constexpr UINT32 PROCESS_VM_WRITE     = 0x0020;
-    constexpr UINT32 PROCESS_VM_OPERATION = 0x0008;
-    constexpr UINT32 PROCESS_ALL_ACCESS   = 0x001FFFFF;
-    constexpr UINT32 PROCESS_CREATE_THREAD = 0x0002;
-    constexpr UINT32 PROCESS_DUP_HANDLE   = 0x0040;
+    // Suspicious access rights (using standard Windows process access rights)
 
     // Check if target is a high-value process
     std::string targetName;

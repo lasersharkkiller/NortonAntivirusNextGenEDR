@@ -176,3 +176,29 @@ DEFINE_GUID(GUID_DEVINTERFACE_DISK_LOCAL,
 DEFINE_GUID(GUID_DEVINTERFACE_1394_LOCAL,
     0x6BDD1FC1, 0x810F, 0x11D0,
     0xBE, 0xC7, 0x08, 0x00, 0x2B, 0xE2, 0x09, 0x2F);
+
+// ---------------------------------------------------------------------------
+// WFP (Windows Filtering Platform) kernel-mode function declarations
+// ---------------------------------------------------------------------------
+
+extern "C" NTSTATUS FwpmFilterSubscribeChanges(
+    HANDLE engineHandle,
+    const FWPM_FILTER_SUBSCRIPTION0* subscription,
+    void* callback,
+    void* context,
+    HANDLE* changeHandle);
+
+extern "C" NTSTATUS FwpmSubLayerSubscribeChanges(
+    HANDLE engineHandle,
+    const FWPM_SUBLAYER_SUBSCRIPTION0* subscription,
+    void* callback,
+    void* context,
+    HANDLE* changeHandle);
+
+extern "C" NTSTATUS FwpmFilterUnsubscribeChanges(
+    HANDLE engineHandle,
+    HANDLE changeHandle);
+
+extern "C" NTSTATUS FwpmSubLayerUnsubscribeChanges(
+    HANDLE engineHandle,
+    HANDLE changeHandle);

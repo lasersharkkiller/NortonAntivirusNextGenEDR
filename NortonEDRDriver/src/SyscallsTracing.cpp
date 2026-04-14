@@ -2178,7 +2178,9 @@ VOID SyscallsUtils::NtSetContextThreadHandler(
 // ---------------------------------------------------------------------------
 
 #define PROCESS_ALL_ACCESS_WIN10  0x1F0FFF
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
 #define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
+#endif
 
 static const char* ClassifyProcessAccessMask(ACCESS_MASK mask, BOOLEAN* outCritical)
 {
@@ -2589,7 +2591,9 @@ VOID SyscallsUtils::NtCreateSectionHandler(
 	ULONG          AllocationAttributes,
 	HANDLE         FileHandle
 ) {
+	#ifndef SEC_COMMIT
 	#define SEC_COMMIT 0x8000000
+	#endif
 
 	// SEC_IMAGE = 0x1000000 — maps a PE as an image (module stomping indicator)
 	BOOLEAN isStomp   = (AllocationAttributes & 0x1000000) != 0;
@@ -2671,7 +2675,7 @@ VOID SyscallsUtils::NtMapViewOfSectionHandler(
 	if (!NT_SUCCESS(ObReferenceObjectByHandle(
 		SectionHandle,
 		0,                    // no specific access check — we're just reading for detection
-		*MmSectionObjectType,
+		MmSectionObjectType,
 		UserMode,
 		&sectionObject,
 		nullptr))) return;
@@ -3662,7 +3666,7 @@ VOID SyscallsUtils::NtOpenThreadTokenExHandler(
 
 	if (isCrossProcess) {
 		char ownerName[15] = {};
-		PUCHAR imgName = PsGetProcessImageFileName(threadOwner);
+		char* imgName = PsGetProcessImageFileName(threadOwner);
 		if (imgName) RtlCopyMemory(ownerName, imgName, min(strlen((char*)imgName), 14u));
 
 		BOOLEAN isSensitive = ObjectUtils::IsSensitiveProcess(threadOwner);
@@ -3899,7 +3903,7 @@ VOID SyscallsUtils::NtImpersonateThreadHandler(
 		if (!isLegit) {
 			char clientName[15] = {};
 			if (clientOwner) {
-				PUCHAR img = PsGetProcessImageFileName(clientOwner);
+				char* img = PsGetProcessImageFileName(clientOwner);
 				if (img) RtlCopyMemory(clientName, img, min(strlen((char*)img), 14u));
 			}
 

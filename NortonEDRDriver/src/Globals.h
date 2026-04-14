@@ -766,64 +766,6 @@ class SyscallsUtils {
 	static PFUNCTION_MAP exportsMap;
 	static PSSDT_TABLE ssdtTable;
 
-	static ULONG NtAllocId;
-	static ULONG NtWriteId;
-	static ULONG NtProtectId;
-	static ULONG NtFreeId;
-	static ULONG NtReadId;
-	static ULONG NtWriteFileId;
-
-	// For future use
-	static ULONG NtQueueApcThreadId;
-	static ULONG NtQueueApcThreadExId;
-	static ULONG NtSetContextThreadId;
-	static ULONG NtMapViewOfSectionId;
-	static ULONG NtResumeThreadId;
-	static ULONG NtContinueId;
-	static ULONG NtContinueEx;
-	static ULONG NtAdjustPrivilegesTokenId;
-
-	// New IDs — cross-process injection, section mapping, driver load
-	static ULONG NtOpenProcessId;        // Fixed: 0x0026 across all Win10/11
-	static ULONG NtCreateThreadExId;     // Variable — resolved in InitIds()
-	static ULONG NtSuspendThreadId;      // Variable — resolved in InitIds()
-	static ULONG NtCreateSectionId;      // Variable — resolved in InitIds()
-	static ULONG NtUnmapViewOfSectionId;        // Variable — resolved in InitIds()
-	static ULONG NtLoadDriverId;               // Variable — resolved in InitIds()
-	static ULONG NtUnloadDriverId;             // Variable — resolved in InitIds()
-	static ULONG NtProtectVirtualMemoryId;     // Variable — resolved in InitIds()
-	static ULONG NtCreateTransactionId;        // Variable — doppelgänging telemetry
-	static ULONG NtRollbackTransactionId;      // Variable — doppelgänging telemetry
-	static ULONG NtCommitTransactionId;        // Variable — TxF commit-path evasion detection
-	static ULONG NtCreateProcessExId;          // Variable — legacy section-based process creation
-	static ULONG NtCreateProcessId;            // Variable — even older legacy API (same technique)
-	static ULONG NtQuerySystemInformationId;   // Variable — EDR callback enumeration recon
-	static ULONG NtSetInformationProcessId;    // Variable — PPL-strip detection (ProcessProtectionLevel = 0x3D)
-	static ULONG NtDuplicateObjectId;         // Stable at 0x003C — handle duplication detection
-	static ULONG NtDebugActiveProcessId;      // Variable — debug-attach credential dump detection
-	static ULONG NtSetInformationThreadId;    // Variable — token impersonation detection
-	static ULONG NtTraceControlId;            // Variable — ETW manipulation detection
-	static ULONG NtCreateNamedPipeFileId;     // Variable — named pipe C2 detection
-	static ULONG NtCreateMailslotFileId;      // Variable — mailslot C2 / lateral movement detection
-	static ULONG NtOpenThreadId;              // Variable — thread hijack / context scrape detection
-	static ULONG NtFlushInstructionCacheId;   // Variable — post-injection cache flush detection
-	static ULONG NtCreateFileId;             // Variable — physical memory / raw device access detection (IOMMU bypass)
-	static ULONG NtAssignProcessToJobObjectId; // Variable — job object assignment attack detection
-
-	// Token impersonation / privilege escalation attack surface
-	static ULONG NtOpenProcessTokenExId;       // Variable — token acquisition from privileged processes
-	static ULONG NtOpenThreadTokenExId;        // Variable — thread token acquisition detection
-	static ULONG NtDuplicateTokenId;           // Variable — token cloning/conversion (impersonation→primary)
-	static ULONG NtCreateTokenExId;            // Variable — token forging (requires SeCreateTokenPrivilege)
-	static ULONG NtCreateTokenId;              // Variable — legacy token forging
-	static ULONG NtImpersonateThreadId;        // Variable — direct thread impersonation
-	static ULONG NtAlpcImpersonateClientOfPortId;  // Variable — ALPC impersonation
-	static ULONG NtAlpcImpersonateClientThreadId;  // Variable — ALPC thread impersonation
-	static ULONG NtFilterTokenId;              // Variable — restricted token manipulation
-	static ULONG NtImpersonateAnonymousTokenId;    // Variable — anonymous token impersonation
-	static ULONG NtTerminateThreadId;              // Variable — Phant0m Event Log thread kill detection
-	static ULONG NtSetSystemInformationId;         // Variable — ETW debug control / kernel structure tampering
-
 	static BufferQueue* bufQueue;
 	static StackUtils* stackUtils;
 	static RegionTracker* vmRegionTracker;
@@ -884,6 +826,8 @@ public:
 	static ULONG NtAlpcImpersonateClientThreadId;
 	static ULONG NtFilterTokenId;
 	static ULONG NtImpersonateAnonymousTokenId;
+	static ULONG NtTerminateThreadId;
+	static ULONG NtSetSystemInformationId;
 
 	SyscallsUtils() {} /*: isTracingEnabled(FALSE) {}*/
 
