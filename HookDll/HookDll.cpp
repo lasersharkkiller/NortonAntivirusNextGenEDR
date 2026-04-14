@@ -1,5 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <objbase.h>    // COM types: LPUNKNOWN, LPCOLESTR, IID, etc.
+#include <ole2.h>       // OLE2 functions
 #include <winternl.h>
 #include <psapi.h>
 #include <winreg.h>
@@ -24,6 +26,9 @@ static HANDLE           g_pipe     = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_pipeLock;
 static DWORD            g_selfPid  = 0;
 static bool             g_lockInit = false;
+
+// Forward declaration for function defined later in file
+static bool IsAddressInKnownModule(const void* addr);
 
 static void ConnectToPipe() {
     if (!WaitNamedPipeA("\\\\.\\pipe\\NortonEDR_HookDll", 2000)) return;

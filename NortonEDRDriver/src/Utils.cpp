@@ -108,7 +108,7 @@ BOOLEAN FileIsExe(PUNICODE_STRING UnicodeString) {
     return FALSE;
 }
 
-BOOLEAN UnicodeStringContains(PUNICODE_STRING UnicodeString, PCWSTR SearchString) {
+BOOLEAN UnicodeStringContains(PCUNICODE_STRING UnicodeString, PCWSTR SearchString) {
 
     if (UnicodeString == NULL || UnicodeString->Buffer == NULL || SearchString == NULL) {
         return FALSE;

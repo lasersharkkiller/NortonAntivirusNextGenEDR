@@ -84,12 +84,40 @@ extern "C" HANDLE PsGetProcessInheritedFromUniqueProcessId(
 // Token / logon-session APIs (used by TokenMonitor)
 // ---------------------------------------------------------------------------
 
+// Windows Process Access Rights (from winnt.h, needed in kernel mode)
+// Note: PROCESS_TERMINATE and PROCESS_VM_READ are defined in Offsets.h
+#ifndef PROCESS_CREATE_THREAD
+#define PROCESS_CREATE_THREAD              (0x0002)
+#define PROCESS_SET_SESSIONID              (0x0004)
+#define PROCESS_VM_OPERATION               (0x0008)
+#define PROCESS_VM_WRITE                   (0x0020)
+#define PROCESS_DUP_HANDLE                 (0x0040)
+#define PROCESS_CREATE_PROCESS             (0x0080)
+#define PROCESS_SET_QUOTA                  (0x0100)
+#define PROCESS_SET_INFORMATION            (0x0200)
+#define PROCESS_QUERY_INFORMATION          (0x0400)
+#define PROCESS_SUSPEND_RESUME             (0x0800)
+#define PROCESS_QUERY_LIMITED_INFORMATION  (0x1000)
+#endif
+
+// PE/Image Constants from winnt.h (needed in kernel mode)
+#ifndef IMAGE_DIRECTORY_ENTRY_SECURITY
+#define IMAGE_DIRECTORY_ENTRY_SECURITY     4
+#define IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR 14
+#define IMAGE_NT_OPTIONAL_HDR64_MAGIC      0x20b
+#define IMAGE_NT_OPTIONAL_HDR32_MAGIC      0x10b
+#define IMAGE_SCN_MEM_READ                 0x40000000
+#define IMAGE_SCN_MEM_WRITE                0x80000000
+#endif
+
 // Opaque logon session identifier passed to SeRegisterLogonSessionTerminatedRoutine.
 typedef LUID* PLUID;
 
 typedef NTSTATUS (NTAPI* PSE_LOGON_SESSION_TERMINATED_ROUTINE)(
     _In_ PLUID LogonId);
 
+#pragma warning(push)
+#pragma warning(disable:4273)  // inconsistent dll linkage
 extern "C" NTSTATUS SeRegisterLogonSessionTerminatedRoutine(
     _In_ PSE_LOGON_SESSION_TERMINATED_ROUTINE CallbackRoutine);
 
@@ -112,6 +140,7 @@ extern "C" NTSTATUS SeQueryInformationToken(
     _In_  PACCESS_TOKEN     Token,
     _In_  TOKEN_INFORMATION_CLASS TokenInformationClass,
     _Out_ PVOID*            TokenInformation);
+#pragma warning(pop)
 
 // ---------------------------------------------------------------------------
 // PnP notification types (used by PnpMonitor)

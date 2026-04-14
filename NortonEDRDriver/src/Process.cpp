@@ -275,13 +275,6 @@ static BOOLEAN IsSuspiciousCmdLine(PCUNICODE_STRING cmdLine, const char* imgName
     return (BOOLEAN)((chars - argStart) < 2);
 }
 
-    if (InterlockedCompareExchange(&g_MitigInitDone, 1, 0) == 0) {
-        UNICODE_STRING us;
-        RtlInitUnicodeString(&us, L"PsGetProcessMitigationPolicy");
-        g_PsGetMitig = (pfnPsGetProcessMitigationPolicy)MmGetSystemRoutineAddress(&us);
-    }
-}
-
 BOOLEAN ProcessUtils::isProcessImageTampered() {
 
 	NTSTATUS status;

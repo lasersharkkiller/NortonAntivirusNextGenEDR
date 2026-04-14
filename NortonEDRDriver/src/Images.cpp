@@ -2745,12 +2745,16 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                             ExFreePool(charBuffer);
                         }
                     }
-                
+
             }
             else {
                 DbgPrint("[-] Failed to allocate memory for section data\n");
             }
         }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Inner try-except: exception during image processing
+        }
+
         __except (EXCEPTION_EXECUTE_HANDLER) {
             DbgPrint("[-] Exception in ImageLoadNotifyRoutine\n");
         }
