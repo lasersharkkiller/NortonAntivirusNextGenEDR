@@ -2165,6 +2165,138 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                             }
 
                             // ---------------------------------------------------
+                            // Generic unsigned DLL from suspicious path loaded
+                            // into a proxy/LOLBin process (T1218 + T1574).
+                            //
+                            // Beyond the 18 named sideload targets above, flag
+                            // ANY DLL loaded from %TEMP%, %PUBLIC%, %APPDATA%,
+                            // or %PROGRAMDATA% into known execution proxy binaries
+                            // (rundll32, msiexec, regsvr32, InstallUtil, etc.).
+                            //
+                            // These proxies are designed to load and execute DLLs;
+                            // adversaries abuse them to run malicious DLLs with
+                            // the proxy's trusted signature.
+                            // ---------------------------------------------------
+                            {
+                                // Check if the loading process is a known proxy
+                                BOOLEAN isProxyHost = FALSE;
+                                if (loadingProcess) {
+                                    static const char* kProxyHosts[] = {
+                                        "rundll32.exe",
+                                        "msiexec.exe",
+                                        "regsvr32.exe",
+                                        "InstallUtil.",   // InstallUtil.exe (truncated to 15)
+                                        "regasm.exe",
+                                        "regsvcs.exe",
+                                        "mshta.exe",
+                                        "odbcconf.exe",
+                                        "cmstp.exe",
+                                        nullptr
+                                    };
+                                    for (int ph = 0; kProxyHosts[ph]; ph++) {
+                                        if (strcmp(loadingProcess,
+                                            kProxyHosts[ph]) == 0) {
+                                            isProxyHost = TRUE;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if (isProxyHost) {
+                                    // Check if DLL path is suspicious
+                                    BOOLEAN fromSuspPath = FALSE;
+                                    static const char* kDllSusPaths[] = {
+                                        "\\temp\\",
+                                        "\\appdata\\",
+                                        "\\users\\public\\",
+                                        "\\programdata\\",
+                                        "\\downloads\\",
+                                        "\\desktop\\",
+                                        nullptr
+                                    };
+                                    for (int dp = 0; kDllSusPaths[dp]; dp++) {
+                                        SIZE_T dpLen = 0;
+                                        while (kDllSusPaths[dp][dpLen]) dpLen++;
+                                        if (cbLen >= dpLen) {
+                                            for (SIZE_T ci = 0;
+                                                 ci <= cbLen - dpLen; ci++) {
+                                                BOOLEAN match = TRUE;
+                                                for (SIZE_T j = 0;
+                                                     j < dpLen; j++) {
+                                                    char a = charBuffer[ci+j];
+                                                    char b = kDllSusPaths[dp][j];
+                                                    if (a >= 'A' && a <= 'Z')
+                                                        a |= 0x20;
+                                                    if (a != b) {
+                                                        match = FALSE;
+                                                        break;
+                                                    }
+                                                }
+                                                if (match) {
+                                                    fromSuspPath = TRUE;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (fromSuspPath) break;
+                                    }
+
+                                    if (fromSuspPath) {
+                                        char pdMsg[380];
+                                        RtlStringCbPrintfA(pdMsg, sizeof(pdMsg),
+                                            "DLL proxy load (T1218/T1574): "
+                                            "DLL from suspicious path "
+                                            "'%.*s' loaded by proxy '%s' "
+                                            "(pid=%lu)",
+                                            (int)(cbLen > 200 ? 200 : cbLen),
+                                            charBuffer,
+                                            loadingProcess
+                                                ? loadingProcess : "?",
+                                            HandleToUlong(ProcessId));
+                                        SIZE_T pdLen = strlen(pdMsg) + 1;
+
+                                        PKERNEL_STRUCTURED_NOTIFICATION pdN =
+                                            (PKERNEL_STRUCTURED_NOTIFICATION)
+                                            ExAllocatePool2(
+                                                POOL_FLAG_NON_PAGED,
+                                                sizeof(KERNEL_STRUCTURED_NOTIFICATION),
+                                                'pdnt');
+                                        if (pdN) {
+                                            RtlZeroMemory(pdN, sizeof(*pdN));
+                                            SET_CRITICAL(*pdN);
+                                            SET_IMAGE_LOAD_PATH_CHECK(*pdN);
+                                            SET_CALLING_PROC_PID_CHECK(*pdN);
+                                            pdN->pid = PsGetProcessId(
+                                                targetProcess);
+                                            pdN->isPath = TRUE;
+                                            if (loadingProcess)
+                                                RtlStringCbCopyA(
+                                                    pdN->procName,
+                                                    sizeof(pdN->procName),
+                                                    loadingProcess);
+                                            pdN->msg = (char*)
+                                                ExAllocatePool2(
+                                                    POOL_FLAG_NON_PAGED,
+                                                    pdLen, 'pdmg');
+                                            if (pdN->msg) {
+                                                RtlCopyMemory(pdN->msg,
+                                                    pdMsg, pdLen);
+                                                pdN->bufSize = (ULONG)pdLen;
+                                                if (!CallbackObjects::
+                                                    GetNotifQueue()->
+                                                    Enqueue(pdN)) {
+                                                    ExFreePool(pdN->msg);
+                                                    ExFreePool(pdN);
+                                                }
+                                            } else {
+                                                ExFreePool(pdN);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ---------------------------------------------------
                             // PE section anomaly detection at image load
                             //
                             // Detect packer/protector section names and high-

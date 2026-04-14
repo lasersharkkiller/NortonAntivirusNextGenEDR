@@ -37,8 +37,13 @@ static const WCHAR* kPersistencePaths[] = {
     L"\\Winlogon\\Userinit",
     L"\\Winlogon\\Notify",
 
-    // --- COM object hijack (persistence via InprocServer32) ---
-    // Too broad to include globally; covered by LOLBin/supply-chain pattern instead.
+    // --- T1546.015: COM object hijack (persistence via InprocServer32/LocalServer32) ---
+    // Adversaries write to HKCU\Software\Classes\CLSID\{...}\InprocServer32 or
+    // LocalServer32 to redirect COM instantiation to a malicious DLL/EXE.
+    // HKCU keys take precedence over HKLM, so no admin rights needed.
+    // Scoped to InprocServer32/LocalServer32 to avoid noise from general CLSID writes.
+    L"\\InprocServer32",
+    L"\\LocalServer32",
 
     // --- Boot configuration / EFI (firmware tampering, BlackLotus) ---
     // HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot is read-only from usermode
@@ -121,6 +126,7 @@ static const BOOLEAN kPersistenceCritical[] = {
     TRUE,                              // IFEO — Critical
     TRUE,                              // AppInit_DLLs — Critical
     TRUE,  TRUE,  TRUE,               // Winlogon — Critical
+    TRUE,  TRUE,                       // COM InprocServer32/LocalServer32 hijack — Critical (T1546.015)
     TRUE,  TRUE,                       // SecureBoot / EFI — Critical
     FALSE,                             // Scheduled tasks — Warning
     TRUE,                              // WMI — Critical (rogue provider registration)

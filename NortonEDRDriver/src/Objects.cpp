@@ -18,6 +18,7 @@ static const char* kSensitiveProcesses[] = {
     "wininit.exe",
     "winlogon.exe",
     "services.exe",
+    "spoolsv.exe",     // Print Spooler — PrintNightmare (CVE-2021-34527) LPE target
     nullptr
 };
 

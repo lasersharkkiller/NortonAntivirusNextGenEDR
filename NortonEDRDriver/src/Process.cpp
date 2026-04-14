@@ -1437,6 +1437,87 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 		}
 
 		// -----------------------------------------------------------------------
+		// Print Spooler exploitation detection (CVE-2021-34527 PrintNightmare,
+		// CVE-2021-1675, CVE-2022-21999, and similar spoolsv.exe LPE/RCE).
+		//
+		// PrintNightmare abuses RpcAddPrinterDriverEx to load a malicious DLL
+		// into spoolsv.exe (SYSTEM).  Detection:
+		//  1. spoolsv.exe spawning unexpected child processes (shell, LOLBin)
+		//  2. DLL writes to \spool\drivers\ are covered in FsFilter
+		//
+		// spoolsv.exe should only spawn splwow64.exe, conhost.exe, and
+		// PrintIsolationHost.exe in normal operation.  Any other child is
+		// a strong exploit indicator.
+		// -----------------------------------------------------------------------
+		{
+			PEPROCESS parentProcess = NULL;
+			if (NT_SUCCESS(PsLookupProcessByProcessId(CreateInfo->ParentProcessId, &parentProcess))) {
+
+				char* parentName = PsGetProcessImageFileName(parentProcess);
+
+				BOOLEAN isSpoolsv = (parentName != NULL &&
+					(strcmp(parentName, "spoolsv.exe") == 0));
+
+				if (isSpoolsv) {
+					char* childName = PsGetProcessImageFileName(Process);
+
+					// Allowlist: legitimate spoolsv children
+					BOOLEAN isAllowedChild = FALSE;
+					if (childName) {
+						static const char* kSpoolAllowed[] = {
+							"splwow64.exe",     // 32-bit print driver host
+							"conhost.exe",
+							"PrintIsolati",     // PrintIsolationHost.exe (truncated)
+							nullptr
+						};
+						for (int i = 0; kSpoolAllowed[i]; i++) {
+							if (strcmp(childName, kSpoolAllowed[i]) == 0) {
+								isAllowedChild = TRUE;
+								break;
+							}
+						}
+					}
+
+					if (!isAllowedChild) {
+						char spoolMsg[380];
+						RtlStringCbPrintfA(spoolMsg, sizeof(spoolMsg),
+							"Print Spooler Exploit (T1068/CVE-2021-34527): spoolsv.exe "
+							"(pid=%llu) spawned unexpected child '%s' (pid=%llu) "
+							"— possible PrintNightmare or spooler LPE",
+							(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+							childName ? childName : "?",
+							(ULONG64)PsGetProcessId(Process));
+
+						PKERNEL_STRUCTURED_NOTIFICATION spNotif =
+							(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+								POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'spnt');
+						if (spNotif) {
+							RtlZeroMemory(spNotif, sizeof(*spNotif));
+							SET_CRITICAL(*spNotif);
+							SET_CALLING_PROC_PID_CHECK(*spNotif);
+							spNotif->isPath = FALSE;
+							spNotif->pid = PsGetProcessId(Process);
+							if (parentName) RtlCopyMemory(spNotif->procName, parentName, 14);
+							SIZE_T mLen = strlen(spoolMsg) + 1;
+							spNotif->msg = (char*)ExAllocatePool2(
+								POOL_FLAG_NON_PAGED, mLen, 'spmg');
+							if (spNotif->msg) {
+								RtlCopyMemory(spNotif->msg, spoolMsg, mLen);
+								spNotif->bufSize = (ULONG)mLen;
+								if (!CallbackObjects::GetNotifQueue()->Enqueue(spNotif)) {
+									ExFreePool(spNotif->msg);
+									ExFreePool(spNotif);
+								}
+							} else { ExFreePool(spNotif); }
+						}
+					}
+				}
+
+				ObDereferenceObject(parentProcess);
+			}
+		}
+
+		// -----------------------------------------------------------------------
 		// msxsl.exe execution detection — XSL script processing LOLBin (T1220).
 		//
 		// msxsl.exe is a legitimate Microsoft XML/XSL transform tool that can
@@ -2384,6 +2465,16 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"frombase64string(",     "FromBase64String -- encoded payload decoding",         TRUE  },
 				{ L"-urlcache",             "certutil -urlcache download lolbin",                  TRUE  },
 				{ L"/transfer",             "BITS transfer download lolbin",                       TRUE  },
+				// --- T1197: BITS job abuse for execution/persistence (Diavol, HAFNIUM) ---
+				// bitsadmin /SetNotifyCmdLine triggers execution when a BITS job
+				// completes — used by Diavol ransomware, HAFNIUM, and others to
+				// execute payloads via the BITS service (svchost.exe -k netsvcs).
+				{ L"/setnotifycmdline",     "BITS SetNotifyCmdLine — execution via BITS job completion callback (T1197)", TRUE },
+				{ L"/setnotifyflags",       "BITS SetNotifyFlags — BITS job notification config (T1197 setup)",          FALSE },
+				{ L"bitsadmin /create",     "BITS job creation — potential persistence/execution staging (T1197)",        FALSE },
+				{ L"bitsadmin /resume",     "BITS job resume — triggers staged BITS execution (T1197)",                  FALSE },
+				{ L"bitsadmin /addfile",    "BITS AddFile — file staging via BITS job (T1197)",                           FALSE },
+				{ L"bitsadmin /rawreturn",  "BITS RawReturn — suppress output for stealth BITS operations",              FALSE },
 				{ L"/i:http",               "msiexec /i:http remote install lolbin",               TRUE  },
 				{ L"javascript:",           "javascript: URI -- script execution via shell",        TRUE  },
 				{ L"vbscript:",             "vbscript: URI -- script execution via shell",          TRUE  },
