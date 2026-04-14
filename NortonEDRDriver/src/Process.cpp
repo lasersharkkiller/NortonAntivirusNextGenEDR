@@ -1075,6 +1075,104 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 		}
 
 		// -----------------------------------------------------------------------
+		// UAC Bypass via auto-elevating binaries (T1548.002)
+		//
+		// fodhelper.exe and eventvwr.exe are Microsoft-signed binaries that
+		// auto-elevate without a UAC prompt.  Attackers hijack their registry
+		// lookups (e.g. ms-settings or mscfile shell\open\command) to spawn
+		// an arbitrary elevated child process.
+		//
+		// Any child process from these parents is suspicious — they are not
+		// intended to launch user-controlled children in normal operation.
+		// -----------------------------------------------------------------------
+		{
+			PEPROCESS parentProcess = NULL;
+			if (NT_SUCCESS(PsLookupProcessByProcessId(CreateInfo->ParentProcessId, &parentProcess))) {
+
+				char* parentName = PsGetProcessImageFileName(parentProcess);
+
+				BOOLEAN isUacBypassHost = (parentName != NULL &&
+					(strcmp(parentName, "fodhelper.exe") == 0 ||
+					 strcmp(parentName, "eventvwr.exe") == 0 ||
+					 strcmp(parentName, "computerdef") == 0 ||    // computerdefaults.exe (truncated)
+					 strcmp(parentName, "sdclt.exe") == 0 ||
+					 strcmp(parentName, "slui.exe") == 0));
+
+				if (isUacBypassHost) {
+					char* childName = PsGetProcessImageFileName(Process);
+
+					// Allowlist: legitimate children
+					BOOLEAN isAllowedChild = FALSE;
+					if (childName) {
+						static const char* kUacAllowedChildren[] = {
+							"conhost.exe",
+							nullptr
+						};
+						for (int i = 0; kUacAllowedChildren[i]; i++) {
+							if (strcmp(childName, kUacAllowedChildren[i]) == 0) {
+								isAllowedChild = TRUE;
+								break;
+							}
+						}
+					}
+
+					if (!isAllowedChild) {
+						// Check if child is a shell/LOLBin — makes it critical
+						BOOLEAN isCriticalChild = FALSE;
+						if (CreateInfo->ImageFileName != NULL) {
+							static const WCHAR* kUacCriticalChildren[] = {
+								L"cmd.exe", L"powershell.exe", L"pwsh.exe",
+								L"wscript.exe", L"cscript.exe", L"mshta.exe",
+								L"rundll32.exe", L"regsvr32.exe", L"certutil.exe",
+								nullptr
+							};
+							for (int i = 0; kUacCriticalChildren[i]; i++) {
+								if (UnicodeStringContains(CreateInfo->ImageFileName, kUacCriticalChildren[i])) {
+									isCriticalChild = TRUE;
+									break;
+								}
+							}
+						}
+
+						char uacMsg[350];
+						RtlStringCbPrintfA(uacMsg, sizeof(uacMsg),
+							"UAC Bypass (T1548.002): %s (pid=%llu) spawned '%s' (pid=%llu)%s",
+							parentName,
+							(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+							childName ? childName : "?",
+							(ULONG64)PsGetProcessId(Process),
+							isCriticalChild ? " [SHELL/LOLBIN]" : "");
+
+						PKERNEL_STRUCTURED_NOTIFICATION kernelNotif =
+							(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+								POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'uact');
+						if (kernelNotif) {
+							RtlZeroMemory(kernelNotif, sizeof(*kernelNotif));
+							SET_CRITICAL(*kernelNotif);  // All UAC bypass children are critical
+							SET_CALLING_PROC_PID_CHECK(*kernelNotif);
+							kernelNotif->isPath = FALSE;
+							kernelNotif->pid = PsGetProcessId(Process);
+							RtlCopyMemory(kernelNotif->procName, parentName, 15);
+							SIZE_T mLen = strlen(uacMsg) + 1;
+							kernelNotif->msg = (char*)ExAllocatePool2(
+								POOL_FLAG_NON_PAGED, mLen, 'uamg');
+							if (kernelNotif->msg) {
+								RtlCopyMemory(kernelNotif->msg, uacMsg, mLen);
+								kernelNotif->bufSize = (ULONG)mLen;
+								if (!CallbackObjects::GetNotifQueue()->Enqueue(kernelNotif)) {
+									ExFreePool(kernelNotif->msg);
+									ExFreePool(kernelNotif);
+								}
+							} else { ExFreePool(kernelNotif); }
+						}
+					}
+				}
+
+				ObDereferenceObject(parentProcess);
+			}
+		}
+
+		// -----------------------------------------------------------------------
 		// mofcomp.exe execution detection — MOF compilation for WMI persistence.
 		//
 		// Attackers compile .mof files containing __EventFilter, __EventConsumer,
@@ -2189,6 +2287,71 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"get-winhomelocation",       "Get-WinHomeLocation — geographic location query (T1614)",          FALSE },
 				{ L"get-timezone",              "Get-TimeZone — timezone query (T1614 location discovery)",         FALSE },
 				{ L"tzutil /g",                 "tzutil /g — timezone query (T1614 location discovery)",            FALSE },
+
+				// --- T1489: Service Stop (ransomware pre-encryption service killing) ---
+				{ L"taskkill /f /im",           "taskkill /F /IM — force-kill process by name (T1489 service stop)", TRUE },
+				{ L"taskkill /im",              "taskkill /IM — kill process by name (T1489 service stop)",         FALSE },
+				{ L"taskkill /f /pid",           "taskkill /F /PID — force-kill process by PID (T1489)",            TRUE  },
+				{ L"net stop samss",            "net stop samss — AD service stop (T1489 ransomware pre-encrypt)", TRUE  },
+				{ L"net stop veeam",            "net stop veeam* — backup service stop (T1489 ransomware)",        TRUE  },
+				{ L"net stop sql",              "net stop sql* — SQL service stop (T1489 ransomware)",             TRUE  },
+				{ L"net stop mysql",            "net stop mysql — MySQL service stop (T1489 ransomware)",          TRUE  },
+				{ L"net stop oracle",           "net stop oracle — Oracle service stop (T1489 ransomware)",        TRUE  },
+				{ L"net stop exchange",         "net stop exchange — Exchange service stop (T1489 ransomware)",    TRUE  },
+				{ L"net stop backup",           "net stop backup — backup service stop (T1489 ransomware)",        TRUE  },
+				{ L"net stop shadow",           "net stop shadow — VSS shadow copy svc stop (T1489/T1490)",        TRUE  },
+				{ L"net stop vss",              "net stop vss — VSS service stop (T1489/T1490)",                   TRUE  },
+				{ L"net stop sophos",           "net stop sophos — AV/EDR service stop (T1489/T1562.001)",        TRUE  },
+				{ L"net stop mba",              "net stop mba* — managed backup service stop (T1489)",            TRUE  },
+
+				// --- T1003.002/004: Credential dumping via reg save ---
+				{ L"reg save hklm\\sam",        "reg save SAM — credential hive dump (T1003.002)",                 TRUE  },
+				{ L"reg save hklm\\security",   "reg save SECURITY — LSA secrets hive dump (T1003.004)",          TRUE  },
+				{ L"reg save hklm\\system",     "reg save SYSTEM — boot key hive dump (T1003.002)",               TRUE  },
+				{ L"reg.exe save hklm\\sam",    "reg.exe save SAM — credential hive dump (T1003.002)",            TRUE  },
+				{ L"reg.exe save hklm\\security", "reg.exe save SECURITY — LSA secrets dump (T1003.004)",         TRUE  },
+				{ L"reg.exe save hklm\\system", "reg.exe save SYSTEM — boot key dump (T1003.002)",               TRUE  },
+
+				// --- T1543.003: Suspicious service creation via sc create ---
+				{ L"sc create",                 "sc create — new service creation (T1543.003 persistence)",        TRUE  },
+				{ L"sc.exe create",             "sc.exe create — new service creation (T1543.003)",                TRUE  },
+				{ L"new-service",               "New-Service — PowerShell service creation (T1543.003)",          TRUE  },
+
+				// --- T1016: Network configuration discovery ---
+				{ L"net config workstation",    "net config workstation — domain/network config recon (T1016)",    FALSE },
+				{ L"net config server",         "net config server — server config recon (T1016)",                 FALSE },
+
+				// --- T1135: Network share discovery ---
+				{ L"net share",                 "net share — network share enumeration (T1135)",                    FALSE },
+				{ L"net1 share",                "net1 share — network share enumeration (T1135)",                  FALSE },
+				{ L"get-smbshare",              "Get-SmbShare — PowerShell share enumeration (T1135)",            FALSE },
+
+				// --- T1070: Anti-forensics ---
+				{ L"fsutil usn deletejournal",  "fsutil usn deletejournal — USN journal wipe (T1070.006 anti-forensics)", TRUE },
+				{ L"fsutil usn deletejournal /d", "fsutil usn deletejournal /D — full USN wipe (T1070.006)",     TRUE  },
+
+				// --- T1220: XSL Script Processing ---
+				{ L"msxsl.exe",                 "msxsl.exe — XSL script processing LOLBin (T1220)",                TRUE  },
+				{ L"msxsl ",                    "msxsl — XSL transform execution (T1220)",                         TRUE  },
+
+				// --- T1003/T1218: esentutl LOLBin ---
+				{ L"esentutl.exe /y",           "esentutl /y — copy locked file (T1003 cred dump LOLBin)",        TRUE  },
+				{ L"esentutl /y",               "esentutl /y — copy locked file bypass (T1003)",                  TRUE  },
+				{ L"esentutl.exe /vss",         "esentutl /vss — VSS file copy (T1003 NTDS/SAM exfil)",          TRUE  },
+				{ L"esentutl /vss",             "esentutl /vss — VSS-based file copy (T1003)",                    TRUE  },
+				{ L"esentutl.exe /p",           "esentutl /p — database repair (T1003 NTDS manipulation)",        FALSE },
+
+				// --- T1057/T1082: Additional recon tools ---
+				{ L"qprocess",                  "qprocess — process/session enumeration (T1057 recon)",            FALSE },
+				{ L"hostname",                  "hostname — hostname discovery (T1082 system info)",               FALSE },
+				{ L"getmac",                    "getmac — MAC address enumeration (T1016 network recon)",         FALSE },
+
+				// --- T1021.006: WinRM lateral movement ---
+				{ L"invoke-command -computer",  "Invoke-Command -ComputerName — WinRM remote exec (T1021.006)",   TRUE  },
+				{ L"enter-pssession",           "Enter-PSSession — WinRM interactive session (T1021.006)",        TRUE  },
+				{ L"new-pssession",             "New-PSSession — WinRM session creation (T1021.006)",             TRUE  },
+				{ L"winrm quickconfig",         "winrm quickconfig — enable WinRM (T1021.006 prep)",              TRUE  },
+				{ L"enable-psremoting",         "Enable-PSRemoting — enable PS remoting (T1021.006 prep)",        TRUE  },
 
 				{ nullptr, nullptr, FALSE }
 			};

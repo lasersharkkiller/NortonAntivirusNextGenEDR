@@ -96,6 +96,14 @@ static const WCHAR* kPersistencePaths[] = {
     L"\\Control Panel\\Desktop\\ScreenSaveActive",
     L"\\Control Panel\\Desktop\\ScreenSaveTimeOut",
 
+    // --- T1552.001: Credentials in Registry — AutoLogon keys ---
+    // Adversaries query DefaultPassword / DefaultUserName from the Winlogon
+    // key to harvest stored AutoLogon credentials (Mimikatz, LaZagne, etc.).
+    L"\\Winlogon\\DefaultPassword",
+    L"\\Winlogon\\DefaultUserName",
+    L"\\Winlogon\\AutoAdminLogon",
+    L"\\Winlogon\\DefaultDomainName",
+
     // --- T1562.002: ETW AutoLogger persistence tampering ---
     // AutoLoggers start ETW sessions at boot.  Deleting or modifying these keys
     // prevents security-critical ETW sessions (Sysmon, Defender, EDR) from starting.
@@ -128,6 +136,10 @@ static const BOOLEAN kPersistenceCritical[] = {
     TRUE,                              // Screensaver SCRNSAVE.EXE — Critical (T1546.002)
     FALSE,                             // ScreenSaveActive — Warning (T1546.002)
     FALSE,                             // ScreenSaveTimeOut — Warning (T1546.002)
+    TRUE,                              // Winlogon\DefaultPassword — Critical (T1552.001)
+    FALSE,                             // Winlogon\DefaultUserName — Warning (T1552.001)
+    FALSE,                             // Winlogon\AutoAdminLogon — Warning (T1552.001)
+    FALSE,                             // Winlogon\DefaultDomainName — Warning (T1552.001)
     TRUE,                              // ETW AutoLogger — Critical (T1562.002)
 };
 
