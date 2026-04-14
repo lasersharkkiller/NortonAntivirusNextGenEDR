@@ -28,6 +28,11 @@
 #include <winioctl.h>
 
 #pragma comment(lib, "crypt32.lib")
+
+// ETW trace level definitions (from wmistr.h)
+#ifndef TRACE_LEVEL_INFORMATIONAL
+#define TRACE_LEVEL_INFORMATIONAL 4
+#endif
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "wintrust.lib")
 
@@ -3822,7 +3827,7 @@ static DWORD WINAPI SysmonEventCallback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
         DetectionSeverity sev = DetectionSeverity::Low;
         std::string dgaNote = "long label";
         if (firstLabel.size() > 20 && entropy > 3.0) {
-            sev = DetectionSeverity::Warning;
+            sev = DetectionSeverity::Medium;
             dgaNote = "possible DGA (T1568.002)";
         }
         if (firstLabel.size() > 30 && entropy > 3.5) {
@@ -5189,8 +5194,8 @@ static void WINAPI LdapEventCallback(PEVENT_RECORD pEvent) {
         {"msds-managedpassword",         "GMSA_PASSWORD_READ",      DetectionSeverity::High},
         // Large enumeration indicators
         {"(objectclass=*)",              "FULL_AD_DUMP",            DetectionSeverity::High},
-        {"(objectcategory=computer)",    "COMPUTER_ENUM",           DetectionSeverity::Warning},
-        {"(objectcategory=person)",      "USER_ENUM",               DetectionSeverity::Warning},
+        {"(objectcategory=computer)",    "COMPUTER_ENUM",           DetectionSeverity::Medium},
+        {"(objectcategory=person)",      "USER_ENUM",               DetectionSeverity::Medium},
         {"admincount=1",                 "PRIV_USER_ENUM",          DetectionSeverity::High},
         {nullptr, nullptr, DetectionSeverity::Low}
     };
@@ -5595,15 +5600,15 @@ static void WINAPI NtlmEventCallback(PEVENT_RECORD pEvent) {
     switch (eventId) {
     case 4001:
         description = "NTLM outbound authentication";
-        sev = DetectionSeverity::Warning;
+        sev = DetectionSeverity::Medium;
         break;
     case 4003:
         description = "NTLM inbound authentication";
-        sev = DetectionSeverity::Warning;
+        sev = DetectionSeverity::Medium;
         break;
     case 8001:
         description = "NTLM auth via LSA";
-        sev = DetectionSeverity::Warning;
+        sev = DetectionSeverity::Medium;
         break;
     default:
         return;
@@ -5646,11 +5651,11 @@ static void WINAPI NtlmEventCallback(PEVENT_RECORD pEvent) {
     // Inbound NTLM from non-domain source could indicate relay
     if (eventId == 4003) {
         flags += " [INBOUND — RELAY RISK]";
-        if (sev < DetectionSeverity::Warning) sev = DetectionSeverity::Warning;
+        if (sev < DetectionSeverity::Medium) sev = DetectionSeverity::Medium;
     }
 
     // Only emit Warning+ to avoid flooding on normal NTLM traffic
-    if (sev < DetectionSeverity::Warning) return;
+    if (sev < DetectionSeverity::Medium) return;
 
     std::string ts = BuildTimestamp();
     std::string context = combined.size() > 150
@@ -6018,7 +6023,7 @@ static void WINAPI CodeIntegrityEventCallback(PEVENT_RECORD pEvent) {
     USHORT dataLen = pEvent->UserDataLength;
 
     const char* description = nullptr;
-    DetectionSeverity sev = DetectionSeverity::Warning;
+    DetectionSeverity sev = DetectionSeverity::Medium;
 
     switch (eventId) {
     case 3001:
@@ -6027,11 +6032,11 @@ static void WINAPI CodeIntegrityEventCallback(PEVENT_RECORD pEvent) {
         break;
     case 3002:
         description = "Code integrity unable to verify image integrity";
-        sev = DetectionSeverity::Warning;
+        sev = DetectionSeverity::Medium;
         break;
     case 3003:
         description = "Code integrity AUDIT — would be blocked under enforced policy";
-        sev = DetectionSeverity::Warning;
+        sev = DetectionSeverity::Medium;
         break;
     case 3004:
         description = "Image did not meet signing level requirements";
@@ -6905,7 +6910,7 @@ static DWORD WINAPI DnsEventCallback(
 
                 std::string ts = BuildTimestamp();
                 DetectionSeverity sev = wd.isCritical ?
-                    DetectionSeverity::Critical : DetectionSeverity::Warning;
+                    DetectionSeverity::Critical : DetectionSeverity::Medium;
 
                 std::string sevStr = wd.isCritical ? "Critical" : "Warning";
                 std::string msg = std::to_string(tab_1_menu_items.size()) +
@@ -8092,7 +8097,7 @@ static DWORD WINAPI WmiEventCallback(
         for (int i = 0; kReconQueries[i].pattern; i++) {
             if (opLower.find(kReconQueries[i].pattern) != std::string::npos) {
                 queryAlert += " [RECON:" + std::string(kReconQueries[i].tag) + "]";
-                sev = DetectionSeverity::Warning;
+                sev = DetectionSeverity::Medium;
                 description = "WMI recon query detected (probing)";
                 break;
             }
@@ -8174,12 +8179,12 @@ static DWORD WINAPI WmiEventCallback(
             consumerTypeAlert = " [CommandLine — SHELL EXECUTION]";
         } else if (opLower.find("nteventlogeventconsumer") != std::string::npos) {
             consumerTypeAlert = " [NTEventLog]";
-            if (sev > DetectionSeverity::Warning) sev = DetectionSeverity::Warning;
+            if (sev > DetectionSeverity::Medium) sev = DetectionSeverity::Medium;
         } else if (opLower.find("smtpeventconsumer") != std::string::npos) {
             consumerTypeAlert = " [SMTP — EXFIL RISK]";
         } else if (opLower.find("logeventconsumer") != std::string::npos) {
             consumerTypeAlert = " [LogFile]";
-            if (sev > DetectionSeverity::Warning) sev = DetectionSeverity::Warning;
+            if (sev > DetectionSeverity::Medium) sev = DetectionSeverity::Medium;
         }
 
         // CommandLineEventConsumer — contains CommandLineTemplate
