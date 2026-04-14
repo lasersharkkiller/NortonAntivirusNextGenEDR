@@ -22,6 +22,7 @@
 #include <sddl.h>
 #include <evntrace.h>
 #include <evntcons.h>
+#include <evntprov.h>
 #include <wincrypt.h>
 #include <winhttp.h>
 #include <winioctl.h>
@@ -4811,6 +4812,138 @@ static void StopClrRundownSession() {
 // is dead, it emits a Critical alert and attempts restart.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ETW Canary: detects ntdll!EtwEventWrite patching in our own process.
+//
+// Registers a throwaway user-mode ETW provider, starts a mini real-time
+// session consuming it, writes one canary event, and checks whether the
+// callback received it.  If the canary doesn't arrive, EtwEventWrite in
+// our ntdll has been NOP'd (ScareCrow, Backstab, custom patcher).
+//
+// This is the ONLY way to detect in-process ETW patches — the kernel-side
+// HookDetection scans other processes' ntdll prologues, but an attacker
+// with handle access to our process can patch our copy directly.
+// ---------------------------------------------------------------------------
+
+// Canary provider GUID — unique, not used elsewhere
+static const GUID kCanaryProviderGuid = {
+    0xCAFECAFE, 0xDEAD, 0xBEEF,
+    {0xCA, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}
+};
+
+static std::atomic<bool> g_canaryReceived(false);
+
+static void WINAPI CanaryEventCallback(PEVENT_RECORD pEvent) {
+    if (IsEqualGUID(pEvent->EventHeader.ProviderId, kCanaryProviderGuid) &&
+        pEvent->EventHeader.EventDescriptor.Id == 9999)
+    {
+        g_canaryReceived = true;
+    }
+}
+
+// Returns true if ETW pipeline is healthy, false if patched/broken
+static bool RunEtwCanaryCheck() {
+    REGHANDLE regHandle = 0;
+    ULONG st = EventRegister(&kCanaryProviderGuid, nullptr, nullptr, &regHandle);
+    if (st != ERROR_SUCCESS) return true;  // can't test, assume OK
+
+    const wchar_t* kSessName = L"NortonEDR-Canary";
+    const size_t nameBuf = (wcslen(kSessName) + 1) * sizeof(wchar_t);
+    const size_t propSz  = sizeof(EVENT_TRACE_PROPERTIES) + nameBuf;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propSz));
+    if (!props) { EventUnregister(regHandle); return true; }
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propSz);
+        props->Wnode.BufferSize  = static_cast<ULONG>(propSz);
+        props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessName) + 1, kSessName);
+    };
+
+    buildProps();
+    TRACEHANDLE sessH = 0;
+    st = StartTraceW(&sessH, kSessName, props);
+    if (st == ERROR_ALREADY_EXISTS) {
+        buildProps();
+        ControlTraceW(0, kSessName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        st = StartTraceW(&sessH, kSessName, props);
+    }
+    if (st != ERROR_SUCCESS) {
+        free(props);
+        EventUnregister(regHandle);
+        return true;
+    }
+
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    EnableTraceEx2(sessH, &kCanaryProviderGuid,
+                   EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                   TRACE_LEVEL_VERBOSE, 0xFFFFFFFFFFFFFFFF, 0, 0, &etp);
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName       = const_cast<LPWSTR>(kSessName);
+    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                               PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = CanaryEventCallback;
+
+    TRACEHANDLE traceH = OpenTraceW(&logFile);
+    if (traceH == INVALID_PROCESSTRACE_HANDLE) {
+        EVENT_TRACE_PROPERTIES stopP{};
+        stopP.Wnode.BufferSize = sizeof(stopP);
+        ControlTraceW(sessH, nullptr, &stopP, EVENT_TRACE_CONTROL_STOP);
+        free(props);
+        EventUnregister(regHandle);
+        return true;
+    }
+
+    // Consume in a background thread so ProcessTrace blocks there
+    g_canaryReceived = false;
+    std::thread consumer([&traceH]() {
+        ProcessTrace(&traceH, 1, nullptr, nullptr);
+    });
+
+    // Give consumer thread a moment to start
+    Sleep(100);
+
+    // Emit canary event (EID 9999, single UINT32 payload = 0xDEADCAFE)
+    EVENT_DESCRIPTOR evtDesc{};
+    evtDesc.Id      = 9999;
+    evtDesc.Version = 0;
+    evtDesc.Channel = 0;
+    evtDesc.Level   = TRACE_LEVEL_VERBOSE;
+    evtDesc.Opcode  = 0;
+    evtDesc.Task    = 0;
+    evtDesc.Keyword = 1;
+
+    UINT32 payload = 0xDEADCAFE;
+    EVENT_DATA_DESCRIPTOR dataDesc;
+    EventDataDescCreate(&dataDesc, &payload, sizeof(payload));
+    EventWrite(regHandle, &evtDesc, 1, &dataDesc);
+
+    // Wait up to 2 seconds for the canary to arrive
+    for (int i = 0; i < 20 && !g_canaryReceived.load(); i++) {
+        Sleep(100);
+    }
+
+    bool received = g_canaryReceived.load();
+
+    // Tear down canary session
+    CloseTrace(traceH);
+    consumer.join();
+    EVENT_TRACE_PROPERTIES stopP{};
+    stopP.Wnode.BufferSize = sizeof(stopP);
+    ControlTraceW(sessH, nullptr, &stopP, EVENT_TRACE_CONTROL_STOP);
+    free(props);
+    EventUnregister(regHandle);
+
+    return received;
+}
+
 static void EtwSessionWatchdogThread()
 {
     constexpr int kCheckIntervalMs = 15000;
@@ -4829,158 +4962,133 @@ static void EtwSessionWatchdogThread()
         return (st == ERROR_SUCCESS);
     };
 
+    // Coordinated kill correlation: track timestamps of session kills
+    // If 3+ sessions killed within kCoordinatedWindowMs, it's a coordinated
+    // blinding attack — not just one session dying from a race condition.
+    constexpr int    kCoordinatedThreshold = 3;
+    constexpr DWORD  kCoordinatedWindowMs  = 5000;
+    constexpr int    kMaxRestartAttempts    = 3;
+    std::vector<DWORD> killTimestamps;
+
+    // Per-session restart attempt counters (prevent infinite restart loops
+    // if attacker keeps killing sessions faster than we can restart)
+    int tiRestarts  = 0, kpRestarts  = 0;
+    int clrRestarts = 0, clrRdRestarts = 0;
+
     while (!g_etwWatchdogStop.load()) {
         Sleep(kCheckIntervalMs);
         if (g_etwWatchdogStop.load()) break;
 
         std::string ts = BuildTimestamp();
+        DWORD now = GetTickCount();
 
-        // --- Check ETW-TI session ---
-        if (g_tiSessionHandle != 0 &&
-            g_tiTraceHandle == INVALID_PROCESSTRACE_HANDLE)
+        // Expire old kill timestamps outside the correlation window
+        killTimestamps.erase(
+            std::remove_if(killTimestamps.begin(), killTimestamps.end(),
+                [&](DWORD t) { return (now - t) > kCoordinatedWindowMs; }),
+            killTimestamps.end());
+
+        // Helper: detect killed session, alert, auto-restart, track correlation
+        auto CheckAndRestart = [&](
+            TRACEHANDLE& sessionHandle,
+            TRACEHANDLE& traceHandle,
+            int& restartCount,
+            const wchar_t* sessionName,
+            const char* displayName,
+            const char* blinded,
+            void(*subscriberFn)())
         {
-            // ProcessTrace returned — session was killed externally
+            bool killed = false;
+
+            // Check 1: ProcessTrace returned (session killed while consuming)
+            if (sessionHandle != 0 &&
+                traceHandle == INVALID_PROCESSTRACE_HANDLE)
+            {
+                killed = true;
+            }
+            // Check 2: session no longer queryable (killed before ProcessTrace saw it)
+            else if (sessionHandle != 0 && !IsSessionAlive(sessionName))
+            {
+                killed = true;
+            }
+
+            if (!killed) return;
+
+            killTimestamps.push_back(now);
+
             std::string msg = std::to_string(tab_1_menu_items.size()) +
                 " - [*] [Critical] | " + ts +
                 " | ETW-Watchdog | Method: ETW Session Integrity" +
-                " | ETW-TI session (NortonEDR-TI) KILLED externally — "
-                "Threat-Intelligence telemetry is BLIND (T1562.002)";
+                " | " + displayName + " session (" +
+                std::string(sessionName, sessionName + wcslen(sessionName)) +
+                ") KILLED externally — " + blinded + " (T1562.002)";
             std::string det = "Date & Time: " + ts +
-                " | ETW-Watchdog | Method: ETW Session Integrity" +
-                " | Microsoft-Windows-Threat-Intelligence session terminated "
-                "by external process — attacker used logman stop / "
-                "NtTraceControl(StopTrace) / ControlTraceW to blind ETW-TI";
+                " | ETW-Watchdog | " + displayName +
+                " session terminated by external process";
+
+            // Auto-restart: re-launch subscriber thread if under retry limit
+            if (restartCount < kMaxRestartAttempts) {
+                restartCount++;
+                sessionHandle = 0;
+                traceHandle   = INVALID_PROCESSTRACE_HANDLE;
+                std::thread restartThread(subscriberFn);
+                restartThread.detach();
+                msg += " [AUTO-RESTART #" + std::to_string(restartCount) + "]";
+                det += " — watchdog restarting session (attempt " +
+                       std::to_string(restartCount) + "/" +
+                       std::to_string(kMaxRestartAttempts) + ")";
+            } else {
+                sessionHandle = 0;
+                msg += " [RESTART EXHAUSTED — BLIND]";
+                det += " — max restart attempts reached, session permanently dead";
+            }
+
             PushUiDetectionEvent(msg, det,
                 "Method: ETW Session Integrity (T1562.002)",
                 0, DetectionSeverity::Critical);
-            g_tiSessionHandle = 0;  // mark as dead so we only alert once
-        }
+        };
 
-        // --- Check ETW Kernel-Process session ---
-        if (g_kpSessionHandle != 0 &&
-            g_kpTraceHandle == INVALID_PROCESSTRACE_HANDLE)
-        {
+        // --- Check all real-time ETW sessions ---
+        CheckAndRestart(g_tiSessionHandle, g_tiTraceHandle,
+            tiRestarts, L"NortonEDR-TI", "ETW-TI",
+            "Threat-Intelligence telemetry is BLIND",
+            EtwTiSubscriberThread);
+
+        CheckAndRestart(g_kpSessionHandle, g_kpTraceHandle,
+            kpRestarts, L"NortonEDR-KernelProcess", "ETW-KP",
+            "PPID spoofing detection is BLIND",
+            KernelProcessSubscriberThread);
+
+        CheckAndRestart(g_clrSessionHandle, g_clrTraceHandle,
+            clrRestarts, L"NortonEDR-DotNETRuntime", "ETW-CLR",
+            ".NET assembly monitoring is BLIND",
+            ClrSubscriberThread);
+
+        CheckAndRestart(g_clrRundownSessionHandle, g_clrRundownTraceHandle,
+            clrRdRestarts, L"NortonEDR-DotNETRundown", "ETW-CLR-Rundown",
+            "pre-loaded assembly enumeration is BLIND",
+            ClrRundownSubscriberThread);
+
+        // --- Coordinated kill correlation ---
+        // 3+ session kills within 5 seconds = coordinated blinding attack
+        if (static_cast<int>(killTimestamps.size()) >= kCoordinatedThreshold) {
             std::string msg = std::to_string(tab_1_menu_items.size()) +
                 " - [*] [Critical] | " + ts +
-                " | ETW-Watchdog | Method: ETW Session Integrity" +
-                " | ETW-KP session (NortonEDR-KernelProcess) KILLED "
-                "externally — PPID spoofing detection is BLIND (T1562.002)";
+                " | ETW-Watchdog | Method: Coordinated ETW Blinding Attack" +
+                " | " + std::to_string(killTimestamps.size()) +
+                " ETW sessions killed within " +
+                std::to_string(kCoordinatedWindowMs / 1000) +
+                "s — COORDINATED ATTACK IN PROGRESS (T1562.002)";
             std::string det = "Date & Time: " + ts +
-                " | ETW-Watchdog | Method: ETW Session Integrity" +
-                " | Microsoft-Windows-Kernel-Process session terminated "
-                "by external process — attacker blinded PPID spoof detection";
+                " | ETW-Watchdog | Multiple ETW sessions terminated in rapid "
+                "succession — attacker is systematically blinding all ETW "
+                "telemetry channels. This pattern matches C2 frameworks "
+                "(Brute Ratel, Nighthawk) that kill all EDR sessions before "
+                "executing primary payload";
             PushUiDetectionEvent(msg, det,
-                "Method: ETW Session Integrity (T1562.002)",
+                "Method: Coordinated ETW Blinding Attack (T1562.002)",
                 0, DetectionSeverity::Critical);
-            g_kpSessionHandle = 0;
-        }
-
-        // --- Check named-session liveness via ControlTrace(QUERY) ---
-        // If sessions were started but attacker stopped them between
-        // our subscriber thread launching and ProcessTrace returning,
-        // the handle is still nonzero but the session is dead.
-        if (g_tiSessionHandle != 0 &&
-            !IsSessionAlive(L"NortonEDR-TI"))
-        {
-            std::string msg = std::to_string(tab_1_menu_items.size()) +
-                " - [*] [Critical] | " + ts +
-                " | ETW-Watchdog | Method: ETW Session Integrity" +
-                " | ETW-TI session no longer queryable — session tampering "
-                "detected (T1562.002)";
-            std::string det = "Date & Time: " + ts +
-                " | ETW-Watchdog | ETW-TI session query failed — "
-                "external termination or provider detach detected";
-            PushUiDetectionEvent(msg, det,
-                "Method: ETW Session Integrity (T1562.002)",
-                0, DetectionSeverity::Critical);
-            g_tiSessionHandle = 0;
-        }
-
-        if (g_kpSessionHandle != 0 &&
-            !IsSessionAlive(L"NortonEDR-KernelProcess"))
-        {
-            std::string msg = std::to_string(tab_1_menu_items.size()) +
-                " - [*] [Critical] | " + ts +
-                " | ETW-Watchdog | Method: ETW Session Integrity" +
-                " | ETW-KP session no longer queryable — session tampering "
-                "detected (T1562.002)";
-            std::string det = "Date & Time: " + ts +
-                " | ETW-Watchdog | ETW-KP session query failed — "
-                "external termination or provider detach detected";
-            PushUiDetectionEvent(msg, det,
-                "Method: ETW Session Integrity (T1562.002)",
-                0, DetectionSeverity::Critical);
-            g_kpSessionHandle = 0;
-        }
-
-        // --- Check CLR DotNETRuntime session ---
-        if (g_clrSessionHandle != 0 &&
-            g_clrTraceHandle == INVALID_PROCESSTRACE_HANDLE)
-        {
-            std::string msg = std::to_string(tab_1_menu_items.size()) +
-                " - [*] [Critical] | " + ts +
-                " | ETW-Watchdog | Method: ETW Session Integrity" +
-                " | ETW-CLR session (NortonEDR-DotNETRuntime) KILLED "
-                "externally — .NET assembly monitoring is BLIND (T1562.002)";
-            std::string det = "Date & Time: " + ts +
-                " | ETW-Watchdog | DotNETRuntime session terminated "
-                "by external process — attacker blinded .NET assembly detection";
-            PushUiDetectionEvent(msg, det,
-                "Method: ETW Session Integrity (T1562.002)",
-                0, DetectionSeverity::Critical);
-            g_clrSessionHandle = 0;
-        }
-
-        if (g_clrSessionHandle != 0 &&
-            !IsSessionAlive(L"NortonEDR-DotNETRuntime"))
-        {
-            std::string msg = std::to_string(tab_1_menu_items.size()) +
-                " - [*] [Critical] | " + ts +
-                " | ETW-Watchdog | Method: ETW Session Integrity" +
-                " | ETW-CLR session no longer queryable — session tampering "
-                "detected (T1562.002)";
-            std::string det = "Date & Time: " + ts +
-                " | ETW-Watchdog | ETW-CLR session query failed — "
-                "external termination or provider detach detected";
-            PushUiDetectionEvent(msg, det,
-                "Method: ETW Session Integrity (T1562.002)",
-                0, DetectionSeverity::Critical);
-            g_clrSessionHandle = 0;
-        }
-
-        // --- Check CLR DotNETRuntimeRundown session ---
-        if (g_clrRundownSessionHandle != 0 &&
-            g_clrRundownTraceHandle == INVALID_PROCESSTRACE_HANDLE)
-        {
-            std::string msg = std::to_string(tab_1_menu_items.size()) +
-                " - [*] [Critical] | " + ts +
-                " | ETW-Watchdog | Method: ETW Session Integrity" +
-                " | ETW-CLR-Rundown session (NortonEDR-DotNETRundown) KILLED "
-                "externally — pre-loaded assembly enumeration is BLIND (T1562.002)";
-            std::string det = "Date & Time: " + ts +
-                " | ETW-Watchdog | DotNETRuntimeRundown session terminated "
-                "by external process — attacker blinded rundown enumeration";
-            PushUiDetectionEvent(msg, det,
-                "Method: ETW Session Integrity (T1562.002)",
-                0, DetectionSeverity::Critical);
-            g_clrRundownSessionHandle = 0;
-        }
-
-        if (g_clrRundownSessionHandle != 0 &&
-            !IsSessionAlive(L"NortonEDR-DotNETRundown"))
-        {
-            std::string msg = std::to_string(tab_1_menu_items.size()) +
-                " - [*] [Critical] | " + ts +
-                " | ETW-Watchdog | Method: ETW Session Integrity" +
-                " | ETW-CLR-Rundown session no longer queryable — session "
-                "tampering detected (T1562.002)";
-            std::string det = "Date & Time: " + ts +
-                " | ETW-Watchdog | ETW-CLR-Rundown session query failed — "
-                "external termination or provider detach detected";
-            PushUiDetectionEvent(msg, det,
-                "Method: ETW Session Integrity (T1562.002)",
-                0, DetectionSeverity::Critical);
-            g_clrRundownSessionHandle = 0;
+            killTimestamps.clear();  // don't re-alert next cycle
         }
 
         // --- Check EvtSubscribe handles (log-based subscriptions) ---
@@ -5017,6 +5125,33 @@ static void EtwSessionWatchdogThread()
             }
         }
 
+        // --- ETW pipeline canary: detect in-process EtwEventWrite patching ---
+        // Run every 3rd watchdog cycle (~45s) to avoid session slot churn.
+        // If canary fails, our ntdll!EtwEventWrite has been NOP'd.
+        {
+            static int s_canaryCounter = 0;
+            if (++s_canaryCounter >= 3) {
+                s_canaryCounter = 0;
+                if (!RunEtwCanaryCheck()) {
+                    std::string msg = std::to_string(tab_1_menu_items.size()) +
+                        " - [*] [Critical] | " + ts +
+                        " | ETW-Watchdog | Method: ETW Pipeline Integrity" +
+                        " | Canary event NOT received — ntdll!EtwEventWrite "
+                        "has been PATCHED in our process (T1562.002)";
+                    std::string det = "Date & Time: " + ts +
+                        " | ETW-Watchdog | ETW canary verification failed — "
+                        "attacker has NOP'd or hooked EtwEventWrite in the "
+                        "NortonEDR user-mode process. All user-mode ETW "
+                        "emission from this process is silently discarded. "
+                        "This matches ScareCrow/Backstab/custom patcher "
+                        "techniques targeting EDR telemetry (T1562.002)";
+                    PushUiDetectionEvent(msg, det,
+                        "Method: ETW Pipeline Integrity (T1562.002)",
+                        0, DetectionSeverity::Critical);
+                }
+            }
+        }
+
         // --- Check for rogue ETW sessions / session count anomaly ---
         // Attackers create rogue sessions targeting our provider GUIDs to
         // exhaust the 8-session-per-provider limit, or create sessions with
@@ -5038,6 +5173,27 @@ static void EtwSessionWatchdogThread()
 
             ULONG st = QueryAllTracesW(propArr, 64, &sessionCount);
             if (st == ERROR_SUCCESS) {
+                // Absolute threshold: approaching 64-session hard limit
+                // Brute Ratel / Nighthawk create dummy sessions to exhaust slots
+                if (sessionCount >= 58) {
+                    std::string msg = std::to_string(tab_1_menu_items.size()) +
+                        " - [*] [Critical] | " + ts +
+                        " | ETW-Watchdog | Method: ETW Session Integrity"
+                        " | ETW session count CRITICAL: " +
+                        std::to_string(sessionCount) +
+                        "/64 — approaching hard limit, new sessions will FAIL "
+                        "(T1562.002)";
+                    std::string det = "Date & Time: " + ts +
+                        " | ETW-Watchdog | " +
+                        std::to_string(sessionCount) +
+                        " of 64 ETW session slots consumed — attacker is "
+                        "exhausting global session limit to prevent EDR "
+                        "from creating new trace sessions";
+                    PushUiDetectionEvent(msg, det,
+                        "Method: ETW Session Integrity (T1562.002)",
+                        0, DetectionSeverity::Critical);
+                }
+
                 if (!s_baselineTaken) {
                     s_lastSessionCount = sessionCount;
                     s_baselineTaken = true;
