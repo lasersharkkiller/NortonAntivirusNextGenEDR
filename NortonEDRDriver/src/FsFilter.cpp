@@ -2268,12 +2268,16 @@ static const PCWSTR kSensitivePipes[] = {
 
 // Known C2 pipe name patterns (substring match) — same set as the syscall hook
 // but checked here on the open/connect side for processes that didn't create the pipe.
+// Updated with additional patterns from Tanium gap analysis (68 undetected C2/malware).
 static const PCWSTR kC2PipePatternsFs[] = {
     L"msagent_",       L"MSSE-",          L"postex_",
     L"postex_ssh_",    L"status_",        L"mojo.5688.8052",
     L"win_svc",        L"ntsvcs_",        L"scerpc_",
     L"meterpreter",    L"PSEXESVC",       L"RemCom",
     L"csexec",         L"winsvc_",
+    L"ransomexx",      L"letmeout",       L"koadic",      // Tanium gap: undetected malware C2 pipes
+    L"netwire",        L"beacon",         L"stager",      // Additional C2 frameworks
+    L"command",        L"response",       L"control",     // Generic C2 control pipes
 };
 
 FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreCreateNpfs(

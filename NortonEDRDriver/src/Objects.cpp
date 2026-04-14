@@ -221,6 +221,28 @@ OB_PREOP_CALLBACK_STATUS ObjectUtils::ProcessPreCallback(
     }
 
     // -----------------------------------------------------------------------
+    // Rule 3b: Enhanced LSASS protection — restrict additional rights used by
+    // credential dumping tools (Tanium gap: 47 undetected credential dumps, 97.9% miss rate).
+    // Strip PROCESS_QUERY_INFORMATION and SYNCHRONIZE from LSASS handles to
+    // prevent procdump, mimikatz, and other dumpers from querying process state.
+    // -----------------------------------------------------------------------
+    if (IsLsass(targetProc)) {
+        const ACCESS_MASK kLsassQueryMask =
+            PROCESS_QUERY_INFORMATION |  // Mimikatz uses this to query process handles
+            PROCESS_QUERY_LIMITED_INFORMATION |  // procdump enumeration
+            SYNCHRONIZE;  // Some dumpers wait on process handle
+
+        ACCESS_MASK lsassRights = original & kLsassQueryMask;
+        if (lsassRights && !(toStrip & lsassRights)) {
+            *pAccess &= ~lsassRights;
+            toStrip  |= lsassRights;
+            EmitObjectAlert(callerProc, targetProc, original, lsassRights,
+                "LSASS access rights restricted — QUERY_INFORMATION/SYNCHRONIZE stripped (credential dumping protection)",
+                TRUE /* Critical */);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Rule 4: PROCESS_VM_READ on any foreign process — visibility into memory
     // scraping even when target is not a "sensitive" OS process.
     // Only alert — don't strip. The caller may have a legitimate reason

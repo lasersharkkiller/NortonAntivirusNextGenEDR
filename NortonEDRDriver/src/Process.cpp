@@ -2794,6 +2794,61 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"winrm quickconfig",         "winrm quickconfig — enable WinRM (T1021.006 prep)",              TRUE  },
 				{ L"enable-psremoting",         "Enable-PSRemoting — enable PS remoting (T1021.006 prep)",        TRUE  },
 
+				// --- T1003.001/006/008: Credential dumping tools (Tanium gap: 47 undetected, 97.9% miss rate) ---
+				{ L"mimikatz",                  "mimikatz execution — pass-the-hash/ticket credential dumping (T1003.008)", TRUE },
+				{ L".exe sekurlsa",             "mimikatz sekurlsa module — LSASS credential extraction (T1003.008)", TRUE },
+				{ L"sekurlsa::logonpasswords",  "mimikatz logonpasswords — plaintext credential dump (T1003.008)",   TRUE },
+				{ L"sekurlsa::minidump",        "mimikatz minidump — LSASS dump for offline parsing (T1003.008)",    TRUE },
+				{ L"lsadump::sam",              "mimikatz lsadump::sam — SAM credential dump (T1003.002)",           TRUE },
+				{ L"lsadump::lsa",              "mimikatz lsadump::lsa — LSA secrets dump (T1003.004)",              TRUE },
+				{ L"token::elevate",            "mimikatz token::elevate — token privilege escalation (T1134.003)",   TRUE },
+				{ L"lazagne",                   "Lazagne credential dumper — browser/email password extraction (T1555)", TRUE },
+				{ L"procdump",                  "procdump LSASS — process memory dump utility (T1003.001)",           TRUE },
+				{ L"procdump.exe -ma lsass",    "procdump LSASS dump — credential extraction (T1003.001)",           TRUE },
+				{ L"/Y /U /MI lsass",           "comsvcs.exe MiniDump — LSASS dump via COM marshaller (T1003.001)",  TRUE },
+				{ L"rundll32 comsvcs.dll MiniDump", "rundll32 comsvcs MiniDump — LSASS dump (T1003.001)",          TRUE },
+				{ L"ntdsutil.exe ifm",          "ntdsutil IFM — NTDS database snapshot (T1003.003 domain cred dump)", TRUE },
+				{ L"invoke-mimikatz",           "Invoke-Mimikatz — PowerShell wrapper for mimikatz (T1003.008)",      TRUE },
+				{ L"invoke-ninjacopy",          "Invoke-NinjaCopy — undetected LSASS dump (T1003.001)",              TRUE },
+				{ L"get-clipboardtext",         "Get-ClipboardText — clipboard credential harvesting (T1115)",       FALSE },
+
+				// --- T1574.001: DLL side-loading via process injection (Tanium gap: 135 undetected, 94.9% miss rate) ---
+				{ L"reflectivepe",              "ReflectivePEInjection — in-memory PE loading (T1574.001)",           TRUE },
+				{ L"hollowprocessinjection",    "HollowProcessInjection — process hollowing (T1055.012)",            TRUE },
+				{ L"writeprocmem",              "WriteProcessMemory usage pattern — cross-process memory write (T1055)", FALSE },
+				{ L"createremotethread",        "CreateRemoteThread pattern — thread injection (T1055.001)",         FALSE },
+				{ L"queueuserapc",              "QueueUserAPC pattern — async injection callback (T1055.004)",       FALSE },
+				{ L"rtlfillmemory",             "RtlFillMemory callback injection — async code execution (T1055)", FALSE },
+				{ L"createthreadpoolwait",      "CreateThreadPoolWait callback injection — threadpool callback exec (T1055)", FALSE },
+
+				// --- T1070.002: Clear command history / Obfuscation (Tanium gap: 42 undetected, 87.5% miss rate) ---
+				{ L"clear-history",             "Clear-History — PowerShell command history wipe (T1070.002)",       TRUE },
+				{ L"remove-item (get-psreadlineoptionhistorysavepath)", "Remove PSReadline history — PS history file deletion (T1070.002)", TRUE },
+				{ L"set-psreadlineoption -historysavesstyle saveinnothing", "Disable PSReadline history — block future history recording (T1070.002)", TRUE },
+
+				// --- T1052: Exfiltration via removable media / Named pipes (Tanium gap: 68 undetected, 91.9% miss rate) ---
+				{ L"\\\\?\\pipe\\lsass",        "LSASS named pipe access — credential dumping C2 channel (T1055/C2)", TRUE },
+				{ L"\\\\?\\pipe\\msagent",      "CobaltStrike default named pipe (msagent_*) — C2 communication (T1571)", TRUE },
+				{ L"\\\\?\\pipe\\mojo",         "Mojo named pipe — potential C2 framework (T1571)",                   FALSE },
+				{ L"\\\\?\\pipe\\status_*",     "CobaltStrike status pipe — C2 internal communication (T1571)",       TRUE },
+				{ L"wmic /node:\\\\",           "WMIC remote code execution — lateral movement C2 (T1047)",           TRUE },
+
+				// --- T1518.001 / T1087: Additional recon patterns (Tanium gap: various recon attacks undetected) ---
+				{ L"adfind",                    "Adfind — AD reconnaissance tool (T1087.002 domain enum)",           TRUE },
+				{ L"ldaputility",               "ldaputility — LDAP AD enumeration (T1087.002 domain enum)",        TRUE },
+				{ L"bloodhound",                "BloodHound — AD exploitation path finder (T1087.002 domain enum)",  TRUE },
+				{ L"sharpmapexec",              "SharpMapExec — credential reuse exploitation tool (T1021.006)",    TRUE },
+				{ L"get-computerinfo",          "Get-ComputerInfo — extended system enumeration (T1082 recon)",    FALSE },
+				{ L"systeminfo.exe",            "systeminfo — system configuration enumeration (T1082 recon)",      FALSE },
+
+				// --- T1059/T1036: Encoded/obfuscated execution (Tanium gap: 42 undetected obfuscation variants) ---
+				{ L"iex(new-object",            "IEX + DownloadString — download+execute pattern (T1059.001)",      TRUE },
+				{ L"sal",                       "Set-Alias PowerShell abbreviation — command obfuscation (T1027)",  FALSE },
+				{ L"gcm",                       "Get-Command abbreviation — command enumeration obfuscation (T1027)", FALSE },
+				{ L"iwr",                       "Invoke-WebRequest abbreviation — download obfuscation (T1027)",     FALSE },
+				{ L"@('",                       "PowerShell char array obfuscation — T1027/T1036 evasion",           FALSE },
+				{ L"join(",                     "PowerShell join() obfuscation — T1027/T1036 evasion",              FALSE },
+
 				{ nullptr, nullptr, FALSE }
 			};
 
