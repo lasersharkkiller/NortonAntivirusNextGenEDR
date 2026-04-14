@@ -259,6 +259,20 @@ static EVT_HANDLE        g_wmiSubscription = nullptr;
 static std::atomic<bool> g_wmiStop(false);
 
 // ---------------------------------------------------------------------------
+// Microsoft-Windows-DotNETRuntime ETW session (.NET assembly load detection)
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_clrSessionHandle  = 0;
+static TRACEHANDLE       g_clrTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+static std::atomic<bool> g_clrStop(false);
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-DotNETRuntimeRundown ETW session (enumerate loaded assemblies)
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_clrRundownSessionHandle  = 0;
+static TRACEHANDLE       g_clrRundownTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+static std::atomic<bool> g_clrRundownStop(false);
+
+// ---------------------------------------------------------------------------
 // Minifilter altitude registry audit
 // ---------------------------------------------------------------------------
 static std::atomic<bool> g_altitudeAuditStop(false);
@@ -4346,6 +4360,444 @@ static void StopKernelProcessSession()
 }
 
 // ---------------------------------------------------------------------------
+// Microsoft-Windows-DotNETRuntime ETW consumer
+// Provider GUID: {E13C0D23-CCBC-4E12-931B-D9CC2EEE27E4}
+//
+// Keyword flags (selective enablement):
+//   0x8  — LoaderKeyword      (AssemblyLoad/Unload, ModuleLoad/Unload)
+//   0x10 — JitKeyword         (JIT compilation events)
+//   0x2000 — StackKeyword     (call stack on events)
+//
+// Key event IDs:
+//   154 — AssemblyLoad (Name, FullyQualifiedAssemblyName, flags)
+//   152 — ModuleLoad   (ModuleILPath, ModuleNativePath)
+//
+// This catches:
+//   - In-memory .NET assembly loads (execute-assembly, Assembly.Load(byte[]))
+//   - Malicious assembly names (AsyncRAT, AgentTesla, SharpHound, Rubeus)
+//   - Assembly loads from suspicious paths (Temp, AppData)
+//   - Reflective loads with no file path (fileless)
+// ---------------------------------------------------------------------------
+
+static const GUID kClrProviderGuid = {
+    0xE13C0D23, 0xCCBC, 0x4E12,
+    {0x93, 0x1B, 0xD9, 0xCC, 0x2E, 0xEE, 0x27, 0xE4}
+};
+
+// CLR Loader keyword = 0x8 (assembly/module load events)
+static constexpr ULONGLONG kClrLoaderKeyword = 0x8;
+
+// Known malicious .NET assembly names (lowercase substring match)
+static const char* kMaliciousAssemblyNames[] = {
+    // RATs
+    "asyncrat",  "xworm",  "dcrat",  "quasarrat",  "nanocore",
+    "njrat",  "darkcomet",  "orcusrat",  "revengerat",  "limerat",
+    "aaborat",  "remcos",
+    // Stealers
+    "agenttesla",  "formbook",  "redline",  "vidar",  "stealc",
+    "lumma",  "meduza",  "raccoon",
+    // Offensive tools
+    "rubeus",  "seatbelt",  "sharpup",  "sharphound",  "certify",
+    "sharpdpapi",  "sharpwmi",  "sharpview",  "sharpchrome",
+    "safetykatz",  "sharpsploit",  "sharppersist",  "inveigh",
+    "sharpmapexec",  "sharpldap",
+    // Cobalt Strike / C2 loaders
+    "stager",  "beacon",  "grunt",  "covenant",
+    // Generic suspicious
+    "mimikatz",  "invoke-mimikatz",  "powerup",  "powercat",
+    "invoke-kerberoast",  "invoke-bloodhound",
+    nullptr
+};
+
+// Known legitimate .NET assemblies to ignore (exact prefix match, lowercase)
+static const char* kAllowedAssemblyPrefixes[] = {
+    "mscorlib",  "system.",  "microsoft.",  "windowsbase",
+    "presentationcore",  "presentationframework",
+    "wpftoolkit",  "newtonsoft.",  "entityframework",
+    "nlog",  "serilog",  "log4net",
+    "nortonav",  "nortonedr",
+    nullptr
+};
+
+static void WINAPI ClrEventCallback(PEVENT_RECORD pEvent) {
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kClrProviderGuid)) return;
+
+    USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
+
+    // AssemblyLoad = 154, ModuleLoad = 152
+    if (eventId != 154 && eventId != 152) return;
+
+    UINT32 pid = pEvent->EventHeader.ProcessId;
+    if (pid == 0 || pid == curPid) return;
+
+    // Parse assembly/module name from UserData.
+    // AssemblyLoad (154) layout: AssemblyID(8), AppDomainID(8), BindingID(8),
+    //   AssemblyFlags(4), FullyQualifiedAssemblyName(wstring)
+    // ModuleLoad (152) layout: ModuleID(8), AssemblyID(8), ModuleFlags(4),
+    //   Reserved1(4), ModuleILPath(wstring), ModuleNativePath(wstring)
+
+    std::string assemblyName;
+    std::string assemblyPath;
+
+    if (pEvent->UserData && pEvent->UserDataLength > 0) {
+        const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+        USHORT dataLen = pEvent->UserDataLength;
+
+        if (eventId == 154 && dataLen > 28) {
+            // Skip AssemblyID(8) + AppDomainID(8) + BindingID(8) + Flags(4) = 28
+            const wchar_t* nameStart = reinterpret_cast<const wchar_t*>(data + 28);
+            size_t maxChars = (dataLen - 28) / sizeof(wchar_t);
+            size_t nameLen = 0;
+            while (nameLen < maxChars && nameStart[nameLen] != L'\0') nameLen++;
+            if (nameLen > 0 && nameLen < 1024) {
+                assemblyName.resize(nameLen);
+                for (size_t i = 0; i < nameLen; i++)
+                    assemblyName[i] = (nameStart[i] < 128)
+                        ? static_cast<char>(nameStart[i]) : '?';
+            }
+        } else if (eventId == 152 && dataLen > 24) {
+            // Skip ModuleID(8) + AssemblyID(8) + ModuleFlags(4) + Reserved(4) = 24
+            const wchar_t* pathStart = reinterpret_cast<const wchar_t*>(data + 24);
+            size_t maxChars = (dataLen - 24) / sizeof(wchar_t);
+            size_t pathLen = 0;
+            while (pathLen < maxChars && pathStart[pathLen] != L'\0') pathLen++;
+            if (pathLen > 0 && pathLen < 1024) {
+                assemblyPath.resize(pathLen);
+                for (size_t i = 0; i < pathLen; i++)
+                    assemblyPath[i] = (pathStart[i] < 128)
+                        ? static_cast<char>(pathStart[i]) : '?';
+            }
+        }
+    }
+
+    if (assemblyName.empty() && assemblyPath.empty()) return;
+
+    // Build a lowercase version for matching
+    std::string nameLower = assemblyName;
+    for (auto& c : nameLower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    std::string pathLower = assemblyPath;
+    for (auto& c : pathLower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+    // Skip known-good assemblies
+    for (int i = 0; kAllowedAssemblyPrefixes[i]; i++) {
+        size_t pLen = strlen(kAllowedAssemblyPrefixes[i]);
+        if (nameLower.length() >= pLen &&
+            nameLower.compare(0, pLen, kAllowedAssemblyPrefixes[i]) == 0)
+            return;
+    }
+
+    DetectionSeverity severity = DetectionSeverity::Low;
+    std::string alertReason;
+
+    // Check 1: Known malicious assembly name
+    for (int i = 0; kMaliciousAssemblyNames[i]; i++) {
+        if (nameLower.find(kMaliciousAssemblyNames[i]) != std::string::npos) {
+            severity = DetectionSeverity::Critical;
+            alertReason = "known malicious assembly: ";
+            alertReason += kMaliciousAssemblyNames[i];
+            break;
+        }
+    }
+
+    // Check 2: In-memory assembly (no file path = fileless)
+    if (alertReason.empty() && assemblyPath.empty() && !assemblyName.empty()) {
+        severity = DetectionSeverity::High;
+        alertReason = "in-memory assembly load (fileless — no ModuleILPath)";
+    }
+
+    // Check 3: Assembly loaded from suspicious path
+    if (alertReason.empty() && !pathLower.empty()) {
+        static const char* kSusPaths[] = {
+            "\\appdata\\local\\temp\\", "\\users\\public\\",
+            "\\windows\\temp\\", "\\$recycle.bin\\",
+            "\\programdata\\", "\\downloads\\",
+            nullptr
+        };
+        for (int i = 0; kSusPaths[i]; i++) {
+            if (pathLower.find(kSusPaths[i]) != std::string::npos) {
+                severity = DetectionSeverity::High;
+                alertReason = "assembly loaded from suspicious path";
+                break;
+            }
+        }
+    }
+
+    // Check 4: Assembly loaded into a native (non-.NET) host process
+    // (execute-assembly pattern — CLR injected into native binary)
+    // We already detect CLR injection in the kernel driver, but this provides
+    // the assembly name which the kernel can't see.
+    if (alertReason.empty()) {
+        std::string procName;
+        {
+            std::lock_guard<std::mutex> lock(process_cache_mutex);
+            auto it = g_processCache.find(pid);
+            if (it != g_processCache.end()) procName = it->second.processName;
+        }
+        std::string procLower = procName;
+        for (auto& c : procLower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+        // If host process is a known Cobalt Strike spawnto target, flag the assembly
+        static const char* kSpawntoTargets[] = {
+            "rundll32.exe", "dllhost.exe", "werfault.exe", "mshta.exe",
+            "gpupdate.exe", "wuauclt.exe", "svchost.exe",
+            nullptr
+        };
+        for (int i = 0; kSpawntoTargets[i]; i++) {
+            if (procLower.find(kSpawntoTargets[i]) != std::string::npos) {
+                severity = DetectionSeverity::High;
+                alertReason = ".NET assembly in native spawnto host (" + procName + ")";
+                break;
+            }
+        }
+    }
+
+    if (alertReason.empty()) return;  // benign assembly load — skip
+
+    std::string procName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(pid);
+        if (it != g_processCache.end()) procName = it->second.processName;
+    }
+    if (procName.empty()) procName = std::to_string(pid);
+
+    std::string ts = BuildTimestamp();
+    std::string displayName = assemblyName.empty() ? assemblyPath : assemblyName;
+    if (displayName.length() > 120) displayName = displayName.substr(0, 120) + "...";
+
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [!] [Alert] | " + ts +
+        " | " + procName +
+        " | Method: ETW DotNETRuntime" +
+        " | " + alertReason +
+        " | assembly=" + displayName;
+
+    std::string det = "Date & Time: " + ts +
+        " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: ETW Microsoft-Windows-DotNETRuntime" +
+        " | " + alertReason +
+        " | Assembly: " + displayName +
+        (!assemblyPath.empty() ? " | Path: " + assemblyPath : "");
+
+    PushUiDetectionEvent(msg, det, "Method: ETW DotNETRuntime",
+                         pid, severity);
+}
+
+
+static void ClrSubscriberThread() {
+    const wchar_t* kSessionName = L"NortonEDR-DotNETRuntime";
+    const size_t nameBufBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize  = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize  = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_clrSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_clrSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-CLR] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    // Enable with LoaderKeyword (0x8) to get AssemblyLoad/ModuleLoad events
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_clrSessionHandle, &kClrProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_INFORMATIONAL,
+        kClrLoaderKeyword, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-CLR] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_clrSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_clrSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-CLR] Session started — consuming .NET assembly load events\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName       = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                               PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = ClrEventCallback;
+
+    g_clrTraceHandle = OpenTraceW(&logFile);
+    if (g_clrTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-CLR] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_clrTraceHandle, 1, nullptr, nullptr);
+    g_clrTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopClrSession() {
+    if (g_clrTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_clrTraceHandle);
+        g_clrTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_clrSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_clrSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_clrSessionHandle = 0;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-DotNETRuntimeRundown ETW consumer
+// Provider GUID: {A669021C-C450-4609-A035-5AF59AF4DF18}
+//
+// Keyword: 0x8 (LoaderRundownKeyword)
+// When a rundown is requested, the CLR enumerates all currently loaded
+// assemblies and modules — this lets us catch assemblies that were loaded
+// BEFORE our ETW session started (e.g., during early process init).
+//
+// Key event IDs:
+//   155 — AssemblyDCStart (assembly already loaded when rundown fires)
+//   153 — ModuleDCStart   (module already loaded)
+//
+// We reuse the same ClrEventCallback since the payload layout is identical
+// to the runtime events (154/152) with different event IDs.
+// ---------------------------------------------------------------------------
+
+static const GUID kClrRundownProviderGuid = {
+    0xA669021C, 0xC450, 0x4609,
+    {0xA0, 0x35, 0x5A, 0xF5, 0x9A, 0xF4, 0xDF, 0x18}
+};
+
+static void WINAPI ClrRundownEventCallback(PEVENT_RECORD pEvent) {
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kClrRundownProviderGuid)) return;
+
+    USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
+
+    // AssemblyDCStart = 155, ModuleDCStart = 153
+    // Map them to the runtime equivalents so we can reuse the same logic
+    if (eventId == 155) {
+        // Rewrite event ID to 154 (AssemblyLoad) temporarily for shared handler
+        const_cast<EVENT_DESCRIPTOR&>(pEvent->EventHeader.EventDescriptor).Id = 154;
+        // Fix the provider GUID so ClrEventCallback accepts it
+        const_cast<GUID&>(pEvent->EventHeader.ProviderId) = kClrProviderGuid;
+        ClrEventCallback(pEvent);
+        // Restore
+        const_cast<EVENT_DESCRIPTOR&>(pEvent->EventHeader.EventDescriptor).Id = 155;
+        const_cast<GUID&>(pEvent->EventHeader.ProviderId) = kClrRundownProviderGuid;
+    } else if (eventId == 153) {
+        const_cast<EVENT_DESCRIPTOR&>(pEvent->EventHeader.EventDescriptor).Id = 152;
+        const_cast<GUID&>(pEvent->EventHeader.ProviderId) = kClrProviderGuid;
+        ClrEventCallback(pEvent);
+        const_cast<EVENT_DESCRIPTOR&>(pEvent->EventHeader.EventDescriptor).Id = 153;
+        const_cast<GUID&>(pEvent->EventHeader.ProviderId) = kClrRundownProviderGuid;
+    }
+}
+
+static void ClrRundownSubscriberThread() {
+    const wchar_t* kSessionName = L"NortonEDR-DotNETRundown";
+    const size_t nameBufBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize  = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize  = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_clrRundownSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_clrRundownSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-CLR-RD] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    // LoaderRundownKeyword = 0x8 triggers enumeration of already-loaded assemblies
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_clrRundownSessionHandle, &kClrRundownProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_INFORMATIONAL,
+        0x8,  // LoaderRundownKeyword
+        0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-CLR-RD] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_clrRundownSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_clrRundownSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-CLR-RD] Session started — enumerating pre-loaded .NET assemblies\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName       = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                               PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = ClrRundownEventCallback;
+
+    g_clrRundownTraceHandle = OpenTraceW(&logFile);
+    if (g_clrRundownTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-CLR-RD] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_clrRundownTraceHandle, 1, nullptr, nullptr);
+    g_clrRundownTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopClrRundownSession() {
+    if (g_clrRundownTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_clrRundownTraceHandle);
+        g_clrRundownTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_clrRundownSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_clrRundownSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_clrRundownSessionHandle = 0;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // ETW session health watchdog.
 //
 // Monitors our real-time ETW sessions (ETW-TI, Kernel-Process) and all
@@ -4459,6 +4911,76 @@ static void EtwSessionWatchdogThread()
                 "Method: ETW Session Integrity (T1562.002)",
                 0, DetectionSeverity::Critical);
             g_kpSessionHandle = 0;
+        }
+
+        // --- Check CLR DotNETRuntime session ---
+        if (g_clrSessionHandle != 0 &&
+            g_clrTraceHandle == INVALID_PROCESSTRACE_HANDLE)
+        {
+            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                " - [*] [Critical] | " + ts +
+                " | ETW-Watchdog | Method: ETW Session Integrity" +
+                " | ETW-CLR session (NortonEDR-DotNETRuntime) KILLED "
+                "externally — .NET assembly monitoring is BLIND (T1562.002)";
+            std::string det = "Date & Time: " + ts +
+                " | ETW-Watchdog | DotNETRuntime session terminated "
+                "by external process — attacker blinded .NET assembly detection";
+            PushUiDetectionEvent(msg, det,
+                "Method: ETW Session Integrity (T1562.002)",
+                0, DetectionSeverity::Critical);
+            g_clrSessionHandle = 0;
+        }
+
+        if (g_clrSessionHandle != 0 &&
+            !IsSessionAlive(L"NortonEDR-DotNETRuntime"))
+        {
+            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                " - [*] [Critical] | " + ts +
+                " | ETW-Watchdog | Method: ETW Session Integrity" +
+                " | ETW-CLR session no longer queryable — session tampering "
+                "detected (T1562.002)";
+            std::string det = "Date & Time: " + ts +
+                " | ETW-Watchdog | ETW-CLR session query failed — "
+                "external termination or provider detach detected";
+            PushUiDetectionEvent(msg, det,
+                "Method: ETW Session Integrity (T1562.002)",
+                0, DetectionSeverity::Critical);
+            g_clrSessionHandle = 0;
+        }
+
+        // --- Check CLR DotNETRuntimeRundown session ---
+        if (g_clrRundownSessionHandle != 0 &&
+            g_clrRundownTraceHandle == INVALID_PROCESSTRACE_HANDLE)
+        {
+            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                " - [*] [Critical] | " + ts +
+                " | ETW-Watchdog | Method: ETW Session Integrity" +
+                " | ETW-CLR-Rundown session (NortonEDR-DotNETRundown) KILLED "
+                "externally — pre-loaded assembly enumeration is BLIND (T1562.002)";
+            std::string det = "Date & Time: " + ts +
+                " | ETW-Watchdog | DotNETRuntimeRundown session terminated "
+                "by external process — attacker blinded rundown enumeration";
+            PushUiDetectionEvent(msg, det,
+                "Method: ETW Session Integrity (T1562.002)",
+                0, DetectionSeverity::Critical);
+            g_clrRundownSessionHandle = 0;
+        }
+
+        if (g_clrRundownSessionHandle != 0 &&
+            !IsSessionAlive(L"NortonEDR-DotNETRundown"))
+        {
+            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                " - [*] [Critical] | " + ts +
+                " | ETW-Watchdog | Method: ETW Session Integrity" +
+                " | ETW-CLR-Rundown session no longer queryable — session "
+                "tampering detected (T1562.002)";
+            std::string det = "Date & Time: " + ts +
+                " | ETW-Watchdog | ETW-CLR-Rundown session query failed — "
+                "external termination or provider detach detected";
+            PushUiDetectionEvent(msg, det,
+                "Method: ETW Session Integrity (T1562.002)",
+                0, DetectionSeverity::Critical);
+            g_clrRundownSessionHandle = 0;
         }
 
         // --- Check EvtSubscribe handles (log-based subscriptions) ---
@@ -5914,6 +6436,66 @@ static DWORD WINAPI WmiEventCallback(
     if (!operation.empty())     detail += " Op=" + operation;
     if (!providerName.empty())  detail += " Provider=" + providerName;
 
+    // Namespace awareness: operations targeting persistence-related WMI
+    // namespaces are inherently more suspicious — elevate severity.
+    std::string nsAlert;
+    if (!namespaceName.empty()) {
+        std::string nsLower = namespaceName;
+        for (auto& c : nsLower) c = (char)tolower((unsigned char)c);
+        if (nsLower.find("root\\subscription") != std::string::npos ||
+            nsLower.find("root/subscription") != std::string::npos ||
+            nsLower.find("root\\default") != std::string::npos ||
+            nsLower.find("root/default") != std::string::npos)
+        {
+            nsAlert = " [PERSISTENCE NAMESPACE]";
+            if (sev < DetectionSeverity::High) sev = DetectionSeverity::High;
+        }
+    }
+
+    // EID 5858: Parse failed WQL queries for reconnaissance patterns.
+    // Attackers use WMI queries to enumerate AV products, processes,
+    // installed software, and network configuration before acting.
+    std::string queryAlert;
+    if (eid == 5858 && !operation.empty()) {
+        std::string opLower = operation;
+        for (auto& c : opLower) c = (char)tolower((unsigned char)c);
+
+        // Recon queries that indicate threat actor enumeration
+        static const struct { const char* pattern; const char* tag; } kReconQueries[] = {
+            {"antivirusproduct",         "AV_ENUM"},
+            {"antispywareproduct",       "AV_ENUM"},
+            {"firewallproduct",          "FIREWALL_ENUM"},
+            {"win32_process",            "PROCESS_ENUM"},
+            {"win32_service",            "SERVICE_ENUM"},
+            {"win32_useraccount",        "USER_ENUM"},
+            {"win32_group",              "GROUP_ENUM"},
+            {"win32_logonsession",       "SESSION_ENUM"},
+            {"win32_networkadapterconfiguration", "NET_RECON"},
+            {"win32_computersystem",     "SYSINFO"},
+            {"win32_operatingsystem",    "SYSINFO"},
+            {"win32_shadowcopy",         "SHADOW_ENUM"},
+            {"win32_product",            "SOFTWARE_ENUM"},
+            {nullptr, nullptr}
+        };
+
+        for (int i = 0; kReconQueries[i].pattern; i++) {
+            if (opLower.find(kReconQueries[i].pattern) != std::string::npos) {
+                queryAlert += " [RECON:" + std::string(kReconQueries[i].tag) + "]";
+                sev = DetectionSeverity::Warning;
+                description = "WMI recon query detected (probing)";
+                break;
+            }
+        }
+
+        // Win32_Process::Create via WMI — lateral movement indicator (T1047)
+        if (opLower.find("win32_process") != std::string::npos &&
+            opLower.find("create") != std::string::npos) {
+            queryAlert = " [WMI PROCESS CREATION — T1047]";
+            sev = DetectionSeverity::Critical;
+            description = "WMI remote process creation (T1047)";
+        }
+    }
+
     // EID 5857: Validate WMI provider DLL path — rogue providers load DLLs
     // from outside %SystemRoot%\System32\wbem\.  Attackers register custom WMI
     // providers via MOF or direct WMI class creation to get code execution
@@ -5966,8 +6548,29 @@ static DWORD WINAPI WmiEventCallback(
     // ScriptText, and ExecutablePath.  The Operation field contains the
     // full MOF consumer representation.  Extract attacker payload content
     // so analysts see exactly what code/command will execute.
+    //
+    // Also classify the consumer type — ActiveScriptEventConsumer and
+    // CommandLineEventConsumer are the dangerous ones used by attackers.
     std::string consumerPayload;
+    std::string consumerTypeAlert;
     if (eid == 5860 && !operation.empty()) {
+        std::string opLower = operation;
+        for (auto& c : opLower) c = (char)tolower((unsigned char)c);
+
+        if (opLower.find("activescripteventconsumer") != std::string::npos) {
+            consumerTypeAlert = " [ActiveScript — SCRIPT EXECUTION]";
+        } else if (opLower.find("commandlineeventconsumer") != std::string::npos) {
+            consumerTypeAlert = " [CommandLine — SHELL EXECUTION]";
+        } else if (opLower.find("nteventlogeventconsumer") != std::string::npos) {
+            consumerTypeAlert = " [NTEventLog]";
+            if (sev > DetectionSeverity::Warning) sev = DetectionSeverity::Warning;
+        } else if (opLower.find("smtpeventconsumer") != std::string::npos) {
+            consumerTypeAlert = " [SMTP — EXFIL RISK]";
+        } else if (opLower.find("logeventconsumer") != std::string::npos) {
+            consumerTypeAlert = " [LogFile]";
+            if (sev > DetectionSeverity::Warning) sev = DetectionSeverity::Warning;
+        }
+
         // CommandLineEventConsumer — contains CommandLineTemplate
         auto extractMof = [&](const std::string& field) -> std::string {
             // MOF format: FieldName = "value"; or FieldName = \"value\"
@@ -6014,14 +6617,16 @@ static DWORD WINAPI WmiEventCallback(
         "] | " + ts +
         " | " + procName +
         " | Method: WMI Persistence Detection (T1546.003)"
-        " | EID " + std::to_string(eid) + ": " + description + detail + consumerPayload + providerDllAlert;
+        " | EID " + std::to_string(eid) + ": " + description + detail +
+        nsAlert + queryAlert + consumerTypeAlert + consumerPayload + providerDllAlert;
 
     std::string det = "Date & Time: " + ts +
         " | " + procName +
         " | PID: " + std::to_string(pid) +
         " | Method: WMI Event Subscription Persistence" +
         " | EventID: " + std::to_string(eid) +
-        " | " + description + detail + consumerPayload + providerDllAlert;
+        " | " + description + detail +
+        nsAlert + queryAlert + consumerTypeAlert + consumerPayload + providerDllAlert;
 
     PushUiDetectionEvent(msg, det, "Method: WMI Persistence Detection (T1546.003)",
                          pid, sev);
@@ -6346,6 +6951,8 @@ VOID ShowUI() {
     g_spoolerStop   = false;
     g_rdpStop       = false;
     g_bitsStop      = false;
+    g_clrStop       = false;
+    g_clrRundownStop = false;
     std::thread sysmonThread(SysmonSubscriberThread);
     std::thread saclThread(SecurityAuditSubscriberThread);
     std::thread tiThread(EtwTiSubscriberThread);
@@ -6362,6 +6969,9 @@ VOID ShowUI() {
 
     g_wmiStop = false;
     std::thread wmiThread(WmiSubscriberThread);
+
+    std::thread clrThread(ClrSubscriberThread);
+    std::thread clrRundownThread(ClrRundownSubscriberThread);
 
     g_capaStop = false;
     std::thread capaWorker(CapaScanWorker);
@@ -6407,6 +7017,8 @@ VOID ShowUI() {
     g_rdpStop      = true;
     g_bitsStop     = true;
     g_wmiStop      = true;
+    g_clrStop      = true;
+    g_clrRundownStop = true;
     sysmonThread.join();
     saclThread.join();
     psThread.join();
@@ -6419,6 +7031,13 @@ VOID ShowUI() {
     rdpThread.join();
     bitsThread.join();
     wmiThread.join();
+
+    // ETW-CLR: unblock ProcessTrace then join
+    StopClrSession();
+    clrThread.join();
+
+    StopClrRundownSession();
+    clrRundownThread.join();
 
     // ETW-TI: unblock ProcessTrace then join
     StopEtwTiSession();

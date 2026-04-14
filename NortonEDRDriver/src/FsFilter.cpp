@@ -4225,6 +4225,49 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreWrite(
                             }
                         }
 
+                        // LNK file with embedded PE payload (T1204.002 / T1566.002)
+                        //
+                        // 197 YARA "EXE_in_LNK" across 19K VT malware samples.
+                        // Malicious .lnk files can carry embedded PE payloads after
+                        // the standard shell link header.  Detect LNK magic (0x4C)
+                        // at offset 0 followed by CLSID {00021401-0000-0000-C000-
+                        // 000000000046} plus embedded MZ anywhere in the buffer.
+                        else if (magic == 0x0000004C && writeLen >= 256) {
+                            // Verify LNK CLSID at offset 4
+                            ULONG clsid0 = *(ULONG*)((PUCHAR)writeBuf + 4);
+                            if (clsid0 == 0x00021401) {
+                                // Scan for MZ/PE header embedded in the LNK body
+                                BOOLEAN foundEmbeddedPE = FALSE;
+                                ULONG scanLimit = min(writeLen - 64, (ULONG)65536);
+                                for (ULONG off = 76; off < scanLimit; off++) {
+                                    if (*(PUSHORT)((PUCHAR)writeBuf + off) == 0x5A4D) {
+                                        // Check e_lfanew -> PE signature
+                                        if (off + 0x40 <= writeLen) {
+                                            LONG elf = *(LONG*)((PUCHAR)writeBuf + off + 0x3C);
+                                            if (elf > 0 && (ULONG)(off + elf + 4) <= writeLen) {
+                                                ULONG peSig = *(ULONG*)((PUCHAR)writeBuf + off + elf);
+                                                if (peSig == 0x00004550) {
+                                                    foundEmbeddedPE = TRUE;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if (foundEmbeddedPE) {
+                                    PEPROCESS proc = IoThreadToProcess(Data->Thread);
+                                    char* pn = PsGetProcessImageFileName(proc);
+
+                                    char msg[220];
+                                    RtlStringCbPrintfA(msg, sizeof(msg),
+                                        "FS: LNK file with embedded PE payload written by '%s' "
+                                        "(pid=%llu) — malicious shortcut with executable (T1204.002)",
+                                        pn ? pn : "?", (ULONG64)(ULONG_PTR)pid);
+                                    EnqueueFsAlert(pid, pn, msg, TRUE);  // CRITICAL
+                                }
+                            }
+                        }
+
                         // Bonus: raw PE header being written to a file at offset 0
                         // could indicate reflective DLL being staged to disk, or a
                         // dropper extracting an embedded payload.  Not as critical

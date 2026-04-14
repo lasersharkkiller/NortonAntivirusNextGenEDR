@@ -2164,6 +2164,442 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                 }
                             }
 
+                            // ---------------------------------------------------
+                            // PE section anomaly detection at image load
+                            //
+                            // Detect packer/protector section names and high-
+                            // entropy sections that indicate packed/encrypted
+                            // payloads.  578 UPX + 153 VMProtect + 65 Themida
+                            // across 19K VT malware samples.
+                            // ---------------------------------------------------
+                            if (ImageInfo->ImageBase && ImageInfo->ImageSize > 0 &&
+                                MmIsAddressValid(ImageInfo->ImageBase))
+                            {
+                                __try {
+                                    PIMAGE_DOS_HEADER peDos =
+                                        (PIMAGE_DOS_HEADER)ImageInfo->ImageBase;
+                                    if (peDos->e_magic == IMAGE_DOS_SIGNATURE &&
+                                        peDos->e_lfanew > 0 &&
+                                        peDos->e_lfanew < 0x1000)
+                                    {
+                                        PIMAGE_NT_HEADERS peNt =
+                                            (PIMAGE_NT_HEADERS)((BYTE*)ImageInfo->ImageBase +
+                                                peDos->e_lfanew);
+                                        if (MmIsAddressValid(peNt) &&
+                                            peNt->Signature == IMAGE_NT_SIGNATURE)
+                                        {
+                                            // -----------------------------------------
+                                            // Unsigned PE from suspicious path (T1036)
+                                            //
+                                            // 769 VT samples with invalid signatures.
+                                            // Check if the PE has no Authenticode cert
+                                            // (Security directory is empty) and it's
+                                            // running from a suspicious directory.
+                                            // Legitimate unsigned EXEs exist but are
+                                            // rare from Temp/Public/Downloads/AppData.
+                                            // -----------------------------------------
+                                            {
+                                                BOOLEAN isSuspPath = FALSE;
+                                                static const char* kUnsignedSusPaths[] = {
+                                                    "\\appdata\\local\\temp\\",
+                                                    "\\users\\public\\",
+                                                    "\\windows\\temp\\",
+                                                    "\\$recycle.bin\\",
+                                                    "\\downloads\\",
+                                                    nullptr
+                                                };
+                                                for (int up = 0;
+                                                     kUnsignedSusPaths[up]; up++) {
+                                                    BOOLEAN found = FALSE;
+                                                    SIZE_T nLen = 0;
+                                                    while (kUnsignedSusPaths[up][nLen])
+                                                        nLen++;
+                                                    if (cbLen >= nLen) {
+                                                        for (SIZE_T ci = 0;
+                                                             ci <= cbLen - nLen; ci++) {
+                                                            BOOLEAN match = TRUE;
+                                                            for (SIZE_T j = 0;
+                                                                 j < nLen; j++) {
+                                                                char a = charBuffer[ci+j];
+                                                                char b = kUnsignedSusPaths[up][j];
+                                                                if (a >= 'A' && a <= 'Z')
+                                                                    a |= 0x20;
+                                                                if (a != b) {
+                                                                    match = FALSE;
+                                                                    break;
+                                                                }
+                                                            }
+                                                            if (match) {
+                                                                found = TRUE;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    if (found) {
+                                                        isSuspPath = TRUE;
+                                                        break;
+                                                    }
+                                                }
+
+                                                if (isSuspPath) {
+                                                    // Check security directory
+                                                    IMAGE_DATA_DIRECTORY secDir2 = {};
+                                                    if (peNt->OptionalHeader.Magic ==
+                                                        IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+                                                        secDir2 = peNt->OptionalHeader.
+                                                            DataDirectory[
+                                                            IMAGE_DIRECTORY_ENTRY_SECURITY];
+                                                    } else {
+                                                        PIMAGE_NT_HEADERS32 nt32 =
+                                                            (PIMAGE_NT_HEADERS32)peNt;
+                                                        if (MmIsAddressValid(nt32))
+                                                            secDir2 = nt32->
+                                                                OptionalHeader.DataDirectory[
+                                                                IMAGE_DIRECTORY_ENTRY_SECURITY];
+                                                    }
+
+                                                    BOOLEAN isUnsigned =
+                                                        (secDir2.VirtualAddress == 0 ||
+                                                         secDir2.Size == 0);
+
+                                                    if (isUnsigned) {
+                                                        char* uProc =
+                                                            PsGetProcessImageFileName(
+                                                                targetProcess);
+
+                                                        // Skip known unsigned helpers
+                                                        BOOLEAN skipUnsigned = FALSE;
+                                                        if (uProc) {
+                                                            skipUnsigned =
+                                                                (strcmp(uProc,
+                                                                    "python.exe") == 0 ||
+                                                                 strcmp(uProc,
+                                                                    "python3.exe") == 0 ||
+                                                                 strcmp(uProc,
+                                                                    "node.exe") == 0);
+                                                        }
+
+                                                        if (!skipUnsigned) {
+                                                            char usMsg[280];
+                                                            RtlStringCbPrintfA(usMsg,
+                                                                sizeof(usMsg),
+                                                                "Unsigned PE from "
+                                                                "suspicious path: '%s' "
+                                                                "(pid=%lu) — no "
+                                                                "Authenticode certificate"
+                                                                " (possible malware drop)",
+                                                                uProc ? uProc : "?",
+                                                                HandleToUlong(ProcessId));
+
+                                                            PKERNEL_STRUCTURED_NOTIFICATION
+                                                                usN = (PKERNEL_STRUCTURED_NOTIFICATION)
+                                                                ExAllocatePool2(
+                                                                    POOL_FLAG_NON_PAGED,
+                                                                    sizeof(KERNEL_STRUCTURED_NOTIFICATION),
+                                                                    'usnt');
+                                                            if (usN) {
+                                                                RtlZeroMemory(usN,
+                                                                    sizeof(*usN));
+                                                                SET_WARNING(*usN);
+                                                                SET_IMAGE_LOAD_PATH_CHECK(
+                                                                    *usN);
+                                                                usN->pid = PsGetProcessId(
+                                                                    targetProcess);
+                                                                usN->isPath = TRUE;
+                                                                if (uProc)
+                                                                    RtlStringCbCopyA(
+                                                                        usN->procName,
+                                                                        sizeof(usN->procName),
+                                                                        uProc);
+                                                                SIZE_T usLen =
+                                                                    strlen(usMsg) + 1;
+                                                                usN->msg = (char*)
+                                                                    ExAllocatePool2(
+                                                                        POOL_FLAG_NON_PAGED,
+                                                                        usLen, 'usmg');
+                                                                if (usN->msg) {
+                                                                    RtlCopyMemory(
+                                                                        usN->msg,
+                                                                        usMsg, usLen);
+                                                                    usN->bufSize =
+                                                                        (ULONG)usLen;
+                                                                    if (!CallbackObjects::
+                                                                        GetNotifQueue()->
+                                                                        Enqueue(usN)) {
+                                                                        ExFreePool(usN->msg);
+                                                                        ExFreePool(usN);
+                                                                    }
+                                                                } else {
+                                                                    ExFreePool(usN);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            WORD numSections =
+                                                peNt->FileHeader.NumberOfSections;
+                                            if (numSections > 0 && numSections <= 96) {
+                                                PIMAGE_SECTION_HEADER secHdr =
+                                                    IMAGE_FIRST_SECTION(peNt);
+
+                                                // Known packer/protector section names
+                                                static const struct {
+                                                    char name[9];
+                                                    const char* packer;
+                                                } kPackerSections[] = {
+                                                    { "UPX0",     "UPX" },
+                                                    { "UPX1",     "UPX" },
+                                                    { "UPX2",     "UPX" },
+                                                    { ".vmp0",    "VMProtect" },
+                                                    { ".vmp1",    "VMProtect" },
+                                                    { ".vmp2",    "VMProtect" },
+                                                    { ".themida", "Themida" },
+                                                    { ".boot",    "Themida/WinLicense" },
+                                                    { ".enigma",  "Enigma Protector" },
+                                                    { ".enigma1", "Enigma Protector" },
+                                                    { ".nsp0",    "NSPack" },
+                                                    { ".nsp1",    "NSPack" },
+                                                    { ".mpress",  "MPRESS" },
+                                                    { ".aspack",  "ASPack" },
+                                                    { "pec2",     "PECompact" },
+                                                    { ".petite",  "Petite" },
+                                                    { ".perplex", "Perplex PE Protector" },
+                                                    { "",         nullptr }  // sentinel
+                                                };
+
+                                                BOOLEAN packerFound = FALSE;
+                                                const char* packerName = nullptr;
+                                                BOOLEAN highEntropySection = FALSE;
+
+                                                for (WORD si = 0; si < numSections; si++) {
+                                                    if (!MmIsAddressValid(&secHdr[si]))
+                                                        break;
+
+                                                    // Check section name against packer list
+                                                    char secName[9] = {};
+                                                    RtlCopyMemory(secName,
+                                                        secHdr[si].Name, 8);
+
+                                                    for (int pi = 0;
+                                                         kPackerSections[pi].packer;
+                                                         pi++)
+                                                    {
+                                                        if (strcmp(secName,
+                                                            kPackerSections[pi].name) == 0)
+                                                        {
+                                                            packerFound = TRUE;
+                                                            packerName =
+                                                                kPackerSections[pi].packer;
+                                                            break;
+                                                        }
+                                                    }
+
+                                                    // Shannon entropy estimate for
+                                                    // packed/encrypted section detection.
+                                                    // Only check .text-equivalent
+                                                    // executable sections with real data.
+                                                    if (!packerFound &&
+                                                        (secHdr[si].Characteristics &
+                                                         IMAGE_SCN_MEM_EXECUTE) &&
+                                                        secHdr[si].SizeOfRawData >= 4096)
+                                                    {
+                                                        // Sample first 4KB for entropy
+                                                        ULONG secRva =
+                                                            secHdr[si].VirtualAddress;
+                                                        BYTE* secData =
+                                                            (BYTE*)ImageInfo->ImageBase +
+                                                            secRva;
+                                                        if (MmIsAddressValid(secData) &&
+                                                            MmIsAddressValid(
+                                                                secData + 4095))
+                                                        {
+                                                            ULONG freq[256] = {};
+                                                            for (int bi = 0;
+                                                                 bi < 4096; bi++)
+                                                                freq[secData[bi]]++;
+
+                                                            // Approximate Shannon entropy
+                                                            // H = -sum(p * log2(p))
+                                                            // Use integer math: sum
+                                                            // f*log2(4096/f) ≈ 12 - ...
+                                                            double entropy = 0.0;
+                                                            for (int bi = 0;
+                                                                 bi < 256; bi++)
+                                                            {
+                                                                if (freq[bi] == 0)
+                                                                    continue;
+                                                                double p =
+                                                                    (double)freq[bi] /
+                                                                    4096.0;
+                                                                // log2(p) = ln(p)/ln(2)
+                                                                // Use Taylor approx:
+                                                                // -p*log2(p) ≈ p*(bits)
+                                                                double logp = 0.0;
+                                                                double x = p;
+                                                                // -p*log2(1/p) =
+                                                                // p * log2(4096/freq[bi])
+                                                                // Use bit-counting approx
+                                                                ULONG inv = 4096 /
+                                                                    freq[bi];
+                                                                ULONG bits = 0;
+                                                                ULONG tmp = inv;
+                                                                while (tmp > 1) {
+                                                                    bits++;
+                                                                    tmp >>= 1;
+                                                                }
+                                                                entropy += p * (double)bits;
+                                                            }
+
+                                                            // Entropy > 7.2 out of 8.0 max
+                                                            // is a strong packing indicator
+                                                            if (entropy > 7.2) {
+                                                                highEntropySection = TRUE;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                char* loadProc =
+                                                    PsGetProcessImageFileName(
+                                                        targetProcess);
+
+                                                // Skip known packers used by legit
+                                                // software (e.g., UPX by some installers)
+                                                BOOLEAN skipAlert = FALSE;
+                                                if (loadProc) {
+                                                    static const char* kPackerAllowed[] = {
+                                                        "MsMpEng.exe",
+                                                        "TrustedInsta",
+                                                        "NortonEDR.e",
+                                                        nullptr
+                                                    };
+                                                    for (int a = 0;
+                                                         kPackerAllowed[a]; a++) {
+                                                        if (strcmp(loadProc,
+                                                            kPackerAllowed[a]) == 0) {
+                                                            skipAlert = TRUE;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+
+                                                if (!skipAlert && packerFound) {
+                                                    char pkMsg[280];
+                                                    RtlStringCbPrintfA(pkMsg,
+                                                        sizeof(pkMsg),
+                                                        "Packed PE loaded: %s packer "
+                                                        "detected in '%s' (pid=%lu) — "
+                                                        "section signatures indicate "
+                                                        "runtime unpacking",
+                                                        packerName,
+                                                        loadProc ? loadProc : "?",
+                                                        HandleToUlong(ProcessId));
+
+                                                    PKERNEL_STRUCTURED_NOTIFICATION pkN =
+                                                        (PKERNEL_STRUCTURED_NOTIFICATION)
+                                                        ExAllocatePool2(
+                                                            POOL_FLAG_NON_PAGED,
+                                                            sizeof(KERNEL_STRUCTURED_NOTIFICATION),
+                                                            'pknt');
+                                                    if (pkN) {
+                                                        RtlZeroMemory(pkN,
+                                                            sizeof(*pkN));
+                                                        SET_WARNING(*pkN);
+                                                        SET_IMAGE_LOAD_PATH_CHECK(*pkN);
+                                                        pkN->pid = PsGetProcessId(
+                                                            targetProcess);
+                                                        pkN->isPath = TRUE;
+                                                        if (loadProc)
+                                                            RtlStringCbCopyA(
+                                                                pkN->procName,
+                                                                sizeof(pkN->procName),
+                                                                loadProc);
+                                                        SIZE_T pkLen =
+                                                            strlen(pkMsg) + 1;
+                                                        pkN->msg = (char*)
+                                                            ExAllocatePool2(
+                                                                POOL_FLAG_NON_PAGED,
+                                                                pkLen, 'pkmg');
+                                                        if (pkN->msg) {
+                                                            RtlCopyMemory(pkN->msg,
+                                                                pkMsg, pkLen);
+                                                            pkN->bufSize =
+                                                                (ULONG)pkLen;
+                                                            if (!CallbackObjects::
+                                                                GetNotifQueue()->
+                                                                Enqueue(pkN)) {
+                                                                ExFreePool(pkN->msg);
+                                                                ExFreePool(pkN);
+                                                            }
+                                                        } else {
+                                                            ExFreePool(pkN);
+                                                        }
+                                                    }
+                                                }
+                                                else if (!skipAlert &&
+                                                         highEntropySection)
+                                                {
+                                                    char enMsg[280];
+                                                    RtlStringCbPrintfA(enMsg,
+                                                        sizeof(enMsg),
+                                                        "High-entropy PE section: "
+                                                        "executable code section in "
+                                                        "'%s' (pid=%lu) has entropy "
+                                                        ">7.2 — likely packed/encrypted",
+                                                        loadProc ? loadProc : "?",
+                                                        HandleToUlong(ProcessId));
+
+                                                    PKERNEL_STRUCTURED_NOTIFICATION enN =
+                                                        (PKERNEL_STRUCTURED_NOTIFICATION)
+                                                        ExAllocatePool2(
+                                                            POOL_FLAG_NON_PAGED,
+                                                            sizeof(KERNEL_STRUCTURED_NOTIFICATION),
+                                                            'ennt');
+                                                    if (enN) {
+                                                        RtlZeroMemory(enN,
+                                                            sizeof(*enN));
+                                                        SET_WARNING(*enN);
+                                                        SET_IMAGE_LOAD_PATH_CHECK(*enN);
+                                                        enN->pid = PsGetProcessId(
+                                                            targetProcess);
+                                                        enN->isPath = TRUE;
+                                                        if (loadProc)
+                                                            RtlStringCbCopyA(
+                                                                enN->procName,
+                                                                sizeof(enN->procName),
+                                                                loadProc);
+                                                        SIZE_T enLen =
+                                                            strlen(enMsg) + 1;
+                                                        enN->msg = (char*)
+                                                            ExAllocatePool2(
+                                                                POOL_FLAG_NON_PAGED,
+                                                                enLen, 'enmg');
+                                                        if (enN->msg) {
+                                                            RtlCopyMemory(enN->msg,
+                                                                enMsg, enLen);
+                                                            enN->bufSize =
+                                                                (ULONG)enLen;
+                                                            if (!CallbackObjects::
+                                                                GetNotifQueue()->
+                                                                Enqueue(enN)) {
+                                                                ExFreePool(enN->msg);
+                                                                ExFreePool(enN);
+                                                            }
+                                                        } else {
+                                                            ExFreePool(enN);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                                    // PE parsing fault — skip silently
+                                }
+                            }
+
                             // Argument-spoofing discrepancy check (Adam Chester / CS "argue"):
                             // compare the kernel's authentic cmdline (saved at CreateProcessNotifyEx)
                             // with what's now in the PEB, while still attached to the process.

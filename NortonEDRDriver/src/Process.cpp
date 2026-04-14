@@ -1173,6 +1173,118 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 		}
 
 		// -----------------------------------------------------------------------
+		// Office application child process detection (T1566.001 / T1204.002)
+		//
+		// WINWORD.EXE, EXCEL.EXE, POWERPNT.EXE, MSACCESS.EXE should almost
+		// never spawn interactive child processes.  When a macro, OLE object,
+		// or embedded payload runs, the Office host becomes the parent of
+		// cmd.exe, powershell.exe, wscript.exe, etc.  This is one of the
+		// highest-signal malware delivery indicators — 76 sigma hits across
+		// 19K malware samples in our VT corpus.
+		//
+		// Detection: any child from an Office parent that is not an allowed
+		// Office-internal process triggers CRITICAL.
+		// -----------------------------------------------------------------------
+		{
+			PEPROCESS parentProcess = NULL;
+			if (NT_SUCCESS(PsLookupProcessByProcessId(CreateInfo->ParentProcessId, &parentProcess))) {
+
+				char* parentName = PsGetProcessImageFileName(parentProcess);
+
+				BOOLEAN isOfficeHost = (parentName != NULL &&
+					(strcmp(parentName, "WINWORD.EXE") == 0 ||
+					 strcmp(parentName, "EXCEL.EXE") == 0 ||
+					 strcmp(parentName, "POWERPNT.EXE") == 0 ||
+					 strcmp(parentName, "MSACCESS.EXE") == 0 ||
+					 strcmp(parentName, "OUTLOOK.EXE") == 0 ||
+					 strcmp(parentName, "MSPUB.EXE") == 0));
+
+				if (isOfficeHost) {
+					char* childName = PsGetProcessImageFileName(Process);
+
+					// Allowlist: legitimate Office helper processes
+					BOOLEAN isAllowedChild = FALSE;
+					if (childName) {
+						static const char* kOfficeAllowed[] = {
+							"splwow64.exe",     // print driver host
+							"conhost.exe",
+							"ai.exe",           // Office AI/Copilot
+							"OSPPSVC.EXE",      // Office protection platform
+							"OfficeClickT",     // OfficeClickToRun (truncated)
+							"AppVShNotify",     // App-V shell notification
+							"MSOSREC.EXE",      // crash recovery
+							"DW20.EXE",         // Dr. Watson crash reporting
+							"FLTLDR.EXE",       // filter loader
+							nullptr
+						};
+						for (int i = 0; kOfficeAllowed[i]; i++) {
+							if (strcmp(childName, kOfficeAllowed[i]) == 0) {
+								isAllowedChild = TRUE;
+								break;
+							}
+						}
+					}
+
+					if (!isAllowedChild) {
+						BOOLEAN isCriticalChild = FALSE;
+						if (CreateInfo->ImageFileName != NULL) {
+							static const WCHAR* kOfficeDangerousChildren[] = {
+								L"cmd.exe", L"powershell.exe", L"pwsh.exe",
+								L"wscript.exe", L"cscript.exe", L"mshta.exe",
+								L"rundll32.exe", L"regsvr32.exe", L"certutil.exe",
+								L"bitsadmin.exe", L"schtasks.exe", L"msbuild.exe",
+								L"installutil.exe", L"regasm.exe", L"regsvcs.exe",
+								L"msxsl.exe", L"forfiles.exe", L"pcalua.exe",
+								nullptr
+							};
+							for (int i = 0; kOfficeDangerousChildren[i]; i++) {
+								if (UnicodeStringContains(CreateInfo->ImageFileName, kOfficeDangerousChildren[i])) {
+									isCriticalChild = TRUE;
+									break;
+								}
+							}
+						}
+
+						char offMsg[350];
+						RtlStringCbPrintfA(offMsg, sizeof(offMsg),
+							"Office child process (T1566.001): %s (pid=%llu) spawned '%s' (pid=%llu)%s",
+							parentName,
+							(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId,
+							childName ? childName : "?",
+							(ULONG64)PsGetProcessId(Process),
+							isCriticalChild ? " [SHELL/LOLBIN]" : "");
+
+						PKERNEL_STRUCTURED_NOTIFICATION kernelNotif =
+							(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+								POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'ofnt');
+						if (kernelNotif) {
+							RtlZeroMemory(kernelNotif, sizeof(*kernelNotif));
+							if (isCriticalChild) { SET_CRITICAL(*kernelNotif); }
+							else                 { SET_WARNING(*kernelNotif);  }
+							SET_CALLING_PROC_PID_CHECK(*kernelNotif);
+							kernelNotif->isPath = FALSE;
+							kernelNotif->pid = PsGetProcessId(Process);
+							RtlCopyMemory(kernelNotif->procName, parentName, 15);
+							SIZE_T mLen = strlen(offMsg) + 1;
+							kernelNotif->msg = (char*)ExAllocatePool2(
+								POOL_FLAG_NON_PAGED, mLen, 'ofmg');
+							if (kernelNotif->msg) {
+								RtlCopyMemory(kernelNotif->msg, offMsg, mLen);
+								kernelNotif->bufSize = (ULONG)mLen;
+								if (!CallbackObjects::GetNotifQueue()->Enqueue(kernelNotif)) {
+									ExFreePool(kernelNotif->msg);
+									ExFreePool(kernelNotif);
+								}
+							} else { ExFreePool(kernelNotif); }
+						}
+					}
+				}
+
+				ObDereferenceObject(parentProcess);
+			}
+		}
+
+		// -----------------------------------------------------------------------
 		// mofcomp.exe execution detection — MOF compilation for WMI persistence.
 		//
 		// Attackers compile .mof files containing __EventFilter, __EventConsumer,
@@ -1768,6 +1880,166 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 					}
 					break;
 				}
+			}
+		}
+
+		// -----------------------------------------------------------------------
+		// Suspicious execution path detection (T1204 / T1059)
+		//
+		// Executables running from Temp, Public, AppData\Local\Temp,
+		// Downloads, or Recycle Bin are strong indicators of malware delivery.
+		// 308 sigma "Suspicious Script Execution From Temp Folder" + 211
+		// "Suspicious Binaries and Scripts in Public Folder" + 276 "Script
+		// Interpreter Execution From Suspicious Folder" in 19K VT corpus.
+		//
+		// Only flag PE executables (not scripts — those are caught by the
+		// cmdline pattern engine).  Skip if the process is a known installer.
+		// -----------------------------------------------------------------------
+		if (CreateInfo->ImageFileName && CreateInfo->ImageFileName->Buffer &&
+			CreateInfo->ImageFileName->Length > 0)
+		{
+			// Check if the image path contains a suspicious directory
+			static const WCHAR* kSuspiciousPaths[] = {
+				L"\\AppData\\Local\\Temp\\",
+				L"\\AppData\\Roaming\\",     // non-standard exe location
+				L"\\Users\\Public\\",
+				L"\\Windows\\Temp\\",
+				L"\\$Recycle.Bin\\",
+				L"\\ProgramData\\",          // ProgramData without a known publisher subfolder
+				nullptr
+			};
+
+			BOOLEAN isSuspiciousPath = FALSE;
+			const WCHAR* matchedPath = nullptr;
+			for (int i = 0; kSuspiciousPaths[i]; i++) {
+				if (UnicodeStringContains(CreateInfo->ImageFileName, kSuspiciousPaths[i])) {
+					isSuspiciousPath = TRUE;
+					matchedPath = kSuspiciousPaths[i];
+					break;
+				}
+			}
+
+			if (isSuspiciousPath) {
+				char* procName = PsGetProcessImageFileName(Process);
+
+				// Allowlist: common legitimate processes that run from temp paths
+				BOOLEAN isAllowedProcess = FALSE;
+				if (procName) {
+					static const char* kTempAllowed[] = {
+						"setup.exe", "install.exe", "update.exe",
+						"msiexec.exe", "TrustedInsta",
+						"MicrosoftEd",   // Edge updater (truncated)
+						"GoogleUpdate",  // Google updater (truncated)
+						"ChromeSetup",
+						"OfficeSetup",
+						"vs_installe",   // Visual Studio installer (truncated)
+						"NortonEDR.e",   // our own service (truncated)
+						nullptr
+					};
+					for (int i = 0; kTempAllowed[i]; i++) {
+						if (strcmp(procName, kTempAllowed[i]) == 0) {
+							isAllowedProcess = TRUE;
+							break;
+						}
+					}
+				}
+
+				if (!isAllowedProcess) {
+					// Narrow the matched path for the message
+					char narrowMatch[48] = {};
+					for (int j = 0; j < 47 && matchedPath[j]; j++) {
+						narrowMatch[j] = (matchedPath[j] < 128) ? (char)matchedPath[j] : '?';
+					}
+
+					char tempMsg[300];
+					RtlStringCbPrintfA(tempMsg, sizeof(tempMsg),
+						"Suspicious execution path: '%s' (pid=%llu) "
+						"running from '%s' — possible malware staging/drop",
+						procName ? procName : "?",
+						(ULONG64)PsGetProcessId(Process),
+						narrowMatch);
+
+					PKERNEL_STRUCTURED_NOTIFICATION n =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'tpnt');
+					if (n) {
+						RtlZeroMemory(n, sizeof(*n));
+						SET_WARNING(*n);
+						SET_CALLING_PROC_PID_CHECK(*n);
+						n->isPath = FALSE;
+						n->pid = PsGetProcessId(Process);
+						if (procName) RtlCopyMemory(n->procName, procName, 14);
+						SIZE_T mLen = strlen(tempMsg) + 1;
+						n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, mLen, 'tpmg');
+						if (n->msg) {
+							RtlCopyMemory(n->msg, tempMsg, mLen);
+							n->bufSize = (ULONG)mLen;
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+								ExFreePool(n->msg); ExFreePool(n);
+							}
+						} else { ExFreePool(n); }
+					}
+				}
+			}
+		}
+
+		// -----------------------------------------------------------------------
+		// svchost.exe parent validation (T1036.004 / T1055)
+		//
+		// Legitimate svchost.exe is ALWAYS spawned by services.exe.  Any
+		// svchost.exe whose parent is NOT services.exe is either:
+		//   - A renamed malware binary masquerading as svchost.exe
+		//   - An injected/hollowed process
+		//   - A persistence payload registered as a bogus service
+		//
+		// 397 sigma "Uncommon Svchost Command Line Parameter" + 135
+		// "Uncommon Svchost Parent Process" across 19K VT malware samples.
+		// -----------------------------------------------------------------------
+		if (CreateInfo->ImageFileName &&
+			UnicodeStringContains(CreateInfo->ImageFileName, L"svchost.exe"))
+		{
+			PEPROCESS parentProcess = NULL;
+			if (NT_SUCCESS(PsLookupProcessByProcessId(CreateInfo->ParentProcessId, &parentProcess))) {
+				char* parentName = PsGetProcessImageFileName(parentProcess);
+
+				BOOLEAN isLegitParent = (parentName != NULL &&
+					(strcmp(parentName, "services.exe") == 0 ||
+					 strcmp(parentName, "MsMpEng.exe") == 0));  // Defender can restart svchost
+
+				if (!isLegitParent) {
+					char* childName = PsGetProcessImageFileName(Process);
+
+					char svchMsg[300];
+					RtlStringCbPrintfA(svchMsg, sizeof(svchMsg),
+						"Suspicious svchost parent (T1036.004): svchost.exe (pid=%llu) "
+						"spawned by '%s' (pid=%llu) — expected parent is services.exe",
+						(ULONG64)PsGetProcessId(Process),
+						parentName ? parentName : "?",
+						(ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId);
+
+					PKERNEL_STRUCTURED_NOTIFICATION n =
+						(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+							POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'svnt');
+					if (n) {
+						RtlZeroMemory(n, sizeof(*n));
+						SET_CRITICAL(*n);
+						SET_CALLING_PROC_PID_CHECK(*n);
+						n->isPath = FALSE;
+						n->pid = PsGetProcessId(Process);
+						if (parentName) RtlCopyMemory(n->procName, parentName, 14);
+						SIZE_T mLen = strlen(svchMsg) + 1;
+						n->msg = (char*)ExAllocatePool2(POOL_FLAG_NON_PAGED, mLen, 'svmg');
+						if (n->msg) {
+							RtlCopyMemory(n->msg, svchMsg, mLen);
+							n->bufSize = (ULONG)mLen;
+							if (!CallbackObjects::GetNotifQueue()->Enqueue(n)) {
+								ExFreePool(n->msg); ExFreePool(n);
+							}
+						} else { ExFreePool(n); }
+					}
+				}
+
+				ObDereferenceObject(parentProcess);
 			}
 		}
 
