@@ -283,6 +283,7 @@ static const UINT16 kSuspiciousPorts[] = {
 static BOOLEAN IsSocksProxyPort(UINT16 port) {
     return port == 1080 || port == 1081 || port == 9050 ||
            port == 9150 || port == 1090 || port == 3128;
+}
 
 static BOOLEAN IsPortBlocked(UINT16 port) {
     KIRQL oldIrql;

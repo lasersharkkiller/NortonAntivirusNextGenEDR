@@ -403,7 +403,9 @@ typedef struct _SUBSECTION
 } SUBSECTION, * PSUBSECTION;
 
 typedef struct _PEB_LDR_DATA {
-    BYTE                          Reserved1[8];
+    BYTE                          Reserved1[4];
+    BOOLEAN                       Initialized;
+    BYTE                          Reserved1b[3];
     PVOID                         Reserved2[3];
     LIST_ENTRY                    InMemoryOrderModuleList;
 } PEB_LDR_DATA, * PPEB_LDR_DATA;

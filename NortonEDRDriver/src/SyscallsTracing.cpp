@@ -373,14 +373,14 @@ BOOLEAN SyscallsUtils::SyscallHandler(PKTRAP_FRAME trapFrame) {
 		}
 
 		// Call-origin check — catches Type 1 direct syscalls on all hardware
-		isSyscallDirect(trapFrame->Rip, (char*)IdToName(id));
+		SyscallsUtils::isSyscallDirect(trapFrame->Rip, (char*)IdToName(id));
 
 		// Indirect syscall check — catches Type 2 from shellcode (non-CET systems)
-		isSyscallIndirect(trapFrame->Rsp);
+		SyscallsUtils::isSyscallIndirect(trapFrame->Rsp);
 
 		// Call stack spoofing check — catches LayeredSyscall / timer-based
 		// spoofing on non-CET systems (Cobalt Strike 4.9+, CallstackSpoofingPOC)
-		isCallStackSpoofed(trapFrame->Rsp);
+		SyscallsUtils::isCallStackSpoofed(trapFrame->Rsp);
 	}
 
 

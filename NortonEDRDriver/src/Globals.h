@@ -19,6 +19,9 @@
 #include "Pe.h"
 #include "Offsets.h"
 
+// Forward declaration for BufferQueue class used throughout
+class BufferQueue;
+
 #pragma comment(lib, "fwpkclnt.lib")
 #pragma comment(lib, "ndis.lib")
 #pragma comment(lib, "fltMgr.lib")
@@ -192,7 +195,7 @@ BOOLEAN FileIsExe(
 );
 
 BOOLEAN UnicodeStringContains(
-	PUNICODE_STRING, 
+	PCUNICODE_STRING,
 	PCWSTR
 );
 
@@ -1260,11 +1263,11 @@ private:
 	OB_OPERATION_REGISTRATION regPreOpDupRegistration;
 	OB_OPERATION_REGISTRATION threadPreOpRegistration;
 
+public:
+
 	// PID of the NortonEDR user-mode service — set via NORTONAV_REGISTER_SERVICE_PID IOCTL.
 	// Handles opened to this process have PROCESS_TERMINATE / VM_WRITE stripped (self-protection).
 	static volatile LONG g_ServicePid;
-
-public:
 
 	VOID setObjectNotificationCallback();
 
@@ -1346,6 +1349,9 @@ public:
 		HANDLE,
 		PPS_CREATE_NOTIFY_INFO
 	);
+
+	// Pointer to CreateProcessNotifyEx callback — exposed for Ps*Notify integrity check.
+	static PVOID s_NotifyFn;
 };
 
 class FsFilter {
@@ -1439,9 +1445,6 @@ public:
 
     // Check notification queue pressure and alert on overflow risk.
     static VOID CheckQueuePressure();
-
-    // Pointer to CreateProcessNotifyEx callback — exposed for Ps*Notify integrity check.
-    static PVOID s_NotifyFn;
 };
 
 // ---------------------------------------------------------------------------
