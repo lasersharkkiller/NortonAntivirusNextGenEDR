@@ -829,10 +829,61 @@ class SyscallsUtils {
 	static RegionTracker* vmRegionTracker;
 
 	VadUtils* vadUtils;
-	
+
 	static HANDLE lastNotifedCidStackCorrupt;
 
 public:
+
+	// Syscall ID constants — made public for use in IdToName()
+	static ULONG NtAllocId;
+	static ULONG NtWriteId;
+	static ULONG NtProtectId;
+	static ULONG NtFreeId;
+	static ULONG NtReadId;
+	static ULONG NtWriteFileId;
+	static ULONG NtQueueApcThreadId;
+	static ULONG NtQueueApcThreadExId;
+	static ULONG NtSetContextThreadId;
+	static ULONG NtMapViewOfSectionId;
+	static ULONG NtResumeThreadId;
+	static ULONG NtContinueId;
+	static ULONG NtContinueEx;
+	static ULONG NtAdjustPrivilegesTokenId;
+	static ULONG NtOpenProcessId;
+	static ULONG NtCreateThreadExId;
+	static ULONG NtSuspendThreadId;
+	static ULONG NtCreateSectionId;
+	static ULONG NtUnmapViewOfSectionId;
+	static ULONG NtLoadDriverId;
+	static ULONG NtUnloadDriverId;
+	static ULONG NtProtectVirtualMemoryId;
+	static ULONG NtCreateTransactionId;
+	static ULONG NtRollbackTransactionId;
+	static ULONG NtCommitTransactionId;
+	static ULONG NtCreateProcessExId;
+	static ULONG NtCreateProcessId;
+	static ULONG NtQuerySystemInformationId;
+	static ULONG NtSetInformationProcessId;
+	static ULONG NtDuplicateObjectId;
+	static ULONG NtDebugActiveProcessId;
+	static ULONG NtSetInformationThreadId;
+	static ULONG NtTraceControlId;
+	static ULONG NtCreateNamedPipeFileId;
+	static ULONG NtCreateMailslotFileId;
+	static ULONG NtOpenThreadId;
+	static ULONG NtFlushInstructionCacheId;
+	static ULONG NtCreateFileId;
+	static ULONG NtAssignProcessToJobObjectId;
+	static ULONG NtOpenProcessTokenExId;
+	static ULONG NtOpenThreadTokenExId;
+	static ULONG NtDuplicateTokenId;
+	static ULONG NtCreateTokenExId;
+	static ULONG NtCreateTokenId;
+	static ULONG NtImpersonateThreadId;
+	static ULONG NtAlpcImpersonateClientOfPortId;
+	static ULONG NtAlpcImpersonateClientThreadId;
+	static ULONG NtFilterTokenId;
+	static ULONG NtImpersonateAnonymousTokenId;
 
 	SyscallsUtils() {} /*: isTracingEnabled(FALSE) {}*/
 
