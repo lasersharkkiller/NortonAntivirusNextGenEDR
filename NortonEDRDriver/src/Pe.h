@@ -128,8 +128,55 @@ typedef struct _IMAGE_NT_HEADERS64 {
 } IMAGE_NT_HEADERS64, * PIMAGE_NT_HEADERS64;
 
 // Generic IMAGE_NT_HEADERS for x64 kernel
+// Note: WDK forward-declares struct _IMAGE_NT_HEADERS without a full definition
+// in kernel mode. We map the generic typedef to the 64-bit variant which IS
+// fully defined. Code that handles both 32/64-bit PE headers should use
+// PIMAGE_NT_HEADERS64 for initial parsing, then recast based on OptionalHeader.Magic.
 typedef IMAGE_NT_HEADERS64 IMAGE_NT_HEADERS;
 typedef PIMAGE_NT_HEADERS64 PIMAGE_NT_HEADERS;
+
+// 32-bit PE header structs for kernel-mode driver analyzing WoW64 processes.
+// The WDK's PIMAGE_NT_HEADERS32 points to the incomplete forward-declared
+// _IMAGE_NT_HEADERS, so we define our own complete 32-bit structs.
+typedef struct _PE_OPTIONAL_HEADER32 {
+    WORD        Magic;
+    BYTE        MajorLinkerVersion;
+    BYTE        MinorLinkerVersion;
+    DWORD       SizeOfCode;
+    DWORD       SizeOfInitializedData;
+    DWORD       SizeOfUninitializedData;
+    DWORD       AddressOfEntryPoint;
+    DWORD       BaseOfCode;
+    DWORD       BaseOfData;
+    DWORD       ImageBase;
+    DWORD       SectionAlignment;
+    DWORD       FileAlignment;
+    WORD        MajorOperatingSystemVersion;
+    WORD        MinorOperatingSystemVersion;
+    WORD        MajorImageVersion;
+    WORD        MinorImageVersion;
+    WORD        MajorSubsystemVersion;
+    WORD        MinorSubsystemVersion;
+    DWORD       Win32VersionValue;
+    DWORD       SizeOfImage;
+    DWORD       SizeOfHeaders;
+    DWORD       CheckSum;
+    WORD        Subsystem;
+    WORD        DllCharacteristics;
+    DWORD       SizeOfStackReserve;
+    DWORD       SizeOfStackCommit;
+    DWORD       SizeOfHeapReserve;
+    DWORD       SizeOfHeapCommit;
+    DWORD       LoaderFlags;
+    DWORD       NumberOfRvaAndSizes;
+    IMAGE_DATA_DIRECTORY DataDirectory[IMAGE_NUMBEROF_DIRECTORY_ENTRIES];
+} PE_OPTIONAL_HEADER32, * PPE_OPTIONAL_HEADER32;
+
+typedef struct _PE_NT_HEADERS32 {
+    DWORD Signature;
+    IMAGE_FILE_HEADER FileHeader;
+    PE_OPTIONAL_HEADER32 OptionalHeader;
+} PE_NT_HEADERS32, * PPE_NT_HEADERS32;
 
 typedef struct _IMAGE_SECTION_HEADER
 {

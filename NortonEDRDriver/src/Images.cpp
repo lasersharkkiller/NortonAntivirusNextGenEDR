@@ -1722,7 +1722,7 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                                             nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress != 0)
                                                             isDotNet = TRUE;
                                                     } else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
-                                                        PIMAGE_NT_HEADERS32 nt32 = (PIMAGE_NT_HEADERS32)ntHdr;
+                                                        PPE_NT_HEADERS32 nt32 = (PPE_NT_HEADERS32)ntHdr;
                                                         if (nt32->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR &&
                                                             nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress != 0)
                                                             isDotNet = TRUE;
@@ -2382,8 +2382,8 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                                             DataDirectory[
                                                             IMAGE_DIRECTORY_ENTRY_SECURITY];
                                                     } else {
-                                                        PIMAGE_NT_HEADERS32 nt32 =
-                                                            (PIMAGE_NT_HEADERS32)peNt;
+                                                        PPE_NT_HEADERS32 nt32 =
+                                                            (PPE_NT_HEADERS32)peNt;
                                                         if (MmIsAddressValid(nt32))
                                                             secDir2 = nt32->
                                                                 OptionalHeader.DataDirectory[
