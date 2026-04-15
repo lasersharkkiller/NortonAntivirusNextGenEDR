@@ -40,6 +40,10 @@
 
 #include <wintrust.h>
 #include <softpub.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 
 using namespace ftxui;
 using namespace std;
@@ -433,8 +437,33 @@ static std::queue<std::pair<std::string, UINT32>> g_capaQueue;
 static std::mutex                                  g_capaMutex;
 static std::condition_variable                     g_capaCv;
 static std::atomic<bool>                           g_capaStop(false);
-static std::unordered_set<std::string>             g_capaScanned;
+// Capa dedup now keyed by path with hash + last-scan time — re-scan on hash
+// change or after TTL (defeats the stale-dedup evasion where an attacker
+// overwrites a file that was scanned once and never again).
+struct CapaDedupEntry {
+    std::string hash;
+    std::chrono::steady_clock::time_point timestamp;
+};
+static std::unordered_map<std::string, CapaDedupEntry> g_capaScanned;
 static constexpr size_t                            kCapaQueueMax = 32;
+static constexpr std::chrono::hours                kCapaDedupTtl(24);
+
+// Drop telemetry — queue overflows mean we went blind. Log every 1st and
+// every 100th drop so a flood attack is visible in the console.
+static std::atomic<size_t> g_yaraScanDropped{0};
+static std::atomic<size_t> g_capaScanDropped{0};
+static void LogScanDrop(std::atomic<size_t>& counter, const char* kind) {
+    size_t n = counter.fetch_add(1) + 1;
+    if (n == 1 || (n % 100) == 0) {
+        std::cerr << "[!] " << kind << " scan queue overflow — dropped " << n << " total (possible flood/evasion)\n";
+    }
+}
+
+// Hash-based allowlist — skip YARA on known-good files (dramatic speedup
+// on scheduled sweeps of Windows/Program Files).
+static std::unordered_set<std::string> g_hashAllowlist;
+static std::mutex                      g_hashAllowlistMutex;
+static const std::string kAllowlistPath = R"(C:\ProgramData\NortonEDR\allowlist.txt)";
 
 // ---------------------------------------------------------------------------
 // HookDll named-pipe server
@@ -2510,6 +2539,8 @@ bool LoadLolDriversCache(const std::string& cachePath) {
 }
 
 
+static bool IsQuarantineEligibleRule(YR_RULE* rule); // forward decl (defined after AddYaraRules*)
+
 int yr_callback_function_file(
     YR_SCAN_CONTEXT* context,
     int message,
@@ -2525,17 +2556,23 @@ int yr_callback_function_file(
             return CALLBACK_CONTINUE;
         }
 
-        DWORD bytesReturned;
-        BOOL endRes = DeviceIoControl(
-            hNortonDevice,
-            END_THAT_PROCESS,
-            &pid,
-            sizeof(pid),
-            nullptr,
-            0,
-            &bytesReturned,
-            nullptr
-        );
+        YR_RULE* matchedRule = reinterpret_cast<YR_RULE*>(message_data);
+        bool terminateAllowed = IsQuarantineEligibleRule(matchedRule);
+
+        DWORD bytesReturned = 0;
+        BOOL endRes = FALSE;
+        if (terminateAllowed) {
+            endRes = DeviceIoControl(
+                hNortonDevice,
+                END_THAT_PROCESS,
+                &pid,
+                sizeof(pid),
+                nullptr,
+                0,
+                &bytesReturned,
+                nullptr
+            );
+        }
 
         time_t now = time(0);
         struct tm timeinfo;
@@ -2549,24 +2586,34 @@ int yr_callback_function_file(
         std::string msgCatch;
         std::string details;
 
-        if (endRes) {
+        const std::string ruleIdent = std::string(matchedRule->identifier);
+        const char* nsName = (matchedRule->ns && matchedRule->ns->name) ? matchedRule->ns->name : "?";
 
-            msgCatch = std::to_string(tab_1_menu_items.size()) + " - [!] " + date_time_str + " | " + method + " | YARA rule Identifier: " + std::string(((YR_RULE*)message_data)->identifier) + " | Process was terminated";
-
+        if (!terminateAllowed) {
+            msgCatch = std::to_string(tab_1_menu_items.size()) + " - [!] " + date_time_str +
+                " | SIGNAL-ONLY [" + nsName + "] | Identifier: " + ruleIdent +
+                " | Match logged; process NOT terminated (rule not in quarantine-safe tier)";
+            details = "Date & Time: " + date_time_str +
+                " | PID: " + std::to_string(pid) +
+                " | Method: " + method +
+                " | YARA rule: " + ruleIdent +
+                " | Namespace: " + nsName +
+                " | Policy: signal-only — process termination suppressed.";
+        }
+        else if (endRes) {
+            msgCatch = std::to_string(tab_1_menu_items.size()) + " - [!] " + date_time_str + " | " + method + " | YARA rule Identifier: " + ruleIdent + " | Process was terminated";
             details = "Date & Time: " + date_time_str +
                 " | PID: " + std::to_string(pid) +
                 " | Method: In-Memory Loaded Image Analysis" +
-                " | YARA rule Identifier: " + std::string(((YR_RULE*)message_data)->identifier) +
+                " | YARA rule Identifier: " + ruleIdent +
                 " | Process was terminated successfully.";
         }
         else {
-
-            msgCatch = std::to_string(tab_1_menu_items.size()) + " - [!] " + date_time_str + " | Memory Mapped Image | Identified: " + std::string(((YR_RULE*)message_data)->identifier) + " | (!) Failed to kill process";
-
+            msgCatch = std::to_string(tab_1_menu_items.size()) + " - [!] " + date_time_str + " | Memory Mapped Image | Identified: " + ruleIdent + " | (!) Failed to kill process";
             details = "Date & Time: " + date_time_str +
                 " | PID: " + std::to_string(pid) +
                 " | Method: In-Memory Loaded Image Analysis" +
-                " | YARA rule Identifier: " + std::string(((YR_RULE*)message_data)->identifier) +
+                " | YARA rule Identifier: " + ruleIdent +
                 " | (!) Process termination failed.";
         }
 
@@ -2615,17 +2662,23 @@ int yr_callback_function_byte_stream(
             return CALLBACK_CONTINUE;
         }
 
-        DWORD bytesReturned;
-        BOOL endRes = DeviceIoControl(
-            hNortonDevice,
-            END_THAT_PROCESS,
-            &pid,
-            sizeof(pid),
-            nullptr,
-            0,
-            &bytesReturned,
-            nullptr
-        );
+        YR_RULE* matchedRule = (YR_RULE*)message_data;
+        bool terminateAllowed = IsQuarantineEligibleRule(matchedRule);
+
+        DWORD bytesReturned = 0;
+        BOOL endRes = FALSE;
+        if (terminateAllowed) {
+            endRes = DeviceIoControl(
+                hNortonDevice,
+                END_THAT_PROCESS,
+                &pid,
+                sizeof(pid),
+                nullptr,
+                0,
+                &bytesReturned,
+                nullptr
+            );
+        }
 
         time_t now = time(0);
         struct tm timeinfo;
@@ -2637,9 +2690,24 @@ int yr_callback_function_byte_stream(
         std::string msgCatch;
         std::string details;
 
-        std::string rule_identifier = std::string(((YR_RULE*)message_data)->identifier);
+        std::string rule_identifier = std::string(matchedRule->identifier);
+        const char* nsName = (matchedRule->ns && matchedRule->ns->name) ? matchedRule->ns->name : "?";
 
-        if (endRes) {
+        if (!terminateAllowed) {
+            msgCatch = std::to_string(tab_1_menu_items.size()) +
+                " - [!] [SIGNAL-ONLY] | " + date_time_str +
+                " | " + procName +
+                " | Byte Stream Analysis | " + nsName + " | Identified: " + rule_identifier +
+                " | Match logged; process NOT terminated.";
+            details = "Date & Time: " + date_time_str +
+                " | PID: " + std::to_string(pid) +
+                " | " + procName +
+                " | Method: Byte Stream Analysis" +
+                " | YARA rule: " + rule_identifier +
+                " | Namespace: " + nsName +
+                " | Policy: signal-only — process termination suppressed.";
+        }
+        else if (endRes) {
 
             msgCatch = std::to_string(tab_1_menu_items.size()) +
                 " - [!] [Alert] | " + date_time_str +
@@ -3063,7 +3131,34 @@ void setConsoleColor(WORD color) {
     SetConsoleTextAttribute(hConsole, color);
 }
 
+// Derive YARA namespace from the rule file's path — this is how we stratify
+// rules by fidelity tier. Tier determines auto-quarantine eligibility and
+// which scanner(s) the rule is eligible for.
+//
+//   quarantine-safe/  — vetted, low-FP, safe to auto-remove on match
+//   memory/           — opcode/shellcode rules for in-memory scanning
+//   signal-only/      — broad/heuristic rules; detect + log, never quarantine
+//   (default)         — treated as signal-only (safe default for unknown sets
+//                       like Loaded-Potato / YARA Forge imported wholesale)
+static const char* DeriveYaraNamespace(const std::string& rulePath) {
+    std::string lower = ToLowerCopy(rulePath);
+    if (lower.find("quarantine-safe") != std::string::npos) return "quarantine-safe";
+    if (lower.find("\\memory\\") != std::string::npos ||
+        lower.find("/memory/") != std::string::npos)        return "memory";
+    if (lower.find("signal-only") != std::string::npos)     return "signal-only";
+    return "signal-only";
+}
+
+static bool IsQuarantineEligibleRule(YR_RULE* rule) {
+    if (!rule || !rule->ns || !rule->ns->name) return false;
+    return strcmp(rule->ns->name, "quarantine-safe") == 0;
+}
+
+void AddYaraRulesFromDirectoryInto(YR_COMPILER* targetCompiler, const std::string& rulesDirectory);
 void AddYaraRulesFromDirectory(const std::string& rulesDirectory) {
+    AddYaraRulesFromDirectoryInto(compiler, rulesDirectory);
+}
+void AddYaraRulesFromDirectoryInto(YR_COMPILER* targetCompiler, const std::string& rulesDirectory) {
     std::error_code existsError;
     if (!std::filesystem::exists(rulesDirectory, existsError)) {
         std::cerr << "[*] YARA directory not found: " << rulesDirectory << "\n";
@@ -3111,7 +3206,8 @@ void AddYaraRulesFromDirectory(const std::string& rulesDirectory) {
             continue;
         }
 
-        if (yr_compiler_add_file(compiler, rule_file, NULL, entry.path().string().c_str()) != ERROR_SUCCESS) {
+        const char* ruleNamespace = DeriveYaraNamespace(entry.path().string());
+        if (yr_compiler_add_file(targetCompiler, rule_file, ruleNamespace, entry.path().string().c_str()) != ERROR_SUCCESS) {
             std::cerr << "Failed to add Yara rule: " << entry.path().string() << "\n";
             fclose(rule_file);
             continue;
@@ -3206,7 +3302,10 @@ void EnqueueYaraByteStreamScan(const KERNEL_STRUCTURED_BUFFER* ksbHeader, const 
     work.bytes.assign(data, data + dataSize);
 
     std::lock_guard<std::mutex> lock(g_yaraScanMutex);
-    if (g_yaraScanQueue.size() >= kYaraScanQueueMax) return; // drop rather than block
+    if (g_yaraScanQueue.size() >= kYaraScanQueueMax) {
+        LogScanDrop(g_yaraScanDropped, "YARA-byte");
+        return;
+    }
     g_yaraScanQueue.push(std::move(work));
     g_yaraScanCv.notify_one();
 }
@@ -3220,7 +3319,10 @@ void EnqueueYaraFileScan(const KERNEL_STRUCTURED_NOTIFICATION* notifHeader, cons
     work.filePath = filePath;
 
     std::lock_guard<std::mutex> lock(g_yaraScanMutex);
-    if (g_yaraScanQueue.size() >= kYaraScanQueueMax) return;
+    if (g_yaraScanQueue.size() >= kYaraScanQueueMax) {
+        LogScanDrop(g_yaraScanDropped, "YARA-file");
+        return;
+    }
     g_yaraScanQueue.push(std::move(work));
     g_yaraScanCv.notify_one();
 }
@@ -3389,12 +3491,85 @@ static void RunCapaScan(const std::string& path, UINT32 pid) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// SHA-256 file hash (Bcrypt). Used for capa dedup invalidation and allowlist.
+// ---------------------------------------------------------------------------
+static bool Sha256HexOfFile(const std::string& path, std::string& outHex) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return false;
+
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) {
+        fclose(f); return false;
+    }
+    DWORD hashLen = 0, cb = 0;
+    BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PUCHAR)&hashLen, sizeof(hashLen), &cb, 0);
+    if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0); fclose(f); return false;
+    }
+
+    std::vector<BYTE> buf(64 * 1024);
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        BCryptHashData(hHash, buf.data(), (ULONG)n, 0);
+    }
+    fclose(f);
+
+    std::vector<BYTE> digest(hashLen);
+    BCryptFinishHash(hHash, digest.data(), hashLen, 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+
+    static const char* kHex = "0123456789abcdef";
+    outHex.resize(hashLen * 2);
+    for (DWORD i = 0; i < hashLen; ++i) {
+        outHex[i * 2]     = kHex[digest[i] >> 4];
+        outHex[i * 2 + 1] = kHex[digest[i] & 0xF];
+    }
+    return true;
+}
+
+static void LoadHashAllowlist() {
+    FILE* f = nullptr;
+    if (fopen_s(&f, kAllowlistPath.c_str(), "r") != 0 || !f) return;
+    char line[512];
+    std::lock_guard<std::mutex> lock(g_hashAllowlistMutex);
+    g_hashAllowlist.clear();
+    while (fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        auto end = s.find_first_of("#\r\n \t");
+        std::string hash = (end == std::string::npos) ? s : s.substr(0, end);
+        if (hash.size() == 64) g_hashAllowlist.insert(ToLowerCopy(hash));
+    }
+    fclose(f);
+    std::cout << "[*] Hash allowlist loaded: " << g_hashAllowlist.size() << " entries\n";
+}
+
+static bool IsHashAllowlisted(const std::string& hex) {
+    std::lock_guard<std::mutex> lock(g_hashAllowlistMutex);
+    return g_hashAllowlist.count(hex) > 0;
+}
+
 static void EnqueueCapaScan(const std::string& path, UINT32 pid) {
     if (path.empty()) return;
+
+    std::string hash;
+    if (!Sha256HexOfFile(path, hash)) return; // unreadable — skip silently
+
     std::lock_guard<std::mutex> lock(g_capaMutex);
-    if (g_capaScanned.count(path)) return;          // deduplicate
-    if (g_capaQueue.size() >= kCapaQueueMax) return; // drop rather than block
-    g_capaScanned.insert(path);
+    auto now = std::chrono::steady_clock::now();
+    auto it = g_capaScanned.find(path);
+    if (it != g_capaScanned.end() &&
+        it->second.hash == hash &&
+        (now - it->second.timestamp) < kCapaDedupTtl) {
+        return; // fresh and unchanged — skip
+    }
+    if (g_capaQueue.size() >= kCapaQueueMax) {
+        LogScanDrop(g_capaScanDropped, "capa");
+        return;
+    }
+    g_capaScanned[path] = { hash, now };
     g_capaQueue.push({ path, pid });
     g_capaCv.notify_one();
 }
@@ -3413,6 +3588,571 @@ void CapaScanWorker() {
         }
         RunCapaScan(work.first, work.second);
     }
+}
+
+// ---------------------------------------------------------------------------
+// On-demand scanner (reactive scans are driven by the kernel; this path lets
+// a user sweep a file or directory at rest — for baseline sweeps and IR triage.
+// No process termination, no driver dependency: YARA matches and capa
+// capabilities are reported to stdout.
+// ---------------------------------------------------------------------------
+
+struct OnDemandScanStats {
+    std::atomic<size_t> filesScanned{0};
+    std::atomic<size_t> yaraMatches{0};
+    std::atomic<size_t> errors{0};
+    std::atomic<size_t> quarantined{0};
+};
+
+struct OnDemandScanCtx {
+    std::string path;
+    OnDemandScanStats* stats;
+    std::vector<std::string> ruleIds;                 // populated by callback, consumed after scan
+    std::vector<std::string> quarantineEligibleRules; // subset of matches in the quarantine-safe namespace
+};
+
+static const std::string kQuarantineDir = R"(C:\ProgramData\NortonEDR\Quarantine)";
+static constexpr BYTE    kQuarantineXorKey = 0xAA;
+
+// Move + neutralize a matched file. Bytes are XOR-scrambled (0xAA) so the file
+// is no longer directly executable/parseable, then moved into the quarantine
+// directory with a timestamped name. A .json sidecar records origin + matches.
+static bool QuarantineFile(const std::string& srcPath, const std::vector<std::string>& ruleIds) {
+    std::error_code ec;
+    std::filesystem::create_directories(kQuarantineDir, ec);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char stamp[64];
+    _snprintf_s(stamp, sizeof(stamp), _TRUNCATE, "%04u%02u%02u_%02u%02u%02u_%03u",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+    std::filesystem::path src(srcPath);
+    std::string baseName = src.filename().string();
+    std::string quarName  = std::string(stamp) + "_" + baseName + ".quar";
+    std::filesystem::path dstPath = std::filesystem::path(kQuarantineDir) / quarName;
+    std::filesystem::path sidecarPath = dstPath;
+    sidecarPath += ".json";
+
+    // Read original, XOR-scramble, write to quarantine path, then delete original.
+    // Read/write in chunks so we don't balloon memory on large files.
+    FILE* fin = nullptr;
+    if (fopen_s(&fin, srcPath.c_str(), "rb") != 0 || !fin) return false;
+    FILE* fout = nullptr;
+    if (fopen_s(&fout, dstPath.string().c_str(), "wb") != 0 || !fout) {
+        fclose(fin);
+        return false;
+    }
+
+    std::vector<BYTE> buf(64 * 1024);
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), fin)) > 0) {
+        for (size_t i = 0; i < n; ++i) buf[i] ^= kQuarantineXorKey;
+        if (fwrite(buf.data(), 1, n, fout) != n) {
+            fclose(fin); fclose(fout);
+            std::filesystem::remove(dstPath, ec);
+            return false;
+        }
+    }
+    fclose(fin);
+    fclose(fout);
+
+    // Delete original. Retry a few times for transient locks (AV scanners,
+    // indexers). If still locked, fall back to MoveFileEx with
+    // MOVEFILE_DELAY_UNTIL_REBOOT so the file is removed at next boot —
+    // critical for persistent malware that keeps its own file open.
+    bool removed = false;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        ec.clear();
+        if (std::filesystem::remove(srcPath, ec)) { removed = true; break; }
+        Sleep(100);
+    }
+    if (!removed) {
+        // Widen to wide-char for MoveFileExW.
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, srcPath.c_str(), -1, nullptr, 0);
+        std::wstring wsrc(wlen > 0 ? wlen - 1 : 0, L'\0');
+        if (wlen > 0) MultiByteToWideChar(CP_UTF8, 0, srcPath.c_str(), -1, &wsrc[0], wlen);
+
+        if (MoveFileExW(wsrc.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT)) {
+            std::cerr << "[!] Quarantine: original locked; scheduled for deletion at reboot: "
+                      << srcPath << "\n";
+        } else {
+            std::cerr << "[!] Quarantine: wrote copy but failed to remove original: "
+                      << srcPath << " (err=" << GetLastError() << ")\n";
+        }
+    }
+
+    // Sidecar metadata
+    FILE* fjson = nullptr;
+    if (fopen_s(&fjson, sidecarPath.string().c_str(), "w") == 0 && fjson) {
+        fprintf(fjson,
+                "{\n"
+                "  \"original_path\": \"%s\",\n"
+                "  \"quarantine_path\": \"%s\",\n"
+                "  \"timestamp\": \"%s\",\n"
+                "  \"xor_key\": \"0x%02X\",\n"
+                "  \"yara_rules\": [",
+                srcPath.c_str(), dstPath.string().c_str(), stamp, kQuarantineXorKey);
+        for (size_t i = 0; i < ruleIds.size(); ++i) {
+            fprintf(fjson, "%s\"%s\"", i == 0 ? "" : ", ", ruleIds[i].c_str());
+        }
+        fprintf(fjson, "]\n}\n");
+        fclose(fjson);
+    }
+
+    setConsoleColor(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+    std::cout << "[QUARANTINE] " << srcPath << " -> " << dstPath.string() << "\n";
+    setConsoleColor(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+    return true;
+}
+
+static int yr_callback_function_ondemand(
+    YR_SCAN_CONTEXT* /*context*/,
+    int message,
+    void* message_data,
+    void* user_data)
+{
+    if (message == CALLBACK_MSG_RULE_MATCHING) {
+        auto* ctx = reinterpret_cast<OnDemandScanCtx*>(user_data);
+        YR_RULE* rule = reinterpret_cast<YR_RULE*>(message_data);
+        const char* ident = rule->identifier;
+        const char* ns = (rule->ns && rule->ns->name) ? rule->ns->name : "?";
+        bool eligible = IsQuarantineEligibleRule(rule);
+
+        ctx->stats->yaraMatches.fetch_add(1);
+        ctx->ruleIds.emplace_back(ident);
+        if (eligible) ctx->quarantineEligibleRules.emplace_back(ident);
+
+        setConsoleColor(FOREGROUND_RED | FOREGROUND_INTENSITY);
+        std::cout << "[YARA:" << ns << (eligible ? " QUAR" : " SIG") << "] "
+                  << ident << "  <-  " << ctx->path << "\n";
+        setConsoleColor(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+    }
+    return CALLBACK_CONTINUE;
+}
+
+static void ScanOneFileOnDemand(const std::string& path, bool doCapa, bool quarantine, OnDemandScanStats& stats) {
+    // Hash-based allowlist short-circuit — dramatic speedup for sweeps of
+    // Windows/Program Files when the allowlist is populated.
+    std::string fileHash;
+    if (Sha256HexOfFile(path, fileHash) && IsHashAllowlisted(fileHash)) {
+        stats.filesScanned.fetch_add(1);
+        return;
+    }
+
+    OnDemandScanCtx ctx{ path, &stats, {}, {} };
+
+    if (rules) {
+        int rc = yr_rules_scan_file(
+            rules,
+            path.c_str(),
+            0,
+            (YR_CALLBACK_FUNC)yr_callback_function_ondemand,
+            &ctx,
+            60 /* seconds timeout */
+        );
+        if (rc != ERROR_SUCCESS && rc != ERROR_SCAN_TIMEOUT) {
+            stats.errors.fetch_add(1);
+        }
+    }
+    stats.filesScanned.fetch_add(1);
+
+    if (doCapa) {
+        // Run capa synchronously (PID 0 — not tied to a live process).
+        RunCapaScan(path, 0);
+    }
+
+    // Quarantine policy: --quarantine is a user intent, but we only act on
+    // matches from the `quarantine-safe` namespace. A signal-only match
+    // logs + counts but never removes the file. This prevents the EDR from
+    // bricking systems when broad/heuristic rules fire on goodware.
+    if (quarantine && !ctx.quarantineEligibleRules.empty()) {
+        if (QuarantineFile(path, ctx.quarantineEligibleRules)) {
+            stats.quarantined.fetch_add(1);
+        }
+    } else if (quarantine && !ctx.ruleIds.empty()) {
+        std::cout << "[*] Matches present but none from quarantine-safe namespace — not quarantining "
+                  << path << "\n";
+    }
+}
+
+static int RunOnDemandScan(const std::string& target, const std::vector<std::string>& yaraDirs, bool doCapa, bool quarantine) {
+    std::cout << "[*] Loading YARA rules for on-demand scan...\n";
+    InitYara(yaraDirs);
+    std::cout << "[*] " << yara_rules_count << " YARA rules loaded\n";
+
+    if (!rules) {
+        std::cerr << "[!] YARA rule compilation failed — aborting scan\n";
+        return 1;
+    }
+
+    std::filesystem::path root(target);
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec)) {
+        std::cerr << "[!] Path does not exist: " << target << "\n";
+        return 1;
+    }
+
+    OnDemandScanStats stats;
+    auto t0 = std::chrono::steady_clock::now();
+
+    if (quarantine) {
+        std::cout << "[*] Quarantine ENABLED — matched files will be neutralized and moved to "
+                  << kQuarantineDir << "\n";
+    }
+
+    if (std::filesystem::is_regular_file(root, ec)) {
+        std::cout << "[*] Scanning file: " << root.string() << "\n";
+        ScanOneFileOnDemand(root.string(), doCapa, quarantine, stats);
+    } else if (std::filesystem::is_directory(root, ec)) {
+        std::cout << "[*] Scanning directory: " << root.string() << " (recursive)\n";
+        std::filesystem::recursive_directory_iterator it(
+            root,
+            std::filesystem::directory_options::skip_permission_denied,
+            ec
+        );
+        std::filesystem::recursive_directory_iterator end;
+        if (ec) {
+            std::cerr << "[!] Failed to iterate: " << ec.message() << "\n";
+            return 1;
+        }
+        for (; it != end; it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            const auto& entry = *it;
+            if (!entry.is_regular_file(ec)) continue;
+            ScanOneFileOnDemand(entry.path().string(), doCapa, quarantine, stats);
+        }
+    } else {
+        std::cerr << "[!] Path is neither a file nor a directory: " << target << "\n";
+        return 1;
+    }
+
+    auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    std::cout << "\n[=] Scan complete: "
+              << stats.filesScanned.load() << " files | "
+              << stats.yaraMatches.load() << " YARA matches | "
+              << stats.quarantined.load() << " quarantined | "
+              << stats.errors.load() << " errors | "
+              << dt << " ms\n";
+
+    return stats.yaraMatches.load() > 0 ? 2 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Quarantine management — list and restore
+// ---------------------------------------------------------------------------
+
+static int QuarantineList() {
+    std::error_code ec;
+    if (!std::filesystem::exists(kQuarantineDir, ec)) {
+        std::cout << "[=] Quarantine is empty (" << kQuarantineDir << " does not exist)\n";
+        return 0;
+    }
+    int count = 0;
+    std::cout << "[*] Quarantined items in " << kQuarantineDir << ":\n";
+    for (auto& entry : std::filesystem::directory_iterator(kQuarantineDir, ec)) {
+        if (entry.path().extension() != ".quar") continue;
+        auto sidecar = entry.path();
+        sidecar += ".json";
+        auto sz = entry.file_size(ec);
+        std::cout << "  " << entry.path().filename().string()
+                  << "  (" << sz << " bytes"
+                  << (std::filesystem::exists(sidecar) ? ", sidecar present)" : ", NO sidecar)")
+                  << "\n";
+        ++count;
+    }
+    std::cout << "[=] " << count << " quarantined item(s)\n";
+    return 0;
+}
+
+static std::string ExtractJsonStringField(const std::string& json, const std::string& key) {
+    std::string needle = "\"" + key + "\"";
+    auto p = json.find(needle);
+    if (p == std::string::npos) return {};
+    auto q1 = json.find('"', p + needle.size());
+    if (q1 == std::string::npos) return {};
+    auto q2 = json.find('"', q1 + 1);
+    if (q2 == std::string::npos) return {};
+    std::string raw = json.substr(q1 + 1, q2 - q1 - 1);
+    // unescape \\ -> \ (sidecar was produced with forward-write — minimal
+    // escaping, but be defensive).
+    std::string out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] == '\\' && i + 1 < raw.size()) {
+            out.push_back(raw[++i]);
+        } else {
+            out.push_back(raw[i]);
+        }
+    }
+    return out;
+}
+
+static int QuarantineRestore(const std::string& name) {
+    std::filesystem::path quarFile = std::filesystem::path(kQuarantineDir) / name;
+    std::filesystem::path sidecar = quarFile;
+    sidecar += ".json";
+
+    std::error_code ec;
+    if (!std::filesystem::exists(quarFile, ec)) {
+        std::cerr << "[!] Not found: " << quarFile.string() << "\n";
+        return 1;
+    }
+    if (!std::filesystem::exists(sidecar, ec)) {
+        std::cerr << "[!] Sidecar missing: " << sidecar.string() << " — cannot determine original path\n";
+        return 1;
+    }
+
+    // Load sidecar
+    std::string jsonText;
+    {
+        FILE* sf = nullptr;
+        if (fopen_s(&sf, sidecar.string().c_str(), "r") != 0 || !sf) {
+            std::cerr << "[!] Could not open sidecar\n";
+            return 1;
+        }
+        char buf[1024];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), sf)) > 0) jsonText.append(buf, n);
+        fclose(sf);
+    }
+    std::string originalPath = ExtractJsonStringField(jsonText, "original_path");
+    if (originalPath.empty()) {
+        std::cerr << "[!] Could not parse original_path from sidecar\n";
+        return 1;
+    }
+
+    // Ensure target parent directory exists
+    std::filesystem::path origP(originalPath);
+    std::filesystem::create_directories(origP.parent_path(), ec);
+
+    FILE* fin = nullptr;
+    FILE* fout = nullptr;
+    if (fopen_s(&fin, quarFile.string().c_str(), "rb") != 0 || !fin) return 1;
+    if (fopen_s(&fout, originalPath.c_str(), "wb") != 0 || !fout) {
+        fclose(fin);
+        std::cerr << "[!] Could not write to original path: " << originalPath << "\n";
+        return 1;
+    }
+
+    std::vector<BYTE> buf(64 * 1024);
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), fin)) > 0) {
+        for (size_t i = 0; i < n; ++i) buf[i] ^= kQuarantineXorKey;
+        fwrite(buf.data(), 1, n, fout);
+    }
+    fclose(fin);
+    fclose(fout);
+
+    std::filesystem::remove(quarFile, ec);
+    std::filesystem::remove(sidecar, ec);
+
+    std::cout << "[=] Restored to: " << originalPath << "\n";
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Memory scanner — walks process committed regions and runs YARA against
+// private (unbacked) memory, which is where reflective loaders, Cobalt
+// Strike beacons, and process-hollowing residue live. File-only scanners
+// miss these entirely.
+// ---------------------------------------------------------------------------
+
+struct MemScanCtx {
+    UINT32 pid;
+    std::string procName;
+    void* base;
+    size_t size;
+    DWORD protect;
+    std::atomic<size_t>* matchCount;
+};
+
+static int yr_callback_function_memscan(
+    YR_SCAN_CONTEXT* /*context*/,
+    int message,
+    void* message_data,
+    void* user_data)
+{
+    if (message == CALLBACK_MSG_RULE_MATCHING) {
+        auto* ctx = reinterpret_cast<MemScanCtx*>(user_data);
+        const char* ident = reinterpret_cast<YR_RULE*>(message_data)->identifier;
+        ctx->matchCount->fetch_add(1);
+
+        setConsoleColor(FOREGROUND_RED | FOREGROUND_INTENSITY);
+        char buf[128];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%p (0x%zx, prot=0x%x)",
+                    ctx->base, ctx->size, ctx->protect);
+        std::cout << "[YARA-MEM] PID " << ctx->pid << " " << ctx->procName
+                  << " @ " << buf << "  ->  " << ident << "\n";
+        setConsoleColor(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+    }
+    return CALLBACK_CONTINUE;
+}
+
+static void ScanProcessMemory(UINT32 pid, const std::string& procName, std::atomic<size_t>& matchCount) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!h) return;
+
+    MEMORY_BASIC_INFORMATION mbi;
+    LPCVOID addr = nullptr;
+    while (VirtualQueryEx(h, addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        addr = (LPCVOID)((ULONG_PTR)mbi.BaseAddress + mbi.RegionSize);
+
+        if (mbi.State != MEM_COMMIT) continue;
+        if (mbi.Protect == 0 || (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) continue;
+        // Focus on MEM_PRIVATE — that's where injected/unbacked code lives.
+        // MEM_IMAGE regions are on-disk DLLs and contribute noise + size.
+        if (mbi.Type != MEM_PRIVATE) continue;
+        if (mbi.RegionSize > 64 * 1024 * 1024) continue; // skip oversized heaps
+
+        std::vector<BYTE> buf(mbi.RegionSize);
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(h, mbi.BaseAddress, buf.data(), mbi.RegionSize, &got) || got == 0) {
+            continue;
+        }
+
+        MemScanCtx ctx{ pid, procName, mbi.BaseAddress, got, mbi.Protect, &matchCount };
+        yr_rules_scan_mem(
+            rules,
+            buf.data(),
+            got,
+            0,
+            (YR_CALLBACK_FUNC)yr_callback_function_memscan,
+            &ctx,
+            5 /* per-region timeout seconds */
+        );
+    }
+    CloseHandle(h);
+}
+
+static int RunMemoryScan(UINT32 singlePid, const std::vector<std::string>& yaraDirs) {
+    std::cout << "[*] Loading YARA rules for memory scan...\n";
+    InitYara(yaraDirs);
+    if (!rules) {
+        std::cerr << "[!] YARA init failed\n";
+        return 1;
+    }
+    std::cout << "[*] " << yara_rules_count << " YARA rules loaded\n";
+
+    std::atomic<size_t> matchCount{0};
+    size_t procCount = 0;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    if (singlePid != 0) {
+        std::cout << "[*] Scanning memory of PID " << singlePid << "\n";
+        ScanProcessMemory(singlePid, std::string(), matchCount);
+        procCount = 1;
+    } else {
+        std::cout << "[*] Scanning memory of all processes (MEM_PRIVATE regions)...\n";
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) return 1;
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (pe.th32ProcessID == 0 || pe.th32ProcessID == 4) continue;
+                int nlen = WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, nullptr, 0, nullptr, nullptr);
+                std::string pname(nlen > 0 ? nlen - 1 : 0, '\0');
+                if (nlen > 0) WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, &pname[0], nlen, nullptr, nullptr);
+                ScanProcessMemory(pe.th32ProcessID, pname, matchCount);
+                ++procCount;
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+
+    auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    std::cout << "\n[=] Memory scan complete: " << procCount << " processes | "
+              << matchCount.load() << " matches | " << dt << " ms\n";
+    return matchCount.load() > 0 ? 2 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// YARA rule hot-reload — ReadDirectoryChangesW watcher. Recompiles rules
+// atomically and swaps the global pointer. Safe because yr_rules_scan_*
+// takes a YR_RULES* by value at call time; the old rules object is held by
+// any in-flight scan thread and freed only after that scan returns.
+// For safety we keep the previous YR_RULES around briefly before freeing.
+// ---------------------------------------------------------------------------
+
+static std::atomic<bool> g_yaraReloadStop{false};
+
+static void YaraRuleWatcherThread(std::vector<std::string> dirs) {
+    if (dirs.empty()) return;
+
+    // Watch first (primary) directory — default is kLoadedPotatoYaraRulesDir.
+    std::wstring watchDir;
+    int wl = MultiByteToWideChar(CP_UTF8, 0, dirs[0].c_str(), -1, nullptr, 0);
+    if (wl <= 0) return;
+    watchDir.resize(wl - 1);
+    MultiByteToWideChar(CP_UTF8, 0, dirs[0].c_str(), -1, &watchDir[0], wl);
+
+    HANDLE hDir = CreateFileW(
+        watchDir.c_str(),
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr
+    );
+    if (hDir == INVALID_HANDLE_VALUE) {
+        std::cerr << "[!] YARA hot-reload: cannot open watch dir\n";
+        return;
+    }
+
+    BYTE buf[4096];
+    DWORD bytesRet = 0;
+
+    while (!g_yaraReloadStop.load()) {
+        if (!ReadDirectoryChangesW(
+                hDir, buf, sizeof(buf), TRUE,
+                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE,
+                &bytesRet, nullptr, nullptr)) {
+            break;
+        }
+        if (g_yaraReloadStop.load()) break;
+
+        // Debounce: wait 2s to coalesce multi-file edits
+        Sleep(2000);
+
+        std::cout << "[*] YARA rule change detected — recompiling...\n";
+
+        YR_COMPILER* newCompiler = nullptr;
+        YR_RULES* newRules = nullptr;
+        if (yr_compiler_create(&newCompiler) != ERROR_SUCCESS) continue;
+
+        // Use private counters so we don't stomp the global during the
+        // swap window (worst case: count display is slightly stale).
+        int savedCount = yara_rules_count;
+        auto savedLoaded = loadedYaraRulePaths;
+        yara_rules_count = 0;
+        loadedYaraRulePaths.clear();
+
+        for (const auto& d : dirs) {
+            AddYaraRulesFromDirectoryInto(newCompiler, d);
+        }
+
+        if (yr_compiler_get_rules(newCompiler, &newRules) == ERROR_SUCCESS && newRules) {
+            YR_RULES* oldRules = rules;
+            rules = newRules; // pointer assignment on x64 is atomic
+            // Give in-flight scans a moment to finish before freeing old rules
+            Sleep(500);
+            if (oldRules) yr_rules_destroy(oldRules);
+            std::cout << "[*] YARA recompiled: " << yara_rules_count << " rules active\n";
+        } else {
+            std::cerr << "[!] YARA recompile failed — keeping previous rules\n";
+            yara_rules_count = savedCount;
+            loadedYaraRulePaths = savedLoaded;
+        }
+        yr_compiler_destroy(newCompiler);
+    }
+    CloseHandle(hDir);
 }
 
 void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) {
@@ -8090,7 +8830,7 @@ static void EtwSessionWatchdogThread()
                 }
                 // Don't update baseline if bit 0 was cleared — preserve original
                 if (current & 1) s_tracingBaseline = current;
-            } __except (...) {}
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
 
         // --- Check for rogue ETW sessions / session count anomaly ---
@@ -10481,6 +11221,18 @@ int main(int argc, char* argv[]) {
     bool includeTraceChildren = false;
     std::string              complianceArg;   // --compliance <standard>
     bool                     hardenMode = false; // --harden (skip interactive prompt)
+    std::string              scanPath;        // --scan <file-or-dir> (on-demand scan mode)
+    std::string              scanYaraRulesDir;// --yara-rules <dir> (override/extra YARA dir for --scan)
+    bool                     scanNoCapa = false;
+    bool                     scanQuarantine = false; // --quarantine
+    std::string              installScanPath;        // --install-scheduled-scan <path>
+    int                      scheduledScanIntervalHours = 24;
+    bool                     uninstallScheduledScan = false;
+    bool                     quarantineListMode = false;
+    std::string              quarantineRestoreName;
+    bool                     memScanMode = false;
+    UINT32                   memScanPid = 0;
+    bool                     enableYaraHotReload = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -10640,6 +11392,88 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (arg == "--scan") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --scan\n"; return 1; }
+            scanPath = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--scan=", 0) == 0) {
+            scanPath = arg.substr(7);
+            continue;
+        }
+
+        if (arg == "--yara-rules") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --yara-rules\n"; return 1; }
+            scanYaraRulesDir = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--yara-rules=", 0) == 0) {
+            scanYaraRulesDir = arg.substr(13);
+            continue;
+        }
+
+        if (arg == "--no-capa") {
+            scanNoCapa = true;
+            continue;
+        }
+
+        if (arg == "--quarantine") {
+            scanQuarantine = true;
+            continue;
+        }
+
+        if (arg == "--install-scheduled-scan") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --install-scheduled-scan\n"; return 1; }
+            installScanPath = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--install-scheduled-scan=", 0) == 0) {
+            installScanPath = arg.substr(25);
+            continue;
+        }
+
+        if (arg == "--scan-interval-hours") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --scan-interval-hours\n"; return 1; }
+            try { scheduledScanIntervalHours = std::stoi(argv[++i]); }
+            catch (...) { std::cerr << "Invalid --scan-interval-hours value\n"; return 1; }
+            continue;
+        }
+
+        if (arg == "--uninstall-scheduled-scan") {
+            uninstallScheduledScan = true;
+            continue;
+        }
+
+        if (arg == "--quarantine-list") {
+            quarantineListMode = true;
+            continue;
+        }
+
+        if (arg == "--quarantine-restore") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --quarantine-restore\n"; return 1; }
+            quarantineRestoreName = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--quarantine-restore=", 0) == 0) {
+            quarantineRestoreName = arg.substr(21);
+            continue;
+        }
+
+        if (arg == "--scan-memory") {
+            memScanMode = true;
+            // Optional following PID
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                try { memScanPid = (UINT32)std::stoul(argv[++i]); }
+                catch (...) { memScanPid = 0; }
+            }
+            continue;
+        }
+
+        if (arg == "--yara-hot-reload") {
+            enableYaraHotReload = true;
+            continue;
+        }
+
         positionalArgs.push_back(arg);
     }
 
@@ -10687,6 +11521,77 @@ int main(int argc, char* argv[]) {
         return ComplianceEngine::RunEvaluation(std, hardenMode);
     }
 
+    // ------------------------------------------------------------------
+    // On-demand scan mode — standalone, no driver required.
+    // Usage: NortonEDR.exe --scan <file-or-dir> [--yara-rules <dir>] [--no-capa]
+    // Exit codes: 0 = clean, 2 = YARA matches, 1 = error.
+    // ------------------------------------------------------------------
+    if (!scanPath.empty()) {
+        std::vector<std::string> scanYaraDirs;
+        if (!scanYaraRulesDir.empty()) scanYaraDirs.push_back(scanYaraRulesDir);
+        scanYaraDirs.push_back(kLoadedPotatoYaraRulesDir);
+        return RunOnDemandScan(scanPath, scanYaraDirs, !scanNoCapa, scanQuarantine);
+    }
+
+    // ------------------------------------------------------------------
+    // Scheduled scan install/uninstall via Windows Task Scheduler.
+    // The task runs this same binary with --scan <path> --quarantine on
+    // a daily schedule, as SYSTEM, so it can sweep protected paths.
+    // ------------------------------------------------------------------
+    if (!installScanPath.empty()) {
+        wchar_t exePathW[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePathW, MAX_PATH);
+        std::wstring exePath(exePathW);
+
+        std::string exePathA;
+        {
+            int needed = WideCharToMultiByte(CP_UTF8, 0, exePath.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            exePathA.resize(needed > 0 ? needed - 1 : 0);
+            if (needed > 0) WideCharToMultiByte(CP_UTF8, 0, exePath.c_str(), -1, &exePathA[0], needed, nullptr, nullptr);
+        }
+
+        std::string cmd =
+            "schtasks /Create /F /SC HOURLY /MO " + std::to_string(scheduledScanIntervalHours) +
+            " /TN \"NortonEDR_ScheduledScan\""
+            " /RU SYSTEM /RL HIGHEST"
+            " /TR \"\\\"" + exePathA + "\\\" --scan \\\"" + installScanPath + "\\\" --quarantine --no-capa\"";
+
+        std::cout << "[*] Installing scheduled scan task:\n    " << cmd << "\n";
+        int rc = system(cmd.c_str());
+        if (rc != 0) {
+            std::cerr << "[!] schtasks returned " << rc << " — are you running as admin?\n";
+            return 1;
+        }
+        std::cout << "[=] Scheduled scan installed. Every " << scheduledScanIntervalHours
+                  << "h it will scan " << installScanPath << " and quarantine matches.\n";
+        return 0;
+    }
+
+    if (uninstallScheduledScan) {
+        int rc = system("schtasks /Delete /F /TN \"NortonEDR_ScheduledScan\"");
+        if (rc != 0) {
+            std::cerr << "[!] schtasks delete returned " << rc << "\n";
+            return 1;
+        }
+        std::cout << "[=] Scheduled scan uninstalled.\n";
+        return 0;
+    }
+
+    if (quarantineListMode) {
+        return QuarantineList();
+    }
+
+    if (!quarantineRestoreName.empty()) {
+        return QuarantineRestore(quarantineRestoreName);
+    }
+
+    if (memScanMode) {
+        std::vector<std::string> scanYaraDirs;
+        if (!scanYaraRulesDir.empty()) scanYaraDirs.push_back(scanYaraRulesDir);
+        scanYaraDirs.push_back(kLoadedPotatoYaraRulesDir);
+        return RunMemoryScan(memScanPid, scanYaraDirs);
+    }
+
     if (positionalArgs.empty()) {
         std::cerr << "Usage: " << argv[0]
             << " <path to driver> [path to YARA rules directory] [path to LOLDrivers cache] [path to Sigma rules directory]"
@@ -10695,7 +11600,11 @@ int main(int argc, char* argv[]) {
             << " [--elastic-api-key <key> | --elastic-user <u> --elastic-pass <p>]"
             << " [--elastic-no-verify]"
             << " [--block-ports <port1,port2,...>]"
-            << " [--compliance <standard>] [--harden]\n";
+            << " [--compliance <standard>] [--harden]"
+            << " [--scan <file-or-dir>] [--yara-rules <dir>] [--no-capa] [--quarantine]"
+            << " [--install-scheduled-scan <path> [--scan-interval-hours N]] [--uninstall-scheduled-scan]"
+            << " [--quarantine-list] [--quarantine-restore <name>]"
+            << " [--scan-memory [pid]] [--yara-hot-reload]\n";
         return 1;
     }
 
@@ -10707,6 +11616,18 @@ int main(int argc, char* argv[]) {
         yaraRulesDirectories.push_back(positionalArgs[1]);
     }
 
+    // Prepend <exe-dir>/rules/yara/ so a fresh checkout with the bundled
+    // rules/ directory works out of the box on any machine.
+    {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
+        std::filesystem::path repoRules = exeDir / "rules" / "yara";
+        std::error_code ec;
+        if (std::filesystem::exists(repoRules, ec)) {
+            yaraRulesDirectories.push_back(repoRules.string());
+        }
+    }
     yaraRulesDirectories.push_back(kLoadedPotatoYaraRulesDir);
 
     std::string lolDriversCachePath = kLoadedPotatoLolDriversCachePath;
@@ -10781,6 +11702,18 @@ int main(int argc, char* argv[]) {
     InitYara(yaraRulesDirectories);
 
     printf("[*] %d Yara Rules Loaded & Compiled\n", yara_rules_count);
+
+    // Load hash allowlist (best-effort — absent file is fine).
+    LoadHashAllowlist();
+
+    // Start YARA hot-reload watcher if requested.
+    std::thread yaraReloadThread;
+    if (enableYaraHotReload) {
+        std::cout << "[*] YARA hot-reload enabled — watching " << yaraRulesDirectories[0] << "\n";
+        yaraReloadThread = std::thread(YaraRuleWatcherThread, yaraRulesDirectories);
+        yaraReloadThread.detach();
+    }
+
     system("pause");
 
     // Send HookDll injection config to the kernel driver.
