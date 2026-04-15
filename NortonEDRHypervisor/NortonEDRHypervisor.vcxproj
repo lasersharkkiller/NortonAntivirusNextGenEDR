@@ -76,6 +76,8 @@
     <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
     <TargetName>NortonEDRHypervisor</TargetName>
     <SkipPackageVerification>true</SkipPackageVerification>
+    <EnableTestSign>false</EnableTestSign>
+    <DriverCatalog_Enable>false</DriverCatalog_Enable>
   </PropertyGroup>
 
   <!-- Debug compiler/linker -->

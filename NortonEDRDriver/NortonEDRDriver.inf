@@ -22,7 +22,7 @@ NortonEDR.CopyFiles = 12
 1 = %DiskName%,,,""
 
 [SourceDisksFiles]
-NortonEDRDriver.sys = 1,,
+nortonav.sys = 1,,
 
 ;*****************************************
 ; Install Section
@@ -51,7 +51,7 @@ Description    = %NortonEDRDriver.SVCDESC%
 ServiceType    = 2                          ; SERVICE_FILE_SYSTEM_DRIVER
 StartType      = 3                          ; SERVICE_DEMAND_START
 ErrorControl   = 1                          ; SERVICE_ERROR_NORMAL
-ServiceBinary  = %12%\NortonEDRDriver.sys
+ServiceBinary  = %12%\nortonav.sys
 LoadOrderGroup = "FSFilter Anti-Virus"
 Dependencies   = FltMgr
 AddReg         = NortonEDR.AddReg
@@ -70,7 +70,7 @@ HKR,"Instances\"%DefaultInstance%,"Flags",0x00010001,0x0
 ;*****************************************
 
 [NortonEDR.CopyFiles]
-NortonEDRDriver.sys
+nortonav.sys
 
 ;*****************************************
 ; String definitions

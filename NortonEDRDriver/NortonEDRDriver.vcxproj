@@ -72,6 +72,7 @@
   <PropertyGroup />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+    <TargetName>nortonav</TargetName>
     <EnableTestSign>false</EnableTestSign>
     <DriverCatalog_Enable>false</DriverCatalog_Enable>
   </PropertyGroup>
@@ -79,6 +80,8 @@
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
     <TargetName>nortonav</TargetName>
+    <EnableTestSign>false</EnableTestSign>
+    <DriverCatalog_Enable>false</DriverCatalog_Enable>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
@@ -100,7 +103,7 @@
     </DriverSign>
     <Link>
       <AdditionalLibraryDirectories>C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64\;C:\Program Files (x86)\Windows Kits\10\Lib\wdf\kmdf\x64\1.33;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64</AdditionalLibraryDirectories>
-      <AdditionalDependencies>$(DDK_LIB_PATH)\fwpkclnt.lib;D:\githubProjects\NortonEDR\fwpmk.lib;$(DDK_LIB_PATH)\ndis.lib;$(DDK_LIB_PATH)\fltMgr.lib;$(SDK_LIB_PATH)\uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(DDK_LIB_PATH)\fwpkclnt.lib;D:\githubProjects\NortonEDR\fwpmk.lib;$(DDK_LIB_PATH)\ndis.lib;$(DDK_LIB_PATH)\fltMgr.lib;$(SDK_LIB_PATH)\uuid.lib;$(DDK_LIB_PATH)\wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
     </Link>
     <ClCompile>
