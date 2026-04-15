@@ -68,6 +68,8 @@
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
     <TargetName>NortonEDRElam</TargetName>
+    <EnableTestSign>false</EnableTestSign>
+    <DriverCatalog_Enable>false</DriverCatalog_Enable>
   </PropertyGroup>
 
   <!-- Debug|x64 compiler/linker settings -->
