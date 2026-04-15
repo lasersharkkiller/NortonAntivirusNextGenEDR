@@ -44,6 +44,7 @@
 #pragma comment(lib, "bcrypt.lib")
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
+#include <set>
 
 using namespace ftxui;
 using namespace std;
@@ -897,6 +898,135 @@ std::string QueryProcessCommandLine(HANDLE hProcess) {
     return WideToUtf8(std::wstring(wbuf.data(), cmdLine.Length / sizeof(WCHAR)));
 }
 
+// Scan a target process's environment block for the classic CLR-profiler
+// hijack (T1574.012). Setting COR_ENABLE_PROFILING=1 + COR_PROFILER={CLSID}
+// on a .NET process causes the CLR to load the CLSID's DLL as a profiler —
+// widely abused for privilege escalation and persistence. .NET Core uses
+// the CORECLR_* prefix for the same behavior.
+//
+// Reads PEB -> ProcessParameters -> Environment (offset 0x80 on x64) and
+// walks the NUL-separated UTF-16 env strings looking for the three vars.
+// Fires at most once per PID (guarded by g_envScannedPids).
+static std::mutex g_envScannedMutex;
+static std::unordered_set<UINT32> g_envScannedPids;
+
+static void ScanProcessEnvironmentForProfilerHijack(HANDLE hProcess, UINT32 pid,
+                                                    const std::string& procName) {
+    if (!hProcess || pid == 0) return;
+    {
+        std::lock_guard<std::mutex> lock(g_envScannedMutex);
+        if (!g_envScannedPids.insert(pid).second) return; // already scanned
+    }
+
+    typedef NTSTATUS(WINAPI* NtQIPFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static auto pfn = reinterpret_cast<NtQIPFn>(
+        GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess"));
+    if (!pfn) return;
+
+    struct { PVOID r1; PVOID PebBaseAddress; PVOID r2[2]; ULONG_PTR UniqueProcessId; PVOID r3; } pbi{};
+    ULONG rlen = 0;
+    if (pfn(hProcess, 0, &pbi, sizeof(pbi), &rlen) != 0 || !pbi.PebBaseAddress) return;
+
+    PVOID procParams = nullptr;
+    SIZE_T br = 0;
+    if (!ReadProcessMemory(hProcess, static_cast<BYTE*>(pbi.PebBaseAddress) + 0x20,
+                           &procParams, sizeof(PVOID), &br) || !procParams) return;
+
+    // Environment ptr @ +0x80, EnvironmentSize @ +0x3F0 on modern x64 Windows.
+    // Size field occasionally shifts across builds — cap at 256KB fallback.
+    PVOID envPtr = nullptr;
+    SIZE_T envSize = 0;
+    ReadProcessMemory(hProcess, static_cast<BYTE*>(procParams) + 0x80,
+                      &envPtr, sizeof(PVOID), &br);
+    ReadProcessMemory(hProcess, static_cast<BYTE*>(procParams) + 0x3F0,
+                      &envSize, sizeof(SIZE_T), &br);
+    if (!envPtr) return;
+    if (envSize == 0 || envSize > 256 * 1024) envSize = 64 * 1024;
+
+    std::vector<wchar_t> envBuf(envSize / sizeof(wchar_t) + 1, L'\0');
+    if (!ReadProcessMemory(hProcess, envPtr, envBuf.data(), envSize, &br) || br == 0) return;
+
+    // Walk NUL-separated entries, building UTF-8 KEY=VAL pairs.
+    // Flag only the profiler variables we care about.
+    static const char* kSuspectVars[] = {
+        "COR_ENABLE_PROFILING", "COR_PROFILER", "COR_PROFILER_PATH",
+        "COR_PROFILER_PATH_32", "COR_PROFILER_PATH_64",
+        "CORECLR_ENABLE_PROFILING", "CORECLR_PROFILER",
+        "CORECLR_PROFILER_PATH", "CORECLR_PROFILER_PATH_32",
+        "CORECLR_PROFILER_PATH_64",
+        nullptr
+    };
+
+    std::vector<std::string> hits;
+    const wchar_t* p = envBuf.data();
+    const wchar_t* end = envBuf.data() + (br / sizeof(wchar_t));
+    while (p < end && *p) {
+        size_t entryLen = wcsnlen(p, end - p);
+        if (entryLen == 0) break;
+
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, p, (int)entryLen, nullptr, 0, nullptr, nullptr);
+        if (utf8Len > 0 && utf8Len < 4096) {
+            std::string entry(utf8Len, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, p, (int)entryLen, &entry[0], utf8Len, nullptr, nullptr);
+            size_t eq = entry.find('=');
+            if (eq != std::string::npos) {
+                std::string key = entry.substr(0, eq);
+                for (int i = 0; kSuspectVars[i]; i++) {
+                    if (_stricmp(key.c_str(), kSuspectVars[i]) == 0) {
+                        hits.push_back(entry);
+                        break;
+                    }
+                }
+            }
+        }
+        p += entryLen + 1;
+    }
+
+    if (hits.empty()) return;
+
+    // Severity: Critical if the profiler path points into a user-writable
+    // location (Temp, AppData, ProgramData, Public) — that's unambiguously
+    // weaponized. High otherwise (legit profilers do exist: .NET tracers,
+    // APM agents, code-coverage tools).
+    DetectionSeverity sev = DetectionSeverity::High;
+    for (const auto& h : hits) {
+        std::string lower = h;
+        for (auto& c : lower) c = (char)tolower((unsigned char)c);
+        if (lower.find("\\appdata\\") != std::string::npos ||
+            lower.find("\\temp\\")    != std::string::npos ||
+            lower.find("\\users\\public\\")   != std::string::npos ||
+            lower.find("\\programdata\\")    != std::string::npos ||
+            lower.find("\\downloads\\") != std::string::npos) {
+            sev = DetectionSeverity::Critical;
+            break;
+        }
+    }
+
+    std::string ts = BuildTimestamp();
+    std::string joined;
+    for (size_t i = 0; i < hits.size(); i++) {
+        if (i) joined += " | ";
+        joined += hits[i];
+    }
+
+    std::string hdr = std::to_string(tab_1_menu_items.size()) +
+        " - [!] [Alert] | " + ts +
+        " | " + procName +
+        " | Method: CLR Profiler Environment Hijack" +
+        " | " + std::to_string(hits.size()) + " profiler var(s) set";
+
+    std::string det = "Date & Time: " + ts +
+        " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: Environment Block Inspection (T1574.012)" +
+        " | Vars: " + joined +
+        " | Indicator: CLR/.NET profiler vars in env block — any .NET runtime in this "
+        "process will load the CLSID's DLL as an in-process profiler. Classic DLL-loading "
+        "hijack used by dnSpy-style tooling, C3, and persistence frameworks.";
+
+    PushUiDetectionEvent(hdr, det, "Behavioral: CLR Profiler Env Var", pid, sev);
+}
+
 ProcessSnapshotData CollectProcessSnapshot(UINT32 pid) {
     ProcessSnapshotData snapshot;
     if (pid == 0) {
@@ -933,6 +1063,7 @@ ProcessSnapshotData CollectProcessSnapshot(UINT32 pid) {
             }
         }
         snapshot.commandLine = QueryProcessCommandLine(processHandle);
+        ScanProcessEnvironmentForProfilerHijack(processHandle, pid, snapshot.processName);
         CloseHandle(processHandle);
     }
 
@@ -2395,6 +2526,62 @@ static DWORD CollectImportFlat(PVOID base, char* buf, DWORD cap) {
 // the convention used by pefile/VirusTotal for threat-intel correlation.
 // Returns lowercase hex string, empty if the PE has no import table.
 // ---------------------------------------------------------------------------
+// Max Shannon entropy across code-bearing PE sections. Packed/encrypted binaries
+// typically push .text entropy above 7.2 (the theoretical max is 8.0 for random
+// bytes; compiled x86/x64 code clusters around 6.0-6.7).
+// Returns: {maxEntropy, sectionName} or {0.0, ""} on parse failure.
+static std::pair<double, std::string> ComputePeSectionEntropy(const std::string& path) {
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return {0.0, ""};
+    HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(hFile);
+    if (!hMap) return {0.0, ""};
+    const BYTE* base = (const BYTE*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hMap);
+    if (!base) return {0.0, ""};
+
+    double maxEnt = 0.0;
+    char maxNameBuf[9] = {};
+
+    __try {
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) __leave;
+        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) __leave;
+
+        const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+            DWORD sz = sec[i].SizeOfRawData;
+            DWORD off = sec[i].PointerToRawData;
+            if (sz == 0 || sz > 64 * 1024 * 1024) continue;
+            if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+
+            size_t counts[256] = {};
+            const BYTE* data = base + off;
+            for (DWORD k = 0; k < sz; k++) counts[data[k]]++;
+
+            double ent = 0.0;
+            for (int k = 0; k < 256; k++) {
+                if (counts[k] == 0) continue;
+                double p = (double)counts[k] / (double)sz;
+                ent -= p * log2(p);
+            }
+            if (ent > maxEnt) {
+                maxEnt = ent;
+                memcpy(maxNameBuf, sec[i].Name, 8);
+                maxNameBuf[8] = 0;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        maxEnt = 0.0;
+    }
+
+    UnmapViewOfFile((LPCVOID)base);
+    return {maxEnt, std::string(maxNameBuf)};
+}
+
 static std::string ComputeImphash(const std::string& path) {
     HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -4027,6 +4214,305 @@ static void ScanProcessMemory(UINT32 pid, const std::string& procName, std::atom
     CloseHandle(h);
 }
 
+// Scan exactly one region — used by the W->X auto-scan path, where the kernel
+// tells us which address/size just flipped to executable. Much cheaper than
+// walking the full VAD tree for every notification.
+static void ScanProcessMemoryRegion(UINT32 pid, const std::string& procName,
+                                    void* base, size_t size) {
+    if (!rules || !base || size == 0 || size > 64 * 1024 * 1024) return;
+
+    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!h) return;
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQueryEx(h, base, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+        mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_NOACCESS) && !(mbi.Protect & PAGE_GUARD)) {
+
+        std::vector<BYTE> buf(size);
+        SIZE_T got = 0;
+        if (ReadProcessMemory(h, base, buf.data(), size, &got) && got > 0) {
+            std::atomic<size_t> matchCount{0};
+            MemScanCtx ctx{ pid, procName, base, got, mbi.Protect, &matchCount };
+            yr_rules_scan_mem(
+                rules, buf.data(), got, 0,
+                (YR_CALLBACK_FUNC)yr_callback_function_memscan,
+                &ctx, 5
+            );
+        }
+    }
+    CloseHandle(h);
+}
+
+// Import-divergence detector (bridge D). On W->X flip, enumerate the DLLs
+// currently loaded into the target process and compare against the import
+// table of its on-disk image. If the runtime has pulled in modules that are
+// not in the static import table, the process has dynamically loaded code
+// (LoadLibrary, reflective DLL, manual-mapped payload) — a strong behavioral
+// signal that the unpacked region comes from somewhere other than the binary
+// on disk, even when both YARA and capa have zero content coverage of it.
+//
+// Rate-limited: one divergence check per PID per 60s (stored in a static map
+// guarded by a mutex — an unpacker typically flips many pages in succession
+// and we only need to catch the divergence once).
+static std::mutex g_divergenceMutex;
+static std::unordered_map<UINT32, std::chrono::steady_clock::time_point> g_divergenceLastRun;
+
+// Extracts DLL-name file offsets into a flat, fixed-size scratch buffer
+// entirely within the __try frame (no C++ objects). The caller then converts
+// the raw C strings into std::set outside SEH.
+static DWORD CollectImportDllOffsets(const BYTE* base, DWORD* outOffsets, DWORD maxEntries) {
+    DWORD count = 0;
+    __try {
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) __leave;
+        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) __leave;
+
+        DWORD impRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+        if (!impRva) __leave;
+
+        const IMAGE_SECTION_HEADER* secs = IMAGE_FIRST_SECTION(nt);
+        WORD nsec = nt->FileHeader.NumberOfSections;
+
+        auto rvaToFileOff = [&](DWORD rva) -> DWORD {
+            for (WORD i = 0; i < nsec; i++) {
+                if (rva >= secs[i].VirtualAddress &&
+                    rva <  secs[i].VirtualAddress + secs[i].SizeOfRawData) {
+                    return secs[i].PointerToRawData + (rva - secs[i].VirtualAddress);
+                }
+            }
+            return 0;
+        };
+
+        DWORD impOff = rvaToFileOff(impRva);
+        if (!impOff) __leave;
+        const IMAGE_IMPORT_DESCRIPTOR* imp =
+            (const IMAGE_IMPORT_DESCRIPTOR*)(base + impOff);
+        for (DWORD i = 0; i < 256 && imp[i].Name && count < maxEntries; i++) {
+            DWORD nameOff = rvaToFileOff(imp[i].Name);
+            if (nameOff) outOffsets[count++] = nameOff;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        count = 0;
+    }
+    return count;
+}
+
+static std::set<std::string> GetDiskImportedDlls(const std::string& exePath) {
+    std::set<std::string> result;
+    HANDLE hFile = CreateFileA(exePath.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return result;
+    HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(hFile);
+    if (!hMap) return result;
+    const BYTE* base = (const BYTE*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hMap);
+    if (!base) return result;
+
+    DWORD offsets[256] = {};
+    DWORD n = CollectImportDllOffsets(base, offsets, 256);
+    for (DWORD i = 0; i < n; i++) {
+        // bounded read — dll names are always NUL-terminated ASCII
+        const char* p = (const char*)(base + offsets[i]);
+        char buf[128] = {};
+        for (size_t k = 0; k < sizeof(buf) - 1 && p[k]; k++) {
+            buf[k] = (char)tolower((unsigned char)p[k]);
+        }
+        if (buf[0]) result.insert(buf);
+    }
+
+    UnmapViewOfFile((LPCVOID)base);
+    return result;
+}
+
+static std::set<std::string> GetRuntimeLoadedDlls(UINT32 pid) {
+    std::set<std::string> result;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE) return result;
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(snap, &me)) {
+        do {
+            int nlen = WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1, nullptr, 0, nullptr, nullptr);
+            if (nlen > 0) {
+                std::string n(nlen - 1, '\0');
+                WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1, &n[0], nlen, nullptr, nullptr);
+                for (auto& c : n) c = (char)tolower((unsigned char)c);
+                result.insert(n);
+            }
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    return result;
+}
+
+static void CheckImportDivergence(UINT32 pid, const std::string& procName) {
+    if (pid == 0) return;
+    {
+        std::lock_guard<std::mutex> lock(g_divergenceMutex);
+        auto now = std::chrono::steady_clock::now();
+        auto it = g_divergenceLastRun.find(pid);
+        if (it != g_divergenceLastRun.end() &&
+            (now - it->second) < std::chrono::seconds(60)) return;
+        g_divergenceLastRun[pid] = now;
+    }
+
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) return;
+    char imagePath[MAX_PATH * 2] = {};
+    DWORD imgSize = sizeof(imagePath);
+    BOOL ok = QueryFullProcessImageNameA(hProc, 0, imagePath, &imgSize);
+    CloseHandle(hProc);
+    if (!ok || imgSize == 0) return;
+
+    std::string exePath(imagePath, imgSize);
+    std::set<std::string> diskDlls = GetDiskImportedDlls(exePath);
+    std::set<std::string> runtimeDlls = GetRuntimeLoadedDlls(pid);
+    if (diskDlls.empty() || runtimeDlls.empty()) return;
+
+    // A small set of DLLs are legitimately pulled in at runtime by the loader
+    // itself (activation context, delay-load resolvers, side-by-side, etc.).
+    // Excluding them cuts the FP rate to near zero on clean processes.
+    static const std::set<std::string> kRuntimeBenign = {
+        "ntdll.dll", "kernelbase.dll", "kernel32.dll", "user32.dll",
+        "gdi32.dll", "advapi32.dll", "msvcrt.dll", "ucrtbase.dll",
+        "rpcrt4.dll", "sechost.dll", "combase.dll", "ole32.dll",
+        "oleaut32.dll", "shlwapi.dll", "shell32.dll", "imm32.dll",
+        "gdi32full.dll", "win32u.dll", "bcryptprimitives.dll",
+        "cryptbase.dll", "msvcp_win.dll", "ws2_32.dll", "bcrypt.dll",
+        "apphelp.dll", "shcore.dll", "cfgmgr32.dll", "windows.storage.dll",
+        "profapi.dll", "powrprof.dll", "kernel.appcore.dll",
+        "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll",
+    };
+
+    std::vector<std::string> extra;
+    for (const auto& d : runtimeDlls) {
+        if (diskDlls.count(d)) continue;
+        if (kRuntimeBenign.count(d)) continue;
+        extra.push_back(d);
+    }
+
+    if (extra.size() < 2) return;  // one unexpected DLL is too noisy
+
+    std::string ts = BuildTimestamp();
+    std::string extraList;
+    for (size_t i = 0; i < extra.size() && i < 12; i++) {
+        if (i) extraList += ", ";
+        extraList += extra[i];
+    }
+    std::string det = "Date & Time: " + ts +
+        " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: Import-Table Divergence (W->X + LoadLibrary)" +
+        " | Extra modules (" + std::to_string(extra.size()) + "): " + extraList +
+        " | Disk imports: " + std::to_string(diskDlls.size()) +
+        " | Runtime modules: " + std::to_string(runtimeDlls.size()) +
+        " | Indicator: dynamically loaded DLLs beyond disk IAT — reflective loader, "
+        "manual-mapped payload, or unpacked code with its own LoadLibrary chain";
+
+    std::string hdr = std::to_string(tab_1_menu_items.size()) +
+        " - [!] [Alert] | " + ts +
+        " | " + procName +
+        " | Method: Runtime IAT Divergence" +
+        " | " + std::to_string(extra.size()) + " dynamically loaded DLL(s) not in disk IAT";
+
+    PushUiDetectionEvent(hdr, det, "Behavioral: Import-Table Divergence",
+                         pid, DetectionSeverity::High);
+}
+
+// capa-on-memory (bridge B). Dump a W->X region to a temp file and feed it
+// through the existing capa pipeline. This runs capa's full behavioral rule
+// set against the unpacked payload, catching RC4/AES/XOR routines, stackstring
+// construction, injection primitives, etc. — the semantic layer that YARA's
+// byte-pattern matching doesn't give us.
+//
+// Rate-limited per (pid, base) with 60s TTL so an unpacker flipping many
+// pages doesn't spam capa. Dumps are raw (not PE — capa's shellcode mode).
+static std::mutex g_capaMemMutex;
+static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> g_capaMemLastDump;
+
+static void EnqueueCapaOnMemoryRegion(UINT32 pid, const std::string& procName,
+                                      void* base, size_t size) {
+    if (pid == 0 || !base || size == 0 || size > 16 * 1024 * 1024) return;
+
+    uint64_t key = (static_cast<uint64_t>(pid) << 32) ^
+                   reinterpret_cast<uint64_t>(base);
+    {
+        std::lock_guard<std::mutex> lock(g_capaMemMutex);
+        auto now = std::chrono::steady_clock::now();
+        auto it = g_capaMemLastDump.find(key);
+        if (it != g_capaMemLastDump.end() &&
+            (now - it->second) < std::chrono::seconds(60)) return;
+        g_capaMemLastDump[key] = now;
+    }
+
+    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!h) return;
+    std::vector<BYTE> buf(size);
+    SIZE_T got = 0;
+    bool ok = (ReadProcessMemory(h, base, buf.data(), size, &got) && got > 0);
+    CloseHandle(h);
+    if (!ok) return;
+
+    char tempDir[MAX_PATH];
+    if (!GetTempPathA(MAX_PATH, tempDir)) return;
+    char tempFile[MAX_PATH];
+    _snprintf_s(tempFile, sizeof(tempFile), _TRUNCATE,
+                "%sNortonEDR_memdump_%u_%p.bin", tempDir, pid, base);
+
+    HANDLE hf = CreateFileA(tempFile, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    WriteFile(hf, buf.data(), (DWORD)got, &wrote, nullptr);
+    // Intentionally keep handle open until capa has run — FILE_FLAG_DELETE_ON_CLOSE
+    // means the file vanishes the moment we CloseHandle.
+    // Since capa runs async on its own worker, dup the path and let capa read it,
+    // then close this handle after a grace period.
+    std::string pathCopy = tempFile;
+    std::string procCopy = procName;
+    std::thread([hf, pathCopy, procCopy, pid]() {
+        // Flush before capa reads
+        FlushFileBuffers(hf);
+        EnqueueCapaScan(pathCopy, pid);
+        // Give the capa worker a window to open the file before we delete.
+        // Worst case the scan queue is behind — we'll miss this dump, but the
+        // next W->X flip in the same process will hit the TTL-cached entry.
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        CloseHandle(hf);
+    }).detach();
+}
+
+// Parse a driver W->X notification and dispatch a targeted region scan.
+// Message format (from SyscallsTracing.cpp:5922):
+//   "NtProtectVirtualMemory: W->X flip on private memory addr=0x%llX size=0x%llX ..."
+static void AutoMemScanOnWxFlip(UINT32 pid, const std::string& procName, const char* msg) {
+    if (!msg || !rules) return;
+    const char* p = strstr(msg, "W->X flip on private memory");
+    if (!p) return;
+
+    const char* aptr = strstr(p, "addr=0x");
+    const char* sptr = strstr(p, "size=0x");
+    if (!aptr || !sptr) return;
+
+    unsigned long long addr = 0, size = 0;
+    if (sscanf_s(aptr, "addr=0x%llx", &addr) != 1) return;
+    if (sscanf_s(sptr, "size=0x%llx", &size) != 1) return;
+    if (addr == 0 || size == 0) return;
+
+    std::thread([pid, procName, addr, size]() {
+        ScanProcessMemoryRegion(pid, procName,
+            reinterpret_cast<void*>(static_cast<uintptr_t>(addr)),
+            static_cast<size_t>(size));
+        CheckImportDivergence(pid, procName);
+        EnqueueCapaOnMemoryRegion(pid, procName,
+            reinterpret_cast<void*>(static_cast<uintptr_t>(addr)),
+            static_cast<size_t>(size));
+    }).detach();
+}
+
 static int RunMemoryScan(UINT32 singlePid, const std::vector<std::string>& yaraDirs) {
     std::cout << "[*] Loading YARA rules for memory scan...\n";
     InitYara(yaraDirs);
@@ -4081,6 +4567,211 @@ static int RunMemoryScan(UINT32 singlePid, const std::vector<std::string>& yaraD
 // ---------------------------------------------------------------------------
 
 static std::atomic<bool> g_yaraReloadStop{false};
+
+// ---------------------------------------------------------------------------
+// CLR Profiler registry watcher. Attackers persist the COR_PROFILER hijack
+// by writing values under HKLM\SOFTWARE\Microsoft\.NETFramework — once set,
+// every .NET process on the system auto-loads the attacker's CLSID as a
+// profiler. We watch both the native and Wow6432Node paths and alert the
+// instant any profiler-related value appears or changes.
+// ---------------------------------------------------------------------------
+
+struct ClrProfilerRegKey {
+    HKEY root;
+    const wchar_t* subkey;
+    REGSAM wow;
+    const char* label;
+};
+
+static const ClrProfilerRegKey kClrProfilerKeys[] = {
+    { HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\.NETFramework",              KEY_WOW64_64KEY, "HKLM\\SOFTWARE\\Microsoft\\.NETFramework (64)" },
+    { HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\.NETFramework",              KEY_WOW64_32KEY, "HKLM\\SOFTWARE\\Microsoft\\.NETFramework (32)" },
+    { HKEY_CURRENT_USER,  L"SOFTWARE\\Microsoft\\.NETFramework",              KEY_WOW64_64KEY, "HKCU\\SOFTWARE\\Microsoft\\.NETFramework (64)" },
+    { HKEY_CURRENT_USER,  L"SOFTWARE\\Microsoft\\.NETFramework",              KEY_WOW64_32KEY, "HKCU\\SOFTWARE\\Microsoft\\.NETFramework (32)" },
+};
+
+static const wchar_t* kClrProfilerValueNames[] = {
+    L"COR_ENABLE_PROFILING", L"COR_PROFILER", L"COR_PROFILER_PATH",
+    L"COR_PROFILER_PATH_32", L"COR_PROFILER_PATH_64",
+    L"CORECLR_ENABLE_PROFILING", L"CORECLR_PROFILER",
+    L"CORECLR_PROFILER_PATH", L"CORECLR_PROFILER_PATH_32",
+    L"CORECLR_PROFILER_PATH_64",
+    nullptr
+};
+
+static std::string ReadRegStringValueUtf8(HKEY hKey, const wchar_t* name) {
+    DWORD type = 0, cb = 0;
+    if (RegQueryValueExW(hKey, name, nullptr, &type, nullptr, &cb) != ERROR_SUCCESS) return {};
+    if (cb == 0 || cb > 8192) return {};
+
+    std::vector<BYTE> buf(cb + sizeof(wchar_t), 0);
+    if (RegQueryValueExW(hKey, name, nullptr, &type, buf.data(), &cb) != ERROR_SUCCESS) return {};
+
+    if (type == REG_SZ || type == REG_EXPAND_SZ) {
+        const wchar_t* w = reinterpret_cast<const wchar_t*>(buf.data());
+        int u8 = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+        if (u8 <= 0) return {};
+        std::string s(u8 - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], u8, nullptr, nullptr);
+        return s;
+    }
+    if (type == REG_DWORD && cb >= sizeof(DWORD)) {
+        return std::to_string(*reinterpret_cast<DWORD*>(buf.data()));
+    }
+    return {};
+}
+
+static void EmitClrProfilerRegDetection(const char* keyLabel,
+                                        const std::vector<std::pair<std::string, std::string>>& hits) {
+    DetectionSeverity sev = DetectionSeverity::High;
+    for (const auto& h : hits) {
+        std::string lower = h.second;
+        for (auto& c : lower) c = (char)tolower((unsigned char)c);
+        if (lower.find("\\appdata\\") != std::string::npos ||
+            lower.find("\\temp\\")    != std::string::npos ||
+            lower.find("\\users\\public\\") != std::string::npos ||
+            lower.find("\\programdata\\")   != std::string::npos ||
+            lower.find("\\downloads\\") != std::string::npos) {
+            sev = DetectionSeverity::Critical;
+            break;
+        }
+    }
+
+    std::string joined;
+    for (size_t i = 0; i < hits.size(); i++) {
+        if (i) joined += " | ";
+        joined += hits[i].first + "=" + hits[i].second;
+    }
+    std::string ts = BuildTimestamp();
+    std::string hdr = std::to_string(tab_1_menu_items.size()) +
+        " - [!] [Alert] | " + ts +
+        " | Registry | Method: CLR Profiler Registry Persistence" +
+        " | " + std::to_string(hits.size()) + " value(s) under " + keyLabel;
+
+    std::string det = "Date & Time: " + ts +
+        " | Source: Registry Watcher" +
+        " | Key: " + keyLabel +
+        " | Values: " + joined +
+        " | Indicator: system-wide CLR profiler persistence (T1574.012) — every "
+        ".NET process launched after this write will load the referenced DLL as "
+        "an in-process profiler. Classic dnSpy-style runtime hijack.";
+
+    PushUiDetectionEvent(hdr, det, "Persistence: Registry — CLR Profiler", 0, sev);
+}
+
+static std::atomic<bool> g_clrProfilerRegWatcherStop{false};
+
+static void ClrProfilerRegistryWatcherThread() {
+    struct WatchSlot {
+        HKEY hKey = nullptr;
+        HANDLE hEvent = nullptr;
+        const ClrProfilerRegKey* desc = nullptr;
+        std::unordered_map<std::string, std::string> lastValues; // name(utf8) -> value(utf8)
+    };
+
+    std::vector<WatchSlot> slots;
+    slots.reserve(std::size(kClrProfilerKeys));
+
+    auto openAndSnapshot = [](const ClrProfilerRegKey& desc, WatchSlot& slot) -> bool {
+        LONG rc = RegOpenKeyExW(desc.root, desc.subkey, 0,
+                                KEY_READ | desc.wow, &slot.hKey);
+        if (rc != ERROR_SUCCESS) {
+            slot.hKey = nullptr;
+            return false;
+        }
+        slot.hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!slot.hEvent) {
+            RegCloseKey(slot.hKey);
+            slot.hKey = nullptr;
+            return false;
+        }
+        slot.desc = &desc;
+        // Initial snapshot of profiler-relevant values only
+        for (int i = 0; kClrProfilerValueNames[i]; i++) {
+            std::string v = ReadRegStringValueUtf8(slot.hKey, kClrProfilerValueNames[i]);
+            if (!v.empty()) {
+                int u8 = WideCharToMultiByte(CP_UTF8, 0, kClrProfilerValueNames[i], -1,
+                                              nullptr, 0, nullptr, nullptr);
+                std::string name(u8 > 0 ? u8 - 1 : 0, '\0');
+                if (u8 > 0) WideCharToMultiByte(CP_UTF8, 0, kClrProfilerValueNames[i], -1,
+                                                 &name[0], u8, nullptr, nullptr);
+                slot.lastValues[name] = v;
+            }
+        }
+        return true;
+    };
+
+    for (const auto& k : kClrProfilerKeys) {
+        WatchSlot s;
+        if (openAndSnapshot(k, s)) slots.push_back(std::move(s));
+    }
+
+    // If any profiler values already exist at startup, surface them once —
+    // a pre-existing hijack is still worth alerting on.
+    for (auto& s : slots) {
+        if (s.lastValues.empty()) continue;
+        std::vector<std::pair<std::string, std::string>> hits(s.lastValues.begin(), s.lastValues.end());
+        EmitClrProfilerRegDetection(s.desc->label, hits);
+    }
+
+    // Register first notification
+    for (auto& s : slots) {
+        RegNotifyChangeKeyValue(s.hKey, FALSE,
+            REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME,
+            s.hEvent, TRUE);
+    }
+
+    std::vector<HANDLE> waitHandles;
+    waitHandles.reserve(slots.size());
+    for (auto& s : slots) waitHandles.push_back(s.hEvent);
+
+    while (!g_clrProfilerRegWatcherStop.load()) {
+        if (waitHandles.empty()) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            continue;
+        }
+        DWORD wr = WaitForMultipleObjects((DWORD)waitHandles.size(), waitHandles.data(),
+                                          FALSE, 5000);
+        if (wr == WAIT_TIMEOUT) continue;
+        if (wr == WAIT_FAILED) break;
+        if (wr < WAIT_OBJECT_0 || wr >= WAIT_OBJECT_0 + waitHandles.size()) continue;
+
+        size_t idx = wr - WAIT_OBJECT_0;
+        WatchSlot& s = slots[idx];
+
+        std::vector<std::pair<std::string, std::string>> changed;
+        std::unordered_map<std::string, std::string> nowValues;
+        for (int i = 0; kClrProfilerValueNames[i]; i++) {
+            std::string v = ReadRegStringValueUtf8(s.hKey, kClrProfilerValueNames[i]);
+            if (v.empty()) continue;
+            int u8 = WideCharToMultiByte(CP_UTF8, 0, kClrProfilerValueNames[i], -1,
+                                          nullptr, 0, nullptr, nullptr);
+            std::string name(u8 > 0 ? u8 - 1 : 0, '\0');
+            if (u8 > 0) WideCharToMultiByte(CP_UTF8, 0, kClrProfilerValueNames[i], -1,
+                                             &name[0], u8, nullptr, nullptr);
+            nowValues[name] = v;
+            auto it = s.lastValues.find(name);
+            if (it == s.lastValues.end() || it->second != v) {
+                changed.emplace_back(name, v);
+            }
+        }
+        s.lastValues = std::move(nowValues);
+
+        if (!changed.empty()) {
+            EmitClrProfilerRegDetection(s.desc->label, changed);
+        }
+
+        // Re-arm
+        RegNotifyChangeKeyValue(s.hKey, FALSE,
+            REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME,
+            s.hEvent, TRUE);
+    }
+
+    for (auto& s : slots) {
+        if (s.hKey)   RegCloseKey(s.hKey);
+        if (s.hEvent) CloseHandle(s.hEvent);
+    }
+}
 
 static void YaraRuleWatcherThread(std::vector<std::string> dirs) {
     if (dirs.empty()) return;
@@ -4277,6 +4968,32 @@ void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) 
                                     );
                                 }
                             }
+
+                            // Packer / crypter detection: high entropy in an
+                            // executable section is the signature of packed
+                            // or encrypted code that will unpack in memory.
+                            {
+                                auto [ent, secName] = ComputePeSectionEntropy(fullPath);
+                                if (ent >= 7.2) {
+                                    char entBuf[32];
+                                    _snprintf_s(entBuf, sizeof(entBuf), _TRUNCATE, "%.3f", ent);
+                                    DetectionSeverity sev = (ent >= 7.6)
+                                        ? DetectionSeverity::High
+                                        : DetectionSeverity::Medium;
+                                    std::string details = "File: " + fullPath +
+                                        "\nSection: " + secName +
+                                        "\nEntropy: " + entBuf +
+                                        "\nIndicator: executable section is packed or encrypted "
+                                        "(likely UPX, custom packer, or crypter stub)";
+                                    PushUiDetectionEvent(
+                                        "Packed PE: " + BaseNameLower(fullPath),
+                                        details,
+                                        "Static: High-Entropy Executable Section",
+                                        notifPid,
+                                        sev
+                                    );
+                                }
+                            }
                         }
                         else {
                             std::vector<std::string> sigmaFields = { std::string(msg), notifProcName };
@@ -4284,6 +5001,10 @@ void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) 
                             NotifySigmaMatches(notifPid, notifProcName, sigmaFields, "generic_notification");
 
                             Notify(notif, msg);
+
+                            // Kernel flagged a W->X protection flip on private memory —
+                            // scan that exact region before the shellcode gets a chance to run.
+                            AutoMemScanOnWxFlip(notifPid, notifProcName, msg);
 
                             // Resolve the process image path and queue a capa scan
                             if (notifPid > 0) {
@@ -11713,6 +12434,9 @@ int main(int argc, char* argv[]) {
         yaraReloadThread = std::thread(YaraRuleWatcherThread, yaraRulesDirectories);
         yaraReloadThread.detach();
     }
+
+    // CLR profiler registry watcher (T1574.012 persistence)
+    std::thread(ClrProfilerRegistryWatcherThread).detach();
 
     system("pause");
 
