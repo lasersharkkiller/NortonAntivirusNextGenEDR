@@ -3672,13 +3672,13 @@ rate_done:
             }
         }
 
-        // ---- .etl file access by non-system processes (T1005 / T1562.002) ----
+        // ---- .etl file access/write by non-system processes (T1005 / T1562.002) ----
         // WPP/ETW binary trace logs (.etl) can contain sensitive data: debug
         // strings with credentials, crypto keys, session tokens, and internal
-        // telemetry.  Attackers read .etl files to harvest this data or to
-        // understand what an EDR's WPP tracing captures before blinding it.
-        // Only System, svchost, tracelog, and performance monitor tools should
-        // access .etl files outside normal log directories.
+        // telemetry.  Attackers read .etl files to harvest this data or
+        // WRITE to corrupt active trace logs (truncate, zero, inject garbage
+        // records).  Only System, svchost, tracelog, and performance monitor
+        // tools should access .etl files outside normal log directories.
         {
             if (nameInfo->FinalComponent.Length >= 8) {
                 PWCHAR etlExt = nameInfo->FinalComponent.Buffer;
@@ -3727,14 +3727,20 @@ rate_done:
                             RtlCopyMemory(etlBuf, ansiEtl.Buffer, n);
                             RtlFreeAnsiString(&ansiEtl);
                         }
+                        // Differentiate read vs write access for severity
+                        ACCESS_MASK etlDa = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+                        BOOLEAN isEtlWrite = (etlDa & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
                         char msg[280];
                         RtlStringCchPrintfA(msg, sizeof(msg),
-                            "FS: ETL trace file access — '%s' by '%s' (pid=%llu) "
-                            "— possible WPP/ETW trace data harvesting (T1005)",
+                            "FS: ETL trace file %s — '%s' by '%s' (pid=%llu) "
+                            "— %s (T1562.002)",
+                            isEtlWrite ? "WRITE/CORRUPT" : "access",
                             etlBuf[0] ? etlBuf : "?.etl",
                             procName ? procName : "?",
-                            (ULONG64)(ULONG_PTR)pid);
-                        EnqueueFsAlert(pid, procName, msg, FALSE);  // WARNING
+                            (ULONG64)(ULONG_PTR)pid,
+                            isEtlWrite ? "ETW/WPP trace file corruption — active trace data tampering"
+                                       : "possible WPP/ETW trace data harvesting (T1005)");
+                        EnqueueFsAlert(pid, procName, msg, isEtlWrite);  // CRITICAL for write, WARNING for read
                     }
                 }
             }
@@ -4750,6 +4756,39 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetInformation(
                         }
                     }
 
+                    // ETL trace file deletion — destroys WPP/ETW trace evidence
+                    // Only System, svchost, and performance tools should delete .etl files.
+                    {
+                        USHORT dExtLen = delNameInfo->Extension.Length / sizeof(WCHAR);
+                        PWCHAR dExtBuf = delNameInfo->Extension.Buffer;
+                        BOOLEAN isEtlDel = FALSE;
+                        if (dExtLen >= 3 && dExtBuf) {
+                            USHORT dOff = (dExtBuf[0] == L'.') ? 1 : 0;
+                            if ((dExtLen - dOff) >= 3)
+                                isEtlDel = ((dExtBuf[dOff] | 0x20) == L'e' &&
+                                            (dExtBuf[dOff+1] | 0x20) == L't' &&
+                                            (dExtBuf[dOff+2] | 0x20) == L'l');
+                        }
+                        if (isEtlDel && (ULONG_PTR)pid > 4) {
+                            BOOLEAN etlDelAllowed = FALSE;
+                            if (procName) {
+                                etlDelAllowed = (strcmp(procName, "svchost.exe") == 0 ||
+                                                 strcmp(procName, "perfmon.exe") == 0 ||
+                                                 strcmp(procName, "TiWorker.exe") == 0 ||
+                                                 strcmp(procName, "WmiPrvSE.exe") == 0 ||
+                                                 strcmp(procName, "MsMpEng.exe") == 0);
+                            }
+                            if (!etlDelAllowed) {
+                                char msg[224];
+                                RtlStringCchPrintfA(msg, sizeof(msg),
+                                    "FS: ETL trace file deletion by '%s' (pid=%llu) "
+                                    "— ETW/WPP trace evidence destruction (T1070.004/T1562.002)",
+                                    procName ? procName : "?", (ULONG64)(ULONG_PTR)pid);
+                                EnqueueFsAlert(pid, procName, msg, TRUE);
+                            }
+                        }
+                    }
+
                     // Prefetch file deletion — anti-forensics (removes execution evidence)
                     // Only TrustedInstaller/System should clean prefetch
                     if (WcsContainsLower(&delNameInfo->Name, kPrefetchPath) &&
@@ -4795,6 +4834,55 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI FsFilter::PreSetInformation(
                 targetBuf[0] ? targetBuf : "?", (ULONG64)(ULONG_PTR)pid);
             EnqueueFsAlert(pid, procName, msg, FALSE);
         } else {
+            // ---- Event log / ETL file rename detection (Slingshot technique T1562.002) ----
+            // Slingshot APT renames active .evtx files to .tmp, breaking the EventLog
+            // service's file handle.  Events accumulate in kernel buffers but are never
+            // written to disk.  Same technique works on .etl WPP/ETW trace files.
+            // Only svchost.exe (EventLog service) should rename .evtx/.etl files.
+            {
+                PFLT_FILE_NAME_INFORMATION srcNameInfo = nullptr;
+                NTSTATUS srcSt = FltGetFileNameInformation(
+                    Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &srcNameInfo);
+                if (NT_SUCCESS(srcSt) && srcNameInfo) {
+                    FltParseFileNameInformation(srcNameInfo);
+
+                    BOOLEAN isEvtxRename = ExtMatch(&srcNameInfo->Extension, L".evtx");
+                    BOOLEAN isEtlRename  = FALSE;
+                    if (!isEvtxRename) {
+                        USHORT eLen = srcNameInfo->Extension.Length / sizeof(WCHAR);
+                        if (eLen >= 3) {
+                            PWCHAR eB = srcNameInfo->Extension.Buffer;
+                            // Match ".etl" (extension includes the dot in some builds, not in others)
+                            USHORT off = (eB[0] == L'.') ? 1 : 0;
+                            if ((eLen - off) >= 3) {
+                                isEtlRename = ((eB[off] | 0x20) == L'e' &&
+                                               (eB[off+1] | 0x20) == L't' &&
+                                               (eB[off+2] | 0x20) == L'l');
+                            }
+                        }
+                    }
+
+                    if ((isEvtxRename || isEtlRename) &&
+                        (!procName || strcmp(procName, "svchost.exe") != 0))
+                    {
+                        char srcBuf[128] = {};
+                        for (ULONG c = 0; c < srcNameInfo->Name.Length / sizeof(WCHAR) && c < 127; c++)
+                            srcBuf[c] = (char)srcNameInfo->Name.Buffer[c];
+                        char msg[280];
+                        RtlStringCchPrintfA(msg, sizeof(msg),
+                            "FS: %s file RENAMED by '%s' (pid=%llu) — %s "
+                            "file handle break (Slingshot technique T1562.002): %s",
+                            isEvtxRename ? "Event log (.evtx)" : "ETW trace (.etl)",
+                            procName ? procName : "?",
+                            (ULONG64)(ULONG_PTR)pid,
+                            isEvtxRename ? "EventLog service" : "WPP/ETW trace",
+                            srcBuf[0] ? srcBuf : "?");
+                        EnqueueFsAlert(pid, procName, msg, TRUE);  // CRITICAL
+                    }
+                    FltReleaseFileNameInformation(srcNameInfo);
+                }
+            }
+
             // Rename — check target extension against known ransomware extensions
             FILE_RENAME_INFORMATION* renameInfo =
                 (FILE_RENAME_INFORMATION*)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;

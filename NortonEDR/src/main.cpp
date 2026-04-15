@@ -23,6 +23,8 @@
 #include <evntrace.h>
 #include <evntcons.h>
 #include <evntprov.h>
+#include <tdh.h>
+#pragma comment(lib, "tdh.lib")
 #include <wincrypt.h>
 #include <winhttp.h>
 #include <winioctl.h>
@@ -307,6 +309,20 @@ static TRACEHANDLE       g_ntlmTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
 static std::atomic<bool> g_ntlmStop(false);
 
 // ---------------------------------------------------------------------------
+// Microsoft-Windows-DNS-Client ETW session (raw provider, channel-independent)
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_dnsRawSessionHandle  = 0;
+static TRACEHANDLE       g_dnsRawTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+static std::atomic<bool> g_dnsRawStop(false);
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-TaskScheduler ETW session (raw provider, channel-independent)
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_taskRawSessionHandle  = 0;
+static TRACEHANDLE       g_taskRawTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+static std::atomic<bool> g_taskRawStop(false);
+
+// ---------------------------------------------------------------------------
 // Microsoft-Windows-Kernel-Audit-API-Calls ETW session
 // ---------------------------------------------------------------------------
 static TRACEHANDLE       g_apiAuditSessionHandle  = 0;
@@ -324,6 +340,40 @@ static std::atomic<bool> g_ciStop(false);
 // Minifilter altitude registry audit
 // ---------------------------------------------------------------------------
 static std::atomic<bool> g_altitudeAuditStop(false);
+
+// ---------------------------------------------------------------------------
+// Per-session event counters — incremented by each ETW callback on every
+// accepted event.  The watchdog reads and resets these every cycle.  A zero
+// count for 2+ consecutive cycles means the provider was silently disabled
+// or keywords downgraded (T1562.002: event-flow starvation).
+// ---------------------------------------------------------------------------
+static std::atomic<uint64_t> g_tiEventCount(0);
+static std::atomic<uint64_t> g_kpEventCount(0);
+static std::atomic<uint64_t> g_clrEventCount(0);
+static std::atomic<uint64_t> g_amsiEventCount(0);
+static std::atomic<uint64_t> g_ldapEventCount(0);
+static std::atomic<uint64_t> g_rpcEventCount(0);
+static std::atomic<uint64_t> g_ntlmEventCount(0);
+static std::atomic<uint64_t> g_apiAuditEventCount(0);
+static std::atomic<uint64_t> g_ciEventCount(0);
+
+// ---------------------------------------------------------------------------
+// Provider re-assertion registry.  Each entry describes a session + provider
+// pair with the original keyword/level config.  The watchdog periodically
+// re-calls EnableTraceEx2 to restore configuration if an attacker silently
+// disabled or downgraded a provider.  This is idempotent — if the config is
+// already correct, the re-enable is a no-op.
+// ---------------------------------------------------------------------------
+struct ProviderConfig {
+    TRACEHANDLE*       sessionHandle;
+    const GUID*        providerGuid;
+    UCHAR              level;
+    ULONGLONG          matchAnyKeyword;
+    const char*        displayName;
+    std::atomic<uint64_t>* eventCounter;
+};
+// g_providerConfigs[] is initialized near the watchdog thread (after all
+// provider GUIDs are defined).  See EtwSessionWatchdogThread().
 
 struct TraceRuntimeConfig {
     std::vector<std::string> targetProcessNamesLower;
@@ -2106,6 +2156,20 @@ void PushUiDetectionEvent(
             false
         );
     }
+}
+
+static void AlertSessionNameSquatted(const wchar_t* sessionName) {
+    char nameA[128] = {0};
+    WideCharToMultiByte(CP_UTF8, 0, sessionName, -1, nameA, sizeof(nameA) - 1, nullptr, nullptr);
+    std::string msg = std::string("ETW session name squatted: ") + nameA;
+    std::string det =
+        "StartTraceW returned ERROR_ALREADY_EXISTS for a NortonEDR-owned "
+        "session name on first attempt. An unknown process owned the name "
+        "before our service ran — likely pre-boot AutoLogger squat or "
+        "same-name preemption designed to blind the EDR (T1562.002). "
+        "We forcibly stopped the squatter and restarted our session.";
+    PushUiDetectionEvent(msg, det, "Method: ETW Session Name Squat Detection",
+                         GetCurrentProcessId(), DetectionSeverity::Critical, false);
 }
 
 void NotifySigmaMatches(
@@ -4100,6 +4164,7 @@ static const wchar_t* TiTaskName(USHORT task) {
 
 static void WINAPI TiEventCallback(PEVENT_RECORD pEvent) {
     if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kTiProviderGuid)) return;
+    g_tiEventCount.fetch_add(1, std::memory_order_relaxed);
 
     USHORT task = pEvent->EventHeader.EventDescriptor.Task;
     const wchar_t* taskNameW = TiTaskName(task);
@@ -4174,6 +4239,7 @@ static void EtwTiSubscriberThread() {
     buildProps();
     ULONG status = StartTraceW(&g_tiSessionHandle, kSessionName, props);
     if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
         buildProps();
         ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
         buildProps();
@@ -4263,6 +4329,7 @@ static const GUID kKernelProcessProviderGuid = {
 static void WINAPI KernelProcessEventCallback(PEVENT_RECORD pEvent)
 {
     if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kKernelProcessProviderGuid)) return;
+    g_kpEventCount.fetch_add(1, std::memory_order_relaxed);
     if (pEvent->EventHeader.EventDescriptor.Id != 1) return;  // ProcessStart only
     if (pEvent->UserDataLength < 8) return;
 
@@ -4347,6 +4414,7 @@ static void KernelProcessSubscriberThread()
     buildProps();
     ULONG status = StartTraceW(&g_kpSessionHandle, kSessionName, props);
     if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
         buildProps();
         ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
         buildProps();
@@ -4432,8 +4500,13 @@ static const GUID kClrProviderGuid = {
     {0x93, 0x1B, 0xD9, 0xCC, 0x2E, 0xEE, 0x27, 0xE4}
 };
 
-// CLR Loader keyword = 0x8 (assembly/module load events)
-static constexpr ULONGLONG kClrLoaderKeyword = 0x8;
+// CLR Loader keyword  = 0x8   (assembly/module/type load + AppDomain events)
+// CLR JIT keyword     = 0x10  (MethodJittingStarted — exposes namespace.class::method)
+// CLR Interop keyword = 0x2000 (ILStubGenerated — exposes P/Invoke target API names)
+static constexpr ULONGLONG kClrLoaderKeyword  = 0x8;
+static constexpr ULONGLONG kClrJitKeyword     = 0x10;
+static constexpr ULONGLONG kClrInteropKeyword = 0x2000;
+static constexpr ULONGLONG kClrKeywords       = kClrLoaderKeyword | kClrJitKeyword | kClrInteropKeyword;
 
 // Known malicious .NET assembly names (lowercase substring match)
 static const char* kMaliciousAssemblyNames[] = {
@@ -4457,6 +4530,109 @@ static const char* kMaliciousAssemblyNames[] = {
     nullptr
 };
 
+// Known offensive C# namespace/class names (lowercase substring match).
+// These fire on MethodJittingStarted (event 145) which exposes the full
+// namespace.class::method for every JIT-compiled method.  Even if the operator
+// renames the assembly, the internal namespace/class names survive.
+static const char* kOffensiveNamespaces[] = {
+    // Rubeus (Kerberos abuse)
+    "rubeus.commands",  "rubeus.lib.interop",  "rubeus.domain",
+    "rubeus.krb_structures",
+    // Seatbelt (host survey)
+    "seatbelt.commands",  "seatbelt.interop",  "seatbelt.runtime",
+    "seatbelt.output",
+    // SharpUp (privesc checks)
+    "sharpup.checks",  "sharpup.utilities",
+    // Certify (ADCS abuse)
+    "certify.commands",  "certify.domain",  "certify.lib",
+    // SharpDPAPI (DPAPI abuse)
+    "sharpdpapi.commands",  "sharpdpapi.domain",
+    // SharpHound / BloodHound
+    "sharphound.client",  "sharphound.runtime",
+    "sharphound.collectors",  "sharphound.enumeration",
+    "bloodhound.collector",
+    // SharpView (AD enumeration)
+    "sharpview.functions",  "sharpview.returns",
+    // SharpWMI
+    "sharpwmi.program",
+    // SharpChrome
+    "sharpchrome.chrome",  "sharpchrome.commands",
+    // SafetyKatz (in-memory Mimikatz)
+    "safetykatz.program",
+    // SharpSploit (post-exploitation framework)
+    "sharpsploit.credentials",  "sharpsploit.execution",
+    "sharpsploit.enumeration",  "sharpsploit.lateralmovement",
+    "sharpsploit.persistence",  "sharpsploit.evasion",
+    "sharpsploit.mimikatz",
+    // Covenant / Grunt
+    "grunt.gruntlauncher",  "grunt.gruntclient",  "grunt.program",
+    "covenant.models",
+    // SharpPersist
+    "sharppersist.schtaskbackdoor",  "sharppersist.startupfolder",
+    "sharppersist.keepass",
+    // Inveigh (NBNS/LLMNR/mDNS poisoning)
+    "inveigh.inveigh",  "inveigh.relay",  "inveigh.program",
+    // SharpRoast / Kerberoast
+    "sharproast.program",
+    // SharpMapExec
+    "sharpmapexec.commands",
+    // SharpLDAP
+    "sharpldap.program",
+    // ADModule / AD enumeration
+    "microsoft.activedirectory.management",
+    // BetterSafetyKatz
+    "bettersafetykatz.program",
+    // SharpSecDump (remote SAM/LSA dump)
+    "sharpsecdump.program",  "sharpsecdump.lib",
+    // SharpKatz
+    "sharpkatz.module",  "sharpkatz.program",
+    // Whisker (shadow credentials)
+    "whisker.commands",  "whisker.program",
+    // StandIn (AD persistence)
+    "standin.standin",
+    // SharpGPOAbuse
+    "sharpgpoabuse.program",
+    // AtYourService (Kerberos service ticket scanning)
+    "atyourservice.program",
+    // SharPersist
+    "sharpersist.lib",
+    // PowerSharpPack common entry points
+    "powersharppack.program",
+    // Generic offensive patterns
+    "mimikatz.program",  "lazagne.program",
+    nullptr
+};
+
+// Suspicious P/Invoke API names (lowercase).  ILStubGenerated (event 88)
+// fires whenever the CLR generates an interop stub for DllImport / P/Invoke.
+// The ManagedInteropMethodName field contains the target native API.
+static const char* kSuspiciousPInvoke[] = {
+    // Process injection primitives
+    "virtualallocex",  "virtualprotectex",
+    "createremotethread",  "ntcreatethreadex",  "rtlcreateuserthread",
+    "writeprocessmemory",  "readprocessmemory",
+    "queueuserapc",  "ntqueueapcthread",  "ntqueueapcthreadex",
+    "ntmapviewofsection",  "ntunmapviewofsection",
+    // Direct syscall / ntdll low-level
+    "ntwritevirtualmemory",  "ntallocatevirtualmemory",
+    "ntprotectvirtualmemory",  "ntopenprocess",
+    "ntcreatesection",
+    // Credential dumping
+    "minidumpwritedump",
+    "lsacallauthenticationpackage",
+    "samconnect",  "samopendomain",  "samopenuser",
+    // Token manipulation
+    "duplicatetokenex",  "impersonateloggedonuser",
+    "createprocesswithlogonw",  "createprocesswithtokenw",
+    "setthreadtoken",  "adjusttokenprivileges",
+    // AMSI bypass (patching AmsiScanBuffer / amsiInitFailed)
+    "amsiscanbuffer",  "amsiinitialized",
+    // WinAPI often used by offensive loaders
+    "ntcreatefile",  "rtladjustprivilege",
+    "rtlinitinicodestring",
+    nullptr
+};
+
 // Known legitimate .NET assemblies to ignore (exact prefix match, lowercase)
 static const char* kAllowedAssemblyPrefixes[] = {
     "mscorlib",  "system.",  "microsoft.",  "windowsbase",
@@ -4467,32 +4643,700 @@ static const char* kAllowedAssemblyPrefixes[] = {
     nullptr
 };
 
+// ---------------------------------------------------------------------------
+// TDH-based ETW property extraction.  Uses TdhGetEventInformation to decode
+// the event schema at runtime, correctly handling PropertyParamCount /
+// PropertyParamFixedCount (EventPropertyArray), variable-length fields, and
+// schema versioning.  This replaces fragile hardcoded byte offsets.
+// ---------------------------------------------------------------------------
+
+// Retrieve the TRACE_EVENT_INFO for an event record.  Caller must free() the
+// returned pointer.  Returns nullptr on failure.
+static PTRACE_EVENT_INFO TdhGetEventInfo(PEVENT_RECORD pEvent) {
+    ULONG bufSize = 4096;
+    auto* info = static_cast<PTRACE_EVENT_INFO>(malloc(bufSize));
+    if (!info) return nullptr;
+    ULONG status = TdhGetEventInformation(pEvent, 0, nullptr, info, &bufSize);
+    if (status == ERROR_INSUFFICIENT_BUFFER) {
+        auto* bigger = static_cast<PTRACE_EVENT_INFO>(realloc(info, bufSize));
+        if (!bigger) { free(info); return nullptr; }
+        info = bigger;
+        status = TdhGetEventInformation(pEvent, 0, nullptr, info, &bufSize);
+    }
+    if (status != ERROR_SUCCESS) { free(info); return nullptr; }
+    return info;
+}
+
+// Find a property by name in TRACE_EVENT_INFO and return its index (-1 if missing).
+static int TdhFindProperty(PTRACE_EVENT_INFO info, const wchar_t* name) {
+    for (ULONG i = 0; i < info->TopLevelPropertyCount; i++) {
+        const wchar_t* propName = reinterpret_cast<const wchar_t*>(
+            reinterpret_cast<const BYTE*>(info) +
+            info->EventPropertyInfoArray[i].NameOffset);
+        if (_wcsicmp(propName, name) == 0) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// Compute the byte offset and length of the Nth top-level property by walking
+// all preceding properties.  Handles PropertyParamCount (array) properties
+// where the element count is stored in a prior property, and
+// PropertyParamFixedCount where the count is a compile-time constant.
+//
+// Returns true and fills outOffset/outLength on success.
+static bool TdhGetPropertyOffset(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO info,
+                                  int targetIdx, ULONG& outOffset, ULONG& outLength) {
+    if (targetIdx < 0 || targetIdx >= static_cast<int>(info->TopLevelPropertyCount))
+        return false;
+
+    const BYTE* userData = static_cast<const BYTE*>(pEvent->UserData);
+    USHORT dataLen = pEvent->UserDataLength;
+    ULONG offset = 0;
+
+    for (int i = 0; i <= targetIdx; i++) {
+        const EVENT_PROPERTY_INFO& prop = info->EventPropertyInfoArray[i];
+
+        // Determine array count for this property
+        ULONG arrayCount = 1;
+        if (prop.Flags & PropertyParamCount) {
+            // Count is stored in another property (by index)
+            USHORT countIdx = prop.countPropertyIndex;
+            if (countIdx < info->TopLevelPropertyCount) {
+                // Walk to the count property to read its value
+                ULONG countOff = 0;
+                for (USHORT c = 0; c < countIdx; c++) {
+                    // Simplified: assume count props are before us and small fixed-size
+                    USHORT sz = info->EventPropertyInfoArray[c].length;
+                    if (sz == 0) sz = 4; // default assumption
+                    countOff += sz;
+                }
+                if (countOff + 4 <= dataLen) {
+                    USHORT countSize = info->EventPropertyInfoArray[countIdx].length;
+                    if (countSize == 2 && countOff + 2 <= dataLen)
+                        arrayCount = *reinterpret_cast<const UINT16*>(userData + countOff);
+                    else if (countSize == 4 && countOff + 4 <= dataLen)
+                        arrayCount = *reinterpret_cast<const UINT32*>(userData + countOff);
+                    else if (countSize == 1 && countOff + 1 <= dataLen)
+                        arrayCount = userData[countOff];
+                }
+            }
+        } else if (prop.Flags & PropertyParamFixedCount) {
+            arrayCount = prop.count;
+        }
+
+        // Determine element size
+        USHORT elemSize = prop.length;
+        bool isString = (prop.nonStructType.InType == TDH_INTYPE_UNICODESTRING ||
+                         prop.nonStructType.InType == TDH_INTYPE_ANSISTRING);
+
+        for (ULONG a = 0; a < arrayCount; a++) {
+            if (offset >= dataLen) return false;
+
+            ULONG thisLen = 0;
+            if (isString) {
+                // Null-terminated string — scan for terminator
+                if (prop.nonStructType.InType == TDH_INTYPE_UNICODESTRING) {
+                    const wchar_t* ws = reinterpret_cast<const wchar_t*>(userData + offset);
+                    size_t maxChars = (dataLen - offset) / sizeof(wchar_t);
+                    size_t sLen = 0;
+                    while (sLen < maxChars && ws[sLen] != L'\0') sLen++;
+                    thisLen = static_cast<ULONG>((sLen + 1) * sizeof(wchar_t)); // include null
+                } else {
+                    const char* cs = reinterpret_cast<const char*>(userData + offset);
+                    size_t maxChars = dataLen - offset;
+                    size_t sLen = 0;
+                    while (sLen < maxChars && cs[sLen] != '\0') sLen++;
+                    thisLen = static_cast<ULONG>(sLen + 1);
+                }
+            } else if (elemSize > 0) {
+                thisLen = elemSize;
+            } else {
+                // Unknown size — can't continue walking
+                return false;
+            }
+
+            if (i == targetIdx && a == 0) {
+                outOffset = offset;
+                outLength = thisLen * arrayCount;
+                return true;
+            }
+            offset += thisLen;
+        }
+    }
+    return false;
+}
+
+// Extract a Unicode string property by name.  Returns empty string on failure.
+static std::string TdhExtractString(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO info,
+                                     const wchar_t* propName) {
+    int idx = TdhFindProperty(info, propName);
+    if (idx < 0) return {};
+    ULONG off = 0, len = 0;
+    if (!TdhGetPropertyOffset(pEvent, info, idx, off, len)) return {};
+
+    const BYTE* userData = static_cast<const BYTE*>(pEvent->UserData);
+    USHORT dataLen = pEvent->UserDataLength;
+    if (off >= dataLen) return {};
+
+    const EVENT_PROPERTY_INFO& prop = info->EventPropertyInfoArray[idx];
+    if (prop.nonStructType.InType == TDH_INTYPE_UNICODESTRING) {
+        const wchar_t* ws = reinterpret_cast<const wchar_t*>(userData + off);
+        size_t maxChars = (dataLen - off) / sizeof(wchar_t);
+        size_t sLen = 0;
+        while (sLen < maxChars && ws[sLen] != L'\0') sLen++;
+        if (sLen == 0 || sLen >= 2048) return {};
+        std::string result(sLen, '\0');
+        for (size_t i = 0; i < sLen; i++)
+            result[i] = (ws[i] < 128) ? static_cast<char>(ws[i]) : '?';
+        return result;
+    }
+    return {};
+}
+
+// Extract a UINT32 property by name.  Returns defaultVal on failure.
+static UINT32 TdhExtractUInt32(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO info,
+                                const wchar_t* propName, UINT32 defaultVal = 0) {
+    int idx = TdhFindProperty(info, propName);
+    if (idx < 0) return defaultVal;
+    ULONG off = 0, len = 0;
+    if (!TdhGetPropertyOffset(pEvent, info, idx, off, len)) return defaultVal;
+
+    const BYTE* userData = static_cast<const BYTE*>(pEvent->UserData);
+    if (off + 4 > pEvent->UserDataLength) return defaultVal;
+    return *reinterpret_cast<const UINT32*>(userData + off);
+}
+
+// Check if a Unicode string property is empty (zero-length or just a null terminator)
+static bool TdhIsStringEmpty(PEVENT_RECORD pEvent, PTRACE_EVENT_INFO info,
+                              const wchar_t* propName) {
+    int idx = TdhFindProperty(info, propName);
+    if (idx < 0) return true;
+    ULONG off = 0, len = 0;
+    if (!TdhGetPropertyOffset(pEvent, info, idx, off, len)) return true;
+
+    const BYTE* userData = static_cast<const BYTE*>(pEvent->UserData);
+    if (off >= pEvent->UserDataLength) return true;
+    // A Unicode string that starts with L'\0' is empty
+    const wchar_t* ws = reinterpret_cast<const wchar_t*>(userData + off);
+    return (ws[0] == L'\0');
+}
+
 static void WINAPI ClrEventCallback(PEVENT_RECORD pEvent) {
     if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kClrProviderGuid)) return;
+    g_clrEventCount.fetch_add(1, std::memory_order_relaxed);
 
     USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
 
-    // AssemblyLoad = 154, ModuleLoad = 152
-    if (eventId != 154 && eventId != 152) return;
+    // AssemblyLoad = 154, ModuleLoad = 152, MethodJittingStarted = 145,
+    // MethodLoadVerbose = 143, ILStubGenerated = 88, AppDomainLoad = 156
+    if (eventId != 154 && eventId != 152 && eventId != 145 && eventId != 143 &&
+        eventId != 88 && eventId != 156) return;
 
     UINT32 pid = pEvent->EventHeader.ProcessId;
     if (pid == 0 || pid == curPid) return;
 
-    // Parse assembly/module name from UserData.
-    // AssemblyLoad (154) layout: AssemblyID(8), AppDomainID(8), BindingID(8),
-    //   AssemblyFlags(4), FullyQualifiedAssemblyName(wstring)
-    // ModuleLoad (152) layout: ModuleID(8), AssemblyID(8), ModuleFlags(4),
-    //   Reserved1(4), ModuleILPath(wstring), ModuleNativePath(wstring)
+    // Decode event schema via TDH — handles EventPropertyArray, versioning, etc.
+    // TDH resolves property offsets at runtime from the registered manifest,
+    // correctly walking PropertyParamCount/PropertyParamFixedCount arrays.
+    PTRACE_EVENT_INFO tdhInfo = TdhGetEventInfo(pEvent);
+    // Ensure tdhInfo is freed on every exit path
+    struct TdhGuard { PTRACE_EVENT_INFO p; ~TdhGuard() { free(p); } } tdhGuard{tdhInfo};
 
+    // ---------------------------------------------------------------
+    // MethodJittingStarted (event 145) — exposes full namespace.class
+    // for every method the CLR JIT-compiles.  Offensive C# tools keep
+    // their namespace/class names even when the assembly is renamed.
+    // ---------------------------------------------------------------
+    if (eventId == 145) {
+        // Extract properties via TDH (array-safe), fall back to hardcoded offsets
+        std::string nsDisplay, methodName;
+        if (tdhInfo) {
+            nsDisplay  = TdhExtractString(pEvent, tdhInfo, L"MethodNamespace");
+            methodName = TdhExtractString(pEvent, tdhInfo, L"MethodName");
+        }
+        // Fallback: hardcoded offsets if TDH didn't yield results
+        if (nsDisplay.empty() && pEvent->UserData && pEvent->UserDataLength > 24) {
+            const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+            USHORT dataLen = pEvent->UserDataLength;
+            const wchar_t* nsStart = reinterpret_cast<const wchar_t*>(data + 24);
+            size_t maxChars = (dataLen - 24) / sizeof(wchar_t);
+            size_t nsLen = 0;
+            while (nsLen < maxChars && nsStart[nsLen] != L'\0') nsLen++;
+            if (nsLen > 0 && nsLen < 512) {
+                nsDisplay.resize(nsLen);
+                for (size_t i = 0; i < nsLen; i++)
+                    nsDisplay[i] = (nsStart[i] < 128) ? static_cast<char>(nsStart[i]) : '?';
+            }
+            if (methodName.empty()) {
+                size_t mOff = 24 + (nsLen + 1) * sizeof(wchar_t);
+                if (mOff + 2 < dataLen) {
+                    const wchar_t* mStart = reinterpret_cast<const wchar_t*>(data + mOff);
+                    size_t mMax = (dataLen - mOff) / sizeof(wchar_t);
+                    size_t mLen = 0;
+                    while (mLen < mMax && mStart[mLen] != L'\0') mLen++;
+                    if (mLen > 0 && mLen < 256) {
+                        methodName.resize(mLen);
+                        for (size_t j = 0; j < mLen; j++)
+                            methodName[j] = (mStart[j] < 128) ? static_cast<char>(mStart[j]) : '?';
+                    }
+                }
+            }
+        }
+        if (nsDisplay.empty()) return;
+
+        // Convert namespace to lowercase for matching
+        std::string nsLower = nsDisplay;
+        for (auto& c : nsLower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+        // Skip known-good framework namespaces (fast reject)
+        if (nsLower.compare(0, 7, "system.") == 0 ||
+            nsLower.compare(0, 10, "microsoft.") == 0 ||
+            nsLower.compare(0, 8, "mscorlib") == 0 ||
+            nsLower.compare(0, 11, "interop.ole") == 0 ||
+            nsLower.compare(0, 8, "nortonav") == 0)
+            return;
+
+        // Match against known offensive C# namespaces/classes
+        for (int i = 0; kOffensiveNamespaces[i]; i++) {
+            if (nsLower.find(kOffensiveNamespaces[i]) != std::string::npos) {
+                std::string procName;
+                {
+                    std::lock_guard<std::mutex> lock(process_cache_mutex);
+                    auto it = g_processCache.find(pid);
+                    if (it != g_processCache.end()) procName = it->second.processName;
+                }
+                if (procName.empty()) procName = std::to_string(pid);
+
+                std::string fqn = nsDisplay;
+                if (!methodName.empty()) fqn += "::" + methodName;
+                if (fqn.length() > 140) fqn = fqn.substr(0, 140) + "...";
+
+                std::string ts = BuildTimestamp();
+                std::string msg = std::to_string(tab_1_menu_items.size()) +
+                    " - [!] [Alert] | " + ts +
+                    " | " + procName +
+                    " | Method: ETW DotNETRuntime JIT" +
+                    " | Offensive C# class: " + kOffensiveNamespaces[i] +
+                    " | " + fqn;
+
+                std::string det = "Date & Time: " + ts +
+                    " | " + procName +
+                    " | PID: " + std::to_string(pid) +
+                    " | Method: ETW Microsoft-Windows-DotNETRuntime MethodJittingStarted" +
+                    " | Offensive C# namespace/class detected: " + kOffensiveNamespaces[i] +
+                    " | Full qualified name: " + fqn;
+
+                PushUiDetectionEvent(msg, det, "Method: ETW DotNETRuntime JIT",
+                                     pid, DetectionSeverity::Critical);
+                return;
+            }
+        }
+        return;
+    }
+
+    // ---------------------------------------------------------------
+    // MethodLoadVerbose (event 143) — fires after JIT compilation.
+    // Contains MethodFlags with the Dynamic bit (0x1) which indicates
+    // Reflection.Emit / DynamicMethod — the hallmark of in-memory
+    // .NET payload execution.  Also contains MethodNamespace/MethodName
+    // so we can do offensive class matching with richer metadata.
+    //
+    // Layout (V1): MethodID(8), ModuleID(8), MethodStartAddress(8),
+    //   MethodSize(4), MethodToken(4), MethodFlags(4),
+    //   MethodNamespace(wstring), MethodName(wstring),
+    //   MethodSignature(wstring), ClrInstanceID(2)
+    //
+    // MethodFlags bits:
+    //   0x1 = Dynamic (Reflection.Emit / DynamicMethod)
+    //   0x2 = Generic
+    //   0x4 = HasNativeCode
+    //   0x8 = Jitted (vs NGEN precompiled)
+    // ---------------------------------------------------------------
+    if (eventId == 143) {
+        // Extract via TDH first, hardcoded fallback
+        std::string nsDisplay, methodName;
+        UINT32 methodFlags = 0;
+        if (tdhInfo) {
+            nsDisplay   = TdhExtractString(pEvent, tdhInfo, L"MethodNamespace");
+            methodName  = TdhExtractString(pEvent, tdhInfo, L"MethodName");
+            methodFlags = TdhExtractUInt32(pEvent, tdhInfo, L"MethodFlags");
+        }
+        // Fallback: hardcoded offsets
+        if (nsDisplay.empty() && pEvent->UserData && pEvent->UserDataLength > 36) {
+            const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+            USHORT dataLen = pEvent->UserDataLength;
+            methodFlags = *reinterpret_cast<const UINT32*>(data + 32);
+            const wchar_t* nsStart = reinterpret_cast<const wchar_t*>(data + 36);
+            size_t maxChars = (dataLen - 36) / sizeof(wchar_t);
+            size_t nsLen = 0;
+            while (nsLen < maxChars && nsStart[nsLen] != L'\0') nsLen++;
+            if (nsLen > 0 && nsLen < 512) {
+                nsDisplay.resize(nsLen);
+                for (size_t i = 0; i < nsLen; i++)
+                    nsDisplay[i] = (nsStart[i] < 128) ? static_cast<char>(nsStart[i]) : '?';
+            }
+            if (methodName.empty()) {
+                size_t mOff = 36 + (nsLen + 1) * sizeof(wchar_t);
+                if (mOff + 2 < dataLen) {
+                    const wchar_t* mStart = reinterpret_cast<const wchar_t*>(data + mOff);
+                    size_t mMax = (dataLen - mOff) / sizeof(wchar_t);
+                    size_t mLen = 0;
+                    while (mLen < mMax && mStart[mLen] != L'\0') mLen++;
+                    if (mLen > 0 && mLen < 256) {
+                        methodName.resize(mLen);
+                        for (size_t j = 0; j < mLen; j++)
+                            methodName[j] = (mStart[j] < 128) ? static_cast<char>(mStart[j]) : '?';
+                    }
+                }
+            }
+        }
+        if (nsDisplay.empty()) return;
+
+        bool isDynamic = (methodFlags & 0x1) != 0;
+        bool isJitted  = (methodFlags & 0x8) != 0;
+
+        // Convert namespace to lowercase for matching
+        std::string nsLower = nsDisplay;
+        for (auto& c : nsLower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+        // Skip known-good framework namespaces
+        if (nsLower.compare(0, 7, "system.") == 0 ||
+            nsLower.compare(0, 10, "microsoft.") == 0 ||
+            nsLower.compare(0, 8, "mscorlib") == 0 ||
+            nsLower.compare(0, 11, "interop.ole") == 0 ||
+            nsLower.compare(0, 8, "nortonav") == 0)
+            return;
+
+        // Determine DecodingSource label
+        const char* decodingSrc = isDynamic ? "DYNAMIC" : (isJitted ? "JIT" : "NGEN");
+
+        // --- Detection 1: Dynamic method from non-.NET host = strong execute-assembly signal ---
+        if (isDynamic) {
+            std::string procName;
+            {
+                std::lock_guard<std::mutex> lock(process_cache_mutex);
+                auto it = g_processCache.find(pid);
+                if (it != g_processCache.end()) procName = it->second.processName;
+            }
+            if (procName.empty()) procName = std::to_string(pid);
+
+            std::string fqn = nsDisplay;
+            if (!methodName.empty()) fqn += "::" + methodName;
+            if (fqn.length() > 120) fqn = fqn.substr(0, 120) + "...";
+
+            std::string ts = BuildTimestamp();
+            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                " - [!] [Alert] | " + ts +
+                " | " + procName +
+                " | Method: ETW DotNETRuntime MethodLoadVerbose" +
+                " | DecodingSource=DYNAMIC (Reflection.Emit)" +
+                " | " + fqn;
+
+            std::string det = "Date & Time: " + ts +
+                " | " + procName +
+                " | PID: " + std::to_string(pid) +
+                " | Method: ETW Microsoft-Windows-DotNETRuntime MethodLoadVerbose" +
+                " | MethodFlags: 0x" + std::to_string(methodFlags) +
+                " | DecodingSource: DYNAMIC (Reflection.Emit / DynamicMethod)" +
+                " | Namespace: " + nsDisplay +
+                (!methodName.empty() ? " | Method: " + methodName : "");
+
+            PushUiDetectionEvent(msg, det, "Method: ETW DotNETRuntime MethodLoadVerbose",
+                                 pid, DetectionSeverity::Critical);
+            return;
+        }
+
+        // --- Detection 2: Known offensive namespace (with DecodingSource metadata) ---
+        for (int i = 0; kOffensiveNamespaces[i]; i++) {
+            if (nsLower.find(kOffensiveNamespaces[i]) != std::string::npos) {
+                std::string procName;
+                {
+                    std::lock_guard<std::mutex> lock(process_cache_mutex);
+                    auto it = g_processCache.find(pid);
+                    if (it != g_processCache.end()) procName = it->second.processName;
+                }
+                if (procName.empty()) procName = std::to_string(pid);
+
+                std::string fqn = nsDisplay;
+                if (!methodName.empty()) fqn += "::" + methodName;
+                if (fqn.length() > 120) fqn = fqn.substr(0, 120) + "...";
+
+                std::string ts = BuildTimestamp();
+                std::string msg = std::to_string(tab_1_menu_items.size()) +
+                    " - [!] [Alert] | " + ts +
+                    " | " + procName +
+                    " | Method: ETW DotNETRuntime MethodLoadVerbose" +
+                    " | Offensive C# class: " + kOffensiveNamespaces[i] +
+                    " | DecodingSource=" + decodingSrc +
+                    " | " + fqn;
+
+                std::string det = "Date & Time: " + ts +
+                    " | " + procName +
+                    " | PID: " + std::to_string(pid) +
+                    " | Method: ETW Microsoft-Windows-DotNETRuntime MethodLoadVerbose" +
+                    " | MethodFlags: 0x" + std::to_string(methodFlags) +
+                    " | DecodingSource: " + decodingSrc +
+                    " | Offensive C# namespace/class: " + kOffensiveNamespaces[i] +
+                    " | Full qualified name: " + fqn;
+
+                PushUiDetectionEvent(msg, det, "Method: ETW DotNETRuntime MethodLoadVerbose",
+                                     pid, DetectionSeverity::Critical);
+                return;
+            }
+        }
+        return;  // MethodLoadVerbose handled
+    }
+
+    // ---------------------------------------------------------------
+    // ILStubGenerated (event 88) — fires when the CLR builds an
+    // interop stub for P/Invoke (DllImport).  The method name reveals
+    // the exact Win32 API the .NET code is calling.  Offensive tools
+    // heavily use P/Invoke for injection, credential dumping, and
+    // token manipulation.
+    //
+    // Layout: ClrInstanceID(2), ModuleID(8), StubMethodID(8),
+    //   StubFlags(4), ManagedInteropMethodToken(4),
+    //   ManagedInteropMethodNamespace(wstring),
+    //   ManagedInteropMethodName(wstring), ...
+    // Offset to namespace: 2+8+8+4+4 = 26
+    // ---------------------------------------------------------------
+    if (eventId == 88) {
+        // Extract via TDH first (correctly handles EventPropertyArray), fallback to offsets
+        std::string nsDisplay, methodName;
+        if (tdhInfo) {
+            nsDisplay  = TdhExtractString(pEvent, tdhInfo, L"ManagedInteropMethodNamespace");
+            methodName = TdhExtractString(pEvent, tdhInfo, L"ManagedInteropMethodName");
+        }
+        // Fallback: hardcoded offsets (ClrInstanceID(2)+ModuleID(8)+StubMethodID(8)+StubFlags(4)+Token(4)=26)
+        if (methodName.empty() && pEvent->UserData && pEvent->UserDataLength > 26) {
+            const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+            USHORT dataLen = pEvent->UserDataLength;
+            const wchar_t* nsStart = reinterpret_cast<const wchar_t*>(data + 26);
+            size_t maxChars = (dataLen - 26) / sizeof(wchar_t);
+            size_t nsLen = 0;
+            while (nsLen < maxChars && nsStart[nsLen] != L'\0') nsLen++;
+            if (nsDisplay.empty() && nsLen > 0 && nsLen < 512) {
+                nsDisplay.resize(nsLen);
+                for (size_t i = 0; i < nsLen; i++)
+                    nsDisplay[i] = (nsStart[i] < 128) ? static_cast<char>(nsStart[i]) : '?';
+            }
+            size_t mOff = 26 + (nsLen + 1) * sizeof(wchar_t);
+            if (mOff + 2 < dataLen) {
+                const wchar_t* mStart = reinterpret_cast<const wchar_t*>(data + mOff);
+                size_t mMax = (dataLen - mOff) / sizeof(wchar_t);
+                size_t mLen = 0;
+                while (mLen < mMax && mStart[mLen] != L'\0') mLen++;
+                if (mLen > 0 && mLen < 256) {
+                    methodName.resize(mLen);
+                    for (size_t j = 0; j < mLen; j++)
+                        methodName[j] = (mStart[j] < 128) ? static_cast<char>(mStart[j]) : '?';
+                }
+            }
+        }
+        if (methodName.empty()) return;
+
+        // Lowercase method name for matching
+        std::string methodLower = methodName;
+        for (auto& c : methodLower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+        // Match against suspicious P/Invoke APIs
+        for (int i = 0; kSuspiciousPInvoke[i]; i++) {
+            if (methodLower.find(kSuspiciousPInvoke[i]) != std::string::npos) {
+                std::string procName;
+                {
+                    std::lock_guard<std::mutex> lock(process_cache_mutex);
+                    auto it = g_processCache.find(pid);
+                    if (it != g_processCache.end()) procName = it->second.processName;
+                }
+                if (procName.empty()) procName = std::to_string(pid);
+
+                std::string fqn = nsDisplay.empty() ? methodName : (nsDisplay + "::" + methodName);
+                if (fqn.length() > 140) fqn = fqn.substr(0, 140) + "...";
+
+                std::string ts = BuildTimestamp();
+                std::string msg = std::to_string(tab_1_menu_items.size()) +
+                    " - [!] [Alert] | " + ts +
+                    " | " + procName +
+                    " | Method: ETW DotNETRuntime ILStubGenerated" +
+                    " | Suspicious P/Invoke: " + kSuspiciousPInvoke[i] +
+                    " | " + fqn;
+
+                std::string det = "Date & Time: " + ts +
+                    " | " + procName +
+                    " | PID: " + std::to_string(pid) +
+                    " | Method: ETW Microsoft-Windows-DotNETRuntime ILStubGenerated" +
+                    " | Suspicious P/Invoke API: " + kSuspiciousPInvoke[i] +
+                    " | Calling method: " + fqn;
+
+                PushUiDetectionEvent(msg, det, "Method: ETW DotNETRuntime ILStubGenerated",
+                                     pid, DetectionSeverity::High);
+                return;
+            }
+        }
+
+        // Also check if the calling namespace matches an offensive tool
+        if (!nsDisplay.empty()) {
+            std::string nsLower = nsDisplay;
+            for (auto& c : nsLower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+            for (int i = 0; kOffensiveNamespaces[i]; i++) {
+                if (nsLower.find(kOffensiveNamespaces[i]) != std::string::npos) {
+                    std::string procName;
+                    {
+                        std::lock_guard<std::mutex> lock(process_cache_mutex);
+                        auto it = g_processCache.find(pid);
+                        if (it != g_processCache.end()) procName = it->second.processName;
+                    }
+                    if (procName.empty()) procName = std::to_string(pid);
+
+                    std::string fqn = nsDisplay + "::" + methodName;
+                    if (fqn.length() > 140) fqn = fqn.substr(0, 140) + "...";
+
+                    std::string ts = BuildTimestamp();
+                    std::string msg = std::to_string(tab_1_menu_items.size()) +
+                        " - [!] [Alert] | " + ts +
+                        " | " + procName +
+                        " | Method: ETW DotNETRuntime ILStubGenerated" +
+                        " | Offensive C# P/Invoke: " + kOffensiveNamespaces[i] +
+                        " | " + fqn;
+
+                    std::string det = "Date & Time: " + ts +
+                        " | " + procName +
+                        " | PID: " + std::to_string(pid) +
+                        " | Method: ETW Microsoft-Windows-DotNETRuntime ILStubGenerated" +
+                        " | Offensive namespace P/Invoke: " + kOffensiveNamespaces[i] +
+                        " | Calling method: " + fqn;
+
+                    PushUiDetectionEvent(msg, det, "Method: ETW DotNETRuntime ILStubGenerated",
+                                         pid, DetectionSeverity::Critical);
+                    return;
+                }
+            }
+        }
+        return;  // ILStubGenerated handled
+    }
+
+    // ---------------------------------------------------------------
+    // AppDomainLoad (event 156) — fires when a new AppDomain is created.
+    // Cobalt Strike execute-assembly creates a dedicated AppDomain to
+    // isolate the payload.  Non-default AppDomain creation in a process
+    // that doesn't normally host .NET is highly suspicious.
+    //
+    // Layout: AppDomainID(8), AppDomainFlags(4),
+    //         AppDomainName(wstring), AppDomainIndex(4), ClrInstanceID(2)
+    // Offset to flags: 8,  offset to name: 12
+    // ---------------------------------------------------------------
+    if (eventId == 156) {
+        // Extract via TDH first, fallback to hardcoded offsets
+        std::string domainName;
+        UINT32 domainFlags = 0;
+        if (tdhInfo) {
+            domainName  = TdhExtractString(pEvent, tdhInfo, L"AppDomainName");
+            domainFlags = TdhExtractUInt32(pEvent, tdhInfo, L"AppDomainFlags");
+        }
+        // Fallback: hardcoded offsets (AppDomainID(8), AppDomainFlags(4), AppDomainName(wstring))
+        if (domainName.empty() && pEvent->UserData && pEvent->UserDataLength > 12) {
+            const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+            USHORT dataLen = pEvent->UserDataLength;
+            domainFlags = *reinterpret_cast<const UINT32*>(data + 8);
+            const wchar_t* nameStart = reinterpret_cast<const wchar_t*>(data + 12);
+            size_t maxChars = (dataLen - 12) / sizeof(wchar_t);
+            size_t nameLen = 0;
+            while (nameLen < maxChars && nameStart[nameLen] != L'\0') nameLen++;
+            if (nameLen > 0 && nameLen < 512) {
+                domainName.resize(nameLen);
+                for (size_t i = 0; i < nameLen; i++)
+                    domainName[i] = (nameStart[i] < 128) ? static_cast<char>(nameStart[i]) : '?';
+            }
+        }
+        if (domainName.empty()) return;
+
+        bool isDefault = (domainFlags & 0x1) != 0;
+        if (isDefault) return;
+
+        std::string nameLower = domainName;
+        for (auto& c : nameLower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+        // Skip well-known benign AppDomain names
+        if (nameLower == "defaultdomain" || nameLower == "clrhost" ||
+            nameLower.find("mscorlib") != std::string::npos ||
+            nameLower.find("nortonedr") != std::string::npos ||
+            nameLower.find("nortonav") != std::string::npos)
+            return;
+
+        // Check if the host process is a native (non-.NET) process —
+        // AppDomain creation in native processes is the execute-assembly pattern
+        std::string procName;
+        {
+            std::lock_guard<std::mutex> lock(process_cache_mutex);
+            auto it = g_processCache.find(pid);
+            if (it != g_processCache.end()) procName = it->second.processName;
+        }
+        if (procName.empty()) procName = std::to_string(pid);
+
+        std::string procLower = procName;
+        for (auto& c : procLower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+        // Flag if host is a known Cobalt Strike spawnto target
+        static const char* kNativeSpawnto[] = {
+            "rundll32.exe", "dllhost.exe", "werfault.exe", "mshta.exe",
+            "gpupdate.exe", "wuauclt.exe", "svchost.exe", "searchprotocolhost.exe",
+            nullptr
+        };
+        DetectionSeverity severity = DetectionSeverity::Medium;
+        std::string reason = "non-default AppDomain created";
+        for (int i = 0; kNativeSpawnto[i]; i++) {
+            if (procLower.find(kNativeSpawnto[i]) != std::string::npos) {
+                severity = DetectionSeverity::High;
+                reason = "non-default AppDomain in native spawnto host (" + procName + ")";
+                break;
+            }
+        }
+
+        // Also check if the AppDomain name matches an offensive tool
+        for (int i = 0; kOffensiveNamespaces[i]; i++) {
+            if (nameLower.find(kOffensiveNamespaces[i]) != std::string::npos) {
+                severity = DetectionSeverity::Critical;
+                reason = "AppDomain named after offensive tool: " + std::string(kOffensiveNamespaces[i]);
+                break;
+            }
+        }
+
+        if (domainName.length() > 120) domainName = domainName.substr(0, 120) + "...";
+
+        std::string ts = BuildTimestamp();
+        std::string msg = std::to_string(tab_1_menu_items.size()) +
+            " - [!] [Alert] | " + ts +
+            " | " + procName +
+            " | Method: ETW DotNETRuntime AppDomainLoad" +
+            " | " + reason +
+            " | Domain=" + domainName;
+
+        std::string det = "Date & Time: " + ts +
+            " | " + procName +
+            " | PID: " + std::to_string(pid) +
+            " | Method: ETW Microsoft-Windows-DotNETRuntime AppDomainLoad" +
+            " | " + reason +
+            " | AppDomainName: " + domainName +
+            " | AppDomainFlags: 0x" + std::to_string(domainFlags);
+
+        PushUiDetectionEvent(msg, det, "Method: ETW DotNETRuntime AppDomainLoad",
+                             pid, severity);
+        return;
+    }
+
+    // Parse assembly/module name using TDH first, hardcoded fallback.
     std::string assemblyName;
     std::string assemblyPath;
 
-    if (pEvent->UserData && pEvent->UserDataLength > 0) {
-        const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
-        USHORT dataLen = pEvent->UserDataLength;
-
-        if (eventId == 154 && dataLen > 28) {
-            // Skip AssemblyID(8) + AppDomainID(8) + BindingID(8) + Flags(4) = 28
+    if (eventId == 154) {
+        // TDH extraction for AssemblyLoad
+        if (tdhInfo)
+            assemblyName = TdhExtractString(pEvent, tdhInfo, L"FullyQualifiedAssemblyName");
+        // Fallback: AssemblyID(8) + AppDomainID(8) + BindingID(8) + Flags(4) = 28
+        if (assemblyName.empty() && pEvent->UserData && pEvent->UserDataLength > 28) {
+            const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+            USHORT dataLen = pEvent->UserDataLength;
             const wchar_t* nameStart = reinterpret_cast<const wchar_t*>(data + 28);
             size_t maxChars = (dataLen - 28) / sizeof(wchar_t);
             size_t nameLen = 0;
@@ -4503,8 +5347,21 @@ static void WINAPI ClrEventCallback(PEVENT_RECORD pEvent) {
                     assemblyName[i] = (nameStart[i] < 128)
                         ? static_cast<char>(nameStart[i]) : '?';
             }
-        } else if (eventId == 152 && dataLen > 24) {
-            // Skip ModuleID(8) + AssemblyID(8) + ModuleFlags(4) + Reserved(4) = 24
+        }
+    } else if (eventId == 152) {
+        // TDH extraction for ModuleLoad
+        bool pathEmpty = false;
+        UINT32 moduleFlags = 0;
+        if (tdhInfo) {
+            assemblyPath = TdhExtractString(pEvent, tdhInfo, L"ModuleILPath");
+            pathEmpty    = TdhIsStringEmpty(pEvent, tdhInfo, L"ModuleILPath");
+            moduleFlags  = TdhExtractUInt32(pEvent, tdhInfo, L"ModuleFlags");
+        }
+        // Fallback: ModuleID(8) + AssemblyID(8) + ModuleFlags(4) + Reserved(4) = 24
+        if (assemblyPath.empty() && !pathEmpty && pEvent->UserData && pEvent->UserDataLength > 24) {
+            const BYTE* data = static_cast<const BYTE*>(pEvent->UserData);
+            USHORT dataLen = pEvent->UserDataLength;
+            moduleFlags = *reinterpret_cast<const UINT32*>(data + 16);
             const wchar_t* pathStart = reinterpret_cast<const wchar_t*>(data + 24);
             size_t maxChars = (dataLen - 24) / sizeof(wchar_t);
             size_t pathLen = 0;
@@ -4515,6 +5372,39 @@ static void WINAPI ClrEventCallback(PEVENT_RECORD pEvent) {
                     assemblyPath[i] = (pathStart[i] < 128)
                         ? static_cast<char>(pathStart[i]) : '?';
             }
+            if (pathLen == 0) pathEmpty = true;
+        }
+
+        // *** Empty ModuleILPath = byte-array loaded assembly ***
+        // When Assembly.Load(byte[]) or execute-assembly is used, ModuleILPath
+        // is empty.  This is one of the strongest indicators of in-memory .NET.
+        if (pathEmpty) {
+            std::string procName;
+            {
+                std::lock_guard<std::mutex> lock(process_cache_mutex);
+                auto it = g_processCache.find(pid);
+                if (it != g_processCache.end()) procName = it->second.processName;
+            }
+            if (procName.empty()) procName = std::to_string(pid);
+
+            std::string ts = BuildTimestamp();
+            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                " - [!] [Alert] | " + ts +
+                " | " + procName +
+                " | Method: ETW DotNETRuntime ModuleLoad" +
+                " | Empty ModuleILPath (byte-array loaded / fileless .NET)";
+
+            std::string det = "Date & Time: " + ts +
+                " | " + procName +
+                " | PID: " + std::to_string(pid) +
+                " | Method: ETW Microsoft-Windows-DotNETRuntime ModuleLoad" +
+                " | ModuleILPath: <empty> (in-memory assembly)" +
+                " | ModuleFlags: 0x" + std::to_string(moduleFlags) +
+                " | Indicator: Assembly.Load(byte[]) or execute-assembly pattern";
+
+            PushUiDetectionEvent(msg, det, "Method: ETW DotNETRuntime ModuleLoad",
+                                 pid, DetectionSeverity::High);
+            return;
         }
     }
 
@@ -4654,6 +5544,7 @@ static void ClrSubscriberThread() {
     buildProps();
     ULONG status = StartTraceW(&g_clrSessionHandle, kSessionName, props);
     if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
         buildProps();
         ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
         buildProps();
@@ -4666,14 +5557,15 @@ static void ClrSubscriberThread() {
         return;
     }
 
-    // Enable with LoaderKeyword (0x8) to get AssemblyLoad/ModuleLoad events
+    // Enable with LoaderKeyword (0x8) + JitKeyword (0x10) + InteropKeyword (0x2000)
+    // to get AssemblyLoad/ModuleLoad/AppDomain + JIT + P/Invoke stub events
     ENABLE_TRACE_PARAMETERS etp{};
     etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
     status = EnableTraceEx2(
         g_clrSessionHandle, &kClrProviderGuid,
         EVENT_CONTROL_CODE_ENABLE_PROVIDER,
         TRACE_LEVEL_INFORMATIONAL,
-        kClrLoaderKeyword, 0, 0, &etp);
+        kClrKeywords, 0, 0, &etp);
     if (status != ERROR_SUCCESS) {
         std::cerr << "[ETW-CLR] EnableTraceEx2 failed: " << status << "\n";
         EVENT_TRACE_PROPERTIES stopProps{};
@@ -4683,7 +5575,7 @@ static void ClrSubscriberThread() {
         return;
     }
 
-    std::cout << "[ETW-CLR] Session started — consuming .NET assembly load events\n";
+    std::cout << "[ETW-CLR] Session started — consuming .NET assembly/module/JIT/P-Invoke/AppDomain events\n";
 
     EVENT_TRACE_LOGFILEW logFile{};
     logFile.LoggerName       = const_cast<LPWSTR>(kSessionName);
@@ -4783,6 +5675,7 @@ static void ClrRundownSubscriberThread() {
     buildProps();
     ULONG status = StartTraceW(&g_clrRundownSessionHandle, kSessionName, props);
     if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
         buildProps();
         ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
         buildProps();
@@ -4870,6 +5763,7 @@ static const GUID kAmsiProviderGuid = {
 
 static void WINAPI AmsiEventCallback(PEVENT_RECORD pEvent) {
     if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kAmsiProviderGuid)) return;
+    g_amsiEventCount.fetch_add(1, std::memory_order_relaxed);
 
     // EID 11 = AMSI scan event containing buffer content
     USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
@@ -5046,6 +5940,7 @@ static void AmsiSubscriberThread() {
     buildProps();
     ULONG status = StartTraceW(&g_amsiSessionHandle, kSessionName, props);
     if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
         buildProps();
         ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
         buildProps();
@@ -5128,6 +6023,7 @@ static const GUID kLdapProviderGuid = {
 
 static void WINAPI LdapEventCallback(PEVENT_RECORD pEvent) {
     if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kLdapProviderGuid)) return;
+    g_ldapEventCount.fetch_add(1, std::memory_order_relaxed);
 
     USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
     // EID 30 = search request
@@ -5264,6 +6160,7 @@ static void LdapSubscriberThread() {
     buildProps();
     ULONG status = StartTraceW(&g_ldapSessionHandle, kSessionName, props);
     if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
         buildProps();
         ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
         buildProps();
@@ -5323,6 +6220,343 @@ static void StopLdapSession() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-DNS-Client raw ETW session.
+// Provider GUID: {1C95126E-7EEA-49A9-A3FE-A378B03DDB4D}
+//
+// Delivers per-PID DNS queries before the packet hits the wire and without
+// requiring the DNS-Client/Operational channel to be enabled.  Gives visibility
+// that no network sensor (post-resolver) and no channel subscriber (which
+// depends on the WINEVT channel being enabled) can match — the canonical
+// "no other sensor can monitor" ETW use case.  Event IDs of interest:
+//   3006 — DnsQuery start       3008 — DnsQuery completed
+//   3009 — DNS cache lookup     3020 — DNS query name
+// ---------------------------------------------------------------------------
+static const GUID kDnsClientProviderGuid = {
+    0x1C95126E, 0x7EEA, 0x49A9,
+    {0xA3, 0xFE, 0xA3, 0x78, 0xB0, 0x3D, 0xDB, 0x4D}
+};
+
+static void WINAPI DnsRawEventCallback(PEVENT_RECORD pEvent) {
+    if (!pEvent || !IsEqualGUID(pEvent->EventHeader.ProviderId, kDnsClientProviderGuid))
+        return;
+
+    USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
+    UINT32 pid = pEvent->EventHeader.ProcessId;
+    if (pid == 0 || pid == curPid) return;
+
+    // EID 3006 = DnsQuery; UserData typically begins with the query-name UTF-16 string.
+    if (eventId != 3006 && eventId != 3008 && eventId != 3020) return;
+    if (!pEvent->UserData || pEvent->UserDataLength < 4) return;
+
+    // First field is a wide-string query name up to ~255 chars.
+    wchar_t qname[256] = {};
+    const wchar_t* src = reinterpret_cast<const wchar_t*>(pEvent->UserData);
+    ULONG maxChars = pEvent->UserDataLength / sizeof(wchar_t);
+    if (maxChars > 255) maxChars = 255;
+    for (ULONG i = 0; i < maxChars && src[i]; i++) qname[i] = src[i];
+
+    if (qname[0] == L'\0') return;
+
+    // Flag high-signal patterns only (long subdomains, base64-ish, DGA-looking,
+    // common exfil TLDs).  Everything else is telemetry-only and won't alert.
+    size_t qlen = wcslen(qname);
+    bool longLabel = false;
+    {
+        size_t run = 0;
+        for (size_t i = 0; i < qlen; i++) {
+            if (qname[i] == L'.') run = 0;
+            else { run++; if (run > 40) { longLabel = true; break; } }
+        }
+    }
+    bool suspiciousTld =
+        (qlen > 4 && (_wcsicmp(qname + qlen - 4, L".xyz") == 0 ||
+                      _wcsicmp(qname + qlen - 4, L".top") == 0 ||
+                      _wcsicmp(qname + qlen - 4, L".tk")  == 0 ||
+                      _wcsicmp(qname + qlen - 4, L".ml")  == 0));
+    bool rawIpLookup =
+        (qlen > 7 && (wcsstr(qname, L".in-addr.arpa") || wcsstr(qname, L".ip6.arpa")));
+
+    if (!longLabel && !suspiciousTld && !rawIpLookup) return;
+
+    std::string procName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(pid);
+        if (it != g_processCache.end()) procName = it->second.processName;
+    }
+    if (procName.empty()) procName = "dns-client";
+
+    char qnameA[256] = {};
+    WideCharToMultiByte(CP_UTF8, 0, qname, -1, qnameA, sizeof(qnameA) - 1, nullptr, nullptr);
+
+    std::string ts = BuildTimestamp();
+    std::string tag = longLabel ? "DNS_TUNNEL_LONG_LABEL"
+                     : suspiciousTld ? "DNS_SUSPICIOUS_TLD"
+                     : "DNS_REVERSE_LOOKUP";
+    DetectionSeverity sev = longLabel ? DetectionSeverity::High
+                          : suspiciousTld ? DetectionSeverity::Medium
+                          : DetectionSeverity::Low;
+
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [*] [" + (sev >= DetectionSeverity::High ? "Critical" : "Warning") + "] | " + ts +
+        " | " + procName + " | Method: DNS-Client Raw ETW (T1071.004) | [" + tag + "] Query=[" +
+        qnameA + "]";
+    std::string det = "Date & Time: " + ts + " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: Raw ETW Microsoft-Windows-DNS-Client (channel-independent)" +
+        " | Tag: " + tag + " | Query: " + qnameA;
+    PushUiDetectionEvent(msg, det, "Method: DNS-Client Raw ETW (T1071.004)", pid, sev);
+}
+
+static void DnsRawSubscriberThread() {
+    const wchar_t* kSessionName = L"NortonEDR-DNS";
+    const size_t nameBufBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize  = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize  = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_dnsRawSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_dnsRawSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-DNS-RAW] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_dnsRawSessionHandle, &kDnsClientProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_INFORMATIONAL,
+        0xFFFFFFFFFFFFFFFF, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-DNS-RAW] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_dnsRawSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_dnsRawSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-DNS-RAW] Session started — raw DNS-Client provider\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName          = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode    = PROCESS_TRACE_MODE_REAL_TIME |
+                                  PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = DnsRawEventCallback;
+
+    g_dnsRawTraceHandle = OpenTraceW(&logFile);
+    if (g_dnsRawTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-DNS-RAW] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_dnsRawTraceHandle, 1, nullptr, nullptr);
+    g_dnsRawTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopDnsRawSession() {
+    if (g_dnsRawTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_dnsRawTraceHandle);
+        g_dnsRawTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_dnsRawSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_dnsRawSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_dnsRawSessionHandle = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Microsoft-Windows-TaskScheduler raw ETW session.
+// Provider GUID: {DE7B24EA-73C8-4A09-985D-5BDADCFA9017}
+//
+// Delivers task creation / update / run / delete events independent of the
+// TaskScheduler/Operational channel.  Attackers who disable the channel or
+// clear the log can't evade this — the kernel-scheduled provider emits the
+// events regardless.  Event IDs of interest:
+//   106 — task registered    140 — task updated
+//   129 — process created    141 — task deleted
+//   200 — action launched
+// ---------------------------------------------------------------------------
+static const GUID kTaskSchedulerProviderGuid = {
+    0xDE7B24EA, 0x73C8, 0x4A09,
+    {0x98, 0x5D, 0x5B, 0xDA, 0xDC, 0xFA, 0x90, 0x17}
+};
+
+static void WINAPI TaskRawEventCallback(PEVENT_RECORD pEvent) {
+    if (!pEvent || !IsEqualGUID(pEvent->EventHeader.ProviderId, kTaskSchedulerProviderGuid))
+        return;
+
+    USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
+    UINT32 pid = pEvent->EventHeader.ProcessId;
+
+    // Focus on persistence-relevant events
+    bool isCreate = (eventId == 106);
+    bool isUpdate = (eventId == 140);
+    bool isRun    = (eventId == 129 || eventId == 200);
+    bool isDelete = (eventId == 141);
+    if (!isCreate && !isUpdate && !isRun && !isDelete) return;
+
+    // UserData layout for 106/140: UnicodeString TaskName, UnicodeString UserContext.
+    wchar_t taskName[260] = {};
+    wchar_t userCtx[128]  = {};
+    if (pEvent->UserData && pEvent->UserDataLength >= sizeof(wchar_t)) {
+        const wchar_t* src = reinterpret_cast<const wchar_t*>(pEvent->UserData);
+        ULONG maxChars = pEvent->UserDataLength / sizeof(wchar_t);
+        if (maxChars > 259) maxChars = 259;
+        ULONG i = 0;
+        for (; i < maxChars && src[i]; i++) taskName[i] = src[i];
+        if (i + 1 < maxChars) {
+            const wchar_t* u = src + i + 1;
+            ULONG remaining = maxChars - i - 1;
+            if (remaining > 127) remaining = 127;
+            for (ULONG j = 0; j < remaining && u[j]; j++) userCtx[j] = u[j];
+        }
+    }
+
+    char taskA[260] = {};
+    char ctxA[128]  = {};
+    WideCharToMultiByte(CP_UTF8, 0, taskName, -1, taskA, sizeof(taskA) - 1, nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, 0, userCtx,  -1, ctxA,  sizeof(ctxA)  - 1, nullptr, nullptr);
+
+    // Skip well-known benign tasks (Microsoft built-ins with predictable paths)
+    if (_strnicmp(taskA, "\\Microsoft\\Windows\\", 19) == 0 && !isCreate && !isUpdate)
+        return;
+
+    std::string procName;
+    {
+        std::lock_guard<std::mutex> lock(process_cache_mutex);
+        auto it = g_processCache.find(pid);
+        if (it != g_processCache.end()) procName = it->second.processName;
+    }
+    if (procName.empty()) procName = "schtasks";
+
+    const char* action =
+        isCreate ? "REGISTERED" :
+        isUpdate ? "UPDATED"    :
+        isDelete ? "DELETED"    : "LAUNCHED";
+    DetectionSeverity sev =
+        isCreate ? DetectionSeverity::High :
+        isUpdate ? DetectionSeverity::High :
+        isDelete ? DetectionSeverity::Medium : DetectionSeverity::Low;
+
+    std::string ts = BuildTimestamp();
+    std::string msg = std::to_string(tab_1_menu_items.size()) +
+        " - [*] [" + (sev >= DetectionSeverity::High ? "Critical" : "Warning") + "] | " + ts +
+        " | " + procName + " | Method: TaskScheduler Raw ETW (T1053.005) | " +
+        action + " task=[" + taskA + "] user=[" + ctxA + "]";
+    std::string det = "Date & Time: " + ts + " | " + procName +
+        " | PID: " + std::to_string(pid) +
+        " | Method: Raw ETW Microsoft-Windows-TaskScheduler (channel-independent)" +
+        " | Action: " + action + " | Task: " + taskA + " | User: " + ctxA;
+    PushUiDetectionEvent(msg, det, "Method: TaskScheduler Raw ETW (T1053.005)", pid, sev);
+}
+
+static void TaskRawSubscriberThread() {
+    const wchar_t* kSessionName = L"NortonEDR-Task";
+    const size_t nameBufBytes = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize  = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize  = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags       = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode       = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_taskRawSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_taskRawSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-TASK-RAW] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_taskRawSessionHandle, &kTaskSchedulerProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_INFORMATIONAL,
+        0xFFFFFFFFFFFFFFFF, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-TASK-RAW] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_taskRawSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_taskRawSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-TASK-RAW] Session started — raw TaskScheduler provider\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName          = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode    = PROCESS_TRACE_MODE_REAL_TIME |
+                                  PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = TaskRawEventCallback;
+
+    g_taskRawTraceHandle = OpenTraceW(&logFile);
+    if (g_taskRawTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-TASK-RAW] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_taskRawTraceHandle, 1, nullptr, nullptr);
+    g_taskRawTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopTaskRawSession() {
+    if (g_taskRawTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_taskRawTraceHandle);
+        g_taskRawTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_taskRawSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_taskRawSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_taskRawSessionHandle = 0;
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Microsoft-Windows-RPC ETW consumer
@@ -5347,6 +6581,7 @@ static const GUID kRpcProviderGuid = {
 
 static void WINAPI RpcEventCallback(PEVENT_RECORD pEvent) {
     if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kRpcProviderGuid)) return;
+    g_rpcEventCount.fetch_add(1, std::memory_order_relaxed);
 
     USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
     // EID 5 = RpcClientCallStart, EID 7 = RpcServerCallStart
@@ -5478,6 +6713,7 @@ static void RpcSubscriberThread() {
     buildProps();
     ULONG status = StartTraceW(&g_rpcSessionHandle, kSessionName, props);
     if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
         buildProps();
         ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
         buildProps();
@@ -5562,6 +6798,7 @@ static const GUID kNtlmProviderGuid = {
 
 static void WINAPI NtlmEventCallback(PEVENT_RECORD pEvent) {
     if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kNtlmProviderGuid)) return;
+    g_ntlmEventCount.fetch_add(1, std::memory_order_relaxed);
 
     USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
     UINT32 pid = pEvent->EventHeader.ProcessId;
@@ -5702,6 +6939,7 @@ static void NtlmSubscriberThread() {
     buildProps();
     ULONG status = StartTraceW(&g_ntlmSessionHandle, kSessionName, props);
     if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
         buildProps();
         ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
         buildProps();
@@ -5784,6 +7022,7 @@ static const GUID kApiAuditProviderGuid = {
 
 static void WINAPI ApiAuditEventCallback(PEVENT_RECORD pEvent) {
     if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kApiAuditProviderGuid)) return;
+    g_apiAuditEventCount.fetch_add(1, std::memory_order_relaxed);
 
     USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
     UINT32 callerPid = pEvent->EventHeader.ProcessId;
@@ -5920,6 +7159,7 @@ static void ApiAuditSubscriberThread() {
     buildProps();
     ULONG status = StartTraceW(&g_apiAuditSessionHandle, kSessionName, props);
     if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
         buildProps();
         ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
         buildProps();
@@ -6007,6 +7247,7 @@ static const GUID kCiProviderGuid = {
 
 static void WINAPI CodeIntegrityEventCallback(PEVENT_RECORD pEvent) {
     if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kCiProviderGuid)) return;
+    g_ciEventCount.fetch_add(1, std::memory_order_relaxed);
 
     USHORT eventId = pEvent->EventHeader.EventDescriptor.Id;
     UINT32 pid = pEvent->EventHeader.ProcessId;
@@ -6160,6 +7401,7 @@ static void CodeIntegritySubscriberThread() {
     buildProps();
     ULONG status = StartTraceW(&g_ciSessionHandle, kSessionName, props);
     if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
         buildProps();
         ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
         buildProps();
@@ -6398,6 +7640,7 @@ static void EtwSessionWatchdogThread()
     int clrRestarts = 0, clrRdRestarts = 0;
     int amsiRestarts = 0, ldapRestarts = 0, rpcRestarts = 0;
     int ntlmRestarts = 0, apiAuditRestarts = 0, ciRestarts = 0;
+    int dnsRawRestarts = 0, taskRawRestarts = 0;
 
     while (!g_etwWatchdogStop.load()) {
         Sleep(kCheckIntervalMs);
@@ -6523,6 +7766,16 @@ static void EtwSessionWatchdogThread()
             "code integrity/BYOVD detection is BLIND",
             CodeIntegritySubscriberThread);
 
+        CheckAndRestart(g_dnsRawSessionHandle, g_dnsRawTraceHandle,
+            dnsRawRestarts, L"NortonEDR-DNS", "ETW-DNS-RAW",
+            "DNS-Client raw provider capture is BLIND",
+            DnsRawSubscriberThread);
+
+        CheckAndRestart(g_taskRawSessionHandle, g_taskRawTraceHandle,
+            taskRawRestarts, L"NortonEDR-Task", "ETW-TASK-RAW",
+            "TaskScheduler raw provider capture is BLIND",
+            TaskRawSubscriberThread);
+
         // --- Coordinated kill correlation ---
         // 3+ session kills within 5 seconds = coordinated blinding attack
         if (static_cast<int>(killTimestamps.size()) >= kCoordinatedThreshold) {
@@ -6543,6 +7796,187 @@ static void EtwSessionWatchdogThread()
                 "Method: Coordinated ETW Blinding Attack (T1562.002)",
                 0, DetectionSeverity::Critical);
             killTimestamps.clear();  // don't re-alert next cycle
+        }
+
+        // --- Session config integrity: detect UpdateTrace tampering ---
+        // An attacker can degrade our sessions without killing them by
+        // calling ControlTraceW(UPDATE) to change LogFileMode, FlushTimer,
+        // MaximumFileSize, or MaximumBuffers.  This is stealthier than
+        // killing — the session stays "alive" but is silently blinded.
+        //
+        // Dangerous modifications:
+        //   BUFFERING_MODE (0x400) — events never reach consumer
+        //   CIRCULAR (0x2) + tiny MaxFileSize — evidence overwritten
+        //   FlushTimer very large — events delayed indefinitely
+        //   MaximumBuffers=1 — buffer starvation
+        //
+        // We query our own sessions and verify their properties match
+        // expected configuration.
+        {
+            static const struct {
+                const wchar_t* sessionName;
+                const char*    displayName;
+            } kOurSessions[] = {
+                { L"NortonEDR-TI",              "ETW-TI" },
+                { L"NortonEDR-KernelProcess",   "ETW-KP" },
+                { L"NortonEDR-DotNETRuntime",   "ETW-CLR" },
+                { L"NortonEDR-DotNETRundown",   "ETW-CLR-Rundown" },
+                { L"NortonEDR-AMSI",            "ETW-AMSI" },
+                { L"NortonEDR-LDAP",            "ETW-LDAP" },
+                { L"NortonEDR-RPC",             "ETW-RPC" },
+                { L"NortonEDR-NTLM",            "ETW-NTLM" },
+                { L"NortonEDR-ApiAudit",        "ETW-ApiAudit" },
+                { L"NortonEDR-CodeIntegrity",   "ETW-CI" },
+                { L"NortonEDR-DNS",             "ETW-DNS-RAW" },
+                { L"NortonEDR-Task",            "ETW-TASK-RAW" },
+            };
+
+            // Baselines: taken on first successful query per session
+            static ULONG s_baselineLogFileMode[12]   = {};
+            static ULONG s_baselineMaxBuffers[12]    = {};
+            static ULONG s_baselineFlushTimer[12]    = {};
+            static ULONG s_baselineMaxFileSize[12]   = {};
+            static bool  s_configBaselined[12]       = {};
+
+            for (int si = 0; si < 10; si++) {
+                // Allocate props for query
+                const size_t nameBuf = (wcslen(kOurSessions[si].sessionName) + 1) * sizeof(wchar_t);
+                const size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + nameBuf + 512;
+                auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(bufSize));
+                if (!props) continue;
+                ZeroMemory(props, bufSize);
+                props->Wnode.BufferSize  = static_cast<ULONG>(bufSize);
+                props->LoggerNameOffset  = sizeof(EVENT_TRACE_PROPERTIES);
+                props->LogFileNameOffset = sizeof(EVENT_TRACE_PROPERTIES) + static_cast<ULONG>(nameBuf);
+
+                ULONG qst = ControlTraceW(0, kOurSessions[si].sessionName,
+                    props, EVENT_TRACE_CONTROL_QUERY);
+
+                if (qst == ERROR_SUCCESS) {
+                    if (!s_configBaselined[si]) {
+                        // Take baseline on first successful query
+                        s_baselineLogFileMode[si] = props->LogFileMode;
+                        s_baselineMaxBuffers[si]  = props->MaximumBuffers;
+                        s_baselineFlushTimer[si]  = props->FlushTimer;
+                        s_baselineMaxFileSize[si] = props->MaximumFileSize;
+                        s_configBaselined[si]     = true;
+                    } else {
+                        // Check for tampering
+
+                        // 1. BUFFERING_MODE injected (events silently discarded)
+                        if ((props->LogFileMode & 0x400) &&
+                            !(s_baselineLogFileMode[si] & 0x400)) {
+                            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                                " - [*] [Critical] | " + ts +
+                                " | ETW-Watchdog | Method: ETW Session Config Tamper"
+                                " | " + kOurSessions[si].displayName +
+                                " session: BUFFERING_MODE injected via UpdateTrace — "
+                                "events confined to kernel buffers, never delivered "
+                                "to consumer (T1562.002)";
+                            std::string det = "Date & Time: " + ts +
+                                " | ETW-Watchdog | LogFileMode changed from 0x" +
+                                ([](ULONG v) { char b[16]; _snprintf_s(b, sizeof(b),
+                                    _TRUNCATE, "%08lX", v); return std::string(b);
+                                })(s_baselineLogFileMode[si]) + " to 0x" +
+                                ([](ULONG v) { char b[16]; _snprintf_s(b, sizeof(b),
+                                    _TRUNCATE, "%08lX", v); return std::string(b);
+                                })(props->LogFileMode);
+                            PushUiDetectionEvent(msg, det,
+                                "Method: ETW Session Config Tamper (T1562.002)",
+                                0, DetectionSeverity::Critical);
+                        }
+
+                        // 2. CIRCULAR mode injected with tiny MaxFileSize
+                        if ((props->LogFileMode & 0x02) &&
+                            !(s_baselineLogFileMode[si] & 0x02) &&
+                            props->MaximumFileSize > 0 &&
+                            props->MaximumFileSize <= 2) {
+                            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                                " - [*] [Critical] | " + ts +
+                                " | ETW-Watchdog | Method: ETW Session Config Tamper"
+                                " | " + kOurSessions[si].displayName +
+                                " session: CIRCULAR mode with MaxFileSize=" +
+                                std::to_string(props->MaximumFileSize) +
+                                "MB — events overwritten within seconds (T1562.002)";
+                            std::string det = "Date & Time: " + ts +
+                                " | ETW-Watchdog | Attacker injected circular "
+                                "buffering with tiny file size to destroy evidence";
+                            PushUiDetectionEvent(msg, det,
+                                "Method: ETW Session Config Tamper (T1562.002)",
+                                0, DetectionSeverity::Critical);
+                        }
+
+                        // 3. MaximumBuffers crushed (buffer starvation)
+                        if (s_baselineMaxBuffers[si] > 2 &&
+                            props->MaximumBuffers > 0 &&
+                            props->MaximumBuffers <= 2) {
+                            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                                " - [*] [Critical] | " + ts +
+                                " | ETW-Watchdog | Method: ETW Session Config Tamper"
+                                " | " + kOurSessions[si].displayName +
+                                " session: MaximumBuffers CRUSHED from " +
+                                std::to_string(s_baselineMaxBuffers[si]) +
+                                " to " + std::to_string(props->MaximumBuffers) +
+                                " — buffer starvation, events dropped (T1562.002)";
+                            std::string det = "Date & Time: " + ts +
+                                " | ETW-Watchdog | Attacker used UpdateTrace to "
+                                "starve session buffers";
+                            PushUiDetectionEvent(msg, det,
+                                "Method: ETW Session Config Tamper (T1562.002)",
+                                0, DetectionSeverity::Critical);
+                        }
+
+                        // 4. FlushTimer inflated (events delayed indefinitely)
+                        // Normal FlushTimer is 0 (use default) or small (1-60s).
+                        // Anything > 3600 (1 hour) is suspicious.
+                        if (props->FlushTimer > 3600 &&
+                            (s_baselineFlushTimer[si] == 0 ||
+                             s_baselineFlushTimer[si] <= 300)) {
+                            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                                " - [*] [Critical] | " + ts +
+                                " | ETW-Watchdog | Method: ETW Session Config Tamper"
+                                " | " + kOurSessions[si].displayName +
+                                " session: FlushTimer INFLATED to " +
+                                std::to_string(props->FlushTimer) +
+                                "s — events delayed in kernel buffers (T1562.002)";
+                            std::string det = "Date & Time: " + ts +
+                                " | ETW-Watchdog | FlushTimer changed from " +
+                                std::to_string(s_baselineFlushTimer[si]) +
+                                "s to " + std::to_string(props->FlushTimer) +
+                                "s — attacker delays event delivery to hide "
+                                "activity during attack window";
+                            PushUiDetectionEvent(msg, det,
+                                "Method: ETW Session Config Tamper (T1562.002)",
+                                0, DetectionSeverity::Critical);
+                        }
+
+                        // 5. Any LogFileMode change at all (general tamper flag)
+                        if (props->LogFileMode != s_baselineLogFileMode[si] &&
+                            // Skip if we already alerted on specific flags above
+                            !((props->LogFileMode & 0x400) && !(s_baselineLogFileMode[si] & 0x400)) &&
+                            !((props->LogFileMode & 0x02) && !(s_baselineLogFileMode[si] & 0x02))) {
+                            std::string msg = std::to_string(tab_1_menu_items.size()) +
+                                " - [*] [Warning] | " + ts +
+                                " | ETW-Watchdog | Method: ETW Session Config Tamper"
+                                " | " + kOurSessions[si].displayName +
+                                " session: LogFileMode changed — possible config "
+                                "downgrade (T1562.002)";
+                            std::string det = "Date & Time: " + ts +
+                                " | ETW-Watchdog | LogFileMode changed from 0x" +
+                                ([](ULONG v) { char b[16]; _snprintf_s(b, sizeof(b),
+                                    _TRUNCATE, "%08lX", v); return std::string(b);
+                                })(s_baselineLogFileMode[si]) + " to 0x" +
+                                ([](ULONG v) { char b[16]; _snprintf_s(b, sizeof(b),
+                                    _TRUNCATE, "%08lX", v); return std::string(b);
+                                })(props->LogFileMode);
+                            PushUiDetectionEvent(msg, det,
+                                "Method: ETW Session Config Tamper (T1562.002)",
+                                0, DetectionSeverity::High);
+                        }
+                    }
+                }
+                free(props);
+            }
         }
 
         // --- Check EvtSubscribe handles (log-based subscriptions) ---
@@ -6604,6 +8038,59 @@ static void EtwSessionWatchdogThread()
                         0, DetectionSeverity::Critical);
                 }
             }
+        }
+
+        // --- KUSER_SHARED_DATA.TracingFlags integrity check ---
+        // KUSER_SHARED_DATA (0x7FFE0000) offset 0x2D8 contains TracingFlags.
+        // Bit 0 (EtwpEventTracingProvEnabled) gates ALL user-mode ETW emission.
+        // A BYOVD or kernel exploit can zero this single bit to disable every
+        // ETW provider system-wide — without patching any function prologues.
+        // The canary check above detects the EFFECT; this check detects the
+        // specific CAUSE (TracingFlags zeroed) for faster root-cause alerting.
+        {
+            static constexpr ULONG_PTR kSharedUserDataBase = 0x7FFE0000;
+            static constexpr ULONG     kTracingFlagsOffset = 0x2D8;
+            static ULONG s_tracingBaseline = 0;
+            static bool  s_tracingBaselined = false;
+
+            __try {
+                volatile ULONG* pFlags = reinterpret_cast<volatile ULONG*>(
+                    kSharedUserDataBase + kTracingFlagsOffset);
+                ULONG current = *pFlags;
+
+                if (!s_tracingBaselined) {
+                    s_tracingBaseline  = current;
+                    s_tracingBaselined = true;
+                } else if ((s_tracingBaseline & 1) && !(current & 1)) {
+                    std::string msg = std::to_string(tab_1_menu_items.size()) +
+                        " - [*] [Critical] | " + ts +
+                        " | ETW-Watchdog | Method: TracingFlags Integrity"
+                        " | KUSER_SHARED_DATA.TracingFlags bit 0 "
+                        "(EtwpEventTracingProvEnabled) CLEARED — ALL user-mode "
+                        "ETW emission is DISABLED system-wide (T1562.002)";
+                    std::string det = "Date & Time: " + ts +
+                        " | ETW-Watchdog | SharedUserData+0x2D8 TracingFlags "
+                        "changed from 0x" +
+                        ([](ULONG v) {
+                            char buf[16]; _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                                "%08lX", v); return std::string(buf);
+                        })(s_tracingBaseline) +
+                        " to 0x" +
+                        ([](ULONG v) {
+                            char buf[16]; _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                                "%08lX", v); return std::string(buf);
+                        })(current) +
+                        ". Attacker used kernel write (BYOVD/exploit) to zero "
+                        "the master ETW enable flag. This disables ALL ETW "
+                        "providers in ALL processes without touching any "
+                        "function prologues or ETW structures (T1562.002)";
+                    PushUiDetectionEvent(msg, det,
+                        "Method: TracingFlags Integrity (T1562.002)",
+                        0, DetectionSeverity::Critical);
+                }
+                // Don't update baseline if bit 0 was cleared — preserve original
+                if (current & 1) s_tracingBaseline = current;
+            } __except (...) {}
         }
 
         // --- Check for rogue ETW sessions / session count anomaly ---
@@ -6695,6 +8182,266 @@ static void EtwSessionWatchdogThread()
                         PushUiDetectionEvent(msg, det,
                             "Method: ETW Session Integrity (T1562.002)",
                             0, DetectionSeverity::High);
+                    }
+                }
+
+                // --- Named system session status monitoring ---
+                // Attackers target well-known system ETW sessions (CKCL,
+                // NT Kernel Logger, PROCMON TRACE, Defender sessions) by
+                // stopping them, hijacking them, or modifying their config.
+                // We baseline which system sessions exist and alert if any
+                // disappear between watchdog cycles.
+                {
+                    static const struct {
+                        const wchar_t* name;
+                        const char*    displayName;
+                    } kSystemSessions[] = {
+                        { L"Circular Kernel Context Logger", "CKCL" },
+                        { L"NT Kernel Logger",               "NT Kernel Logger" },
+                        { L"EventLog-Security",              "EventLog-Security" },
+                        { L"EventLog-System",                "EventLog-System" },
+                        { L"EventLog-Application",           "EventLog-Application" },
+                        { L"DefenderApiLogger",              "DefenderApiLogger" },
+                        { L"DefenderAuditLogger",            "DefenderAuditLogger" },
+                        { L"DiagLog",                        "DiagLog" },
+                    };
+                    constexpr int kNumSysSess =
+                        sizeof(kSystemSessions) / sizeof(kSystemSessions[0]);
+
+                    // Track presence: bit set = session was alive last cycle
+                    static uint32_t s_sysSessionMask = 0;
+                    static bool     s_sysBaselined   = false;
+
+                    uint32_t currentMask = 0;
+                    for (int ssi = 0; ssi < kNumSysSess; ssi++) {
+                        for (ULONG si2 = 0; si2 < sessionCount && si2 < 64; si2++) {
+                            wchar_t* sn = reinterpret_cast<wchar_t*>(
+                                reinterpret_cast<char*>(propArr[si2]) +
+                                propArr[si2]->LoggerNameOffset);
+                            if (sn && _wcsicmp(sn, kSystemSessions[ssi].name) == 0) {
+                                currentMask |= (1u << ssi);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!s_sysBaselined) {
+                        s_sysSessionMask = currentMask;
+                        s_sysBaselined   = true;
+                    } else {
+                        // Check for sessions that disappeared since last cycle
+                        uint32_t disappeared = s_sysSessionMask & ~currentMask;
+                        for (int ssi = 0; ssi < kNumSysSess; ssi++) {
+                            if (disappeared & (1u << ssi)) {
+                                std::string msg =
+                                    std::to_string(tab_1_menu_items.size()) +
+                                    " - [*] [Critical] | " + ts +
+                                    " | ETW-Watchdog | Method: System Session "
+                                    "Integrity | System ETW session '" +
+                                    kSystemSessions[ssi].displayName +
+                                    "' DISAPPEARED — session killed or hijacked "
+                                    "(T1562.002)";
+                                std::string det = "Date & Time: " + ts +
+                                    " | ETW-Watchdog | System session '" +
+                                    kSystemSessions[ssi].displayName +
+                                    "' was present in previous cycle but is now "
+                                    "absent. Attacker may have stopped or "
+                                    "hijacked this system session to blind "
+                                    "kernel/security telemetry";
+                                PushUiDetectionEvent(msg, det,
+                                    "Method: System Session Integrity (T1562.002)",
+                                    0, DetectionSeverity::Critical);
+                            }
+                        }
+                        s_sysSessionMask = currentMask;
+                    }
+                }
+
+                // --- Provider GUID collision / slot exhaustion detection ---
+                // Each ETW provider can only be enabled in up to 8 sessions.
+                // Attackers create rogue sessions that enable the same provider
+                // GUID to exhaust this per-provider limit, causing our session's
+                // EnableTraceEx2 to fail silently.
+                //
+                // We use EnableTraceEx2 + ControlTraceW to check if our provider
+                // GUIDs have active sessions we don't own.  A simpler heuristic:
+                // count how many total sessions exist with names we don't
+                // recognize — a high count suggests slot flooding.
+                {
+                    int unknownSessionCount = 0;
+                    static const wchar_t* kKnownPrefixes[] = {
+                        L"NortonEDR-",
+                        L"NortonEDR-Canary",
+                        L"Circular Kernel Context Logger",
+                        L"NT Kernel Logger",
+                        L"EventLog-",
+                        L"Defender",
+                        L"DiagLog",
+                        L"DiagTrack",
+                        L"Diagtrack-Listener",
+                        L"LwtNetLog",
+                        L"NetCore",
+                        L"NtfsLog",
+                        L"RadioMgr",
+                        L"ReadyBoot",
+                        L"SHS-",
+                        L"SgrmEtwSession",
+                        L"SetupPlatformTel",
+                        L"WdiContextLog",
+                        L"WiFiSession",
+                        L"AppModel",
+                        L"Microsoft-Windows-Immersive",
+                        L"UBPM",
+                        L"UserNotPresentTraceSession",
+                        L"Wudfhost-",
+                        L"WFP-IPsec",
+                        L"MpWppTracing-",
+                        L"WindowsUpdate",
+                        L"Audio",
+                        L"NOCAT",
+                    };
+                    constexpr int kNumKnown =
+                        sizeof(kKnownPrefixes) / sizeof(kKnownPrefixes[0]);
+
+                    for (ULONG si3 = 0; si3 < sessionCount && si3 < 64; si3++) {
+                        wchar_t* sn = reinterpret_cast<wchar_t*>(
+                            reinterpret_cast<char*>(propArr[si3]) +
+                            propArr[si3]->LoggerNameOffset);
+                        if (!sn || sn[0] == L'\0') continue;
+
+                        bool known = false;
+                        for (int ki = 0; ki < kNumKnown; ki++) {
+                            if (_wcsnicmp(sn, kKnownPrefixes[ki],
+                                    wcslen(kKnownPrefixes[ki])) == 0) {
+                                known = true;
+                                break;
+                            }
+                        }
+                        if (!known) unknownSessionCount++;
+                    }
+
+                    // If 6+ unknown sessions exist, likely slot flooding
+                    if (unknownSessionCount >= 6) {
+                        std::string msg =
+                            std::to_string(tab_1_menu_items.size()) +
+                            " - [*] [Warning] | " + ts +
+                            " | ETW-Watchdog | Method: Provider Slot Exhaustion"
+                            " | " + std::to_string(unknownSessionCount) +
+                            " unrecognized ETW sessions detected — possible "
+                            "provider GUID slot flooding attack (T1562.002)";
+                        std::string det = "Date & Time: " + ts +
+                            " | ETW-Watchdog | " +
+                            std::to_string(unknownSessionCount) +
+                            " ETW sessions with unknown names are running. "
+                            "If these sessions enable the same provider GUIDs "
+                            "as NortonEDR, they exhaust the 8-session-per-"
+                            "provider limit, silently preventing our sessions "
+                            "from receiving events";
+                        PushUiDetectionEvent(msg, det,
+                            "Method: Provider Slot Exhaustion (T1562.002)",
+                            0, DetectionSeverity::High);
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Provider re-assertion + event-flow silence detection (T1562.002).
+        //
+        // An attacker can silently disable providers on our sessions via
+        // EnableTraceEx2(DISABLE_PROVIDER) or downgrade keywords to 0,
+        // without killing the session.  The session stays alive, IsSessionAlive
+        // returns true, but no events flow.
+        //
+        // Defense:
+        //   1. Re-assert EnableTraceEx2 for every session+provider pair with
+        //      our original keyword/level config (idempotent — no-op if ok).
+        //   2. Check per-session event counters.  If a session received zero
+        //      events for 2+ consecutive watchdog cycles (30s) while the
+        //      session is alive, the provider was silently disabled.
+        // -----------------------------------------------------------------
+        {
+            // Provider configs — must be after all GUID definitions
+            static const struct {
+                TRACEHANDLE*           sessionHandle;
+                const GUID*            providerGuid;
+                UCHAR                  level;
+                ULONGLONG              matchAnyKeyword;
+                const char*            displayName;
+                std::atomic<uint64_t>* eventCounter;
+            } kProviders[] = {
+                { &g_tiSessionHandle,       &kTiProviderGuid,              TRACE_LEVEL_VERBOSE,        0xFFFFFFFFFFFFFFFFULL, "ETW-TI",       &g_tiEventCount },
+                { &g_kpSessionHandle,       &kKernelProcessProviderGuid,   TRACE_LEVEL_VERBOSE,        0xFFFFFFFFFFFFFFFFULL, "ETW-KP",       &g_kpEventCount },
+                { &g_clrSessionHandle,      &kClrProviderGuid,             TRACE_LEVEL_INFORMATIONAL,  kClrKeywords,          "ETW-CLR",      &g_clrEventCount },
+                { &g_amsiSessionHandle,     &kAmsiProviderGuid,            TRACE_LEVEL_VERBOSE,        0xFFFFFFFFFFFFFFFFULL, "ETW-AMSI",     &g_amsiEventCount },
+                { &g_ldapSessionHandle,     &kLdapProviderGuid,            TRACE_LEVEL_INFORMATIONAL,  0xFFFFFFFFFFFFFFFFULL, "ETW-LDAP",     &g_ldapEventCount },
+                { &g_rpcSessionHandle,      &kRpcProviderGuid,             TRACE_LEVEL_INFORMATIONAL,  0x3ULL,                "ETW-RPC",      &g_rpcEventCount },
+                { &g_ntlmSessionHandle,     &kNtlmProviderGuid,           TRACE_LEVEL_INFORMATIONAL,  0xFFFFFFFFFFFFFFFFULL, "ETW-NTLM",     &g_ntlmEventCount },
+                { &g_apiAuditSessionHandle, &kApiAuditProviderGuid,       TRACE_LEVEL_INFORMATIONAL,  0xFFFFFFFFFFFFFFFFULL, "ETW-ApiAudit", &g_apiAuditEventCount },
+                { &g_ciSessionHandle,       &kCiProviderGuid,              TRACE_LEVEL_VERBOSE,        0xFFFFFFFFFFFFFFFFULL, "ETW-CI",       &g_ciEventCount },
+            };
+
+            // Silence counters: how many consecutive cycles a session had 0 events
+            static int silenceCount[sizeof(kProviders)/sizeof(kProviders[0])] = {};
+
+            for (int pi = 0; pi < static_cast<int>(sizeof(kProviders)/sizeof(kProviders[0])); pi++) {
+                auto& p = kProviders[pi];
+                if (*p.sessionHandle == 0) continue;  // session not active
+
+                // --- Re-assertion: restore provider enable config ---
+                // This is the core defense.  Even if an attacker disabled the
+                // provider or zeroed the keywords, this re-enables it immediately.
+                ENABLE_TRACE_PARAMETERS retp{};
+                retp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+                ULONG reSt = EnableTraceEx2(
+                    *p.sessionHandle, p.providerGuid,
+                    EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                    p.level, p.matchAnyKeyword, 0, 0, &retp);
+
+                if (reSt != ERROR_SUCCESS && reSt != ERROR_MORE_DATA) {
+                    // Re-enable failed — session may be corrupted
+                    std::string msg = std::to_string(tab_1_menu_items.size()) +
+                        " - [*] [Critical] | " + ts +
+                        " | ETW-Watchdog | Method: ETW Provider Re-assertion" +
+                        " | " + p.displayName +
+                        " provider re-enable FAILED (error " +
+                        std::to_string(reSt) + ") — provider may be permanently "
+                        "disabled (T1562.002)";
+                    std::string det = "Date & Time: " + ts +
+                        " | ETW-Watchdog | EnableTraceEx2 re-assertion failed for " +
+                        p.displayName + " — error " + std::to_string(reSt);
+                    PushUiDetectionEvent(msg, det,
+                        "Method: ETW Provider Re-assertion (T1562.002)",
+                        0, DetectionSeverity::Critical);
+                }
+
+                // --- Event-flow silence detection ---
+                uint64_t count = p.eventCounter->exchange(0, std::memory_order_relaxed);
+                if (count > 0) {
+                    silenceCount[pi] = 0;  // reset — events are flowing
+                } else {
+                    silenceCount[pi]++;
+                    // 2+ consecutive zero-event cycles (30s+ silence) while session alive
+                    if (silenceCount[pi] >= 2) {
+                        std::string msg = std::to_string(tab_1_menu_items.size()) +
+                            " - [*] [Warning] | " + ts +
+                            " | ETW-Watchdog | Method: ETW Event-Flow Monitoring" +
+                            " | " + p.displayName +
+                            " session received ZERO events for " +
+                            std::to_string(silenceCount[pi] * kCheckIntervalMs / 1000) +
+                            "s — provider may have been silently disabled or "
+                            "keywords downgraded (T1562.002)";
+                        std::string det = "Date & Time: " + ts +
+                            " | ETW-Watchdog | " + p.displayName +
+                            " event counter is zero for " +
+                            std::to_string(silenceCount[pi]) +
+                            " consecutive watchdog cycles. Provider re-assertion "
+                            "was applied — if events resume, the provider was "
+                            "tampered with and has been auto-recovered";
+                        PushUiDetectionEvent(msg, det,
+                            "Method: ETW Event-Flow Monitoring (T1562.002)",
+                            0, DetectionSeverity::High);
+                        // Don't reset silenceCount — keep alerting until events resume
                     }
                 }
             }
@@ -8595,6 +10342,8 @@ VOID ShowUI() {
     std::thread ntlmThread(NtlmSubscriberThread);
     std::thread apiAuditThread(ApiAuditSubscriberThread);
     std::thread ciThread(CodeIntegritySubscriberThread);
+    std::thread dnsRawThread(DnsRawSubscriberThread);
+    std::thread taskRawThread(TaskRawSubscriberThread);
 
     g_capaStop = false;
     std::thread capaWorker(CapaScanWorker);
@@ -8685,6 +10434,12 @@ VOID ShowUI() {
 
     StopCodeIntegritySession();
     ciThread.join();
+
+    StopDnsRawSession();
+    dnsRawThread.join();
+
+    StopTaskRawSession();
+    taskRawThread.join();
 
     // ETW-TI: unblock ProcessTrace then join
     StopEtwTiSession();

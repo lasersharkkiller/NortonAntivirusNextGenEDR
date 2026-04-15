@@ -4,11 +4,19 @@
 #include <ole2.h>       // OLE2 functions
 #include <winternl.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <winreg.h>
 // wincrypt.h types used in CRYPT32 hooks — defined as opaque pointers to avoid
 // WIN32_LEAN_AND_MEAN / include-order conflicts with the full wincrypt.h header.
 typedef void*       HCERTSTORE_OPAQUE;
 typedef const void* PCCERT_CONTEXT_OPAQUE;
+// evntprov.h REGHANDLE — avoid full header pull-in under WIN32_LEAN_AND_MEAN
+#ifndef _EVNTPROV_H_
+typedef ULONGLONG REGHANDLE;
+#endif
+// evntprov.h EVENT_DESCRIPTOR fwd — we only need the pointer type
+struct _EVENT_DESCRIPTOR_FWD;
+struct _EVENT_DATA_DESCRIPTOR_FWD;
 #include <cstdio>
 #include <cstring>
 
@@ -137,7 +145,16 @@ enum HookIdx : int {
     IDX_COCREATEINSTANCE               = 65, // ole32.dll — COM object creation (script engines)
     IDX_COCREATEINSTANCEEX             = 66, // ole32.dll — DCOM remote COM instantiation
     IDX_CLSIDFROMPROGID                = 67, // ole32.dll — ProgID → CLSID resolution
-    HOOK_COUNT                  = 68
+    // --- ETW filter descriptor attack detection ---
+    IDX_ENABLETRACEEX2                 = 68, // advapi32/sechost — filter descriptor injection
+    // --- REGHANDLE nulling detection (T1562.002) ---
+    IDX_ETWEVENTWRITE                  = 69, // ntdll — catches RegHandle==0 writes
+    // --- Session security descriptor / rogue consumer detection ---
+    IDX_EVENTACCESSCONTROL             = 70, // advapi32 — session SD rewrites
+    IDX_OPENTRACEW                     = 71, // advapi32 — rogue real-time consumer attach
+    // --- Dylan Hall user-mode _ETW_REG_ENTRY tampering detection ---
+    IDX_ETWEVENTREGISTER               = 72, // ntdll — capture REGHANDLEs for baselining
+    HOOK_COUNT                  = 73
 };
 
 struct ApiHook {
@@ -272,6 +289,56 @@ static HRESULT WINAPI Hook_CoCreateInstanceEx(REFCLSID rclsid, LPUNKNOWN pUnkOut
 // ProgIDs to avoid hardcoding CLSIDs.
 typedef HRESULT (WINAPI *FnCLSIDFromProgID)(LPCOLESTR, LPCLSID);
 static HRESULT WINAPI Hook_CLSIDFromProgID(LPCOLESTR lpszProgID, LPCLSID lpclsid);
+// EnableTraceEx2 — ETW filter descriptor injection detection
+// ENABLE_TRACE_PARAMETERS contains FilterDescCount + EnableFilterDesc array.
+// Attackers attach EVENT_FILTER_TYPE_PAYLOAD / EVENT_ID / EVENT_NAME filters
+// to silently drop specific events without disabling the provider.
+typedef struct _ENABLE_TRACE_PARAMETERS_HOOK {
+    ULONG  Version;
+    ULONG  EnableProperty;
+    ULONG  ControlFlags;
+    GUID   SourceId;
+    /* PEVENT_FILTER_DESCRIPTOR */ PVOID EnableFilterDesc;
+    ULONG  FilterDescCount;
+} ENABLE_TRACE_PARAMETERS_HOOK;
+typedef ULONG (WINAPI *FnEnableTraceEx2)(
+    ULONG_PTR TraceHandle, const GUID* ProviderId, ULONG ControlCode,
+    UCHAR Level, ULONGLONG MatchAnyKeyword, ULONGLONG MatchAllKeyword,
+    ULONG Timeout, ENABLE_TRACE_PARAMETERS_HOOK* EnableParameters);
+static ULONG WINAPI Hook_EnableTraceEx2(
+    ULONG_PTR TraceHandle, const GUID* ProviderId, ULONG ControlCode,
+    UCHAR Level, ULONGLONG MatchAnyKeyword, ULONGLONG MatchAllKeyword,
+    ULONG Timeout, ENABLE_TRACE_PARAMETERS_HOOK* EnableParameters);
+
+// REGHANDLE-nulling detection — fires if EventWrite is called with handle=0
+typedef ULONG (NTAPI *FnEtwEventWrite)(
+    REGHANDLE RegHandle, PVOID EventDescriptor,
+    ULONG UserDataCount, PVOID UserData);
+static ULONG NTAPI Hook_EtwEventWrite(
+    REGHANDLE RegHandle, PVOID EventDescriptor,
+    ULONG UserDataCount, PVOID UserData);
+
+// Session security descriptor rewrite — EventAccessControl tweaks SD on a
+// provider GUID, granting non-admin callers session-modification rights.
+typedef ULONG (WINAPI *FnEventAccessControl)(
+    LPGUID Guid, ULONG Operation, PSID Sid, ULONG Rights, BOOLEAN AllowOrDeny);
+static ULONG WINAPI Hook_EventAccessControl(
+    LPGUID Guid, ULONG Operation, PSID Sid, ULONG Rights, BOOLEAN AllowOrDeny);
+
+// Rogue real-time consumer — OpenTraceW with EVENT_TRACE_REAL_TIME_MODE
+// attaches a consumer to a live session, intercepting events before any
+// file write.  Trusted consumers are few (EventViewer, logman, Sysmon, us).
+typedef ULONG_PTR (WINAPI *FnOpenTraceW)(PVOID Logfile);
+static ULONG_PTR WINAPI Hook_OpenTraceW(PVOID Logfile);
+
+// Dylan Hall "Universally Evading Sysmon and ETW" — capture REGHANDLEs
+// so we can baseline and diff user-mode _ETW_REG_ENTRY structs each tick.
+typedef ULONG (NTAPI *FnEtwEventRegister)(
+    LPCGUID ProviderId, PVOID EnableCallback, PVOID CallbackContext,
+    REGHANDLE* RegHandle);
+static ULONG NTAPI Hook_EtwEventRegister(
+    LPCGUID ProviderId, PVOID EnableCallback, PVOID CallbackContext,
+    REGHANDLE* RegHandle);
 
 static ApiHook g_hooks[HOOK_COUNT] = {
     { "kernel32.dll", "VirtualAlloc",         (FARPROC)Hook_VirtualAlloc,        nullptr, nullptr, {}, nullptr, false },
@@ -349,6 +416,17 @@ static ApiHook g_hooks[HOOK_COUNT] = {
     { "ole32.dll",    "CoCreateInstance",               (FARPROC)Hook_CoCreateInstance,              nullptr, nullptr, {}, nullptr, false },
     { "ole32.dll",    "CoCreateInstanceEx",             (FARPROC)Hook_CoCreateInstanceEx,            nullptr, nullptr, {}, nullptr, false },
     { "ole32.dll",    "CLSIDFromProgID",                (FARPROC)Hook_CLSIDFromProgID,               nullptr, nullptr, {}, nullptr, false },
+    // ETW filter descriptor attack — EnableTraceEx2 interception
+    { "advapi32.dll", "EnableTraceEx2",                  (FARPROC)Hook_EnableTraceEx2,                nullptr, nullptr, {}, nullptr, false },
+    // REGHANDLE nulling — EtwEventWrite called with handle=0 means caller's
+    // REGHANDLE variable was zeroed, silently dropping events (T1562.002)
+    { "ntdll.dll",    "EtwEventWrite",                   (FARPROC)Hook_EtwEventWrite,                 nullptr, nullptr, {}, nullptr, false },
+    // Session security descriptor rewrite detection
+    { "advapi32.dll", "EventAccessControl",              (FARPROC)Hook_EventAccessControl,            nullptr, nullptr, {}, nullptr, false },
+    // Rogue real-time consumer attach detection
+    { "advapi32.dll", "OpenTraceW",                      (FARPROC)Hook_OpenTraceW,                    nullptr, nullptr, {}, nullptr, false },
+    // Dylan Hall user-mode _ETW_REG_ENTRY tampering — capture REGHANDLEs
+    { "ntdll.dll",    "EtwEventRegister",                (FARPROC)Hook_EtwEventRegister,              nullptr, nullptr, {}, nullptr, false },
 };
 
 // Returns the correct call-through address.
@@ -616,7 +694,7 @@ struct CriticalFuncGuard {
     const char* modName;
     const char* funcName;
     BYTE* addr;            // resolved address
-    BYTE  baseline[16];    // original prologue bytes
+    BYTE  baseline[64];    // 64 bytes catches deep trampoline splices past typical prologues
     bool  valid;           // baseline captured
 };
 
@@ -643,6 +721,11 @@ static CriticalFuncGuard g_etwGuards[] = {
     { "ntdll.dll",    "EtwEventUnregister", nullptr, {}, false },
     { "ntdll.dll",    "EtwEventWriteTransfer", nullptr, {}, false },
     { "ntdll.dll",    "EtwEventWriteNoRegistration", nullptr, {}, false },
+    // ETW provider/session property manipulation APIs — attackers call these to
+    // silently alter provider traits or session config from within the process.
+    { "ntdll.dll",    "EventSetInformation",      nullptr, {}, false },
+    { "advapi32.dll", "TraceSetInformation",      nullptr, {}, false },
+    { "sechost.dll",  "TraceSetInformation",      nullptr, {}, false },
     // ETW controller APIs — patching these prevents session management.
     // advapi32.dll exports (forwarded to sechost.dll on Win10 1709+)
     { "advapi32.dll", "StartTraceW",           nullptr, {}, false },
@@ -682,7 +765,7 @@ static void InitCriticalFuncGuards() {
 
         g_etwGuards[i].addr = fn;
         __try {
-            memcpy(g_etwGuards[i].baseline, fn, 16);
+            memcpy(g_etwGuards[i].baseline, fn, 64);
             g_etwGuards[i].valid = true;
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
@@ -701,23 +784,75 @@ static void VerifyCriticalFuncIntegrity() {
             if (!fn) continue;
             g.addr = fn;
             __try {
-                memcpy(g.baseline, fn, 16);
+                memcpy(g.baseline, fn, 64);
                 g.valid = true;
             } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
         }
 
+        // --- PAGE_NOACCESS / PAGE_GUARD detection ---
+        // An attacker can change the page protection of a critical function
+        // to PAGE_NOACCESS or add PAGE_GUARD, then register a VEH to
+        // intercept the resulting exception and return a fake success value.
+        // The function prologue is never modified, so byte-level checks pass.
+        // Detection: VirtualQuery the function address and verify the page
+        // has execute permission and no PAGE_GUARD flag.
+        {
+            MEMORY_BASIC_INFORMATION mbi = {};
+            if (VirtualQuery(g.addr, &mbi, sizeof(mbi)) >= sizeof(mbi)) {
+                DWORD prot = mbi.Protect;
+                bool noExec = (prot == PAGE_NOACCESS ||
+                               prot == PAGE_READONLY ||
+                               prot == PAGE_READWRITE ||
+                               prot == PAGE_WRITECOPY);
+                bool hasGuard = (prot & PAGE_GUARD) != 0;
+
+                if (noExec || hasGuard) {
+                    char det[300];
+                    _snprintf_s(det, sizeof(det), _TRUNCATE,
+                        "%s!%s page protection TAMPERED: 0x%lX (%s%s) — "
+                        "function page is %s, exception-based hooking "
+                        "suspected (VEH/SEH intercepts access violation) "
+                        "(T1562.002)",
+                        g.modName, g.funcName, prot,
+                        noExec ? "NO_EXECUTE" : "",
+                        hasGuard ? "PAGE_GUARD" : "",
+                        noExec ? "non-executable" : "guard-flagged");
+                    SendHookEvent("Critical", "PageProtectionTamper", 0, det);
+
+                    // Restore execute permission
+                    DWORD old = 0;
+                    if (g_vpOriginal)
+                        g_vpOriginal(g.addr, 64, PAGE_EXECUTE_READ, &old);
+                }
+            }
+        }
+
         bool tampered = false;
-        BYTE current[16] = {};
+        BYTE current[64] = {};
         __try {
-            memcpy(current, g.addr, 16);
-            tampered = (memcmp(current, g.baseline, 16) != 0);
-        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+            memcpy(current, g.addr, 64);
+            tampered = (memcmp(current, g.baseline, 64) != 0);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // If we can't read the prologue, the page may have been made
+            // inaccessible — this is itself evidence of tampering
+            char det[256];
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "%s!%s prologue UNREADABLE — page access violation during "
+                "integrity check, likely PAGE_NOACCESS/PAGE_GUARD attack "
+                "(T1562.002)",
+                g.modName, g.funcName);
+            SendHookEvent("Critical", "PageProtectionTamper", 0, det);
+            continue;
+        }
 
         if (!tampered) continue;
 
         // Identify the specific patch pattern for better alerting
         const char* pattern = "unknown modification";
-        if (current[0] == 0xC3)
+        if (current[0] == 0xCC)
+            pattern = "INT3 (0xCC) — software breakpoint hook (VEH/SEH-based "
+                "function hijacking without trampoline)";
+        else if (current[0] == 0xC3)
             pattern = "ret (0xC3) — XPN ETW/AMSI blind technique";
         else if (current[0] == 0xB8 && current[5] == 0xC3)
             pattern = "mov eax,imm + ret — forced clean return";
@@ -725,6 +860,27 @@ static void VerifyCriticalFuncIntegrity() {
             pattern = "xor eax,eax + ret — forced S_OK return";
         else if (current[0] == 0x48 && current[1] == 0x31 && current[2] == 0xC0 && current[3] == 0xC3)
             pattern = "xor rax,rax + ret — forced zero return (x64)";
+        else if (current[0] == 0xE9)
+            pattern = "JMP rel32 (0xE9) — near jump trampoline hook";
+        else if (current[0] == 0xFF && current[1] == 0x25)
+            pattern = "JMP [rip+disp32] (FF 25) — indirect jump hook";
+        else if (current[0] == 0x48 && current[1] == 0xB8 &&
+                 current[10] == 0xFF && current[11] == 0xE0)
+            pattern = "MOV rax,imm64 + JMP rax — 64-bit trampoline hook";
+        else if (current[0] == 0x68 && current[5] == 0xC3)
+            pattern = "PUSH imm32 + RET — push/ret trampoline hook";
+        else {
+            // Scan for INT3 at non-zero offsets (instruction boundary hooks).
+            // With 64-byte baselines, we catch splices/trampolines placed deep
+            // past the prologue that 16/32-byte checks would miss entirely.
+            for (int b = 1; b < 64; b++) {
+                if (current[b] == 0xCC && g.baseline[b] != 0xCC) {
+                    pattern = "INT3 at non-zero offset — mid-function software "
+                        "breakpoint hook (targets instruction boundary)";
+                    break;
+                }
+            }
+        }
 
         char det[256];
         _snprintf_s(det, sizeof(det), _TRUNCATE,
@@ -735,14 +891,178 @@ static void VerifyCriticalFuncIntegrity() {
             current[0], current[1], current[2], current[3]);
         SendHookEvent("Critical", "EtwAmsiIntegrity", 0, det);
 
-        // Restore the original prologue to re-enable ETW/AMSI
+        // Restore the original prologue (64 bytes) to re-enable ETW/AMSI
         DWORD old = 0;
         if (g_vpOriginal &&
-            g_vpOriginal(g.addr, 16, PAGE_EXECUTE_READWRITE, &old)) {
-            memcpy(g.addr, g.baseline, 16);
-            g_vpOriginal(g.addr, 16, old, &old);
+            g_vpOriginal(g.addr, 64, PAGE_EXECUTE_READWRITE, &old)) {
+            memcpy(g.addr, g.baseline, 64);
+            g_vpOriginal(g.addr, 64, old, &old);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// TLS callback integrity — malware can overwrite a loaded DLL's
+// IMAGE_TLS_DIRECTORY.AddressOfCallBacks array (or add a new callback via
+// AddrOfCallBacks pointer redirection) so their code runs on every thread
+// creation/exit.  This is a classic persistence + ETW-bypass vector because
+// TLS callbacks execute before DllMain on every thread attach.
+//
+// Coverage: baseline the list of TLS callback addresses for critical modules
+// at init; on each watchdog tick, re-walk and diff.  Any addition/change
+// outside of baseline is reported.
+// ---------------------------------------------------------------------------
+struct TlsGuard {
+    const char* modName;
+    HMODULE     hMod;
+    PVOID*      cbArray;         // address of AddressOfCallBacks array
+    PVOID       baselineCbs[16]; // captured callback pointers
+    ULONG       baselineCount;
+    bool        valid;
+};
+
+static TlsGuard g_tlsGuards[] = {
+    { "ntdll.dll",   nullptr, nullptr, {}, 0, false },
+    { "kernel32.dll",nullptr, nullptr, {}, 0, false },
+    { "kernelbase.dll", nullptr, nullptr, {}, 0, false },
+    { "advapi32.dll",nullptr, nullptr, {}, 0, false },
+    { "sechost.dll", nullptr, nullptr, {}, 0, false },
+    { "amsi.dll",    nullptr, nullptr, {}, 0, false },
+    { "NortonEDR_HookDll.dll", nullptr, nullptr, {}, 0, false },
+    { nullptr, nullptr, nullptr, {}, 0, false }
+};
+
+static PVOID* ResolveTlsCallbackArray(HMODULE hMod) {
+    if (!hMod) return nullptr;
+    BYTE* base = (BYTE*)hMod;
+    __try {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+        IMAGE_DATA_DIRECTORY& tlsDir =
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+        if (tlsDir.VirtualAddress == 0 || tlsDir.Size == 0) return nullptr;
+        PIMAGE_TLS_DIRECTORY tls =
+            (PIMAGE_TLS_DIRECTORY)(base + tlsDir.VirtualAddress);
+        // AddressOfCallBacks is a VA (not RVA); returns pointer to a
+        // null-terminated array of PIMAGE_TLS_CALLBACK.
+        return (PVOID*)tls->AddressOfCallBacks;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+static ULONG CaptureTlsCallbacks(PVOID* arr, PVOID out[16]) {
+    if (!arr) return 0;
+    ULONG n = 0;
+    __try {
+        while (n < 16 && arr[n] != nullptr) {
+            out[n] = arr[n];
+            n++;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return n;
+}
+
+static void InitTlsGuards() {
+    for (int i = 0; g_tlsGuards[i].modName; i++) {
+        HMODULE hMod = GetModuleHandleA(g_tlsGuards[i].modName);
+        if (!hMod) continue;
+        PVOID* arr = ResolveTlsCallbackArray(hMod);
+        if (!arr) continue;
+        g_tlsGuards[i].hMod = hMod;
+        g_tlsGuards[i].cbArray = arr;
+        g_tlsGuards[i].baselineCount =
+            CaptureTlsCallbacks(arr, g_tlsGuards[i].baselineCbs);
+        g_tlsGuards[i].valid = true;
+    }
+}
+
+static void CheckTlsCallbacks() {
+    for (int i = 0; g_tlsGuards[i].modName; i++) {
+        TlsGuard& g = g_tlsGuards[i];
+        // Late-bind if the module wasn't loaded at init
+        if (!g.valid) {
+            HMODULE hMod = GetModuleHandleA(g.modName);
+            if (!hMod) continue;
+            PVOID* arr = ResolveTlsCallbackArray(hMod);
+            if (!arr) continue;
+            g.hMod = hMod;
+            g.cbArray = arr;
+            g.baselineCount = CaptureTlsCallbacks(arr, g.baselineCbs);
+            g.valid = true;
+            continue;
+        }
+        if (!g.cbArray) continue;
+
+        PVOID current[16] = {};
+        ULONG curN = CaptureTlsCallbacks(g.cbArray, current);
+
+        if (curN != g.baselineCount) {
+            char det[300];
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "%s TLS callback count changed: %lu -> %lu — malware may have "
+                "appended a TLS callback to gain per-thread execution "
+                "(T1546.015)", g.modName, g.baselineCount, curN);
+            SendHookEvent("Critical", "TlsCallbackTamper", 0, det);
+            continue;
+        }
+        for (ULONG k = 0; k < curN; k++) {
+            if (current[k] != g.baselineCbs[k]) {
+                char det[300];
+                _snprintf_s(det, sizeof(det), _TRUNCATE,
+                    "%s TLS callback[%lu] pointer changed: %p -> %p — "
+                    "callback redirection, possible hook/persistence "
+                    "(T1546.015)",
+                    g.modName, k, g.baselineCbs[k], current[k]);
+                SendHookEvent("Critical", "TlsCallbackTamper", 0, det);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// First-in-line Vectored Exception Handler — catches exception-based hooks
+// (INT3 0xCC, PAGE_GUARD, PAGE_NOACCESS, hardware breakpoints DR0-DR3) that
+// fire on critical-module addresses.  AddVectoredExceptionHandler is already
+// hooked for post-load registrations; this handler covers the *runtime fire*
+// signal even for pre-existing malware VEHs that registered before our DLL
+// loaded.  We register with FirstHandler=1 so we see the exception first.
+// ---------------------------------------------------------------------------
+static PVOID g_firstVeh = nullptr;
+
+static LONG CALLBACK FirstVectoredHandler(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    PVOID addr = ep->ExceptionRecord->ExceptionAddress;
+
+    // Only surface exceptions commonly used for hooking and only when they
+    // fire inside a known critical module — reduces false positives from
+    // normal app exception flow (STATUS_ACCESS_VIOLATION in game code etc.).
+    bool hookLike =
+        (code == EXCEPTION_BREAKPOINT)      ||  // INT3 (0xCC) hook
+        (code == EXCEPTION_SINGLE_STEP)     ||  // DR0-DR3 hardware bp fire
+        (code == STATUS_GUARD_PAGE_VIOLATION) ||
+        (code == EXCEPTION_ACCESS_VIOLATION);
+
+    if (!hookLike) return EXCEPTION_CONTINUE_SEARCH;
+    if (!IsAddressInKnownModule(addr)) return EXCEPTION_CONTINUE_SEARCH;
+
+    char det[300];
+    _snprintf_s(det, sizeof(det), _TRUNCATE,
+        "Exception-based hook fire: code=0x%08lX at %p (critical module) — "
+        "INT3/GUARD/DR fire inside EDR-monitored code, an attacker VEH likely "
+        "handles this to emulate the function (T1562.002)",
+        code, addr);
+    SendHookEvent("Critical", "VehHookFire", 0, det);
+
+    // Pass through — any legitimate handler (including debuggers) still runs.
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void InstallFirstVeh() {
+    if (g_firstVeh) return;
+    g_firstVeh = AddVectoredExceptionHandler(1 /* FirstHandler */,
+        FirstVectoredHandler);
 }
 
 // Check for amsi.dll loads that happened after our initial scan
@@ -755,7 +1075,7 @@ static void RefreshAmsiGuards() {
         if (!fn) continue;
         g_etwGuards[i].addr = fn;
         __try {
-            memcpy(g_etwGuards[i].baseline, fn, 16);
+            memcpy(g_etwGuards[i].baseline, fn, 64);
             g_etwGuards[i].valid = true;
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
@@ -770,20 +1090,25 @@ static void RefreshAmsiGuards() {
 // This hooks functions WITHOUT modifying code bytes, bypassing prologue
 // integrity checks.
 //
-// Detection: GetThreadContext on the current thread and check if any DR0-DR3
-// registers point into security-critical DLLs (ntdll, amsi, sspicli, etc.).
+// Detection: enumerate ALL threads in the current process via
+// CreateToolhelp32Snapshot and check each thread's DR0-DR3 registers against
+// security-critical module address ranges.  Previous versions only checked
+// the current thread — attackers set breakpoints from a DIFFERENT thread to
+// evade single-thread detection.
+//
 // Legitimate software almost never sets hardware breakpoints; only debuggers
 // and offensive tools (TamperingSyscalls, HWSyscalls, AMSI-bypass-via-hwbp).
 // ---------------------------------------------------------------------------
 
-static void CheckHardwareBreakpoints()
+static void CheckHardwareBreakpointsOnThread(HANDLE hThread, DWORD tid,
+    const char* critModNames[], ULONG_PTR critModBases[],
+    ULONG_PTR critModEnds[], int numMods)
 {
     CONTEXT ctx = {};
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext(GetCurrentThread(), &ctx)) return;
+    if (!GetThreadContext(hThread, &ctx)) return;
 
     // DR7 bit layout: bits 0,2,4,6 = local enable for DR0-DR3
-    // If no breakpoints are enabled, skip.
     if ((ctx.Dr7 & 0x55) == 0) return;
 
     ULONG_PTR breakpoints[4] = { ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3 };
@@ -794,39 +1119,24 @@ static void CheckHardwareBreakpoints()
         (BYTE)((ctx.Dr7 >> 6) & 1),
     };
 
-    // Critical modules where hardware breakpoints indicate hooking
-    struct { const char* mod; HMODULE hMod; } critMods[] = {
-        { "ntdll.dll",    GetModuleHandleA("ntdll.dll") },
-        { "amsi.dll",     GetModuleHandleA("amsi.dll") },
-        { "sspicli.dll",  GetModuleHandleA("sspicli.dll") },
-        { "kernelbase.dll", GetModuleHandleA("kernelbase.dll") },
-    };
-
     for (int i = 0; i < 4; i++) {
         if (!localEnable[i] || breakpoints[i] == 0) continue;
 
-        for (int m = 0; m < _countof(critMods); m++) {
-            if (!critMods[m].hMod) continue;
+        for (int m = 0; m < numMods; m++) {
+            if (critModBases[m] == 0) continue;
 
-            MODULEINFO mi = {};
-            if (!GetModuleInformation(GetCurrentProcess(), critMods[m].hMod,
-                    &mi, sizeof(mi)))
-                continue;
-
-            ULONG_PTR base = (ULONG_PTR)mi.lpBaseOfDll;
-            ULONG_PTR end  = base + mi.SizeOfImage;
-
-            if (breakpoints[i] >= base && breakpoints[i] < end) {
-                char det[256];
+            if (breakpoints[i] >= critModBases[m] &&
+                breakpoints[i] < critModEnds[m]) {
+                char det[300];
                 _snprintf_s(det, sizeof(det), _TRUNCATE,
-                    "Hardware breakpoint hooking: DR%d=0x%llX points into %s — "
-                    "VEH-based function hooking without code modification "
-                    "(AMSI/ETW/syscall bypass via hardware breakpoints)",
-                    i, (unsigned long long)breakpoints[i], critMods[m].mod);
+                    "Hardware breakpoint hooking: DR%d=0x%llX on thread %lu "
+                    "points into %s — VEH-based function hooking without "
+                    "code modification (AMSI/ETW/syscall bypass via hwbp)",
+                    i, (unsigned long long)breakpoints[i], tid,
+                    critModNames[m]);
                 SendHookEvent("Critical", "HardwareBreakpointHook", 0, det);
 
                 // Clear the breakpoint to neutralize the hook
-                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
                 switch (i) {
                     case 0: ctx.Dr0 = 0; break;
                     case 1: ctx.Dr1 = 0; break;
@@ -834,12 +1144,476 @@ static void CheckHardwareBreakpoints()
                     case 3: ctx.Dr3 = 0; break;
                 }
                 ctx.Dr7 &= ~(3ULL << (i * 2)); // clear local+global enable
-                SetThreadContext(GetCurrentThread(), &ctx);
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                SetThreadContext(hThread, &ctx);
                 break;
             }
         }
     }
 }
+
+static void CheckHardwareBreakpoints()
+{
+    // Resolve critical module address ranges once per check cycle
+    static const char* kCritModNames[] = {
+        "ntdll.dll", "amsi.dll", "sspicli.dll", "kernelbase.dll",
+        "advapi32.dll", "sechost.dll",
+    };
+    constexpr int kNumMods = _countof(kCritModNames);
+    ULONG_PTR bases[kNumMods] = {};
+    ULONG_PTR ends[kNumMods]  = {};
+
+    for (int m = 0; m < kNumMods; m++) {
+        HMODULE hMod = GetModuleHandleA(kCritModNames[m]);
+        if (!hMod) continue;
+        MODULEINFO mi = {};
+        if (GetModuleInformation(GetCurrentProcess(), hMod, &mi, sizeof(mi))) {
+            bases[m] = (ULONG_PTR)mi.lpBaseOfDll;
+            ends[m]  = bases[m] + mi.SizeOfImage;
+        }
+    }
+
+    // Enumerate ALL threads in the current process
+    DWORD pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        // Fallback: check current thread only
+        CheckHardwareBreakpointsOnThread(
+            GetCurrentThread(), GetCurrentThreadId(),
+            kCritModNames, bases, ends, kNumMods);
+        return;
+    }
+
+    THREADENTRY32 te = {};
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid) continue;
+
+            HANDLE hThread = OpenThread(
+                THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                FALSE, te.th32ThreadID);
+            if (!hThread) continue;
+
+            // Must suspend thread to safely read debug registers
+            // (skip our own thread — we can read it directly)
+            bool isSelf = (te.th32ThreadID == GetCurrentThreadId());
+            if (!isSelf) SuspendThread(hThread);
+
+            CheckHardwareBreakpointsOnThread(
+                hThread, te.th32ThreadID,
+                kCritModNames, bases, ends, kNumMods);
+
+            if (!isSelf) ResumeThread(hThread);
+            CloseHandle(hThread);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+}
+
+// ---------------------------------------------------------------------------
+// KUSER_SHARED_DATA.TracingFlags integrity check
+//
+// KUSER_SHARED_DATA is mapped read-only at 0x7FFE0000 in every user-mode
+// process.  Offset 0x2D8 contains TracingFlags — a ULONG where bit 0
+// (EtwpEventTracingProvEnabled) controls whether ANY user-mode ETW event
+// emission occurs.  EtwEventWrite checks this flag before doing anything:
+//
+//   if (!(SharedUserData->TracingFlags & 1)) return STATUS_SUCCESS;
+//
+// An attacker with kernel write access (BYOVD, vulnerable driver) can zero
+// this single bit to disable ALL user-mode ETW providers system-wide.  This
+// bypasses every prologue integrity check because the function itself
+// short-circuits before reaching any hooked code.
+//
+// Detection: baseline TracingFlags on first check, alert if zeroed.
+// We also check bit 1 (EtwpContextSwapTracingEnabled) and bit 2 (EtwpSpare).
+// ---------------------------------------------------------------------------
+
+static void CheckTracingFlags()
+{
+    // KUSER_SHARED_DATA is always at 0x7FFE0000 in user-mode
+    static constexpr ULONG_PTR kSharedUserDataBase = 0x7FFE0000;
+    static constexpr ULONG     kTracingFlagsOffset = 0x2D8;
+
+    static ULONG s_baseline      = 0;
+    static bool  s_baselineTaken = false;
+
+    __try {
+        volatile ULONG* pFlags = reinterpret_cast<volatile ULONG*>(
+            kSharedUserDataBase + kTracingFlagsOffset);
+        ULONG current = *pFlags;
+
+        if (!s_baselineTaken) {
+            s_baseline      = current;
+            s_baselineTaken = true;
+            return;
+        }
+
+        // Bit 0: EtwpEventTracingProvEnabled — if cleared, ALL ETW is dead
+        if ((s_baseline & 1) && !(current & 1)) {
+            SendHookEvent("Critical", "TracingFlagsTamper", 0,
+                "KUSER_SHARED_DATA.TracingFlags bit 0 (EtwpEventTracingProvEnabled) "
+                "CLEARED — all user-mode ETW event emission is DISABLED system-wide. "
+                "Attacker used kernel write to zero SharedUserData+0x2D8 (T1562.002)");
+        }
+
+        // Full value changed (bits 1-2 control context-switch tracing)
+        if (current != s_baseline && (current & 1)) {
+            char det[256];
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "KUSER_SHARED_DATA.TracingFlags modified: 0x%08lX -> 0x%08lX "
+                "— ETW tracing configuration altered (T1562.002)",
+                s_baseline, current);
+            SendHookEvent("Warning", "TracingFlagsTamper", 0, det);
+        }
+
+        // Update baseline only if bit 0 is still set (don't baseline a tampered state)
+        if (current & 1) s_baseline = current;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// ---------------------------------------------------------------------------
+// ntdll!EtwpEventTracingProvEnabled global integrity check
+//
+// SEPARATE from KUSER_SHARED_DATA.TracingFlags — this is a DWORD in ntdll's
+// .data section that EtwEventWrite checks FIRST before any other logic:
+//
+//   EtwEventWrite:
+//     cmp dword ptr [ntdll!EtwpEventTracingProvEnabled], 0
+//     je  early_return       ; ← if zero, skip ALL event emission
+//
+// An attacker can zero this single DWORD to disable all ETW emission from
+// the process without patching any function prologue and without touching
+// KUSER_SHARED_DATA.  Since it's a writable .data section variable, it
+// only requires PAGE_READWRITE access (already the default for .data).
+//
+// Resolution strategy: scan the first ~0x40 bytes of ntdll!EtwEventWrite
+// for a CMP/TEST instruction with a RIP-relative operand (the pattern that
+// loads EtwpEventTracingProvEnabled).  Common patterns:
+//   83 3D xx xx xx xx 00     CMP dword ptr [rip+disp32], 0
+//   39 05 xx xx xx xx        CMP [rip+disp32], eax (where eax=0 from xor)
+//   85 05 xx xx xx xx        TEST [rip+disp32], eax
+//   8B 05 xx xx xx xx        MOV eax, [rip+disp32] (followed by test eax,eax)
+// ---------------------------------------------------------------------------
+
+static volatile ULONG* s_pEtwpProvEnabled  = nullptr;
+static ULONG            s_etwpProvBaseline  = 0;
+static bool             s_etwpProvResolved  = false;
+static bool             s_etwpProvBaselined = false;
+
+static void ResolveEtwpEventTracingProvEnabled()
+{
+    if (s_etwpProvResolved) return;
+    s_etwpProvResolved = true;
+
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (!hNtdll) return;
+
+    BYTE* pEtwEventWrite = (BYTE*)GetProcAddress(hNtdll, "EtwEventWrite");
+    if (!pEtwEventWrite) return;
+
+    // Get ntdll module bounds for validation
+    MODULEINFO mi = {};
+    if (!GetModuleInformation(GetCurrentProcess(), hNtdll, &mi, sizeof(mi)))
+        return;
+    ULONG_PTR ntdllBase = (ULONG_PTR)mi.lpBaseOfDll;
+    ULONG_PTR ntdllEnd  = ntdllBase + mi.SizeOfImage;
+
+    __try {
+        // Scan the first 0x60 bytes of EtwEventWrite for RIP-relative
+        // memory operands that reference a .data section global.
+        for (int i = 0; i < 0x60 - 6; i++) {
+            ULONG_PTR candidate = 0;
+
+            // Pattern 1: 83 3D xx xx xx xx 00 — CMP [rip+disp32], 0
+            if (pEtwEventWrite[i] == 0x83 && pEtwEventWrite[i+1] == 0x3D &&
+                pEtwEventWrite[i+6] == 0x00) {
+                LONG disp = *(LONG*)(&pEtwEventWrite[i+2]);
+                candidate = (ULONG_PTR)(&pEtwEventWrite[i+7]) + disp;
+            }
+            // Pattern 2: 8B 05 xx xx xx xx — MOV eax, [rip+disp32]
+            // (typically followed by 85 C0 = TEST eax,eax or 3B C0)
+            else if (pEtwEventWrite[i] == 0x8B && pEtwEventWrite[i+1] == 0x05) {
+                LONG disp = *(LONG*)(&pEtwEventWrite[i+2]);
+                candidate = (ULONG_PTR)(&pEtwEventWrite[i+6]) + disp;
+            }
+            // Pattern 3: 39 05 xx xx xx xx — CMP [rip+disp32], reg
+            else if (pEtwEventWrite[i] == 0x39 && pEtwEventWrite[i+1] == 0x05) {
+                LONG disp = *(LONG*)(&pEtwEventWrite[i+2]);
+                candidate = (ULONG_PTR)(&pEtwEventWrite[i+6]) + disp;
+            }
+            // Pattern 4: 85 05 xx xx xx xx — TEST [rip+disp32], reg
+            else if (pEtwEventWrite[i] == 0x85 && pEtwEventWrite[i+1] == 0x05) {
+                LONG disp = *(LONG*)(&pEtwEventWrite[i+2]);
+                candidate = (ULONG_PTR)(&pEtwEventWrite[i+6]) + disp;
+            }
+            // Pattern 5: 44 8B 05 xx xx xx xx — MOV r8d, [rip+disp32]
+            // (some Windows builds use r8d instead of eax)
+            else if (pEtwEventWrite[i] == 0x44 && pEtwEventWrite[i+1] == 0x8B &&
+                     pEtwEventWrite[i+2] == 0x05) {
+                LONG disp = *(LONG*)(&pEtwEventWrite[i+3]);
+                candidate = (ULONG_PTR)(&pEtwEventWrite[i+7]) + disp;
+            }
+
+            if (candidate == 0) continue;
+
+            // Validate: must be within ntdll's image
+            if (candidate < ntdllBase || candidate >= ntdllEnd) continue;
+
+            // Validate: must be readable and contain a plausible value
+            // EtwpEventTracingProvEnabled should be nonzero (1) when ETW is active
+            ULONG val = *(volatile ULONG*)candidate;
+            if (val == 0 || val > 0xFF) continue;  // typically 1
+
+            s_pEtwpProvEnabled = (volatile ULONG*)candidate;
+            s_etwpProvBaseline = val;
+            s_etwpProvBaselined = true;
+            return;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void CheckEtwpEventTracingProvEnabled()
+{
+    if (!s_etwpProvResolved) {
+        ResolveEtwpEventTracingProvEnabled();
+        return;  // first call — just resolve, check next cycle
+    }
+
+    if (!s_etwpProvBaselined || !s_pEtwpProvEnabled) return;
+
+    __try {
+        ULONG current = *s_pEtwpProvEnabled;
+
+        if (s_etwpProvBaseline != 0 && current == 0) {
+            char det[350];
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "ntdll!EtwpEventTracingProvEnabled ZEROED at %p (was 0x%lX) — "
+                "ALL EtwEventWrite calls in this process will short-circuit "
+                "before reaching any ETW code. This is SEPARATE from "
+                "KUSER_SHARED_DATA.TracingFlags — attacker patched ntdll "
+                ".data section directly (T1562.002)",
+                (void*)s_pEtwpProvEnabled, s_etwpProvBaseline);
+            SendHookEvent("Critical", "EtwpProvEnabledZeroed", 0, det);
+
+            // Restore the original value
+            DWORD old = 0;
+            if (g_vpOriginal &&
+                g_vpOriginal((LPVOID)s_pEtwpProvEnabled, 4,
+                    PAGE_READWRITE, &old)) {
+                *s_pEtwpProvEnabled = s_etwpProvBaseline;
+                g_vpOriginal((LPVOID)s_pEtwpProvEnabled, 4, old, &old);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// ---------------------------------------------------------------------------
+// EventSetInformation / TraceSetInformation interception
+//
+// These APIs modify provider/session properties from within the process:
+//   EventSetInformation(REGHANDLE, EVENT_INFO_CLASS, data, dataSize)
+//     - EventProviderSetTraits: alters provider metadata
+//     - EventProviderUseDescriptorType: changes event encoding
+//   TraceSetInformation(TRACEHANDLE, TRACE_INFO_CLASS, data, dataSize)
+//     - TraceProviderBinaryTracking: changes provider binary path tracking
+//     - TraceSetGlobalLoggerHandle: redirects system logger
+//
+// We monitor these by hooking the ntdll-level stubs.  Since they're rarely
+// called by legitimate code, any call from non-system code is suspicious.
+// ---------------------------------------------------------------------------
+
+// EventSetInformation — ntdll export
+typedef ULONG (WINAPI *FnEventSetInformation)(
+    REGHANDLE RegHandle, ULONG EventInfoClass, PVOID EventInfo, ULONG InfoLength);
+static FnEventSetInformation g_origEventSetInformation = nullptr;
+
+static ULONG WINAPI Hook_EventSetInformation(
+    REGHANDLE RegHandle, ULONG EventInfoClass, PVOID EventInfo, ULONG InfoLength)
+{
+    // EventInfoClass values:
+    //   2 = EventProviderSetTraits        — alters provider identity
+    //   3 = EventProviderUseDescriptorType — changes event format
+    //   4 = EventProviderDecodeGuid       — redirect GUID decoding
+    char det[256];
+    _snprintf_s(det, sizeof(det), _TRUNCATE,
+        "EventSetInformation(class=%lu, len=%lu) — provider property modification "
+        "from within process (T1562.002)",
+        EventInfoClass, InfoLength);
+    SendHookEvent("Warning", "EventSetInformation", 0, det);
+
+    if (g_origEventSetInformation)
+        return g_origEventSetInformation(RegHandle, EventInfoClass, EventInfo, InfoLength);
+    return ERROR_INVALID_FUNCTION;
+}
+
+// TraceSetInformation — advapi32/sechost export
+typedef ULONG (WINAPI *FnTraceSetInformation)(
+    ULONG_PTR TraceHandle, ULONG TraceInfoClass, PVOID Info, ULONG InfoLength);
+static FnTraceSetInformation g_origTraceSetInformation = nullptr;
+
+static ULONG WINAPI Hook_TraceSetInformation(
+    ULONG_PTR TraceHandle, ULONG TraceInfoClass, PVOID Info, ULONG InfoLength)
+{
+    // TraceInfoClass values of concern:
+    //   6  = TraceProviderBinaryTracking  — alter provider binary association
+    //   11 = TraceSystemTraceEnableFlagsInfo — modify system trace flags
+    //   12 = TraceSampledProfileIntervalInfo — alter profiling
+    char det[256];
+    _snprintf_s(det, sizeof(det), _TRUNCATE,
+        "TraceSetInformation(class=%lu, handle=0x%llX, len=%lu) — "
+        "session/provider config modification from within process (T1562.002)",
+        TraceInfoClass, (unsigned long long)TraceHandle, InfoLength);
+    SendHookEvent("Warning", "TraceSetInformation", 0, det);
+
+    if (g_origTraceSetInformation)
+        return g_origTraceSetInformation(TraceHandle, TraceInfoClass, Info, InfoLength);
+    return ERROR_INVALID_FUNCTION;
+}
+
+// EventUnregister interception — detect unauthorized provider unregistration
+// that silently kills ETW event flow without patching any function.
+typedef ULONG (WINAPI *FnEventUnregister)(REGHANDLE RegHandle);
+static FnEventUnregister g_origEventUnregister = nullptr;
+
+static ULONG WINAPI Hook_EventUnregister(REGHANDLE RegHandle)
+{
+    // Any EventUnregister from non-system code is suspicious in an EDR-injected
+    // process — legitimate code unregisters at shutdown, not mid-execution.
+    char det[256];
+    _snprintf_s(det, sizeof(det), _TRUNCATE,
+        "EventUnregister(REGHANDLE=0x%llX) — provider unregistration may disable "
+        "ETW emission from this process without patching any code (T1562.002)",
+        (unsigned long long)RegHandle);
+    SendHookEvent("Warning", "EventUnregister", 0, det);
+
+    if (g_origEventUnregister)
+        return g_origEventUnregister(RegHandle);
+    return ERROR_INVALID_FUNCTION;
+}
+
+// ---------------------------------------------------------------------------
+// ETW-disabling environment variable detection
+//
+// The .NET CLR reads specific environment variables at startup to decide
+// whether ETW providers are registered.  These are checked ONCE at CLR init
+// and never re-checked — setting them before launching a .NET process
+// permanently blinds all CLR ETW telemetry for that process.
+//
+// Attack pattern (Cobalt Strike, Sliver, execute-assembly wrappers):
+//   set COMPlus_ETWEnabled=0   ← .NET Framework 4.x
+//   set DOTNET_ETWEnabled=0    ← .NET 6+
+//   dotnet_payload.exe
+//
+// Our CLR ETW session stays alive, but the provider inside the target process
+// never emits — complete evasion of assembly/JIT/module load detection.
+//
+// Also checks for other telemetry-suppressing environment variables:
+//   COMPlus_ETWFlags=0         — zeros the CLR ETW keyword mask
+//   COMPlus_PerfMapEnabled=0   — disables perf-map generation
+//   DOTNET_PerfMapEnabled=0    — .NET 6+ equivalent
+//   COMPlus_EnableEventLog=0   — disables CLR event log writing
+//   COMPlus_LegacyCorruptedState...=1 — suppresses CSE crash indicators
+// ---------------------------------------------------------------------------
+
+static void CheckEtwEnvironmentVariables()
+{
+    static const struct {
+        const char* varName;
+        const char* blindValue;  // value that disables telemetry (NULL = any non-empty)
+        const char* description;
+        const char* severity;    // "Critical" or "Warning"
+    } kEtwEnvVars[] = {
+        { "COMPlus_ETWEnabled",    "0",
+          "CLR ETW providers DISABLED (.NET Framework) — all .NET assembly/JIT/module "
+          "telemetry from this process is blind",
+          "Critical" },
+        { "DOTNET_ETWEnabled",     "0",
+          "CLR ETW providers DISABLED (.NET 6+) — all .NET assembly/JIT/module "
+          "telemetry from this process is blind",
+          "Critical" },
+        { "COMPlus_ETWFlags",      "0",
+          "CLR ETW keyword mask ZEROED — CLR events filtered to nothing",
+          "Critical" },
+        { "COMPlus_PerfMapEnabled","0",
+          "CLR PerfMap generation disabled — auxiliary .NET telemetry suppressed",
+          "Warning" },
+        { "DOTNET_PerfMapEnabled", "0",
+          "CLR PerfMap generation disabled (.NET 6+) — auxiliary .NET telemetry suppressed",
+          "Warning" },
+        { "COMPlus_EnableEventLog","0",
+          "CLR Event Log writing disabled — .NET runtime events not written to Windows Event Log",
+          "Warning" },
+        { "COMPlus_LegacyCorruptedStateExceptionsPolicy", "1",
+          "Corrupted State Exceptions policy overridden — crash indicators suppressed",
+          "Warning" },
+        { "DOTNET_LegacyCorruptedStateExceptionsPolicy", "1",
+          "Corrupted State Exceptions policy overridden (.NET 6+) — crash "
+          "indicators suppressed", "Warning" },
+        // OpenTelemetry / diagnostics suppression — modern .NET and OTel SDK
+        // read these at startup; setting them pre-launch blinds tracing/logs.
+        { "OTEL_SDK_DISABLED",     "true",
+          "OpenTelemetry SDK disabled — all OTel spans/metrics/logs suppressed",
+          "Warning" },
+        { "OTEL_TRACES_EXPORTER",  "none",
+          "OpenTelemetry trace export set to 'none' — tracing data dropped",
+          "Warning" },
+        { "OTEL_METRICS_EXPORTER", "none",
+          "OpenTelemetry metrics export set to 'none' — metrics dropped",
+          "Warning" },
+        { "OTEL_LOGS_EXPORTER",    "none",
+          "OpenTelemetry logs export set to 'none' — structured logs dropped",
+          "Warning" },
+        { "DOTNET_EnableDiagnostics", "0",
+          "DiagnosticsServer disabled — EventPipe/ICorProfiler attach blocked, "
+          "dotnet-trace/dotnet-counters blind (T1562.002)", "Critical" },
+        { "DOTNET_EnableDiagnostics_Profiler", "0",
+          "ICorProfiler diagnostics disabled — profiling/ETW-via-CLR blocked "
+          "(T1562.002)", "Critical" },
+        { "COREHOST_TRACE",        "0",
+          "CoreCLR host trace disabled — runtime startup telemetry suppressed",
+          "Warning" },
+        { "DOTNET_CLI_TELEMETRY_OPTOUT", "1",
+          "DOTNET CLI telemetry opted out — benign alone, noted as part of "
+          "telemetry-suppression clusters", "Warning" },
+        // AMSI environment variable bypass (rare but documented)
+        { "COMPLUS_LEGACYCORRUPTEDSTATE", nullptr,
+          nullptr, nullptr },  // sentinel
+    };
+
+    // Track which vars we've already alerted on to avoid spamming every 2s
+    static DWORD s_alertedMask = 0;
+
+    char valBuf[64] = {};
+    for (int i = 0; kEtwEnvVars[i].description; i++) {
+        DWORD len = GetEnvironmentVariableA(
+            kEtwEnvVars[i].varName, valBuf, sizeof(valBuf));
+        if (len == 0) continue;  // not set
+
+        bool match = false;
+        if (kEtwEnvVars[i].blindValue) {
+            match = (strcmp(valBuf, kEtwEnvVars[i].blindValue) == 0);
+        } else {
+            match = (len > 0);  // any value
+        }
+
+        if (!match) continue;
+
+        // Only alert once per variable per process lifetime
+        if (s_alertedMask & (1u << i)) continue;
+        s_alertedMask |= (1u << i);
+
+        char det[400];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "ETW environment variable bypass: %s=%s — %s (T1562.002)",
+            kEtwEnvVars[i].varName, valBuf, kEtwEnvVars[i].description);
+        SendHookEvent(kEtwEnvVars[i].severity, "EtwEnvVarBypass", 0, det);
+    }
+}
+
+static void CheckEtwRegistrations();
 
 static DWORD WINAPI WatchThreadProc(LPVOID) {
     // WaitForSingleObject with 2000 ms timeout: fires VerifyHooks on each expiry,
@@ -849,6 +1623,11 @@ static DWORD WINAPI WatchThreadProc(LPVOID) {
         RefreshAmsiGuards();
         VerifyCriticalFuncIntegrity();
         CheckHardwareBreakpoints();
+        CheckTlsCallbacks();
+        CheckTracingFlags();
+        CheckEtwpEventTracingProvEnabled();
+        CheckEtwEnvironmentVariables();
+        CheckEtwRegistrations();
     }
     return 0;
 }
@@ -2057,17 +2836,82 @@ static BOOL WINAPI Hook_CryptUnprotectData(
 // handle open for section creation.
 // ---------------------------------------------------------------------------
 
+// Helper: detect ETW log/event file targets by path substring.  Matches
+// .etl (trace log) and .evtx (Windows Event Log) under the standard system
+// locations.  Flags deletion/rename/truncation of these files as telemetry
+// destruction (T1070.001 / T1562.002).
+static bool PathIsEtwLogFile(const WCHAR* path) {
+    if (!path) return false;
+    // Normalize by walking the tail for extension and middle for folder.
+    const WCHAR* ext = nullptr;
+    const WCHAR* p = path;
+    for (; *p; p++) { if (*p == L'.') ext = p; }
+    if (!ext) return false;
+    bool isEtl  = (_wcsicmp(ext, L".etl")  == 0);
+    bool isEvtx = (_wcsicmp(ext, L".evtx") == 0);
+    if (!isEtl && !isEvtx) return false;
+    // Require the path to be in a known telemetry directory to avoid noise.
+    return (wcsstr(path, L"\\LogFiles\\WMI\\")  != nullptr) ||
+           (wcsstr(path, L"\\winevt\\Logs\\")   != nullptr) ||
+           (wcsstr(path, L"\\Microsoft\\Diagnosis\\") != nullptr) ||
+           (wcsstr(path, L"\\ETW\\")             != nullptr);
+}
+
 static NTSTATUS NTAPI Hook_NtSetInformationFile(
     HANDLE FileHandle, PVOID IoStatusBlock, PVOID FileInformation,
     ULONG Length, ULONG FileInformationClass)
 {
     typedef NTSTATUS(NTAPI* Fn)(HANDLE, PVOID, PVOID, ULONG, ULONG);
 
+    // ETW log destruction: delete (13/64), rename (10/65), or truncate (20)
+    // of .etl/.evtx files under system telemetry directories.  Resolve the
+    // handle path up front so we can annotate all three paths.
+    bool isEtwLog = false;
+    WCHAR filePath[MAX_PATH] = {};
+    if (FileHandle && (FileInformationClass == 13 || FileInformationClass == 64 ||
+                       FileInformationClass == 10 || FileInformationClass == 65 ||
+                       FileInformationClass == 20))
+    {
+        // VOLUME_NAME_DOS returns the drive-letter form
+        DWORD got = GetFinalPathNameByHandleW(FileHandle, filePath,
+            sizeof(filePath)/sizeof(filePath[0]), 0x0 /*VOLUME_NAME_DOS*/);
+        if (got > 0 && got < sizeof(filePath)/sizeof(filePath[0]))
+            isEtwLog = PathIsEtwLogFile(filePath);
+    }
+
+    // FileEndOfFileInformation (20) — truncation attack on open ETL handle
+    if (FileInformationClass == 20 && isEtwLog) {
+        char det[400];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "ETW log truncation: SetFileInformation(EndOfFile) on "
+            "'%ls' — recorded events destroyed (T1070.001/T1562.002)",
+            filePath);
+        SendHookEvent("Critical", "NtSetInformationFile", 0, det);
+    }
+
+    // FileRenameInformation (10) / FileRenameInformationEx (65) — move ETL/EVTX
+    if ((FileInformationClass == 10 || FileInformationClass == 65) && isEtwLog) {
+        char det[400];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "ETW log rename: '%ls' moved via SetFileInformation — "
+            "telemetry path redirect / evidence relocation (T1070.001)",
+            filePath);
+        SendHookEvent("Critical", "NtSetInformationFile", 0, det);
+    }
+
     // FileDispositionInformation = 13, FileDispositionInformationEx = 64
     if ((FileInformationClass == 13 || FileInformationClass == 64) &&
         FileInformation && Length >= sizeof(BOOLEAN))
     {
         BOOLEAN deleteFile = *(BOOLEAN*)FileInformation;
+        if (deleteFile && isEtwLog) {
+            char det[400];
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "ETW log DELETE-pending on '%ls' — recorded events destroyed "
+                "(T1070.001/T1562.002)",
+                filePath);
+            SendHookEvent("Critical", "NtSetInformationFile", 0, det);
+        }
         if (deleteFile) {
             // Check if this file handle was recently written to (heuristic for ghosting)
             // For now, flag delete-pending from non-system processes as suspicious
@@ -2674,6 +3518,443 @@ static HRESULT WINAPI Hook_CLSIDFromProgID(LPCOLESTR lpszProgID, LPCLSID lpclsid
 }
 
 // ---------------------------------------------------------------------------
+// ETW Filter Descriptor attack detection — EnableTraceEx2 hook
+//
+// EnableTraceEx2 accepts ENABLE_TRACE_PARAMETERS with an array of
+// EVENT_FILTER_DESCRIPTOR entries.  An attacker with SeDebugPrivilege or
+// session controller access can attach filter descriptors that silently drop
+// events matching specific criteria — without disabling the provider.
+//
+// Dangerous filter types:
+//   EVENT_FILTER_TYPE_PAYLOAD   (0x80000100) — drop events by field value
+//   EVENT_FILTER_TYPE_EVENT_ID  (0x80000200) — drop events by ID
+//   EVENT_FILTER_TYPE_EVENT_NAME(0x80000400) — drop events by name
+//   EVENT_FILTER_TYPE_STACKWALK (0x80001000) — suppress stack collection
+//   EVENT_FILTER_TYPE_PID       (0x80000010) — restrict to specific PIDs
+//
+// This hook logs all EnableTraceEx2 calls with filter descriptors and
+// emits Critical alerts when dangerous filter types are used.
+// ---------------------------------------------------------------------------
+static ULONG WINAPI Hook_EnableTraceEx2(
+    ULONG_PTR TraceHandle, const GUID* ProviderId, ULONG ControlCode,
+    UCHAR Level, ULONGLONG MatchAnyKeyword, ULONGLONG MatchAllKeyword,
+    ULONG Timeout, ENABLE_TRACE_PARAMETERS_HOOK* EnableParameters)
+{
+    // Detect provider removal from trace session (EVENT_CONTROL_CODE_DISABLE_PROVIDER)
+    // Attack: `logman update trace <name> --p <provider> --ets` or direct
+    // sechost!EnableTraceEx2(..., ControlCode=0, ...) to silently unhook a
+    // security provider from a running session without stopping the session.
+    if (ControlCode == 0) {
+        char pdet[384];
+        if (ProviderId) {
+            _snprintf_s(pdet, sizeof(pdet), _TRUNCATE,
+                "EnableTraceEx2(DISABLE): provider {%08lX-%04X-%04X-%02X%02X-"
+                "%02X%02X%02X%02X%02X%02X} removed from session handle=0x%llX "
+                "— provider unhooked from running trace (T1562.002)",
+                ProviderId->Data1, ProviderId->Data2, ProviderId->Data3,
+                ProviderId->Data4[0], ProviderId->Data4[1],
+                ProviderId->Data4[2], ProviderId->Data4[3],
+                ProviderId->Data4[4], ProviderId->Data4[5],
+                ProviderId->Data4[6], ProviderId->Data4[7],
+                (unsigned long long)TraceHandle);
+        } else {
+            _snprintf_s(pdet, sizeof(pdet), _TRUNCATE,
+                "EnableTraceEx2(DISABLE): NULL provider GUID on session "
+                "handle=0x%llX — mass provider removal (T1562.002)",
+                (unsigned long long)TraceHandle);
+        }
+        SendHookEvent("Critical", "EnableTraceEx2", 0, pdet);
+    }
+
+    // Detect keyword downgrade: MatchAnyKeyword=0 with enable silently drops all
+    if (ControlCode == 1 && MatchAnyKeyword == 0) {
+        SendHookEvent("Critical", "EnableTraceEx2",
+            0, "MatchAnyKeyword=0 — ALL events silently filtered, "
+               "provider appears enabled but blind (T1562.002)");
+    }
+
+    // Detect level downgrade to Critical-only
+    if (ControlCode == 1 && Level == 1) {
+        SendHookEvent("Critical", "EnableTraceEx2",
+            0, "Level=1 (Critical only) — Info/Warning/Error events "
+               "silently suppressed (T1562.002)");
+    }
+
+    // Inspect filter descriptors
+    if (EnableParameters != nullptr && EnableParameters->FilterDescCount > 0) {
+        ULONG fdCount = EnableParameters->FilterDescCount;
+
+        // Cap inspection to prevent abuse
+        if (fdCount > 64) fdCount = 64;
+
+        static const struct {
+            ULONG type;
+            const char* name;
+        } kDangerousTypes[] = {
+            { 0x80000100, "PAYLOAD" },
+            { 0x80000200, "EVENT_ID" },
+            { 0x80000400, "EVENT_NAME" },
+            { 0x80001000, "STACKWALK" },
+            { 0x80000800, "SCHEMATIZED" },
+            { 0x80000010, "PID" },
+        };
+
+        // EVENT_FILTER_DESCRIPTOR: { ULONGLONG Ptr; ULONG Size; ULONG Type; }
+        struct FilterDesc { ULONGLONG Ptr; ULONG Size; ULONG Type; };
+        FilterDesc* fdArr = (FilterDesc*)EnableParameters->EnableFilterDesc;
+
+        char det[384];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "EnableTraceEx2: %lu filter descriptor(s) attached — "
+            "event suppression filters detected (T1562.002)",
+            EnableParameters->FilterDescCount);
+        SendHookEvent("Warning", "EnableTraceEx2", 0, det);
+
+        if (fdArr) {
+            __try {
+                for (ULONG i = 0; i < fdCount; i++) {
+                    for (auto& dt : kDangerousTypes) {
+                        if (fdArr[i].Type == dt.type) {
+                            char fdDet[384];
+                            _snprintf_s(fdDet, sizeof(fdDet), _TRUNCATE,
+                                "EnableTraceEx2: DANGEROUS filter type %s "
+                                "(0x%08lX) — silently drops matching events "
+                                "(size=%lu bytes) (T1562.002)",
+                                dt.name, dt.type, fdArr[i].Size);
+                            SendHookEvent("Critical", "EnableTraceEx2", 0, fdDet);
+                            break;
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+
+    return ((FnEnableTraceEx2)GetCallThrough(IDX_ENABLETRACEEX2))(
+        TraceHandle, ProviderId, ControlCode, Level,
+        MatchAnyKeyword, MatchAllKeyword, Timeout, EnableParameters);
+}
+
+// ---------------------------------------------------------------------------
+// Hook_EtwEventWrite — detects attacker-nulled REGHANDLE.
+//
+// Attack: malware locates a provider's REGHANDLE variable (typically a global
+// in the providing DLL, returned by EventRegister) and zeroes it directly in
+// memory.  The target code still calls EventWrite, but with handle=0 — ETW
+// silently drops the event because the registration slot is invalid.
+//
+// Normal call sites either check `if (handle)` before writing, or only arrive
+// here AFTER a successful EventRegister — so a handle=0 in this hook is
+// strong evidence of tampering.  Rate-limited to bound perf overhead on this
+// hot path.
+// ---------------------------------------------------------------------------
+static volatile LONG g_nullRegHandleAlerted = 0;
+static ULONG NTAPI Hook_EtwEventWrite(
+    REGHANDLE RegHandle, PVOID EventDescriptor,
+    ULONG UserDataCount, PVOID UserData)
+{
+    if (RegHandle == 0 &&
+        InterlockedCompareExchange(&g_nullRegHandleAlerted, 1, 0) == 0)
+    {
+        SendHookEvent("Critical", "EtwEventWrite_NullRegHandle", 0,
+            "EtwEventWrite called with RegHandle=0 — provider REGHANDLE "
+            "zeroed in caller memory, events silently dropped (T1562.002)");
+    }
+    return ((FnEtwEventWrite)GetCallThrough(IDX_ETWEVENTWRITE))(
+        RegHandle, EventDescriptor, UserDataCount, UserData);
+}
+
+// ---------------------------------------------------------------------------
+// Hook_EventAccessControl — detects session/provider security descriptor
+// rewrites.  EventAccessControl modifies the DACL on an ETW provider or
+// session GUID, granting arbitrary SIDs rights like TRACELOG_GUID_ENABLE
+// or WMIGUID_NOTIFICATION.  Legitimate callers are rare (wevtutil, logman,
+// session-creation installers).  Any call from non-trusted code is a strong
+// signal of a session-takeover prep step.
+// ---------------------------------------------------------------------------
+static ULONG WINAPI Hook_EventAccessControl(
+    LPGUID Guid, ULONG Operation, PSID Sid, ULONG Rights, BOOLEAN AllowOrDeny)
+{
+    char guidStr[64] = "<null>";
+    if (Guid) {
+        _snprintf_s(guidStr, sizeof(guidStr), _TRUNCATE,
+            "%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+            Guid->Data1, Guid->Data2, Guid->Data3,
+            Guid->Data4[0], Guid->Data4[1], Guid->Data4[2], Guid->Data4[3],
+            Guid->Data4[4], Guid->Data4[5], Guid->Data4[6], Guid->Data4[7]);
+    }
+    // Operation: 0=EventSecuritySetDACL, 1=EventSecuritySetSACL,
+    // 2=EventSecurityAddDACL, 3=EventSecurityAddSACL
+    char det[384];
+    _snprintf_s(det, sizeof(det), _TRUNCATE,
+        "EventAccessControl: Guid=%s Op=%lu Rights=0x%08lX Allow=%u — "
+        "session/provider DACL %s, possible access grant to rogue SID for "
+        "subsequent session takeover (T1562.002)",
+        guidStr, Operation, Rights, AllowOrDeny,
+        (Operation == 0 || Operation == 2) ? "modified" : "SACL changed");
+    SendHookEvent("Critical", "EventAccessControl", 0, det);
+
+    return ((FnEventAccessControl)GetCallThrough(IDX_EVENTACCESSCONTROL))(
+        Guid, Operation, Sid, Rights, AllowOrDeny);
+}
+
+// ---------------------------------------------------------------------------
+// Hook_OpenTraceW — detects rogue real-time consumers attaching to live
+// ETW sessions.  EVENT_TRACE_REAL_TIME_MODE (0x100) in the logfile mode
+// means the caller wants live event delivery.  Only a narrow set of
+// processes legitimately consume real-time: Event Viewer (mmc.exe),
+// logman.exe, wevtutil.exe, Sysmon, the Windows SDK xperf tools, and us.
+// Any other caller performing a real-time attach is suspicious.
+// ---------------------------------------------------------------------------
+static ULONG_PTR WINAPI Hook_OpenTraceW(PVOID Logfile)
+{
+    // EVENT_TRACE_LOGFILEW layout (offsets stable across Win7+):
+    //   +0x00 LPWSTR LogFileName
+    //   +0x08 LPWSTR LoggerName
+    //   +0x10 LONGLONG CurrentTime
+    //   +0x18 ULONG BuffersRead
+    //   +0x1C ULONG LogFileMode
+    ULONG logFileMode = 0;
+    WCHAR loggerName[128] = {};
+    if (Logfile) {
+        __try {
+            logFileMode = *(PULONG)((PUCHAR)Logfile + 0x1C);
+            LPWSTR ln = *(LPWSTR*)((PUCHAR)Logfile + 0x08);
+            if (ln) {
+                for (int i = 0; i < 127 && ln[i]; i++) loggerName[i] = ln[i];
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    if (logFileMode & 0x100 /* EVENT_TRACE_REAL_TIME_MODE */) {
+        char exeName[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exeName, sizeof(exeName));
+        const char* base = exeName;
+        for (const char* p = exeName; *p; p++)
+            if (*p == '\\' || *p == '/') base = p + 1;
+
+        bool trusted =
+            _stricmp(base, "mmc.exe")       == 0 ||  // Event Viewer
+            _stricmp(base, "logman.exe")    == 0 ||
+            _stricmp(base, "wevtutil.exe")  == 0 ||
+            _stricmp(base, "tracerpt.exe")  == 0 ||
+            _stricmp(base, "xperf.exe")     == 0 ||
+            _stricmp(base, "wpr.exe")       == 0 ||
+            _stricmp(base, "perfmon.exe")   == 0 ||
+            _stricmp(base, "Sysmon.exe")    == 0 ||
+            _stricmp(base, "Sysmon64.exe")  == 0 ||
+            _stricmp(base, "NortonEDR.exe") == 0;
+
+        if (!trusted) {
+            char det[400];
+            _snprintf_s(det, sizeof(det), _TRUNCATE,
+                "Rogue real-time ETW consumer: %s attached to session '%ls' "
+                "(LogFileMode=0x%08lX) — consumer intercepts events live "
+                "before any file write, can drop/modify events in transit "
+                "(T1562.002)",
+                base, loggerName[0] ? loggerName : L"<unknown>", logFileMode);
+            SendHookEvent("Critical", "OpenTraceW_RogueConsumer", 0, det);
+        }
+    }
+
+    return ((FnOpenTraceW)GetCallThrough(IDX_OPENTRACEW))(Logfile);
+}
+
+// ---------------------------------------------------------------------------
+// Hook_EtwEventRegister — Dylan Hall "Universally Evading Sysmon and ETW".
+//
+// Attack: the attacker walks ntdll!EtwpRegistrationTable in user-mode and
+// overwrites _ETW_REG_ENTRY.EnableMask (and optionally .Callback) to zero.
+// Subsequent EtwEventWrite calls bail out in the "am I enabled?" check and
+// never trap to kernel, so the kernel-side baseline we maintain never sees
+// tampering.  We backstop by baselining EnableMask byte directly in the
+// user-mode struct, which we can locate via the returned REGHANDLE.
+//
+// REGHANDLE encoding (pre-20H1): bits [63:16] = _ETW_REG_ENTRY pointer.
+// On 20H1+ the handle encodes a table index and obfuscation; we fall back
+// to a probe heuristic that scans a narrow range around the observed
+// handle for the provider GUID and anchors on that.
+// ---------------------------------------------------------------------------
+struct EtwRegBaseline {
+    REGHANDLE regHandle;
+    GUID      providerGuid;
+    PVOID     regEntryAddr;      // nullptr if not resolvable on this build
+    UCHAR     enableMaskBaseline;
+    PVOID     callbackBaseline;
+    bool      valid;
+    bool      tampered;          // one-shot alert latch
+};
+
+static CRITICAL_SECTION g_etwRegCs;
+static EtwRegBaseline  g_etwRegs[128];
+static volatile LONG   g_etwRegCount = 0;
+static bool            g_etwRegCsInit = false;
+
+static PVOID ResolveEtwRegEntry(REGHANDLE h) {
+    // Pre-20H1: _ETW_REG_ENTRY* = (h >> 16) sign-extended; pointer must
+    // be a kernel-looking user-heap address (ntdll private heap) —
+    // validate via MEM_COMMIT + PAGE_READWRITE probe.
+    ULONGLONG candidate = (ULONGLONG)(h >> 16);
+    // User-mode heap lives below 0x00007FFFFFFFFFFF
+    if (candidate == 0 || candidate > 0x00007FFFFFFFFFFFULL) return nullptr;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery((LPCVOID)candidate, &mbi, sizeof(mbi)) == 0) return nullptr;
+    if (mbi.State != MEM_COMMIT) return nullptr;
+    if (!(mbi.Protect & (PAGE_READWRITE | PAGE_READONLY))) return nullptr;
+    return (PVOID)candidate;
+}
+
+// Offsets within _ETW_REG_ENTRY that vary by build.  We scan a window
+// around the resolved struct for a matching provider GUID and lock our
+// EnableMask offset relative to that anchor.
+static bool CaptureRegEntryBaseline(EtwRegBaseline* b) {
+    if (!b->regEntryAddr) return false;
+    __try {
+        // Scan first 0x100 bytes of the struct for the provider GUID.
+        // When found, typical layouts place EnableMask ~0x28..0x30 after
+        // the GUID anchor.  We baseline a conservative 8-byte window.
+        PUCHAR p = (PUCHAR)b->regEntryAddr;
+        for (ULONG off = 0; off < 0x100; off += 8) {
+            if (memcmp(p + off, &b->providerGuid, sizeof(GUID)) == 0) {
+                // Try offsets {0x28, 0x30, 0x20} after GUID anchor for EnableMask
+                ULONG kMaskOffsets[] = { 0x28, 0x30, 0x20 };
+                for (ULONG mo : kMaskOffsets) {
+                    UCHAR m = *(p + off + mo);
+                    if (m != 0) {
+                        b->enableMaskBaseline = m;
+                        b->regEntryAddr = (PVOID)(p + off); // re-anchor to GUID
+                        // Callback is typically further out; capture at +0x38/+0x40/+0x48
+                        b->callbackBaseline = *(PVOID*)(p + off + 0x40);
+                        return true;
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
+static ULONG NTAPI Hook_EtwEventRegister(
+    LPCGUID ProviderId, PVOID EnableCallback, PVOID CallbackContext,
+    REGHANDLE* RegHandle)
+{
+    ULONG status = ((FnEtwEventRegister)GetCallThrough(IDX_ETWEVENTREGISTER))(
+        ProviderId, EnableCallback, CallbackContext, RegHandle);
+
+    if (status == 0 /*ERROR_SUCCESS*/ && RegHandle && *RegHandle != 0 && ProviderId) {
+        if (!g_etwRegCsInit) return status;
+
+        EnterCriticalSection(&g_etwRegCs);
+        LONG idx = InterlockedCompareExchange(&g_etwRegCount, 0, 0);
+        if (idx < (LONG)(sizeof(g_etwRegs) / sizeof(g_etwRegs[0]))) {
+            EtwRegBaseline* b = &g_etwRegs[idx];
+            b->regHandle    = *RegHandle;
+            b->providerGuid = *ProviderId;
+            b->regEntryAddr = ResolveEtwRegEntry(*RegHandle);
+            b->enableMaskBaseline = 0;
+            b->callbackBaseline = nullptr;
+            b->tampered = false;
+            b->valid = CaptureRegEntryBaseline(b);
+            // Even if direct baseline failed, keep the REGHANDLE for the
+            // layer-1 functional probe (EtwEventEnabled call below).
+            InterlockedIncrement(&g_etwRegCount);
+        }
+        LeaveCriticalSection(&g_etwRegCs);
+    }
+    return status;
+}
+
+// Functional probe + struct-diff check — called from WatchThreadProc tick.
+typedef BOOLEAN (NTAPI *FnEtwEventEnabled)(REGHANDLE, PVOID);
+static void CheckEtwRegistrations() {
+    if (!g_etwRegCsInit) return;
+
+    static FnEtwEventEnabled pEtwEventEnabled = nullptr;
+    if (!pEtwEventEnabled) {
+        HMODULE h = GetModuleHandleW(L"ntdll.dll");
+        if (h) pEtwEventEnabled =
+            (FnEtwEventEnabled)GetProcAddress(h, "EtwEventEnabled");
+    }
+
+    EnterCriticalSection(&g_etwRegCs);
+    LONG n = InterlockedCompareExchange(&g_etwRegCount, 0, 0);
+    for (LONG i = 0; i < n; i++) {
+        EtwRegBaseline* b = &g_etwRegs[i];
+        if (b->tampered) continue;
+
+        // --- Layer 2: direct struct-byte diff ---
+        if (b->valid && b->regEntryAddr && b->enableMaskBaseline != 0) {
+            __try {
+                PUCHAR anchor = (PUCHAR)b->regEntryAddr; // GUID anchor
+                bool hit = false;
+                ULONG kMaskOffsets[] = { 0x28, 0x30, 0x20 };
+                for (ULONG mo : kMaskOffsets) {
+                    UCHAR cur = *(anchor + mo);
+                    if (cur == 0 && b->enableMaskBaseline != 0) {
+                        char det[384];
+                        _snprintf_s(det, sizeof(det), _TRUNCATE,
+                            "User-mode _ETW_REG_ENTRY.EnableMask zeroed "
+                            "(was 0x%02X) for provider "
+                            "{%08lX-%04X-%04X-...} — Dylan Hall technique, "
+                            "provider silently suppressed (T1562.002)",
+                            b->enableMaskBaseline,
+                            b->providerGuid.Data1, b->providerGuid.Data2,
+                            b->providerGuid.Data3);
+                        SendHookEvent("Critical", "EtwRegEntry_Tamper", 0, det);
+                        // Restore under VirtualProtect
+                        DWORD old = 0;
+                        if (VirtualProtect(anchor + mo, 1, PAGE_READWRITE, &old)) {
+                            *(anchor + mo) = b->enableMaskBaseline;
+                            VirtualProtect(anchor + mo, 1, old, &old);
+                        }
+                        b->tampered = true;
+                        hit = true;
+                        break;
+                    }
+                }
+                if (!hit && b->callbackBaseline) {
+                    PVOID curCb = *(PVOID*)(anchor + 0x40);
+                    if (curCb != b->callbackBaseline) {
+                        char det[384];
+                        _snprintf_s(det, sizeof(det), _TRUNCATE,
+                            "User-mode _ETW_REG_ENTRY.Callback hijacked for "
+                            "{%08lX-...} (baseline=%p current=%p) — "
+                            "provider redirected to attacker handler (T1562.002)",
+                            b->providerGuid.Data1,
+                            b->callbackBaseline, curCb);
+                        SendHookEvent("Critical", "EtwRegEntry_Tamper", 0, det);
+                        DWORD old = 0;
+                        if (VirtualProtect(anchor + 0x40, sizeof(PVOID),
+                                           PAGE_READWRITE, &old)) {
+                            *(PVOID*)(anchor + 0x40) = b->callbackBaseline;
+                            VirtualProtect(anchor + 0x40, sizeof(PVOID), old, &old);
+                        }
+                        b->tampered = true;
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
+        // --- Layer 1: functional probe (version-agnostic backstop) ---
+        // If EtwEventEnabled returns FALSE for every reasonable level,
+        // the provider is disabled.  Since we don't track legitimate
+        // disables via NtTraceControl(31) in user-mode, rely on kernel
+        // correlation — here we only alert if struct-diff already showed
+        // tamper but we missed the exact byte (e.g., 20H1+ layout shift).
+        if (!b->tampered && pEtwEventEnabled && !b->valid) {
+            __try {
+                BOOLEAN en = pEtwEventEnabled(b->regHandle, nullptr);
+                // Without a kernel legitimate-disable feed, we can't
+                // distinguish attacker-disable from admin-disable here,
+                // so leave this probe informational / telemetry only.
+                (void)en;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+    LeaveCriticalSection(&g_etwRegCs);
+}
+
+// ---------------------------------------------------------------------------
 // Authentication downgrade detection — SSPI hooks (T1556.001)
 //
 // 1. AcquireCredentialsHandleW — monitors which authentication package is
@@ -2821,9 +4102,66 @@ void InstallHooks() {
         }
     }
 
+    // Initialize the Dylan-Hall ETW registration baseline list.
+    if (!g_etwRegCsInit) {
+        InitializeCriticalSection(&g_etwRegCs);
+        g_etwRegCsInit = true;
+    }
+
     // Snapshot ETW/AMSI critical function prologues before the watch thread starts.
     // These baselines are checked every 2s to detect XPN-style patching.
     InitCriticalFuncGuards();
+
+    // Snapshot TLS callback arrays for critical modules — detects callback
+    // injection/redirection used for persistence and ETW-bypass shims.
+    InitTlsGuards();
+
+    // Install first-in-line VEH — catches exception-based hook fires
+    // (INT3/PAGE_GUARD/DR0-DR3) that originate inside critical modules,
+    // including those registered by malware BEFORE HookDll loaded.
+    InstallFirstVeh();
+
+    // Check for ETW-disabling environment variables set BEFORE injection.
+    // The CLR reads these at startup — if already set, .NET telemetry is dead.
+    CheckEtwEnvironmentVariables();
+
+    // --- Install ETW control API interception hooks ---
+    // These are manual IAT-style hooks for APIs that modify ETW provider/session
+    // properties from within the process.  Not in the main hook table because
+    // they're low-frequency APIs that only need alerting, not full IAT coverage.
+    {
+        // EventSetInformation — ntdll.dll (modifies provider traits/encoding)
+        HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+        if (hNtdll) {
+            g_origEventSetInformation = (FnEventSetInformation)
+                GetProcAddress(hNtdll, "EventSetInformation");
+        }
+
+        // TraceSetInformation — advapi32.dll / sechost.dll
+        HMODULE hAdv = GetModuleHandleA("advapi32.dll");
+        if (hAdv) {
+            g_origTraceSetInformation = (FnTraceSetInformation)
+                GetProcAddress(hAdv, "TraceSetInformation");
+        }
+        if (!g_origTraceSetInformation) {
+            HMODULE hSec = GetModuleHandleA("sechost.dll");
+            if (hSec) {
+                g_origTraceSetInformation = (FnTraceSetInformation)
+                    GetProcAddress(hSec, "TraceSetInformation");
+            }
+        }
+
+        // EventUnregister — advapi32.dll (provider unregistration)
+        if (hAdv) {
+            g_origEventUnregister = (FnEventUnregister)
+                GetProcAddress(hAdv, "EventUnregister");
+        }
+
+        // Add these to the critical function guard list for prologue checks
+        // (already covered by g_etwGuards[] entries for EventUnregister/advapi32
+        //  and EtwEventUnregister/ntdll — the hooks here add CALL interception
+        //  on top of the prologue integrity monitoring).
+    }
 
     // Start the hook-integrity watch thread.
     // WatchThreadProc is inside HookDll so IsAddressInKnownModule() returns true

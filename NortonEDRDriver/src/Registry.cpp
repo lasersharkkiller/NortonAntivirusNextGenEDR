@@ -359,6 +359,126 @@ static const DefenseEvasionEntry kDefenseEvasionPaths[] = {
     { L"\\WMI\\Autologger\\",              L"Status",
       "AutoLogger Status modified — WPP/ETW provider status tamper (T1562.002)", TRUE },
 
+    // WMI security DACL rewrite — grants attacker rights to modify normally-
+    // protected trace sessions (EventLog-Security, LwtNetLog, etc.) without
+    // elevating further.  Any write under Control\WMI\Security is suspicious.
+    { L"\\Control\\WMI\\Security",          NULL,
+      "Control\\WMI\\Security DACL modified — attacker granting self trace "
+      "modification rights on protected sessions (T1562.002)", TRUE },
+
+    // SilentProcessExit / ImageFileExecutionOptions global-flag tamper —
+    // ReportingMode=1 + GlobalFlag=0x200 + MonitorProcess=<attacker.exe>
+    // silently redirects dump collection to attacker code AND suppresses
+    // the WER ETW event that would otherwise fire.  Adjacent telemetry-kill
+    // used for LSASS credential harvesting.
+    { L"\\SilentProcessExit\\",             L"ReportingMode",
+      "SilentProcessExit ReportingMode set — dump handler redirect, "
+      "suppresses WER ETW event (T1562.002/T1003.001)", TRUE },
+    { L"\\SilentProcessExit\\",             L"MonitorProcess",
+      "SilentProcessExit MonitorProcess set — attacker-controlled dump "
+      "receiver (T1562.002/T1003.001)", TRUE },
+    { L"\\SilentProcessExit\\",             L"GlobalFlag",
+      "SilentProcessExit GlobalFlag=0x200 — enables silent-exit dumping "
+      "path (T1562.002)", TRUE },
+    { L"\\SilentProcessExit\\",             L"DumpFolder",
+      "SilentProcessExit DumpFolder set — dump redirection for credential "
+      "harvesting (T1003.001)", TRUE },
+    { L"Image File Execution Options\\",    L"MiniDumpAuxiliaryDlls",
+      "IFEO MiniDumpAuxiliaryDlls set — attacker DLL loaded into WER dump "
+      "pipeline (T1574.002)", TRUE },
+    { L"Session Manager\\Kernel",           L"MiniDumpAuxiliaryDlls",
+      "Session Manager MiniDumpAuxiliaryDlls set — kernel dump auxiliary "
+      "DLL redirect (T1574.002)", TRUE },
+
+    // --- Registry-mirrored ETW kill switches ---
+    // These keys mirror environment variables like COMPlus_ETWEnabled.
+    // Writing here disables ETW emission system-wide (or per-app) without
+    // having to set an env var on every launch.  All are CRITICAL.
+    { L"\\.NETFramework",                   L"ETWEnabled",
+      ".NET Framework CLR ETW DISABLED via registry (HKLM\\SOFTWARE\\"
+      "Microsoft\\.NETFramework\\ETWEnabled=0) — system-wide CLR telemetry "
+      "kill (T1562.002)", TRUE },
+    { L"\\.NETFramework",                   L"ETWFlags",
+      ".NET Framework CLR ETW keyword mask tampered — CLR event filtering "
+      "downgrade (T1562.002)", TRUE },
+    { L"\\.NETFramework",                   L"EnableEventLog",
+      ".NET Framework CLR EventLog writing disabled via registry "
+      "(T1562.002)", TRUE },
+    { L"\\.NETFramework",                   L"PerfMapEnabled",
+      ".NET Framework PerfMap generation disabled via registry "
+      "(T1562.002)", TRUE },
+    { L"\\Wow6432Node\\Microsoft\\.NETFramework", L"ETWEnabled",
+      ".NET Framework CLR ETW DISABLED via 32-bit registry mirror "
+      "(T1562.002)", TRUE },
+    { L"\\Wow6432Node\\Microsoft\\.NETFramework", L"ETWFlags",
+      ".NET Framework CLR ETW flags tampered via 32-bit mirror "
+      "(T1562.002)", TRUE },
+
+    // .NET 6+ registry configuration (DOTNET_* equivalent)
+    { L"\\Microsoft\\dotnet",               L"ETWEnabled",
+      ".NET 6+ CLR ETW DISABLED via registry (T1562.002)", TRUE },
+    { L"\\Microsoft\\dotnet",               L"EnableDiagnostics",
+      ".NET 6+ DiagnosticsServer disabled via registry — EventPipe/ICorProfiler "
+      "attach blocked (T1562.002)", TRUE },
+
+    // Per-application CLR kill switches — HKLM\SOFTWARE\Microsoft\.NETFramework\v*\*
+    // These apply to specific runtime versions; writes indicate targeted
+    // telemetry suppression for a specific app/service.
+    { L"\\.NETFramework\\v",                L"ETWEnabled",
+      "Per-version CLR ETW disabled via registry (T1562.002)", TRUE },
+    { L"\\.NETFramework\\v",                L"ETWFlags",
+      "Per-version CLR ETW flags tampered (T1562.002)", TRUE },
+
+    // Perflib — disables all performance counter ETW providers
+    { L"\\Windows NT\\CurrentVersion\\Perflib", L"Disable Performance Counters",
+      "Perflib Disable Performance Counters=1 — all perf-counter ETW providers "
+      "silenced system-wide (T1562.002)", TRUE },
+    { L"\\Windows NT\\CurrentVersion\\Perflib", L"Disable Performance Objects",
+      "Perflib Disable Performance Objects modified — counter object filtering "
+      "(T1562.002)", FALSE },
+
+    // Windows Tracing root — WPP config for user-mode tracing sessions
+    { L"\\Windows NT\\CurrentVersion\\Tracing", NULL,
+      "WPP/Windows Tracing registry configuration modified — user-mode trace "
+      "session tampering (T1562.002)", TRUE },
+
+    // DiagTrack / Connected User Experiences and Telemetry — disabling the
+    // service via Start=4 kills the DiagTrack ETW pipeline used for a large
+    // swath of Windows diagnostic/security telemetry.
+    { L"\\Services\\DiagTrack",             L"Start",
+      "DiagTrack service Start value modified — Connected User Experiences "
+      "and Telemetry service disable, kills Microsoft-Windows-Diagnostics-* "
+      "ETW providers (T1562.001)", TRUE },
+    { L"\\Windows\\CurrentVersion\\Diagnostics\\DiagTrack", L"Start",
+      "DiagTrack diagnostics Start modified — telemetry pipeline disable "
+      "(T1562.001)", TRUE },
+
+    // Policy-based telemetry kill — GPO/MDM level kill switch
+    { L"\\Policies\\DataCollection",        L"AllowTelemetry",
+      "AllowTelemetry policy set to 0 — all Windows diagnostic telemetry "
+      "disabled via policy (T1562.001)", TRUE },
+    { L"\\Windows\\CurrentVersion\\Policies\\DataCollection", L"AllowTelemetry",
+      "AllowTelemetry policy modified — Windows telemetry policy kill "
+      "(T1562.001)", TRUE },
+    { L"\\Windows\\DataCollection",         L"AllowTelemetry",
+      "AllowTelemetry policy modified (HKLM mirror) — Windows telemetry "
+      "policy kill (T1562.001)", TRUE },
+
+    // Sysmon / Defender ETW consumer disable — these services drive high-value
+    // security ETW consumption; disabling them via Start=4 blinds the sensor.
+    { L"\\Services\\Sysmon",                L"Start",
+      "Sysmon service Start modified — Sysmon ETW consumer disabled "
+      "(T1562.001)", TRUE },
+    { L"\\Services\\Sysmon64",              L"Start",
+      "Sysmon64 service Start modified — Sysmon ETW consumer disabled "
+      "(T1562.001)", TRUE },
+    { L"\\Services\\Sense",                 L"Start",
+      "MDE Sense service Start modified — Defender for Endpoint ETW consumer "
+      "disabled (T1562.001)", TRUE },
+    { L"\\Services\\WdNisSvc",              L"Start",
+      "Defender NIS service Start modified — network inspection ETW disabled "
+      "(T1562.001)", TRUE },
+
     // --- Misc defense evasion ---
     // AMSI provider unregistration (COM CLSID nuke)
     { L"\\AMSI\\Providers",                 NULL,
@@ -1130,6 +1250,56 @@ skip_persistence_alert:
 				strcmp(pn, "services.exe") == 0 ||
 				strcmp(pn, "TrustedInsta") == 0);
 			if (!trusted) return STATUS_ACCESS_DENIED;
+		}
+
+		// Autologger subkey deletion — attacker wipes an entire session
+		// definition (e.g. \Control\WMI\Autologger\EventLog-Security) so
+		// the session never starts at next boot (T1562.002).
+		if (UnicodeStringContains((PUNICODE_STRING)regPath, L"\\WMI\\Autologger\\") ||
+		    UnicodeStringContains((PUNICODE_STRING)regPath, L"\\WMI\\Security")) {
+
+			char* procName = PsGetProcessImageFileName(IoGetCurrentProcess());
+			BOOLEAN trustedDel = procName && (
+				strcmp(procName, "TrustedInsta") == 0 ||
+				strcmp(procName, "services.exe") == 0);
+
+			if (!trustedDel) {
+				char delMsg[384];
+				ULONG pathChars = regPath->Length / sizeof(WCHAR);
+				if (pathChars > 180) pathChars = 180;
+				RtlStringCbPrintfA(delMsg, sizeof(delMsg),
+					"AutoLogger subkey DELETED by %s: %wZ — persistent ETW "
+					"session definition wiped, will not start at boot (T1562.002)",
+					procName ? procName : "unknown",
+					regPath);
+				SIZE_T delLen = strlen(delMsg) + 1;
+
+				PKERNEL_STRUCTURED_NOTIFICATION dNotif =
+					(PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+						POOL_FLAG_NON_PAGED,
+						sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+				if (dNotif) {
+					RtlZeroMemory(dNotif, sizeof(*dNotif));
+					SET_CRITICAL(*dNotif);
+					SET_SYSCALL_CHECK(*dNotif);
+					dNotif->bufSize = (ULONG)delLen;
+					dNotif->isPath  = FALSE;
+					dNotif->pid     = PsGetProcessId(IoGetCurrentProcess());
+					dNotif->msg     = (char*)ExAllocatePool2(
+						POOL_FLAG_NON_PAGED, delLen, 'msg');
+					if (procName)
+						RtlCopyMemory(dNotif->procName, procName, 14);
+					if (dNotif->msg) {
+						RtlCopyMemory(dNotif->msg, delMsg, delLen);
+						if (!CallbackObjects::GetNotifQueue()->Enqueue(dNotif)) {
+							ExFreePool(dNotif->msg);
+							ExFreePool(dNotif);
+						}
+					} else {
+						ExFreePool(dNotif);
+					}
+				}
+			}
 		}
 		break;
 	}

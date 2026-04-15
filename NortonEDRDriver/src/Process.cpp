@@ -2842,6 +2842,23 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"@('",                       "PowerShell char array obfuscation — T1027/T1036 evasion",           FALSE },
 				{ L"join(",                     "PowerShell join() obfuscation — T1027/T1036 evasion",              FALSE },
 
+				// --- T1562.002: ETW environment variable bypass ---
+				// Attacker sets COMPlus_ETWEnabled=0 / DOTNET_ETWEnabled=0 before
+				// launching .NET payloads — CLR reads these at startup and permanently
+				// disables all .NET ETW providers in that process.  Pattern: cmd /c
+				// "set COMPlus_ETWEnabled=0 && payload.exe" or PowerShell $env:.
+				{ L"complus_etwenabled=0",      "COMPlus_ETWEnabled=0 — CLR ETW providers DISABLED, .NET telemetry blind (T1562.002)", TRUE },
+				{ L"dotnet_etwenabled=0",       "DOTNET_ETWEnabled=0 — .NET 6+ ETW providers DISABLED (T1562.002)",  TRUE },
+				{ L"complus_etwflags=0",        "COMPlus_ETWFlags=0 — CLR ETW keyword mask zeroed, all events filtered (T1562.002)", TRUE },
+				{ L"complus_enableeventlog=0",  "COMPlus_EnableEventLog=0 — CLR event log writing disabled (T1562.002)", TRUE },
+				// PowerShell $env: variants for setting these env vars
+				{ L"$env:complus_etwenabled",   "$env:COMPlus_ETWEnabled — PowerShell CLR ETW disable (T1562.002)",  TRUE },
+				{ L"$env:dotnet_etwenabled",    "$env:DOTNET_ETWEnabled — PowerShell .NET 6+ ETW disable (T1562.002)", TRUE },
+				{ L"$env:complus_etwflags",     "$env:COMPlus_ETWFlags — PowerShell CLR keyword mask zeroing (T1562.002)", TRUE },
+				// SetEnvironmentVariable API call patterns in PowerShell
+				{ L"setenvironmentvariable(\"complus_etw", "SetEnvironmentVariable(COMPlus_ETW*) — API-based CLR ETW disable (T1562.002)", TRUE },
+				{ L"setenvironmentvariable(\"dotnet_etw",  "SetEnvironmentVariable(DOTNET_ETW*) — API-based .NET 6+ ETW disable (T1562.002)", TRUE },
+
 				{ nullptr, nullptr, FALSE }
 			};
 

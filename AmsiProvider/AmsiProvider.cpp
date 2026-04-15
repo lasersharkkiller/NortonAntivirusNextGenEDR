@@ -94,6 +94,61 @@ static const char* const kMaliciousKeywords[] = {
     "system(",                         // PHP/Python command execution (in script context)
     "proc_open(",                      // PHP process execution
     "pcntl_exec(",                     // PHP direct exec
+    // ---------------------------------------------------------------
+    // Offensive C# tool namespace/class signatures — these appear in
+    // the AMSI buffer when .NET assemblies are loaded via
+    // Assembly.Load(byte[]) / execute-assembly.
+    // ---------------------------------------------------------------
+    "rubeus.commands",  "rubeus.lib.interop",
+    "seatbelt.commands",  "seatbelt.runtime",
+    "sharpup.checks",  "sharpup.utilities",
+    "certify.commands",  "certify.domain",
+    "sharpdpapi.commands",
+    "sharphound.client",  "sharphound.collectors",
+    "sharpview.functions",
+    "sharpwmi.program",
+    "sharpchrome.commands",
+    "safetykatz.program",
+    "sharpsploit.credentials",  "sharpsploit.execution",
+    "sharpsploit.lateralmovement",  "sharpsploit.mimikatz",
+    "grunt.gruntlauncher",  "covenant.models",
+    "sharppersist.schtaskbackdoor",
+    "inveigh.inveigh",  "inveigh.relay",
+    "sharproast.program",
+    "sharpsecdump.program",
+    "sharpkatz.module",
+    "whisker.commands",
+    "standin.standin",
+    "sharpgpoabuse.program",
+    // ---------------------------------------------------------------
+    // Adam Chester (@_xpn_) "Hiding Your .NET — ETW" techniques.
+    // PowerShell/C# reflection patches against managed EventSource /
+    // EventProvider private fields, and the EtwEventWrite prologue.
+    // ---------------------------------------------------------------
+    "m_eventsourceenabled",                  // EventSource private field nulled
+    "m_eventpipeprovider",                   // EventPipe provider field
+    "m_reghandle",                           // EventSource REGHANDLE nulled
+    "etweventprovider",                      // internal framework class
+    "eventsource.m_enabled",                 // qualified form
+    "eventprovider.m_enabled",               // qualified form
+    "getfield(\"m_eventsourceenabled\"",     // reflection lookup (double-quote)
+    "getfield('m_eventsourceenabled'",       // reflection lookup (single-quote)
+    "getfield(\"m_reghandle\"",
+    "getfield('m_reghandle'",
+    "getfield(\"etwprovider\"",              // static field lookup on EventPipe
+    "getfield('etwprovider'",
+    "nonpublic, instance",                   // reflection binding flags (frequent with field patch)
+    "nonpublic,instance",                    // no-space variant
+    "bindingflags.nonpublic",
+    "[system.diagnostics.tracing.eventsource]",  // PS type cast used in PoC
+    "system.diagnostics.tracing.eventprovider",  // internal type reference
+    "\"etweventwrite\"",                     // GetProcAddress lookup in ntdll (double-quote)
+    "'etweventwrite'",                       // single-quote variant
+    "getprocaddress(getmodulehandle(\"ntdll",// precursor to EtwEventWrite patch
+    "virtualprotect",                        // ntdll prologue patch (context + EtwEventWrite)
+    "\\xc2\\x14\\x00",                       // RET 0x14 x64 patch bytes
+    "\\xc3",                                 // bare RET patch (often quoted in PoC)
+    "0xc3, 0x00",                            // RET sled form used in xpn gist
     nullptr
 };
 

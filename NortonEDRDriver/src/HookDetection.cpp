@@ -487,7 +487,20 @@ BOOLEAN HookDetector::CheckEtwHooks(BufferQueue* bufQueue) {
 static PVOID    s_EtwRegEntry        = nullptr;  // resolved _ETW_REG_ENTRY*
 static PVOID    s_EtwGuidEntry       = nullptr;  // resolved _ETW_GUID_ENTRY*
 static UCHAR    s_EnableMaskBaseline = 0;        // _ETW_REG_ENTRY.EnableMask
+static PVOID    s_EnableMaskAddr     = nullptr;  // resolved address (captured at baseline)
 static ULONG    s_ProviderEnableBaseline = 0;    // _ETW_GUID_ENTRY.ProviderEnableInfo.IsEnabled
+// Full _TRACE_ENABLE_INFO struct baseline (32 bytes):
+//   +0x00 ULONG     IsEnabled
+//   +0x04 UCHAR     Level       ← level downgrade target
+//   +0x05 UCHAR     Reserved1
+//   +0x06 USHORT    LoggerId
+//   +0x08 ULONG     EnableProperty
+//   +0x0C ULONG     Reserved2
+//   +0x10 ULONGLONG MatchAnyKeyword  ← keyword filter target
+//   +0x18 ULONGLONG MatchAllKeyword
+static PVOID    s_EnableInfoAddr         = nullptr;
+static UCHAR    s_EnableInfoBaseline[32] = {};
+static BOOLEAN  s_EnableInfoValid        = FALSE;
 static ULONG    s_RegListCountBaseline = 0;      // count of _ETL_ENTRY nodes in RegList
 static BOOLEAN  s_EtwStructureValid  = FALSE;
 
@@ -500,6 +513,49 @@ static BOOLEAN  s_EtwpDebuggerValid    = FALSE;
 static PVOID    s_LoggerContext       = nullptr;
 static PVOID    s_GetCpuClockBaseline = nullptr;
 static BOOLEAN  s_LoggerContextValid  = FALSE;
+
+// _ETW_GUID_ENTRY hash-table linkage baseline.
+// _ETW_GUID_ENTRY is linked into EtwpGuidHashTable via the first LIST_ENTRY
+// at offset 0 (Flink at +0x00, Blink at +0x08).  An attacker that unlinks
+// the entry (sets neighbors to skip it) leaves the entry intact but removes
+// it from provider lookups — our REGHANDLE→RegEntry→GuidEntry path still
+// works, but EtwpFindGuidEntry no longer finds us, so providers appear
+// gone from session enumeration.  Baseline the Flink/Blink at init; if
+// either is zeroed or points outside the kernel range, the entry has been
+// unlinked.
+static PVOID    s_GuidHashFlinkBase = nullptr;
+static PVOID    s_GuidHashBlinkBase = nullptr;
+static BOOLEAN  s_GuidHashLinkValid = FALSE;
+
+// Kernel ETW export address freeze.  Baseline the resolved addresses of
+// NtTraceControl, NtTraceEvent, and EtwRegister at init.  If an attacker
+// patches the ntoskrnl export directory to redirect these names to a
+// malicious stub, MmGetSystemRoutineAddress will return a different value.
+// PatchGuard-safe: read-only comparison, no writes to ntoskrnl.
+struct EtwExportFreeze {
+    const wchar_t* name;
+    PVOID          baseline;
+    BOOLEAN        valid;
+};
+static EtwExportFreeze s_EtwExports[] = {
+    { L"NtTraceControl",   nullptr, FALSE },
+    { L"NtTraceEvent",     nullptr, FALSE },
+    { L"EtwRegister",      nullptr, FALSE },
+    { L"EtwWrite",         nullptr, FALSE },
+    { L"EtwWriteEx",       nullptr, FALSE },
+    { nullptr,             nullptr, FALSE }
+};
+
+// _WMI_LOGGER_CONTEXT.LoggerMode baseline.
+// LoggerMode is a ULONG containing EVENT_TRACE_* flags that control session
+// behavior: CIRCULAR (0x2), BUFFERING (0x400), PRIVATE_LOGGER (0x800),
+// SECURE (0x4), INDEPENDENT (0x08000000), SYSTEM_LOGGER (0x02000000), etc.
+// Attackers flip BUFFERING to stop disk writes or INDEPENDENT to isolate the
+// session from rundown events — all silent, no syscall.  Validated offset
+// range (0x40..0x80) via plausible flag-only value (< 0x0FFFFFFF).
+static PULONG   s_LoggerModeAddr      = nullptr;
+static ULONG    s_LoggerModeBaseline  = 0;
+static BOOLEAN  s_LoggerModeValid     = FALSE;
 
 // TraceLogging metadata integrity baseline.
 // _ETW_REG_ENTRY contains a Callback pointer (offset ~0x38-0x48) that for
@@ -608,6 +664,7 @@ VOID HookDetector::TakeEtwStructureBaseline()
                 // EnableMask should be nonzero if provider is enabled
                 if (val != 0) {
                     s_EnableMaskBaseline = val;
+                    s_EnableMaskAddr     = addr;   // lock address for partial-change detection
                     break;
                 }
             }
@@ -631,16 +688,21 @@ VOID HookDetector::TakeEtwStructureBaseline()
         }
 
         if (s_EtwGuidEntry) {
-            // ProviderEnableInfo.IsEnabled is at ~+0x80 in _ETW_GUID_ENTRY
+            // ProviderEnableInfo.IsEnabled is at ~+0x80 in _ETW_GUID_ENTRY.
+            // Capture the full 32-byte _TRACE_ENABLE_INFO so we can diff Level,
+            // MatchAnyKeyword, and MatchAllKeyword — not just IsEnabled.
             static const ULONG kEnableInfoOffsets[] = { 0x80, 0x78, 0x88, 0x70 };
             for (int i = 0; i < 4; i++) {
                 PVOID addr = (PVOID)((ULONG_PTR)s_EtwGuidEntry + kEnableInfoOffsets[i]);
-                if (MmIsAddressValid(addr)) {
-                    ULONG val = *(PULONG)addr;
-                    if (val != 0) {
-                        s_ProviderEnableBaseline = val;
-                        break;
-                    }
+                if (!MmIsAddressValid(addr)) continue;
+                if (!MmIsAddressValid((PVOID)((ULONG_PTR)addr + 31))) continue;
+                ULONG val = *(PULONG)addr;
+                if (val != 0) {
+                    s_ProviderEnableBaseline = val;
+                    s_EnableInfoAddr = addr;
+                    RtlCopyMemory(s_EnableInfoBaseline, addr, 32);
+                    s_EnableInfoValid = TRUE;
+                    break;
                 }
             }
 
@@ -648,6 +710,28 @@ VOID HookDetector::TakeEtwStructureBaseline()
             PLIST_ENTRY regList = (PLIST_ENTRY)((ULONG_PTR)s_EtwGuidEntry + 0x20);
             if (MmIsAddressValid(regList))
                 s_RegListCountBaseline = CountListEntries(regList, 64);
+
+            // Baseline the hash-table linkage at offset 0 (Flink/Blink).
+            // Unlinking leaves the entry intact but removes it from
+            // EtwpGuidHashTable — detected as Flink=Blink=self or as the
+            // links pointing outside the kernel address range.
+            PLIST_ENTRY hashLink = (PLIST_ENTRY)s_EtwGuidEntry;
+            if (MmIsAddressValid(hashLink) &&
+                MmIsAddressValid((PVOID)((ULONG_PTR)hashLink + sizeof(LIST_ENTRY) - 1)))
+            {
+                PVOID fl = hashLink->Flink;
+                PVOID bl = hashLink->Blink;
+                if (fl && bl &&
+                    (ULONG_PTR)fl > 0xFFFF800000000000ULL &&
+                    (ULONG_PTR)bl > 0xFFFF800000000000ULL)
+                {
+                    s_GuidHashFlinkBase = fl;
+                    s_GuidHashBlinkBase = bl;
+                    s_GuidHashLinkValid = TRUE;
+                    DbgPrint("[+] EtwStructure: GuidEntry hash link Flink=%p "
+                        "Blink=%p\n", fl, bl);
+                }
+            }
         }
 
         // TraceLogging metadata pointer — the Callback field in _ETW_REG_ENTRY
@@ -696,6 +780,25 @@ VOID HookDetector::TakeEtwStructureBaseline()
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         DbgPrint("[-] EtwStructure: exception during baseline capture\n");
+    }
+
+    // Freeze ETW-related kernel export addresses.  If any export redirect
+    // happens later, MmGetSystemRoutineAddress returns a different pointer.
+    __try {
+        for (int i = 0; s_EtwExports[i].name; i++) {
+            UNICODE_STRING u;
+            RtlInitUnicodeString(&u, s_EtwExports[i].name);
+            PVOID fn = MmGetSystemRoutineAddress(&u);
+            if (fn) {
+                s_EtwExports[i].baseline = fn;
+                s_EtwExports[i].valid    = TRUE;
+                DbgPrint("[+] EtwStructure: export %ws frozen at %p\n",
+                    s_EtwExports[i].name, fn);
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] EtwStructure: exception freezing ETW exports\n");
     }
 
     // Resolve EtwpDebuggerData by scanning near EtwWriteEx
@@ -796,6 +899,32 @@ VOID HookDetector::TakeEtwStructureBaseline()
                     DbgPrint("[+] EtwStructure: CKCL _WMI_LOGGER_CONTEXT at %p, "
                         "GetCpuClock=%p (KeQueryPerf=%p, SysTime=%p)\n",
                         slot2, clockFn, halPerf, sysTime);
+
+                    // Baseline LoggerMode — scan offsets 0x40..0x80 for a
+                    // plausible flag-only ULONG (no high bits set by counters).
+                    // Accept the first candidate whose bits match known ETW
+                    // mode flags (low nibble + standard flag positions).
+                    static const ULONG kModeOffsets[] = {
+                        0x6C, 0x70, 0x68, 0x74, 0x78, 0x64, 0x60
+                    };
+                    for (int mi = 0;
+                         mi < (int)(sizeof(kModeOffsets)/sizeof(kModeOffsets[0]));
+                         mi++)
+                    {
+                        PULONG pMode = (PULONG)((ULONG_PTR)slot2 + kModeOffsets[mi]);
+                        if (!MmIsAddressValid(pMode)) continue;
+                        ULONG val = *pMode;
+                        // LoggerMode uses bits in the range 0x00000001..0x0FFFFFFF
+                        // and must be non-zero for an active session.  Reject
+                        // values that look like timestamps/counters.
+                        if (val == 0 || (val & 0xF0000000)) continue;
+                        s_LoggerModeAddr     = pMode;
+                        s_LoggerModeBaseline = val;
+                        s_LoggerModeValid    = TRUE;
+                        DbgPrint("[+] EtwStructure: LoggerMode at +0x%lX = 0x%08lX\n",
+                            kModeOffsets[mi], val);
+                        break;
+                    }
                     break;
                 }
             }
@@ -818,52 +947,86 @@ VOID HookDetector::CheckEtwStructureIntegrity(BufferQueue* bufQueue)
     // --- Check 1+3: _ETW_REG_ENTRY EnableMask and ProviderEnableInfo ---
     if (s_EtwStructureValid && s_EtwRegEntry) {
         __try {
-            // EnableMask check
-            if (s_EnableMaskBaseline != 0) {
-                static const ULONG kEnableMaskOffsets[] = { 0x28, 0x30, 0x20 };
-                for (int i = 0; i < 3; i++) {
-                    PVOID addr = (PVOID)((ULONG_PTR)s_EtwRegEntry + kEnableMaskOffsets[i]);
-                    if (!MmIsAddressValid(addr)) continue;
-                    UCHAR current = *(PUCHAR)addr;
-                    if (current == 0 && s_EnableMaskBaseline != 0) {
-                        char msg[256];
-                        RtlStringCbPrintfA(msg, sizeof(msg),
-                            "ETW BYPASS CRITICAL: _ETW_REG_ENTRY.EnableMask ZEROED "
-                            "at %p (was 0x%02X, now 0x00) — provider silently "
-                            "disabled without code patching (T1562.002: Backstab/"
-                            "PPLdump technique)",
-                            addr, s_EnableMaskBaseline);
-                        EmitEtwStructureAlert(bufQueue, msg);
-                        // Restore
-                        *(PUCHAR)addr = s_EnableMaskBaseline;
-                        DbgPrint("[!] EtwStructure: EnableMask RESTORED to 0x%02X\n",
-                            s_EnableMaskBaseline);
-                        break;
-                    }
+            // EnableMask check — detect full zeroing (Backstab) AND partial
+            // bit clearing that silences specific levels (e.g. 0x1F → 0x01 to
+            // drop info/warning/error while leaving critical-only).  EnableMask
+            // bits correspond to enabled levels: clearing a bit silently
+            // suppresses all events of that level.
+            if (s_EnableMaskBaseline != 0 && s_EnableMaskAddr &&
+                MmIsAddressValid(s_EnableMaskAddr))
+            {
+                UCHAR current = *(PUCHAR)s_EnableMaskAddr;
+                UCHAR cleared = s_EnableMaskBaseline & ~current; // bits that dropped
+                if (cleared != 0) {
+                    const char* kind = (current == 0)
+                        ? "ZEROED (Backstab/PPLdump — full provider disable)"
+                        : "PARTIALLY CLEARED (selective level suppression)";
+                    char msg[320];
+                    RtlStringCbPrintfA(msg, sizeof(msg),
+                        "ETW BYPASS CRITICAL: _ETW_REG_ENTRY.EnableMask %s "
+                        "at %p (was 0x%02X, now 0x%02X, cleared bits=0x%02X) — "
+                        "events matching cleared level bits silently dropped "
+                        "(T1562.002)",
+                        kind, s_EnableMaskAddr, s_EnableMaskBaseline,
+                        current, cleared);
+                    EmitEtwStructureAlert(bufQueue, msg);
+                    // Restore original mask
+                    *(PUCHAR)s_EnableMaskAddr = s_EnableMaskBaseline;
+                    DbgPrint("[!] EtwStructure: EnableMask RESTORED 0x%02X→0x%02X\n",
+                        current, s_EnableMaskBaseline);
                 }
             }
 
-            // ProviderEnableInfo check
-            if (s_EtwGuidEntry && s_ProviderEnableBaseline != 0) {
-                static const ULONG kEnableInfoOffsets[] = { 0x80, 0x78, 0x88, 0x70 };
-                for (int i = 0; i < 4; i++) {
-                    PVOID addr = (PVOID)((ULONG_PTR)s_EtwGuidEntry + kEnableInfoOffsets[i]);
-                    if (!MmIsAddressValid(addr)) continue;
-                    ULONG current = *(PULONG)addr;
-                    if (current == 0 && s_ProviderEnableBaseline != 0) {
-                        char msg[256];
-                        RtlStringCbPrintfA(msg, sizeof(msg),
-                            "ETW BYPASS CRITICAL: _ETW_GUID_ENTRY.ProviderEnableInfo "
-                            "ZEROED at %p (was 0x%lX) — EtwEventEnabled() returns "
-                            "FALSE, all events silently dropped (T1562.002: "
-                            "Phant0m/SyscallDumper technique)",
-                            addr, s_ProviderEnableBaseline);
-                        EmitEtwStructureAlert(bufQueue, msg);
-                        // Restore
-                        *(PULONG)addr = s_ProviderEnableBaseline;
-                        DbgPrint("[!] EtwStructure: ProviderEnableInfo RESTORED\n");
-                        break;
-                    }
+            // ProviderEnableInfo check — compare full 32-byte _TRACE_ENABLE_INFO.
+            // Catches:
+            //   - Full zeroing (Phant0m/SyscallDumper)
+            //   - Level downgrade (UCHAR at +0x04): attacker sets Level=1
+            //     while IsEnabled stays 1, dropping info/warning/error
+            //   - Keyword masking (ULONGLONG at +0x10 MatchAnyKeyword): attacker
+            //     zeroes keywords, silently filtering all events
+            if (s_EnableInfoValid && s_EnableInfoAddr &&
+                MmIsAddressValid(s_EnableInfoAddr) &&
+                MmIsAddressValid((PVOID)((ULONG_PTR)s_EnableInfoAddr + 31)))
+            {
+                UCHAR current[32] = {};
+                RtlCopyMemory(current, s_EnableInfoAddr, 32);
+
+                if (RtlCompareMemory(current, s_EnableInfoBaseline, 32) != 32) {
+                    ULONG     baseIsEnabled = *(PULONG)&s_EnableInfoBaseline[0x00];
+                    ULONG     curIsEnabled  = *(PULONG)&current[0x00];
+                    UCHAR     baseLevel     = s_EnableInfoBaseline[0x04];
+                    UCHAR     curLevel      = current[0x04];
+                    ULONGLONG baseMatchAny  = *(PULONGLONG)&s_EnableInfoBaseline[0x10];
+                    ULONGLONG curMatchAny   = *(PULONGLONG)&current[0x10];
+                    ULONGLONG baseMatchAll  = *(PULONGLONG)&s_EnableInfoBaseline[0x18];
+                    ULONGLONG curMatchAll   = *(PULONGLONG)&current[0x18];
+
+                    const char* attack = "modified";
+                    if (curIsEnabled == 0 && baseIsEnabled != 0)
+                        attack = "ZEROED (Phant0m — provider silently disabled)";
+                    else if (curLevel != 0 && curLevel < baseLevel)
+                        attack = "LEVEL DOWNGRADE (selective event suppression)";
+                    else if (curMatchAny == 0 && baseMatchAny != 0)
+                        attack = "KEYWORD ZEROED (all events filtered by keyword)";
+                    else if (curMatchAny != baseMatchAny)
+                        attack = "KEYWORD MASK CHANGED (selective keyword suppression)";
+
+                    char msg[384];
+                    RtlStringCbPrintfA(msg, sizeof(msg),
+                        "ETW BYPASS CRITICAL: _ETW_GUID_ENTRY.ProviderEnableInfo "
+                        "%s at %p — IsEnabled %lu→%lu, Level %u→%u, "
+                        "MatchAnyKeyword 0x%llX→0x%llX, MatchAll 0x%llX→0x%llX "
+                        "(T1562.002)",
+                        attack, s_EnableInfoAddr,
+                        baseIsEnabled, curIsEnabled,
+                        baseLevel, curLevel,
+                        baseMatchAny, curMatchAny,
+                        baseMatchAll, curMatchAll);
+                    EmitEtwStructureAlert(bufQueue, msg);
+
+                    // Restore full baseline
+                    RtlCopyMemory(s_EnableInfoAddr, s_EnableInfoBaseline, 32);
+                    DbgPrint("[!] EtwStructure: ProviderEnableInfo RESTORED\n");
                 }
             }
 
@@ -997,6 +1160,117 @@ VOID HookDetector::CheckEtwStructureIntegrity(BufferQueue* bufQueue)
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             DbgPrint("[-] EtwStructure: exception in GetCpuClock check\n");
+        }
+    }
+
+    // --- Check 7: _ETW_GUID_ENTRY hash-table linkage ---
+    // Detects provider unlinking from EtwpGuidHashTable.  When a legit entry
+    // sits in the table, its Flink/Blink at +0x00 point to neighbors in the
+    // same kernel pool range.  Unlinking sets Flink==Blink==self (empty ring)
+    // or redirects them to attacker memory.
+    if (s_GuidHashLinkValid && s_EtwGuidEntry &&
+        MmIsAddressValid(s_EtwGuidEntry))
+    {
+        __try {
+            PLIST_ENTRY hashLink = (PLIST_ENTRY)s_EtwGuidEntry;
+            PVOID fl = hashLink->Flink;
+            PVOID bl = hashLink->Blink;
+
+            bool unlinked =
+                (fl == nullptr || bl == nullptr)           ||
+                (fl == hashLink && bl == hashLink)         ||  // empty ring
+                ((ULONG_PTR)fl < 0xFFFF800000000000ULL)    ||
+                ((ULONG_PTR)bl < 0xFFFF800000000000ULL);
+
+            if (unlinked) {
+                char msg[320];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "ETW BYPASS CRITICAL: _ETW_GUID_ENTRY hash-table UNLINK "
+                    "at %p (was Flink=%p Blink=%p, now Flink=%p Blink=%p) — "
+                    "provider hidden from EtwpGuidHashTable lookup, events "
+                    "bypass session without code patching (T1562.002)",
+                    s_EtwGuidEntry, s_GuidHashFlinkBase, s_GuidHashBlinkBase,
+                    fl, bl);
+                EmitEtwStructureAlert(bufQueue, msg);
+
+                // Restore original linkage
+                hashLink->Flink = (PLIST_ENTRY)s_GuidHashFlinkBase;
+                hashLink->Blink = (PLIST_ENTRY)s_GuidHashBlinkBase;
+                DbgPrint("[!] EtwStructure: GuidEntry hash linkage RESTORED\n");
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrint("[-] EtwStructure: exception in GuidEntry hash check\n");
+        }
+    }
+
+    // --- Check 8: ETW kernel export freeze ---
+    // Re-resolve each ETW export and compare to baseline.  A change means
+    // ntoskrnl's export directory was redirected — one of the last unpatched
+    // vectors for silently hooking syscall-level entry points.
+    __try {
+        for (int i = 0; s_EtwExports[i].name; i++) {
+            if (!s_EtwExports[i].valid) continue;
+            UNICODE_STRING u;
+            RtlInitUnicodeString(&u, s_EtwExports[i].name);
+            PVOID cur = MmGetSystemRoutineAddress(&u);
+            if (cur && cur != s_EtwExports[i].baseline) {
+                char msg[320];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "ETW BYPASS CRITICAL: ntoskrnl export %ws redirected "
+                    "(was %p, now %p) — export directory tampered, syscall "
+                    "entry silently hooked without prologue patch "
+                    "(T1562.002)",
+                    s_EtwExports[i].name, s_EtwExports[i].baseline, cur);
+                EmitEtwStructureAlert(bufQueue, msg);
+                // No restore: writing to ntoskrnl export directory would
+                // risk PatchGuard BSOD.  Alert + log only.
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[-] EtwStructure: exception in export freeze check\n");
+    }
+
+    // --- Check 9: _WMI_LOGGER_CONTEXT.LoggerMode tamper ---
+    // Flipping CIRCULAR/BUFFERING/PRIVATE/SECURE/INDEPENDENT bits silently
+    // changes session behavior (drop-to-ram, isolation) without any syscall.
+    if (s_LoggerModeValid && s_LoggerModeAddr &&
+        MmIsAddressValid(s_LoggerModeAddr))
+    {
+        __try {
+            ULONG current = *s_LoggerModeAddr;
+            if (current != s_LoggerModeBaseline) {
+                ULONG setBits     = current & ~s_LoggerModeBaseline; // newly set
+                ULONG clearedBits = s_LoggerModeBaseline & ~current; // newly dropped
+                const char* attack = "modified";
+                if ((setBits & 0x400) /* EVENT_TRACE_BUFFERING_MODE */)
+                    attack = "BUFFERING bit set — events held in RAM, not flushed";
+                else if ((setBits & 0x08000000) /* INDEPENDENT_SESSION_MODE */)
+                    attack = "INDEPENDENT bit set — session isolated from rundown";
+                else if ((clearedBits & 0x4) /* EVENT_TRACE_SECURE_MODE */)
+                    attack = "SECURE bit cleared — tamper protections dropped";
+                else if (clearedBits != 0)
+                    attack = "flag bits cleared — mode downgrade";
+
+                char msg[320];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "ETW BYPASS CRITICAL: _WMI_LOGGER_CONTEXT.LoggerMode %s "
+                    "at %p (was 0x%08lX, now 0x%08lX, set=0x%08lX, "
+                    "cleared=0x%08lX) — CKCL session flags tampered in memory "
+                    "without calling NtTraceControl (T1562.002)",
+                    attack, s_LoggerModeAddr, s_LoggerModeBaseline,
+                    current, setBits, clearedBits);
+                EmitEtwStructureAlert(bufQueue, msg);
+
+                // Restore original mode bits
+                *s_LoggerModeAddr = s_LoggerModeBaseline;
+                DbgPrint("[!] EtwStructure: LoggerMode RESTORED 0x%08lX→0x%08lX\n",
+                    current, s_LoggerModeBaseline);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrint("[-] EtwStructure: exception in LoggerMode check\n");
         }
     }
 }

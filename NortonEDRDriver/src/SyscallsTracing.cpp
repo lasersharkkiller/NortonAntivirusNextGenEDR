@@ -4253,10 +4253,461 @@ VOID SyscallsUtils::NtTraceControlHandler(ULONG FunctionCode,
 					minBuffers, maxBuffers);
 				EmitSyscallNotif(0, bufMsg, caller, nullptr, TRUE);
 			}
+
+			// --- Check: WNODE_HEADER.Guid rewrite on live session (code 5) ---
+			// UpdateTrace normally does not change session identity.  A non-
+			// zero Guid combined with a LogFileMode change strongly indicates
+			// a session-identity-takeover attempt: attacker rewrites WNODE.Guid
+			// to impersonate a protected session or to decouple a live session
+			// from its controller, then flips LogFileMode to redirect output.
+			if (FunctionCode == 5 && InBufferLen >= 0x34) {
+				PUCHAR guidBytes = buf + 0x18;
+				bool guidNonZero = false;
+				for (int gi = 0; gi < 16; gi++) {
+					if (guidBytes[gi] != 0) { guidNonZero = true; break; }
+				}
+				if (guidNonZero) {
+					char guidMsg[384];
+					RtlStringCbPrintfA(guidMsg, sizeof(guidMsg),
+						"NtTraceControl UpdateTrace: WNODE_HEADER.Guid "
+						"rewritten on live session "
+						"(%02X%02X%02X%02X-%02X%02X-%02X%02X-..., "
+						"LogFileMode=0x%08lX) — session identity takeover "
+						"attempt, attacker may be impersonating a protected "
+						"session (T1562.002)",
+						guidBytes[0], guidBytes[1], guidBytes[2], guidBytes[3],
+						guidBytes[4], guidBytes[5], guidBytes[6], guidBytes[7],
+						logFileMode);
+					EmitSyscallNotif(0, guidMsg, caller, nullptr, TRUE);
+				}
+			}
+
+			// --- Check: WNODE_FLAG_SECURITY removal (code 5 UpdateTrace) ---
+			// WNODE_FLAG_SECURITY (0x00000008) in WNODE_HEADER.Flags enables
+			// the security descriptor on the session.  Removing it allows any
+			// unprivileged process to attach consumers or modify the session.
+			// Attackers strip this flag via UpdateTrace to gain session access.
+			ULONG wnodeFlags = *(PULONG)(buf + 0x34);
+			if (FunctionCode == 5 && !(wnodeFlags & 0x00000008)) {
+				// Flag is absent — if this is an update to an existing session,
+				// it may be stripping the security flag.  Alert on all cases
+				// since legitimate updates rarely clear WNODE_FLAG_SECURITY.
+				char secMsg[350];
+				RtlStringCbPrintfA(secMsg, sizeof(secMsg),
+					"NtTraceControl UpdateTrace: WNODE_FLAG_SECURITY absent "
+					"(Flags=0x%08lX) — SecurityTrace flag may have been "
+					"stripped to allow unauthorized session access (T1562.002)",
+					wnodeFlags);
+				EmitSyscallNotif(0, secMsg, caller, nullptr, TRUE);
+			}
+
+			// --- Check: EVENT_TRACE_BUFFERING_MODE (0x400) ---
+			// Buffering-only mode: events stay in kernel ring buffers and are
+			// never delivered to a log file or real-time consumer.  Once the
+			// buffers fill, new events silently overwrite old ones.  Combined
+			// with session takeover (UpdateTrace), this discards all events
+			// without stopping the session — a stealthy blinding technique.
+			if (logFileMode & 0x400) {
+				char bufModeMsg[350];
+				RtlStringCbPrintfA(bufModeMsg, sizeof(bufModeMsg),
+					"NtTraceControl %s: EVENT_TRACE_BUFFERING_MODE (0x%08lX) "
+					"— events confined to kernel buffers, never delivered to "
+					"file or real-time consumer — silent event black hole "
+					"(T1562.002)",
+					FunctionCode == 0 ? "StartTrace" : "UpdateTrace",
+					logFileMode);
+				EmitSyscallNotif(0, bufModeMsg, caller, nullptr, TRUE);
+			}
+
+			// --- Check: CIRCULAR mode with small MaximumFileSize ---
+			// EVENT_TRACE_FILE_MODE_CIRCULAR (0x2) writes events in a circular
+			// buffer on disk.  If an attacker sets this via UpdateTrace with a
+			// tiny MaximumFileSize, old events are overwritten within seconds
+			// under normal load — effectively erasing forensic evidence.
+			// MaximumFileSize is at +0x54 in the NtTraceControl input buffer
+			// (EVENT_TRACE_PROPERTIES.MaximumFileSize).
+			if ((logFileMode & 0x02) && InBufferLen >= 0x58) {
+				ULONG maxFileSize = *(PULONG)(buf + 0x54);
+				if (maxFileSize > 0 && maxFileSize <= 2) {
+					char circMsg[350];
+					RtlStringCbPrintfA(circMsg, sizeof(circMsg),
+						"NtTraceControl %s: CIRCULAR mode with MaxFileSize=%lu MB "
+						"— events overwritten within seconds under load, forensic "
+						"evidence destroyed without stopping session (T1562.002)",
+						FunctionCode == 0 ? "StartTrace" : "UpdateTrace",
+						maxFileSize);
+					EmitSyscallNotif(0, circMsg, caller, nullptr, TRUE);
+				}
+			}
+
+			// --- Check: FlushTimer manipulation ---
+			// EVENT_TRACE_PROPERTIES.FlushTimer controls how frequently kernel
+			// buffers are flushed to disk or the real-time consumer.  Setting it
+			// to a very large value (e.g., 0xFFFFFFFF = ~49 days) via UpdateTrace
+			// delays event delivery indefinitely — events accumulate in kernel
+			// buffers and are effectively invisible until the timer fires.
+			// FlushTimer is at +0x5C in the NtTraceControl input buffer.
+			if (FunctionCode == 5 && InBufferLen >= 0x60) {
+				ULONG flushTimer = *(PULONG)(buf + 0x5C);
+				// Flag extreme values: >24 hours (86400 seconds) is suspicious,
+				// >1 hour (3600) from a non-PPL caller warrants a warning.
+				if (flushTimer >= 86400) {
+					char flushMsg[350];
+					RtlStringCbPrintfA(flushMsg, sizeof(flushMsg),
+						"NtTraceControl UpdateTrace: FlushTimer=%lu seconds "
+						"(%lu hours) — events delayed indefinitely in kernel "
+						"buffers, effectively invisible to consumers (T1562.002)",
+						flushTimer, flushTimer / 3600);
+					EmitSyscallNotif(0, flushMsg, caller, nullptr, TRUE);
+				}
+			}
+
+			// --- Check: LogFileMode contains EVENT_TRACE_INDEPENDENT_SESSION_MODE ---
+			// 0x08000000 = EVENT_TRACE_INDEPENDENT_SESSION_MODE — bypasses
+			// the 8-provider-per-session limit, useful for targeted GUID flooding.
+			if (logFileMode & 0x08000000) {
+				char indMsg[350];
+				RtlStringCbPrintfA(indMsg, sizeof(indMsg),
+					"NtTraceControl %s: INDEPENDENT_SESSION_MODE (0x%08lX) "
+					"— bypasses per-provider session limit, possible targeted "
+					"provider slot exhaustion (T1562.002)",
+					FunctionCode == 0 ? "StartTrace" : "UpdateTrace",
+					logFileMode);
+				EmitSyscallNotif(0, indMsg, caller, nullptr, TRUE);
+			}
+
+			// --- Check: LogFile path redirection ---
+			// UpdateTrace can change LogFileName to redirect the .etl output
+			// to a black hole (NUL device, pipe, nonexistent path, or temp
+			// directory).  The session stays alive but events go nowhere or
+			// to an attacker-controlled location.
+			// LogFileNameOffset is at +0x38 in the NtTraceControl input buffer.
+			if (FunctionCode == 5 && InBufferLen >= 0x3C) {
+				ULONG logFileNameOff = *(PULONG)(buf + 0x38);
+				if (logFileNameOff > 0 && logFileNameOff < InBufferLen &&
+					(InBufferLen - logFileNameOff) >= 4) {
+					const wchar_t* logPath = (const wchar_t*)(buf + logFileNameOff);
+					if (logPath[0] != L'\0') {
+						// Check for suspicious log file destinations
+						BOOLEAN suspicious = FALSE;
+						const char* reason = "";
+
+						// NUL device — events written to void
+						if (_wcsnicmp(logPath, L"NUL", 3) == 0 ||
+							_wcsnicmp(logPath, L"\\\\.\\NUL", 7) == 0) {
+							suspicious = TRUE;
+							reason = "NUL device — events written to void";
+						}
+						// Named pipe — events redirected to attacker consumer
+						else if (_wcsnicmp(logPath, L"\\\\.\\pipe\\", 9) == 0 ||
+								 _wcsnicmp(logPath, L"\\\\", 2) == 0) {
+							suspicious = TRUE;
+							reason = "pipe/UNC path — events redirected to "
+								"attacker-controlled destination";
+						}
+						// Temp directories — ephemeral, easily cleaned up
+						else if (_wcsnicmp(logPath, L"C:\\Windows\\Temp", 15) == 0 ||
+								 wcsstr(logPath, L"\\Temp\\") != nullptr ||
+								 wcsstr(logPath, L"\\tmp\\") != nullptr ||
+								 wcsstr(logPath, L"\\AppData\\Local\\Temp") != nullptr) {
+							suspicious = TRUE;
+							reason = "temp directory — evidence easily destroyed";
+						}
+
+						if (suspicious) {
+							char pathMsg[400];
+							// Narrow the path for the alert (first 80 chars)
+							char narrowPath[82] = {};
+							for (int c = 0; c < 80 && logPath[c]; c++)
+								narrowPath[c] = (logPath[c] < 128)
+									? (char)logPath[c] : '?';
+							RtlStringCbPrintfA(pathMsg, sizeof(pathMsg),
+								"NtTraceControl UpdateTrace: LogFileName REDIRECTED "
+								"to '%s' — %s (T1562.002)",
+								narrowPath, reason);
+							EmitSyscallNotif(0, pathMsg, caller, nullptr, TRUE);
+						}
+					}
+				}
+			}
+
+			// --- Check: Named system session targeting ---
+			// Extract session name from EVENT_TRACE_PROPERTIES.LoggerNameOffset.
+			// WNODE_HEADER.BufferSize is at +0x00, LoggerNameOffset at +0x3C.
+			ULONG loggerNameOff = *(PULONG)(buf + 0x3C);
+			if (loggerNameOff > 0 && loggerNameOff < InBufferLen &&
+				(InBufferLen - loggerNameOff) >= 2) {
+				const wchar_t* sessName = (const wchar_t*)(buf + loggerNameOff);
+				// Validate: at least one non-null wchar
+				if (sessName[0] != L'\0') {
+					// Well-known system sessions that attackers target
+					static const struct {
+						const wchar_t* name;
+						const char*    desc;
+					} kTargetedSessions[] = {
+						{ L"Circular Kernel Context Logger",
+						  "CKCL — InfinityHook target, kernel event interception" },
+						{ L"NT Kernel Logger",
+						  "NT Kernel Logger — system-wide kernel tracing" },
+						{ L"PROCMON TRACE",
+						  "PROCMON TRACE — Process Monitor session hijacking" },
+						{ L"DefenderApiLogger",
+						  "DefenderApiLogger — Defender ETW session blinding" },
+						{ L"DefenderAuditLogger",
+						  "DefenderAuditLogger — Defender audit session blinding" },
+						{ L"NLA",
+						  "NLA — Network Location Awareness session" },
+						{ L"DiagLog",
+						  "DiagLog — Diagnostic session manipulation" },
+						{ L"EventLog-Security",
+						  "EventLog-Security — Security event log session" },
+						{ L"EventLog-System",
+						  "EventLog-System — System event log session" },
+						{ L"EventLog-Application",
+						  "EventLog-Application — Application event log session" },
+					};
+					for (auto& ts : kTargetedSessions) {
+						if (_wcsnicmp(sessName, ts.name, wcslen(ts.name)) == 0) {
+							char tgtMsg[400];
+							RtlStringCbPrintfA(tgtMsg, sizeof(tgtMsg),
+								"NtTraceControl(code=%lu) targeting SYSTEM SESSION "
+								"'%s': %s — %s (T1562.002)",
+								FunctionCode, ts.desc,
+								FunctionCode == 0 ? "hijack/replace" :
+								FunctionCode == 1 ? "KILL" :
+								FunctionCode == 5 ? "config downgrade" :
+								FunctionCode == 28 ? "KILL (no flush)" : "manipulation",
+								ts.desc);
+							EmitSyscallNotif(0, tgtMsg, caller, nullptr, TRUE);
+							break;
+						}
+					}
+
+					// Also check if targeting our own sessions
+					static const wchar_t* kOurSessions[] = {
+						L"NortonEDR-TI", L"NortonEDR-KernelProcess",
+						L"NortonEDR-DotNETRuntime", L"NortonEDR-DotNETRundown",
+						L"NortonEDR-AMSI", L"NortonEDR-LDAP",
+						L"NortonEDR-RPC", L"NortonEDR-NTLM",
+						L"NortonEDR-ApiAudit", L"NortonEDR-CodeIntegrity",
+						L"NortonEDR-DNS", L"NortonEDR-Task",
+					};
+					for (auto& ourName : kOurSessions) {
+						if (_wcsnicmp(sessName, ourName, wcslen(ourName)) == 0) {
+							char ourMsg[400];
+							RtlStringCbPrintfA(ourMsg, sizeof(ourMsg),
+								"NtTraceControl(code=%lu) TARGETING OUR SESSION "
+								"'%S' — direct EDR blinding attack (T1562.002)",
+								FunctionCode, ourName);
+							EmitSyscallNotif(0, ourMsg, caller, nullptr, TRUE);
+							break;
+						}
+					}
+				}
+			}
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
 			// InBuffer is user-mode — probe failure is expected for bad pointers
 		}
+	}
+
+	// --- Deep inspection for EnableProvider/DisableProvider (codes 30/31) ---
+	// InBuffer for EnableProvider contains ENABLE_TRACE_PARAMETERS which
+	// includes the provider GUID.  For DisableProvider the InBuffer layout
+	// varies but typically starts with the provider GUID (16 bytes).
+	// Detect targeting of our provider GUIDs or well-known security providers.
+	if ((FunctionCode == 30 || FunctionCode == 31) &&
+		InBuffer != nullptr && InBufferLen >= sizeof(GUID)) {
+		__try {
+			ProbeForRead(InBuffer, InBufferLen, 1);
+			// The provider GUID is typically the first field in the input
+			GUID targetGuid = *(GUID*)InBuffer;
+
+			// Well-known security-critical provider GUIDs
+			static const struct {
+				GUID guid;
+				const char* name;
+			} kSecurityProviders[] = {
+				// Microsoft-Windows-Threat-Intelligence
+				{ {0xF4E1897A, 0xBB5D, 0x5A14, {0x8F, 0x42, 0xD8, 0x11, 0x63, 0xF1, 0x32, 0x4D}}, "ThreatIntelligence" },
+				// Microsoft-Windows-DotNETRuntime
+				{ {0xE13C0D23, 0xCCBC, 0x4E12, {0x93, 0x1B, 0xD9, 0xCC, 0x2E, 0xEE, 0x27, 0xE4}}, "DotNETRuntime" },
+				// Microsoft-Antimalware-Scan-Interface
+				{ {0x2A576B87, 0x09A7, 0x520E, {0xC2, 0x1A, 0x47, 0x82, 0x20, 0xBF, 0x48, 0x5B}}, "AMSI" },
+				// Microsoft-Windows-Kernel-Process
+				{ {0x22FB2CD6, 0x0E7B, 0x422B, {0xA0, 0xC7, 0x2F, 0xAD, 0x1F, 0xD0, 0xE7, 0x16}}, "KernelProcess" },
+				// Microsoft-Windows-LDAP-Client
+				{ {0x099614A5, 0x5DD7, 0x4788, {0x8B, 0xC9, 0xE2, 0x9F, 0x43, 0xDB, 0x28, 0xFC}}, "LDAP" },
+				// Microsoft-Windows-RPC
+				{ {0x6AD52B32, 0xD609, 0x4BE9, {0xAE, 0x07, 0xCE, 0x8D, 0xAE, 0x93, 0x7E, 0x39}}, "RPC" },
+				// Microsoft-Windows-CodeIntegrity
+				{ {0x4EE76BD8, 0x3CF4, 0x44A0, {0xA0, 0xAC, 0x33, 0x43, 0x29, 0x16, 0x02, 0x2E}}, "CodeIntegrity" },
+			};
+
+			for (auto& sp : kSecurityProviders) {
+				if (IsEqualGUID(targetGuid, sp.guid)) {
+					char provMsg[400];
+					RtlStringCbPrintfA(provMsg, sizeof(provMsg),
+						"NtTraceControl %s targeting SECURITY PROVIDER '%s' "
+						"— direct provider %s (T1562.002)",
+						FunctionCode == 30 ? "EnableProvider" : "DisableProvider",
+						sp.name,
+						FunctionCode == 31 ? "REMOVAL" :
+						"re-enable (keyword/level downgrade)");
+					EmitSyscallNotif(0, provMsg, caller, nullptr, TRUE);
+					break;
+				}
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+
+	// --- Deep inspection for EnableProvider (code 30): Filter Descriptor attacks ---
+	//
+	// EnableTraceEx2 passes ENABLE_TRACE_PARAMETERS with an array of
+	// EVENT_FILTER_DESCRIPTOR entries.  An attacker with session controller
+	// privileges can attach filter descriptors that silently drop events
+	// matching specific criteria — without disabling the provider or altering
+	// keywords.  This is stealthier than keyword downgrade because the provider
+	// still appears fully enabled.
+	//
+	// NtTraceControl code 30 internal buffer layout (Windows 10 21H2+):
+	//   +0x00  GUID      ProviderId           (16 bytes)
+	//   +0x10  ULONG     ControlCode          (1 = enable, 0 = disable)
+	//   +0x14  UCHAR     Level
+	//   +0x15  padding   (3 bytes)
+	//   +0x18  ULONGLONG MatchAnyKeyword
+	//   +0x20  ULONGLONG MatchAllKeyword
+	//   +0x28  ULONG     Timeout
+	//   +0x2C  ULONG     EnableProperty       (EVENT_ENABLE_PROPERTY_*)
+	//   +0x30  ULONG     FilterDescCount
+	//   +0x34  padding   (4 bytes on x64)
+	//   +0x38  PEVENT_FILTER_DESCRIPTOR EnableFilterDesc  (user-mode pointer)
+	//
+	// EVENT_FILTER_DESCRIPTOR (8+4+4 = 16 bytes each):
+	//   +0x00  ULONGLONG Ptr    (pointer to filter data)
+	//   +0x08  ULONG     Size   (size of filter data)
+	//   +0x0C  ULONG     Type   (EVENT_FILTER_TYPE_*)
+	//
+	// Dangerous filter types:
+	//   0x80000100 = EVENT_FILTER_TYPE_PAYLOAD      — drop events by field value
+	//   0x80000200 = EVENT_FILTER_TYPE_EVENT_ID      — drop events by ID
+	//   0x80000400 = EVENT_FILTER_TYPE_EVENT_NAME    — drop events by name
+	//   0x80001000 = EVENT_FILTER_TYPE_STACKWALK     — suppress stack collection
+	//   0x80000800 = EVENT_FILTER_TYPE_SCHEMATIZED   — schema-based filtering
+	//   0x80000010 = EVENT_FILTER_TYPE_PID           — restrict to specific PIDs
+	//
+	// We flag any filter descriptor usage from non-PPL callers as suspicious,
+	// with elevated severity for payload/event-ID/event-name filters that can
+	// selectively blind specific event types.
+	if (FunctionCode == 30 && InBuffer != nullptr && InBufferLen >= 0x40) {
+		__try {
+			ProbeForRead(InBuffer, InBufferLen, 1);
+			PUCHAR buf = (PUCHAR)InBuffer;
+
+			ULONG filterDescCount = *(PULONG)(buf + 0x30);
+
+			if (filterDescCount > 0 && filterDescCount <= 64) {
+				// Read the EnableFilterDesc pointer at +0x38
+				PVOID pFilterArray = *(PVOID*)(buf + 0x38);
+
+				// Known dangerous filter type constants
+				static const struct {
+					ULONG type;
+					const char* name;
+					const char* risk;
+				} kDangerousFilters[] = {
+					{ 0x80000100, "PAYLOAD",     "silently drops events by field value match" },
+					{ 0x80000200, "EVENT_ID",    "silently drops events by event ID" },
+					{ 0x80000400, "EVENT_NAME",  "silently drops events by name" },
+					{ 0x80001000, "STACKWALK",   "suppresses stack trace collection" },
+					{ 0x80000800, "SCHEMATIZED", "schema-based selective event filtering" },
+					{ 0x80000010, "PID",         "restricts provider to attacker-controlled PIDs only" },
+				};
+
+				// Extract provider GUID name for context
+				GUID provGuid = *(GUID*)buf;
+				const char* provName = "unknown";
+				// Re-use kSecurityProviders for name lookup
+				static const struct { GUID guid; const char* name; } kProvLookup[] = {
+					{ {0xF4E1897A, 0xBB5D, 0x5A14, {0x8F, 0x42, 0xD8, 0x11, 0x63, 0xF1, 0x32, 0x4D}}, "ThreatIntelligence" },
+					{ {0xE13C0D23, 0xCCBC, 0x4E12, {0x93, 0x1B, 0xD9, 0xCC, 0x2E, 0xEE, 0x27, 0xE4}}, "DotNETRuntime" },
+					{ {0x2A576B87, 0x09A7, 0x520E, {0xC2, 0x1A, 0x47, 0x82, 0x20, 0xBF, 0x48, 0x5B}}, "AMSI" },
+					{ {0x22FB2CD6, 0x0E7B, 0x422B, {0xA0, 0xC7, 0x2F, 0xAD, 0x1F, 0xD0, 0xE7, 0x16}}, "KernelProcess" },
+					{ {0x099614A5, 0x5DD7, 0x4788, {0x8B, 0xC9, 0xE2, 0x9F, 0x43, 0xDB, 0x28, 0xFC}}, "LDAP" },
+					{ {0x6AD52B32, 0xD609, 0x4BE9, {0xAE, 0x07, 0xCE, 0x8D, 0xAE, 0x93, 0x7E, 0x39}}, "RPC" },
+					{ {0x4EE76BD8, 0x3CF4, 0x44A0, {0xA0, 0xAC, 0x33, 0x43, 0x29, 0x16, 0x02, 0x2E}}, "CodeIntegrity" },
+				};
+				for (auto& p : kProvLookup) {
+					if (IsEqualGUID(provGuid, p.guid)) { provName = p.name; break; }
+				}
+
+				// First alert: filter descriptors present at all
+				char filterMsg[400];
+				RtlStringCbPrintfA(filterMsg, sizeof(filterMsg),
+					"NtTraceControl EnableProvider: %lu FILTER DESCRIPTOR(s) "
+					"attached to provider '%s' — event suppression filters "
+					"can silently blind specific event types (T1562.002)",
+					filterDescCount, provName);
+				EmitSyscallNotif(0, filterMsg, caller, nullptr, TRUE);
+
+				// Walk the filter descriptor array if the pointer is valid
+				if (pFilterArray != nullptr && InBufferLen >= 0x40) {
+					// EVENT_FILTER_DESCRIPTOR is 16 bytes: Ptr(8) + Size(4) + Type(4)
+					SIZE_T arraySize = (SIZE_T)filterDescCount * 16;
+					ProbeForRead(pFilterArray, (ULONG)arraySize, 1);
+					PUCHAR fdArr = (PUCHAR)pFilterArray;
+
+					for (ULONG fi = 0; fi < filterDescCount && fi < 16; fi++) {
+						ULONG fdType = *(PULONG)(fdArr + fi * 16 + 0x0C);
+						ULONG fdSize = *(PULONG)(fdArr + fi * 16 + 0x08);
+
+						for (auto& df : kDangerousFilters) {
+							if (fdType == df.type) {
+								char fdMsg[400];
+								RtlStringCbPrintfA(fdMsg, sizeof(fdMsg),
+									"NtTraceControl EnableProvider: DANGEROUS filter "
+									"type %s (0x%08lX) on provider '%s' — %s "
+									"(size=%lu bytes) (T1562.002)",
+									df.name, df.type, provName, df.risk, fdSize);
+								EmitSyscallNotif(0, fdMsg, caller, nullptr, TRUE);
+								break;
+							}
+						}
+					}
+				}
+			}
+
+			// --- Keyword downgrade detection ---
+			// MatchAnyKeyword=0 with ControlCode=1 (enable) effectively filters
+			// out ALL events since no keyword bits match.  This is a classic
+			// silent blinding technique.
+			ULONG controlCode = *(PULONG)(buf + 0x10);
+			ULONGLONG matchAny = *(PULONGLONG)(buf + 0x18);
+			ULONGLONG matchAll = *(PULONGLONG)(buf + 0x20);
+			UCHAR level = *(PUCHAR)(buf + 0x14);
+
+			if (controlCode == 1 && matchAny == 0) {
+				char kwMsg[350];
+				RtlStringCbPrintfA(kwMsg, sizeof(kwMsg),
+					"NtTraceControl EnableProvider: MatchAnyKeyword=0 — ALL events "
+					"silently filtered (provider appears enabled but receives "
+					"nothing) (T1562.002)");
+				EmitSyscallNotif(0, kwMsg, caller, nullptr, TRUE);
+			}
+
+			// Level downgrade: setting Level=0 disables level-based filtering,
+			// but Level=1 (Critical only) drops everything except Critical events.
+			if (controlCode == 1 && level == 1) {
+				char lvlMsg[350];
+				RtlStringCbPrintfA(lvlMsg, sizeof(lvlMsg),
+					"NtTraceControl EnableProvider: Level=1 (Critical only) — "
+					"all Verbose/Info/Warning/Error events silently suppressed "
+					"(T1562.002)");
+				EmitSyscallNotif(0, lvlMsg, caller, nullptr, TRUE);
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
 	}
 }
 
