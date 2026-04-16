@@ -81,6 +81,50 @@ static PDEVICE_OBJECT    g_FilterCdo           = nullptr;
 // Queue pressure tracking — suppress repeated alerts
 static BOOLEAN g_QueuePressureAlerted = FALSE;
 
+// FltMgr internal _FLT_CALLBACK_NODE DKOM detection.
+// FltMgr makes an internal copy of our PreOp/PostOp callback function pointers
+// into per-instance _FLT_CALLBACK_NODE structures.  An attacker can DKOM-patch
+// those internal copies while g_FsCallbacks (our source array) stays untouched.
+// At init we scan each instance's memory for our callback pointers and snapshot
+// the addresses of those internal copies.  Periodic checks verify the internal
+// copies still match our originals.
+//
+// _FLT_CALLBACK_NODE (Win10/11 x64, approximate):
+//   +0x00  LIST_ENTRY   Links
+//   +0x10  FLT_OPERATION_REGISTRATION*  OperationRegistration
+//   +0x18  PFLT_INSTANCE  Instance
+//   +0x20  PFLT_PRE_OPERATION_CALLBACK  PreOperation
+//   +0x28  PFLT_POST_OPERATION_CALLBACK PostOperation
+//   +0x30  ...
+//
+// We don't rely on fixed offsets — we scan the instance memory for our known
+// callback pointers and record the addresses where we find them.
+#define MAX_INTERNAL_CB_ENTRIES 32
+
+struct InternalCbNodeEntry {
+    PVOID  internalAddr;     // address inside FltMgr's copy where pointer lives
+    PVOID  expectedValue;    // our callback function pointer
+    UCHAR  majorFunction;    // IRP_MJ_* this corresponds to
+    BOOLEAN isPreOp;         // TRUE = PreOp, FALSE = PostOp
+    BOOLEAN valid;
+};
+
+static InternalCbNodeEntry  g_InternalCbNodes[MAX_INTERNAL_CB_ENTRIES] = {};
+static ULONG                g_InternalCbNodeCount = 0;
+static BOOLEAN              g_InternalCbNodesValid = FALSE;
+
+// Altitude registry drift detection.
+// At init we read our registered altitude from the registry and verify it
+// matches NORTONAV_FS_ALTITUDE.  Periodically we re-read and alert if an
+// attacker modified the registry value — the running instance stays at the
+// original altitude but next boot would load at the tampered altitude.
+static WCHAR  g_AltitudeRegistryBaseline[32] = {};
+static BOOLEAN g_AltitudeBaselineValid       = FALSE;
+
+static const WCHAR* kAltitudeRegPath =
+    L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services"
+    L"\\NortonEDRDriver\\Instances\\NortonEDRDrvInstance";
+
 // IoCallDriver detection — track volume device objects at Init for later
 // validation that their DriverObject->MajorFunction table hasn't been hooked
 // to bypass our minifilter.
@@ -1231,6 +1275,12 @@ NTSTATUS FsFilter::Init(PDRIVER_OBJECT DriverObject, NotifQueue* queue) {
     // Snapshot 3: record FltMgr-internal _FLT_FILTER structure pointers.
     FsFilter::TakeFltFilterSnapshot();
 
+    // Snapshot 3b: locate FltMgr's internal callback node copies of our pointers.
+    FsFilter::TakeInternalCbNodeSnapshot();
+
+    // Snapshot 3c: baseline our altitude registry value for drift detection.
+    FsFilter::TakeAltitudeRegistryBaseline();
+
     // Snapshot 4: record volume device objects and their MJ_CREATE dispatch
     // entries for IoCallDriver bypass detection.
     {
@@ -1655,6 +1705,17 @@ VOID FsFilter::ValidateMinifilterIntegrity() {
     // ---- Check 4: Deep DKOM — _FLT_FILTER internal structure integrity ----
     ValidateFltFilterInternal();
 
+    // ---- Check 4b: FltMgr internal callback node DKOM ----
+    // Verifies that FltMgr's internal copies of our PreOp/PostOp pointers
+    // (in _FLT_CALLBACK_NODE structures) haven't been patched independently
+    // of our g_FsCallbacks source array.
+    ValidateInternalCbNodes();
+
+    // ---- Check 4c: Altitude registry drift ----
+    // Detects post-load registry modification that would change our altitude on
+    // next boot (altitude squatting setup, persistence destruction).
+    ValidateAltitudeRegistry();
+
     // ---- Check 5: FastIO / volume device dispatch table integrity ----
     ValidateFastIoDispatch();
 
@@ -1812,6 +1873,257 @@ VOID FsFilter::TakeFltFilterSnapshot() {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         DbgPrint("[-] FsFilter: could not read _FLT_FILTER.Base.Flags\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TakeInternalCbNodeSnapshot — scan FltMgr's internal per-instance callback
+// node structures to locate our PreOp/PostOp function pointer copies.
+//
+// Strategy: for each attached instance, scan its raw memory (up to 4KB) for
+// pointer-sized values that match any of our known callback function pointers.
+// Record the address within the instance structure for periodic re-verification.
+// ---------------------------------------------------------------------------
+VOID FsFilter::TakeInternalCbNodeSnapshot() {
+    g_InternalCbNodeCount = 0;
+    g_InternalCbNodesValid = FALSE;
+
+    if (!g_FilterHandle || g_InstanceSnapshotCount == 0 || g_CallbackSnapshotCount == 0)
+        return;
+
+    // Use the first valid instance to scan for internal callback copies
+    for (ULONG vi = 0; vi < g_InstanceSnapshotCount; vi++) {
+        if (!g_InstanceSnapshot[vi].Valid) continue;
+
+        PFLT_INSTANCE inst = nullptr;
+        NTSTATUS st = FltGetVolumeInstanceFromName(
+            g_FilterHandle, g_InstanceSnapshot[vi].Volume, nullptr, &inst);
+        if (!NT_SUCCESS(st) || !inst) continue;
+
+        __try {
+            // Scan the instance structure memory for our callback pointers.
+            // _FLT_INSTANCE is typically ~0x200-0x400 bytes; scan up to 4KB
+            // to account for version differences and linked structures.
+            PULONG_PTR base = (PULONG_PTR)inst;
+            ULONG scanSlots = 512;  // 512 * 8 = 4096 bytes
+
+            for (ULONG slot = 0; slot < scanSlots; slot++) {
+                if (!MmIsAddressValid(&base[slot])) break;
+                ULONG_PTR val = base[slot];
+                if (!val) continue;
+
+                // Check if this value matches any of our callback function pointers
+                for (ULONG ci = 0; ci < g_CallbackSnapshotCount; ci++) {
+                    if (g_InternalCbNodeCount >= MAX_INTERNAL_CB_ENTRIES) break;
+
+                    PVOID preOp  = g_CallbackSnapshot[ci].PreOperation;
+                    PVOID postOp = g_CallbackSnapshot[ci].PostOperation;
+
+                    // Skip NULL callbacks (not all IRP types have both Pre and Post)
+                    if (preOp && val == (ULONG_PTR)preOp) {
+                        InternalCbNodeEntry& e = g_InternalCbNodes[g_InternalCbNodeCount];
+                        e.internalAddr  = &base[slot];
+                        e.expectedValue = preOp;
+                        e.majorFunction = g_CallbackSnapshot[ci].MajorFunction;
+                        e.isPreOp       = TRUE;
+                        e.valid         = TRUE;
+                        g_InternalCbNodeCount++;
+                    }
+                    else if (postOp && val == (ULONG_PTR)postOp) {
+                        InternalCbNodeEntry& e = g_InternalCbNodes[g_InternalCbNodeCount];
+                        e.internalAddr  = &base[slot];
+                        e.expectedValue = postOp;
+                        e.majorFunction = g_CallbackSnapshot[ci].MajorFunction;
+                        e.isPreOp       = FALSE;
+                        e.valid         = TRUE;
+                        g_InternalCbNodeCount++;
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        FltObjectDereference(inst);
+
+        if (g_InternalCbNodeCount > 0) {
+            g_InternalCbNodesValid = TRUE;
+            DbgPrint("[+] FsFilter: internal callback node snapshot — %lu entries found\n",
+                     g_InternalCbNodeCount);
+        } else {
+            DbgPrint("[-] FsFilter: no internal callback node copies found in instance scan\n");
+        }
+        break;  // only need one instance for the scan
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ValidateInternalCbNodes — periodic check that FltMgr's internal copies
+// of our callback function pointers haven't been DKOM-patched.
+// ---------------------------------------------------------------------------
+static VOID ValidateInternalCbNodes() {
+    if (!g_InternalCbNodesValid || g_InternalCbNodeCount == 0) return;
+
+    for (ULONG i = 0; i < g_InternalCbNodeCount; i++) {
+        InternalCbNodeEntry& e = g_InternalCbNodes[i];
+        if (!e.valid || !e.internalAddr) continue;
+
+        __try {
+            if (!MmIsAddressValid(e.internalAddr)) {
+                char msg[256];
+                RtlStringCchPrintfA(msg, sizeof(msg),
+                    "MINIFILTER DKOM: internal callback node at %p became inaccessible "
+                    "— FltMgr instance structure may have been freed or remapped!",
+                    e.internalAddr);
+                EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+                e.valid = FALSE;
+                continue;
+            }
+
+            PVOID currentValue = *(PVOID*)e.internalAddr;
+            if (currentValue != e.expectedValue) {
+                char msg[280];
+                RtlStringCchPrintfA(msg, sizeof(msg),
+                    "MINIFILTER DEEP DKOM: FltMgr internal %s callback for IRP_MJ_%u "
+                    "patched! Expected %p, found %p — attacker modified "
+                    "_FLT_CALLBACK_NODE without touching g_FsCallbacks!",
+                    e.isPreOp ? "PreOp" : "PostOp",
+                    (ULONG)e.majorFunction,
+                    e.expectedValue, currentValue);
+                EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+                DbgPrint("[!] %s\n", msg);
+                e.valid = FALSE;  // don't spam
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            e.valid = FALSE;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReadAltitudeFromRegistry — read the Altitude string value from our minifilter
+// instance registry key.  Returns TRUE if successful, fills dst (up to dstLen
+// WCHARs including null terminator).
+// ---------------------------------------------------------------------------
+static BOOLEAN ReadAltitudeFromRegistry(WCHAR* dst, ULONG dstLen) {
+    if (!dst || dstLen < 2) return FALSE;
+
+    UNICODE_STRING keyPath;
+    RtlInitUnicodeString(&keyPath, kAltitudeRegPath);
+
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &keyPath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    HANDLE hKey = nullptr;
+    NTSTATUS st = ZwOpenKey(&hKey, KEY_READ, &oa);
+    if (!NT_SUCCESS(st)) return FALSE;
+
+    // Query the "Altitude" value
+    UNICODE_STRING valName;
+    RtlInitUnicodeString(&valName, L"Altitude");
+
+    UCHAR buf[128] = {};
+    ULONG resultLen = 0;
+    st = ZwQueryValueKey(hKey, &valName, KeyValuePartialInformation,
+                         buf, sizeof(buf), &resultLen);
+    ZwClose(hKey);
+
+    if (!NT_SUCCESS(st)) return FALSE;
+
+    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+    if (info->Type != REG_SZ || info->DataLength < 2) return FALSE;
+
+    ULONG charsToCopy = info->DataLength / sizeof(WCHAR);
+    if (charsToCopy >= dstLen) charsToCopy = dstLen - 1;
+    RtlCopyMemory(dst, info->Data, charsToCopy * sizeof(WCHAR));
+    dst[charsToCopy] = L'\0';
+
+    // Strip trailing null if registry value included one
+    if (charsToCopy > 0 && dst[charsToCopy - 1] == L'\0')
+        charsToCopy--;
+
+    return TRUE;
+}
+
+// ---------------------------------------------------------------------------
+// TakeAltitudeRegistryBaseline — read our altitude from the registry at init.
+// ---------------------------------------------------------------------------
+VOID FsFilter::TakeAltitudeRegistryBaseline() {
+    g_AltitudeBaselineValid = FALSE;
+    RtlZeroMemory(g_AltitudeRegistryBaseline, sizeof(g_AltitudeRegistryBaseline));
+
+    if (ReadAltitudeFromRegistry(g_AltitudeRegistryBaseline, 32)) {
+        g_AltitudeBaselineValid = TRUE;
+
+        // Verify it matches our expected altitude at init
+        UNICODE_STRING regAlt, expected;
+        RtlInitUnicodeString(&regAlt, g_AltitudeRegistryBaseline);
+        RtlInitUnicodeString(&expected, NORTONAV_FS_ALTITUDE);
+
+        if (!RtlEqualUnicodeString(&regAlt, &expected, FALSE)) {
+            char msg[256];
+            char regAltA[32] = {};
+            for (ULONG c = 0; c < 31 && g_AltitudeRegistryBaseline[c]; c++)
+                regAltA[c] = (char)g_AltitudeRegistryBaseline[c];
+            RtlStringCchPrintfA(msg, sizeof(msg),
+                "ALTITUDE TAMPER (at load): registry altitude '%s' does not match "
+                "expected '%ws' — filter will load at wrong altitude on next boot!",
+                regAltA, NORTONAV_FS_ALTITUDE);
+            EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+            DbgPrint("[!] %s\n", msg);
+        } else {
+            DbgPrint("[+] FsFilter: altitude registry baseline captured ('%ws')\n",
+                     g_AltitudeRegistryBaseline);
+        }
+    } else {
+        DbgPrint("[-] FsFilter: could not read altitude from registry\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ValidateAltitudeRegistry — periodic check that our altitude registry value
+// hasn't been modified.  Detects next-boot altitude manipulation attacks.
+// ---------------------------------------------------------------------------
+static VOID ValidateAltitudeRegistry() {
+    if (!g_AltitudeBaselineValid) return;
+
+    WCHAR currentAlt[32] = {};
+    if (!ReadAltitudeFromRegistry(currentAlt, 32)) {
+        // Registry key/value deleted — the instance won't auto-attach on next boot
+        EnqueueFsAlert(PsGetCurrentProcessId(), nullptr,
+            "ALTITUDE DELETED: minifilter Altitude registry value is missing! "
+            "Filter will NOT auto-attach on next boot — persistence destroyed!",
+            TRUE);
+        g_AltitudeBaselineValid = FALSE;  // don't spam
+        return;
+    }
+
+    // Compare current value with baseline
+    BOOLEAN match = TRUE;
+    for (ULONG c = 0; c < 31; c++) {
+        if (g_AltitudeRegistryBaseline[c] != currentAlt[c]) {
+            match = FALSE; break;
+        }
+        if (g_AltitudeRegistryBaseline[c] == L'\0') break;
+    }
+
+    if (!match) {
+        char baseA[32] = {}, currA[32] = {};
+        for (ULONG c = 0; c < 31 && g_AltitudeRegistryBaseline[c]; c++)
+            baseA[c] = (char)g_AltitudeRegistryBaseline[c];
+        for (ULONG c = 0; c < 31 && currentAlt[c]; c++)
+            currA[c] = (char)currentAlt[c];
+
+        char msg[256];
+        RtlStringCchPrintfA(msg, sizeof(msg),
+            "ALTITUDE DRIFT: registry altitude changed from '%s' to '%s'! "
+            "Attacker is repositioning our minifilter for next boot "
+            "(altitude squatting/sandwiching setup)!",
+            baseA, currA);
+        EnqueueFsAlert(PsGetCurrentProcessId(), nullptr, msg, TRUE);
+        DbgPrint("[!] %s\n", msg);
+
+        // Update baseline so we only alert once per change
+        RtlCopyMemory(g_AltitudeRegistryBaseline, currentAlt, sizeof(g_AltitudeRegistryBaseline));
     }
 }
 

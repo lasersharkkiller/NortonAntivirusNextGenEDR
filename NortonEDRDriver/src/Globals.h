@@ -1436,6 +1436,13 @@ public:
     // Snapshot of the FltMgr-internal _FLT_FILTER.Operations pointer for deep DKOM detection.
     static VOID TakeFltFilterSnapshot();
 
+    // Snapshot FltMgr's internal _FLT_CALLBACK_NODE copies of our callback pointers.
+    // Must be called after TakeCallbackSnapshot + instance attachment.
+    static VOID TakeInternalCbNodeSnapshot();
+
+    // Altitude registry drift detection — read altitude at init, verify periodically.
+    static VOID TakeAltitudeRegistryBaseline();
+
     // Validate the FltMgr-internal _FLT_FILTER structure hasn't been tampered with.
     static VOID ValidateFltFilterInternal();
 
@@ -1747,6 +1754,22 @@ public:
         char*        procName,
         BufferQueue* bufQueue
     );
+
+    // ---------------------------------------------------------------------------
+    // Per-process amsi.dll image base tracking — used by NtSetContextThread /
+    // NtContinue handlers to detect hardware breakpoints targeting AMSI
+    // functions (Ceri Coburn technique).
+    // ---------------------------------------------------------------------------
+
+    // Record amsi.dll base + size when it loads into a process.
+    // Called from ImageLoadNotifyRoutine.
+    static VOID RecordAmsiImageBase(HANDLE pid, PVOID imageBase, SIZE_T imageSize);
+
+    // Remove entry when process terminates.
+    static VOID RemoveAmsiImageBase(HANDLE pid);
+
+    // Check whether a user-mode address falls within amsi.dll for a given PID.
+    static BOOLEAN IsAddressInAmsiDll(HANDLE pid, ULONG64 address);
 };
 
 // ---------------------------------------------------------------------------
@@ -1765,8 +1788,9 @@ public:
 #define OB_CALLBACK_SNAPSHOT_MAX 32
 
 struct ObCallbackSnapshot {
-    PVOID preOpPointers[OB_CALLBACK_SNAPSHOT_MAX];  // sorted array of known-good PreOp ptrs
+    PVOID preOpPointers[OB_CALLBACK_SNAPSHOT_MAX];  // ordered array of known-good PreOp ptrs
     ULONG count;
+    ULONG ourIndex;   // index of our callback in the list at init time (execution order)
 };
 
 // Snapshot of Ps*Notify callback arrays (PspCreateProcessNotifyRoutine[], etc).
@@ -1776,6 +1800,7 @@ struct PsCallbackSnapshot {
     PVOID  arrayBase;    // base of PspCreate*NotifyRoutine[64]
     PVOID  ourCallback;  // our registered function pointer (what to look for)
     BOOLEAN valid;       // FALSE if LEA scan failed — check is skipped
+    ULONG  ourSlotIndex; // slot index of our callback at init (for order tracking)
 };
 
 // Snapshot of CmpCallBackVector[] — the EX_CALLBACK array backing CmRegisterCallback.

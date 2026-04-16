@@ -1449,6 +1449,15 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                     }
                                 }
                                 if (isAmsiDll) {
+                                    // Record amsi.dll base for this process so the
+                                    // NtSetContextThread / NtContinue handlers can detect
+                                    // hardware breakpoints targeting AMSI functions
+                                    // (Ceri Coburn technique).
+                                    AmsiDetector::RecordAmsiImageBase(
+                                        ProcessId,
+                                        ImageInfo->ImageBase,
+                                        ImageInfo->ImageSize);
+
                                     AmsiDetector::ScanAmsiBypassPatterns(
                                         ImageInfo->ImageBase,
                                         ImageInfo->ImageSize,
@@ -1456,6 +1465,96 @@ VOID ImageUtils::ImageLoadNotifyRoutine(
                                         PsGetProcessImageFileName(targetProcess),
                                         CallbackObjects::GetNotifQueue()
                                     );
+                                }
+
+                                // -------------------------------------------------------
+                                // Detect our AMSI provider DLL (AmsiProvider.dll) loading
+                                // into a process that already has amsi.dll loaded. This is
+                                // normal — AMSI triggers COM activation which loads us. But
+                                // if our provider loads into a process that is NOT a script
+                                // engine or managed host, it may indicate an attacker loading
+                                // our DLL to study/patch it. Emit an informational alert.
+                                // -------------------------------------------------------
+                                BOOLEAN isOurProviderDll = FALSE;
+                                for (SIZE_T k = 0; k + 16 <= cbLen; k++) {
+                                    if (((charBuffer[k]    | 0x20) == 'a') &&
+                                        ((charBuffer[k+1]  | 0x20) == 'm') &&
+                                        ((charBuffer[k+2]  | 0x20) == 's') &&
+                                        ((charBuffer[k+3]  | 0x20) == 'i') &&
+                                        ((charBuffer[k+4]  | 0x20) == 'p') &&
+                                        ((charBuffer[k+5]  | 0x20) == 'r') &&
+                                        ((charBuffer[k+6]  | 0x20) == 'o') &&
+                                        ((charBuffer[k+7]  | 0x20) == 'v') &&
+                                        ((charBuffer[k+8]  | 0x20) == 'i') &&
+                                        ((charBuffer[k+9]  | 0x20) == 'd') &&
+                                        ((charBuffer[k+10] | 0x20) == 'e') &&
+                                        ((charBuffer[k+11] | 0x20) == 'r') &&
+                                         (charBuffer[k+12]          == '.') &&
+                                        ((charBuffer[k+13] | 0x20) == 'd') &&
+                                        ((charBuffer[k+14] | 0x20) == 'l') &&
+                                        ((charBuffer[k+15] | 0x20) == 'l')) {
+                                        isOurProviderDll = TRUE;
+                                        break;
+                                    }
+                                }
+                                if (isOurProviderDll) {
+                                    char* hostProc = PsGetProcessImageFileName(targetProcess);
+                                    // Normal hosts: powershell, pwsh, cscript, wscript, mshta,
+                                    // dotnet, w3wp, etc. Anything else loading our provider is
+                                    // suspicious (attacker analysis / DLL study).
+                                    BOOLEAN isSuspiciousHost = TRUE;
+                                    if (hostProc != NULL) {
+                                        if (strcmp(hostProc, "powershell.exe")  == 0 ||
+                                            strcmp(hostProc, "pwsh.exe")        == 0 ||
+                                            strcmp(hostProc, "cscript.exe")     == 0 ||
+                                            strcmp(hostProc, "wscript.exe")     == 0 ||
+                                            strcmp(hostProc, "mshta.exe")       == 0 ||
+                                            strcmp(hostProc, "dotnet.exe")      == 0 ||
+                                            strcmp(hostProc, "w3wp.exe")        == 0 ||
+                                            strcmp(hostProc, "wsmprovhost.exe") == 0 ||
+                                            strcmp(hostProc, "powershell_ise")  == 0 ||
+                                            strcmp(hostProc, "excel.exe")       == 0 ||
+                                            strcmp(hostProc, "winword.exe")     == 0 ||
+                                            strcmp(hostProc, "outlook.exe")     == 0) {
+                                            isSuspiciousHost = FALSE;
+                                        }
+                                    }
+                                    if (isSuspiciousHost) {
+                                        const char* provMsg = "AMSI provider DLL loaded into unexpected process — possible provider analysis/patching setup";
+                                        SIZE_T provMsgLen = strlen(provMsg);
+
+                                        PKERNEL_STRUCTURED_NOTIFICATION provNotif =
+                                            (PKERNEL_STRUCTURED_NOTIFICATION)ExAllocatePool2(
+                                                POOL_FLAG_NON_PAGED, sizeof(KERNEL_STRUCTURED_NOTIFICATION), 'krnl');
+                                        if (provNotif) {
+                                            SET_CRITICAL(*provNotif);
+                                            SET_IMAGE_LOAD_PATH_CHECK(*provNotif);
+                                            SET_CALLING_PROC_PID_CHECK(*provNotif);
+
+                                            provNotif->pid    = PsGetProcessId(targetProcess);
+                                            provNotif->isPath = FALSE;
+                                            if (hostProc) {
+                                                RtlStringCbCopyA(provNotif->procName,
+                                                                 sizeof(provNotif->procName), hostProc);
+                                            }
+
+                                            char* msgBuf = (char*)ExAllocatePool2(
+                                                POOL_FLAG_NON_PAGED, provMsgLen + 1, 'msg');
+                                            if (msgBuf) {
+                                                RtlCopyMemory(msgBuf, provMsg, provMsgLen);
+                                                msgBuf[provMsgLen] = '\0';
+                                                provNotif->msg     = msgBuf;
+                                                provNotif->bufSize = (ULONG)(provMsgLen + 1);
+
+                                                if (!CallbackObjects::GetNotifQueue()->Enqueue(provNotif)) {
+                                                    ExFreePool(provNotif->msg);
+                                                    ExFreePool(provNotif);
+                                                }
+                                            } else {
+                                                ExFreePool(provNotif);
+                                            }
+                                        }
+                                    }
                                 }
 
                                 // Detect unmanaged PowerShell hosting:

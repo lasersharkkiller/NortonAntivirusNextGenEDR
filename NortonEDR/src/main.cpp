@@ -44,6 +44,22 @@
 #pragma comment(lib, "bcrypt.lib")
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
+
+// OLE Structured Storage (StgOpenStorage) for CFB document parsing
+#include <objbase.h>
+#pragma comment(lib, "ole32.lib")
+
+// zlib for OOXML (ZIP) entry inflation — install via:
+//   vcpkg install zlib:x64-windows
+// CFB path works without zlib; only OOXML extraction requires it.
+#if __has_include(<zlib.h>)
+#include <zlib.h>
+#pragma comment(lib, "zlib.lib")
+#define NORTONAV_HAS_ZLIB 1
+#else
+#define NORTONAV_HAS_ZLIB 0
+#endif
+
 #include <set>
 
 using namespace ftxui;
@@ -210,6 +226,12 @@ static std::atomic<bool> g_tiStop(false);
 // ---------------------------------------------------------------------------
 static TRACEHANDLE       g_kpSessionHandle  = 0;
 static TRACEHANDLE       g_kpTraceHandle    = INVALID_PROCESSTRACE_HANDLE;
+
+// ---------------------------------------------------------------------------
+// Microsoft-Antimalware-Scan-Interface ETW session (AMSI bypass/no-call)
+// ---------------------------------------------------------------------------
+static TRACEHANDLE       g_amsiSessionHandle = 0;
+static TRACEHANDLE       g_amsiTraceHandle   = INVALID_PROCESSTRACE_HANDLE;
 
 // ---------------------------------------------------------------------------
 // PowerShell script-block logging subscription
@@ -1065,6 +1087,56 @@ ProcessSnapshotData CollectProcessSnapshot(UINT32 pid) {
         snapshot.commandLine = QueryProcessCommandLine(processHandle);
         ScanProcessEnvironmentForProfilerHijack(processHandle, pid, snapshot.processName);
         CloseHandle(processHandle);
+    }
+
+    // Runtime LOLBin-relocation check. Catches the "copy cmd.exe to
+    // %TEMP%\update.exe" trick: a Microsoft-signed LOLBin executed from a
+    // non-System32 path. The image path here is the actual on-disk location,
+    // regardless of what basename the attacker renamed it to.
+    if (!snapshot.imagePath.empty()) {
+        static const char* const kLolbinBasenames[] = {
+            "certutil.exe", "bitsadmin.exe", "rundll32.exe", "regsvr32.exe",
+            "mshta.exe", "installutil.exe", "msbuild.exe", "msxsl.exe",
+            "wmic.exe", "cmstp.exe", "atbroker.exe", "mavinject.exe",
+            "ieexec.exe", "regasm.exe", "regsvcs.exe", "scriptrunner.exe",
+            "presentationhost.exe", "cdb.exe", "csc.exe", "vbc.exe",
+            "jsc.exe", "forfiles.exe", "pcalua.exe", "xwizard.exe",
+            "odbcconf.exe", "verclsid.exe", "finger.exe",
+            nullptr
+        };
+        std::string lowPath = snapshot.imagePath;
+        std::string lowBase = snapshot.processName;
+        for (auto& c : lowPath) c = (char)tolower((unsigned char)c);
+        for (auto& c : lowBase) c = (char)tolower((unsigned char)c);
+
+        bool inSystem =
+            lowPath.find("\\windows\\system32\\")       != std::string::npos ||
+            lowPath.find("\\windows\\syswow64\\")       != std::string::npos ||
+            lowPath.find("\\windows\\winsxs\\")         != std::string::npos ||
+            lowPath.find("\\program files\\")           != std::string::npos ||
+            lowPath.find("\\program files (x86)\\")     != std::string::npos ||
+            lowPath.find("\\microsoft visual studio\\") != std::string::npos ||
+            lowPath.find("\\microsoft sdks\\")          != std::string::npos ||
+            lowPath.find("\\dotnet\\sdk\\")             != std::string::npos;
+
+        if (!inSystem) {
+            for (int i = 0; kLolbinBasenames[i]; i++) {
+                if (lowBase == kLolbinBasenames[i]) {
+                    std::string details = "Image: " + snapshot.imagePath +
+                        "\nBasename: " + snapshot.processName +
+                        "\nIndicator: Microsoft-signed LOLBin executing from "
+                        "non-system path — renamed/copied for LOL* abuse";
+                    PushUiDetectionEvent(
+                        "Relocated LOLBin: " + snapshot.processName,
+                        details,
+                        "Defense-Evasion: LOLBin Relocation (T1036.003)",
+                        pid,
+                        DetectionSeverity::High
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     return snapshot;
@@ -2580,6 +2652,106 @@ static std::pair<double, std::string> ComputePeSectionEntropy(const std::string&
 
     UnmapViewOfFile((LPCVOID)base);
     return {maxEnt, std::string(maxNameBuf)};
+}
+
+// Overlay + non-executable-section entropy. Catches payloads hidden in .rsrc,
+// .rdata, or the overlay region (post-last-section bytes) — where donut-style
+// shellcode carriers, steganographic loaders, and crypted resource blobs
+// usually sit. Returns {overlayEntropy, overlaySize, nonExecMaxEntropy, nonExecSecName}.
+struct PeHiddenPayloadInfo {
+    double overlayEntropy = 0.0;
+    size_t overlaySize    = 0;
+    double nonExecMaxEnt  = 0.0;
+    std::string nonExecSecName;
+};
+
+static PeHiddenPayloadInfo ComputePeHiddenPayloadInfo(const std::string& path) {
+    PeHiddenPayloadInfo out;
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return out;
+    LARGE_INTEGER fsz{};
+    GetFileSizeEx(hFile, &fsz);
+    HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(hFile);
+    if (!hMap) return out;
+    const BYTE* base = (const BYTE*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hMap);
+    if (!base) return out;
+
+    DWORD overlayStart = 0;
+    DWORD overlayLen   = 0;
+    DWORD nonExecOff   = 0;
+    DWORD nonExecSz    = 0;
+    char  nonExecName[9] = {};
+
+    __try {
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) __leave;
+        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) __leave;
+
+        const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+        DWORD maxEndOfSection = 0;
+
+        double nonExecMax = 0.0;
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+            DWORD sz  = sec[i].SizeOfRawData;
+            DWORD off = sec[i].PointerToRawData;
+            if (off + sz > maxEndOfSection) maxEndOfSection = off + sz;
+            if (sz == 0 || sz > 64 * 1024 * 1024) continue;
+            if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) continue; // handled elsewhere
+
+            size_t counts[256] = {};
+            const BYTE* data = base + off;
+            for (DWORD k = 0; k < sz; k++) counts[data[k]]++;
+            double ent = 0.0;
+            for (int k = 0; k < 256; k++) {
+                if (counts[k] == 0) continue;
+                double p = (double)counts[k] / (double)sz;
+                ent -= p * log2(p);
+            }
+            if (ent > nonExecMax) {
+                nonExecMax = ent;
+                nonExecOff = off;
+                nonExecSz  = sz;
+                memcpy(nonExecName, sec[i].Name, 8);
+                nonExecName[8] = 0;
+            }
+        }
+        // Overlay = bytes between end of last section and EOF
+        if (fsz.QuadPart > 0 && (ULONGLONG)fsz.QuadPart > maxEndOfSection) {
+            ULONGLONG ov = (ULONGLONG)fsz.QuadPart - maxEndOfSection;
+            if (ov > 0 && ov < 128 * 1024 * 1024) {
+                overlayStart = maxEndOfSection;
+                overlayLen   = (DWORD)ov;
+            }
+        }
+        // Stash computed non-exec entropy
+        out.nonExecMaxEnt = nonExecMax;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    // Compute overlay entropy outside __try (safer — reads tail of map)
+    if (overlayLen) {
+        size_t counts[256] = {};
+        const BYTE* data = base + overlayStart;
+        __try {
+            for (DWORD k = 0; k < overlayLen; k++) counts[data[k]]++;
+            double ent = 0.0;
+            for (int k = 0; k < 256; k++) {
+                if (counts[k] == 0) continue;
+                double p = (double)counts[k] / (double)overlayLen;
+                ent -= p * log2(p);
+            }
+            out.overlayEntropy = ent;
+            out.overlaySize    = overlayLen;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    out.nonExecSecName = nonExecName;
+
+    UnmapViewOfFile((LPCVOID)base);
+    return out;
 }
 
 static std::string ComputeImphash(const std::string& path) {
@@ -4773,6 +4945,546 @@ static void ClrProfilerRegistryWatcherThread() {
     }
 }
 
+// PendingFileRenameOperations watcher. HKLM\SYSTEM\CurrentControlSet\Control\
+// Session Manager\PendingFileRenameOperations is a REG_MULTI_SZ of alternating
+// source\0destination\0 pairs consumed by smss.exe at boot. Malware writes to
+// this key to:
+//   - Delete its own on-disk footprint at next reboot (destination is empty)
+//   - Overwrite system binaries after reboot (bypasses file-in-use locks on
+//     kernel drivers, AV core DLLs, etc.)
+//   - Replace EDR/AV binaries with attacker-controlled copies
+// Any write to this key from a non-installer process is high-signal.
+static void PendingFileRenameWatcherThread() {
+    HKEY hKey = nullptr;
+    LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\Session Manager",
+        0, KEY_NOTIFY | KEY_READ, &hKey);
+    if (rc != ERROR_SUCCESS) return;
+
+    HANDLE hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!hEvent) { RegCloseKey(hKey); return; }
+
+    auto readPfro = [&](std::vector<std::string>& outPairs) {
+        DWORD type = 0, cb = 0;
+        if (RegQueryValueExW(hKey, L"PendingFileRenameOperations", nullptr,
+                &type, nullptr, &cb) != ERROR_SUCCESS || cb == 0) return;
+        std::vector<BYTE> buf(cb + 2, 0);
+        if (RegQueryValueExW(hKey, L"PendingFileRenameOperations", nullptr,
+                &type, buf.data(), &cb) != ERROR_SUCCESS) return;
+        const wchar_t* p = reinterpret_cast<const wchar_t*>(buf.data());
+        const wchar_t* end = p + (cb / sizeof(wchar_t));
+        while (p < end && *p) {
+            std::wstring w = p;
+            p += w.size() + 1;
+            int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
+                nullptr, 0, nullptr, nullptr);
+            std::string s(n, '\0');
+            if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
+                &s[0], n, nullptr, nullptr);
+            outPairs.push_back(s);
+        }
+    };
+
+    auto emit = [](const std::vector<std::string>& entries) {
+        if (entries.empty()) return;
+        std::string details = "Registry: HKLM\\SYSTEM\\CurrentControlSet\\Control\\"
+            "Session Manager\\PendingFileRenameOperations";
+        DetectionSeverity sev = DetectionSeverity::Medium;
+        int shown = 0;
+        for (size_t i = 0; i < entries.size(); i += 2) {
+            const std::string& src = entries[i];
+            const std::string& dst = (i + 1 < entries.size()) ? entries[i + 1] : std::string();
+            details += "\n  Source: " + src;
+            if (dst.empty()) {
+                details += "\n  Action: DELETE at reboot";
+            } else {
+                details += "\n  Dest:   " + dst;
+            }
+            // Escalate when a security-sensitive path is involved
+            std::string lowSrc = src;
+            std::string lowDst = dst;
+            for (auto& c : lowSrc) c = (char)tolower((unsigned char)c);
+            for (auto& c : lowDst) c = (char)tolower((unsigned char)c);
+            auto hot = [](const std::string& s) {
+                return s.find("\\system32\\") != std::string::npos ||
+                       s.find("\\syswow64\\") != std::string::npos ||
+                       s.find("\\drivers\\")  != std::string::npos ||
+                       s.find("nortonedr")    != std::string::npos ||
+                       s.find("\\defender\\") != std::string::npos ||
+                       s.find("\\windefend")  != std::string::npos;
+            };
+            if (hot(lowSrc) || hot(lowDst)) sev = DetectionSeverity::High;
+            if (++shown >= 16) { details += "\n  ... (truncated)"; break; }
+        }
+        PushUiDetectionEvent(
+            "Boot-time file rename scheduled",
+            details,
+            "Persistence: PendingFileRenameOperations",
+            0,
+            sev
+        );
+    };
+
+    // Snapshot existing entries (persisted from before we started watching)
+    std::vector<std::string> prev;
+    readPfro(prev);
+    if (!prev.empty()) emit(prev);
+
+    RegNotifyChangeKeyValue(hKey, FALSE,
+        REG_NOTIFY_CHANGE_LAST_SET, hEvent, TRUE);
+
+    while (true) {
+        DWORD w = WaitForSingleObject(hEvent, INFINITE);
+        if (w != WAIT_OBJECT_0) break;
+        ResetEvent(hEvent);
+
+        std::vector<std::string> cur;
+        readPfro(cur);
+        std::vector<std::string> diff;
+        // Emit only entries not present in prev (pair-wise compare by source path)
+        for (size_t i = 0; i + 1 < cur.size(); i += 2) {
+            bool seen = false;
+            for (size_t j = 0; j + 1 < prev.size(); j += 2) {
+                if (prev[j] == cur[i] && prev[j + 1] == cur[i + 1]) { seen = true; break; }
+            }
+            if (!seen) {
+                diff.push_back(cur[i]);
+                diff.push_back(cur[i + 1]);
+            }
+        }
+        if (!diff.empty()) emit(diff);
+        prev = std::move(cur);
+
+        RegNotifyChangeKeyValue(hKey, FALSE,
+            REG_NOTIFY_CHANGE_LAST_SET, hEvent, TRUE);
+    }
+
+    CloseHandle(hEvent);
+    RegCloseKey(hKey);
+}
+
+
+// ---------------------------------------------------------------------------
+// All-provider AMSI tamper watcher. Enumerates every CLSID registered under
+// HKLM\SOFTWARE\Microsoft\AMSI\Providers at startup, snapshots each one's
+// InProcServer32 DLL path, and watches the parent key for changes. On each
+// tick: re-enumerate, alert on deletions and DLL-path redirections.
+//
+// This catches attacks that target ANY AMSI provider on the host (ours,
+// Defender, CrowdStrike, SentinelOne, etc.) — informed by the WhoAMSI
+// enumeration technique (github.com/subat0mik/whoamsi). Watching only our
+// own CLSID left a gap: an attacker who disables Defender's provider while
+// leaving ours intact still evades a significant scan layer.
+//
+// Additionally watches the parent Providers key itself — if the entire
+// key is deleted, all AMSI providers are silently disabled.
+// ---------------------------------------------------------------------------
+struct AmsiProviderSnapshot {
+    std::wstring clsid;
+    std::string  dllPath;
+    bool         isOurs;
+};
+
+static std::string ReadRegDefaultUtf8(HKEY hKey) {
+    if (!hKey) return {};
+    DWORD type = 0, cb = 0;
+    if (RegQueryValueExW(hKey, nullptr, nullptr, &type, nullptr, &cb) != ERROR_SUCCESS)
+        return {};
+    if (cb == 0 || (type != REG_SZ && type != REG_EXPAND_SZ)) return {};
+    std::vector<BYTE> buf(cb + 2, 0);
+    if (RegQueryValueExW(hKey, nullptr, nullptr, &type, buf.data(), &cb) != ERROR_SUCCESS)
+        return {};
+    const wchar_t* w = reinterpret_cast<const wchar_t*>(buf.data());
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n - 1 : 0, '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+static std::vector<AmsiProviderSnapshot> EnumerateAmsiProviders() {
+    std::vector<AmsiProviderSnapshot> out;
+    const wchar_t* kOurClsid = L"{C18BED31-4E42-4E0F-B00D-A7E3FE09E18D}";
+
+    HKEY hProviders = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\AMSI\\Providers", 0,
+            KEY_READ, &hProviders) != ERROR_SUCCESS) {
+        return out;
+    }
+
+    wchar_t subName[128];
+    DWORD idx = 0;
+    while (RegEnumKeyW(hProviders, idx++, subName, _countof(subName)) == ERROR_SUCCESS) {
+        AmsiProviderSnapshot snap;
+        snap.clsid = subName;
+        snap.isOurs = (_wcsicmp(subName, kOurClsid) == 0);
+
+        // Read InProcServer32 default for this CLSID
+        wchar_t inprocPath[300];
+        swprintf_s(inprocPath, 300,
+            L"SOFTWARE\\Classes\\CLSID\\%s\\InProcServer32", subName);
+        HKEY hInproc = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, inprocPath, 0, KEY_READ, &hInproc) == ERROR_SUCCESS) {
+            snap.dllPath = ReadRegDefaultUtf8(hInproc);
+            RegCloseKey(hInproc);
+        }
+
+        out.push_back(std::move(snap));
+    }
+    RegCloseKey(hProviders);
+    return out;
+}
+
+// Read the current AMSI FeatureBits value.  Returns 0 if missing/unreadable.
+static DWORD ReadAmsiFeatureBits() {
+    HKEY hKey = nullptr;
+    DWORD val = 0, sz = sizeof(val);
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\AMSI", 0,
+            KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExW(hKey, L"FeatureBits", nullptr, nullptr,
+            reinterpret_cast<LPBYTE>(&val), &sz);
+        RegCloseKey(hKey);
+    }
+    return val;
+}
+
+static void AmsiProviderTamperWatcherThread() {
+    // Snapshot all registered AMSI providers at startup
+    auto baseline = EnumerateAmsiProviders();
+
+    // Snapshot FeatureBits — the correct production value is 0x1 (AMSI enabled).
+    // 0x0 means AMSI disabled; 0x2 means "Win10 RS4+ enhanced telemetry".
+    // Anything other than 0x1 (or 0x3) is suspicious.
+    DWORD baselineFeatureBits = ReadAmsiFeatureBits();
+    std::cout << "[AMSI-Watch] FeatureBits = 0x" << std::hex
+              << baselineFeatureBits << std::dec << "\n";
+    if (baselineFeatureBits == 0) {
+        PushUiDetectionEvent(
+            "AMSI FeatureBits is 0 at startup",
+            "HKLM\\SOFTWARE\\Microsoft\\AMSI\\FeatureBits = 0x0\n"
+            "AMSI is disabled system-wide — no script content will be scanned.\n"
+            "Expected value: 0x1 (enabled)",
+            "Defense-Evasion: AMSI Disabled via FeatureBits (T1562.001)",
+            0, DetectionSeverity::Critical);
+    }
+
+    std::cout << "[AMSI-Watch] " << baseline.size()
+              << " AMSI provider(s) snapshotted at startup:\n";
+    for (const auto& p : baseline) {
+        std::string clsidUtf8 = WideToUtf8(p.clsid);
+        std::cout << "  " << clsidUtf8
+                  << (p.isOurs ? " (NortonEDR)" : "")
+                  << " -> " << (p.dllPath.empty() ? "(no DLL)" : p.dllPath) << "\n";
+    }
+
+    // Open the parent Providers key for change notification
+    HKEY hProviders = nullptr;
+    HANDLE hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+    auto openProvidersKey = [&]() {
+        if (hProviders) { RegCloseKey(hProviders); hProviders = nullptr; }
+        RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\AMSI\\Providers", 0,
+            KEY_NOTIFY | KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hProviders);
+    };
+
+    auto armNotification = [&]() {
+        if (hProviders && hEvent) {
+            ResetEvent(hEvent);
+            RegNotifyChangeKeyValue(hProviders, TRUE,
+                REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME,
+                hEvent, TRUE);
+        }
+    };
+
+    openProvidersKey();
+    if (!hProviders) {
+        PushUiDetectionEvent(
+            "AMSI Providers key missing",
+            "HKLM\\SOFTWARE\\Microsoft\\AMSI\\Providers does not exist — "
+            "all AMSI providers are disabled",
+            "Defense-Evasion: AMSI Providers Key Deleted",
+            0, DetectionSeverity::Critical);
+    }
+    armNotification();
+
+    while (true) {
+        WaitForSingleObject(hEvent, 15000);
+
+        // Re-enumerate current providers
+        auto current = EnumerateAmsiProviders();
+
+        // Build lookup of current state
+        std::map<std::wstring, std::string> curMap;
+        for (const auto& c : current) curMap[c.clsid] = c.dllPath;
+
+        // Check for deletions (provider in baseline but not in current)
+        for (const auto& b : baseline) {
+            if (curMap.find(b.clsid) == curMap.end()) {
+                std::string clsidUtf8 = WideToUtf8(b.clsid);
+                std::string details = "CLSID: " + clsidUtf8 +
+                    "\nOriginal DLL: " + (b.dllPath.empty() ? "(unknown)" : b.dllPath) +
+                    (b.isOurs ? "\nProvider: NortonEDR (our provider!)" : "\nProvider: third-party security vendor") +
+                    "\nSource: AMSI provider enumeration (ref: WhoAMSI)";
+                PushUiDetectionEvent(
+                    "AMSI provider unregistered: " + clsidUtf8,
+                    details,
+                    "Defense-Evasion: AMSI Provider Unregister (T1562.001)",
+                    0,
+                    b.isOurs ? DetectionSeverity::Critical : DetectionSeverity::High
+                );
+            }
+        }
+
+        // Check for DLL redirections (same CLSID, different InProcServer32)
+        for (const auto& b : baseline) {
+            auto it = curMap.find(b.clsid);
+            if (it != curMap.end() && !b.dllPath.empty() && !it->second.empty()
+                && b.dllPath != it->second) {
+                std::string clsidUtf8 = WideToUtf8(b.clsid);
+                std::string details = "CLSID: " + clsidUtf8 +
+                    "\nOriginal DLL: " + b.dllPath +
+                    "\nRedirected to: " + it->second +
+                    (b.isOurs ? "\nProvider: NortonEDR (our provider!)" : "\nProvider: third-party security vendor") +
+                    "\nIndicator: InProcServer32 redirected — AMSI will load "
+                    "attacker DLL as this provider";
+                PushUiDetectionEvent(
+                    "AMSI provider DLL redirected: " + clsidUtf8,
+                    details,
+                    "Defense-Evasion: AMSI Provider DLL Redirect (T1562.001)",
+                    0,
+                    DetectionSeverity::Critical
+                );
+            }
+        }
+
+        // Check for new providers (might be attacker registering a rogue one)
+        for (const auto& c : current) {
+            bool found = false;
+            for (const auto& b : baseline)
+                if (b.clsid == c.clsid) { found = true; break; }
+            if (!found) {
+                std::string clsidUtf8 = WideToUtf8(c.clsid);
+                std::string details = "CLSID: " + clsidUtf8 +
+                    "\nDLL: " + (c.dllPath.empty() ? "(unknown)" : c.dllPath) +
+                    "\nIndicator: new AMSI provider registered after startup — "
+                    "may be legitimate install or attacker-controlled shim";
+                PushUiDetectionEvent(
+                    "New AMSI provider registered: " + clsidUtf8,
+                    details,
+                    "Defense-Evasion: AMSI Provider Registration Change",
+                    0,
+                    DetectionSeverity::Medium
+                );
+            }
+        }
+
+        // Check if entire Providers key was deleted
+        HKEY probe = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                L"SOFTWARE\\Microsoft\\AMSI\\Providers", 0,
+                KEY_READ, &probe) != ERROR_SUCCESS) {
+            PushUiDetectionEvent(
+                "AMSI Providers key deleted",
+                "HKLM\\SOFTWARE\\Microsoft\\AMSI\\Providers no longer exists — "
+                "all AMSI providers are disabled (T1562.001)",
+                "Defense-Evasion: AMSI Providers Key Deleted",
+                0, DetectionSeverity::Critical);
+        } else {
+            RegCloseKey(probe);
+        }
+
+        // Check AMSI FeatureBits for tampering (0x0 = AMSI disabled)
+        DWORD curFeatureBits = ReadAmsiFeatureBits();
+        if (curFeatureBits != baselineFeatureBits) {
+            if (curFeatureBits == 0) {
+                PushUiDetectionEvent(
+                    "AMSI FeatureBits set to 0 — AMSI disabled",
+                    "HKLM\\SOFTWARE\\Microsoft\\AMSI\\FeatureBits changed from 0x" +
+                    ([&]{ char buf[16]; snprintf(buf, sizeof(buf), "%lX", baselineFeatureBits); return std::string(buf); })() +
+                    " to 0x0\nAMSI is now disabled system-wide — "
+                    "no script content will be scanned by any provider.",
+                    "Defense-Evasion: AMSI Disabled via FeatureBits (T1562.001)",
+                    0, DetectionSeverity::Critical);
+            } else {
+                PushUiDetectionEvent(
+                    "AMSI FeatureBits changed",
+                    "HKLM\\SOFTWARE\\Microsoft\\AMSI\\FeatureBits changed from 0x" +
+                    ([&]{ char buf[16]; snprintf(buf, sizeof(buf), "%lX", baselineFeatureBits); return std::string(buf); })() +
+                    " to 0x" +
+                    ([&]{ char buf[16]; snprintf(buf, sizeof(buf), "%lX", curFeatureBits); return std::string(buf); })() +
+                    "\nUnexpected modification to AMSI configuration.",
+                    "Defense-Evasion: AMSI FeatureBits Tamper (T1562.001)",
+                    0, DetectionSeverity::High);
+            }
+            baselineFeatureBits = curFeatureBits;
+        }
+
+        // Update baseline to current (so we don't re-alert on the same state)
+        baseline = current;
+
+        // Re-arm
+        openProvidersKey();
+        armNotification();
+    }
+
+    if (hProviders) RegCloseKey(hProviders);
+    if (hEvent) CloseHandle(hEvent);
+}
+
+
+// ---------------------------------------------------------------------------
+// Office IOfficeAntiVirus (mpoav) provider tamper watcher.
+//
+// Office (Word/Excel/PowerPoint/Outlook/Publisher) calls IOfficeAntiVirus::Scan
+// on any inbound OLE/VBA content via the registered provider. Defender's
+// implementation lives in mpoav.dll at CLSID {2781761E-28E0-4109-99FE-
+// B9D127C57AFE}. Attackers (e.g., Lockbit macro-droppers, recent Raspberry
+// Robin shell-extension variants) disable or redirect this registration to
+// silence the macro-scan path before executing a stage-1 VBA.
+//
+// We watch three locations:
+//   - HKLM\SOFTWARE\Microsoft\OfficeAntiVirus            (component category)
+//   - HKLM\SOFTWARE\Classes\CLSID\{mpoav CLSID}           (COM registration)
+//   - HKLM\SOFTWARE\Classes\CLSID\{mpoav CLSID}\InProcServer32 (DLL path)
+//
+// Snapshot the InProcServer32 default at startup; alert Critical on deletion
+// or redirection away from the snapshotted path.
+// ---------------------------------------------------------------------------
+static void OfficeAntiVirusTamperWatcherThread() {
+    const wchar_t* kMpoavClsid = L"{2781761E-28E0-4109-99FE-B9D127C57AFE}";
+
+    wchar_t clsidPath[300];
+    wchar_t inprocPath[300];
+    swprintf_s(clsidPath, 300,
+        L"SOFTWARE\\Classes\\CLSID\\%s", kMpoavClsid);
+    swprintf_s(inprocPath, 300,
+        L"SOFTWARE\\Classes\\CLSID\\%s\\InProcServer32", kMpoavClsid);
+
+    struct Slot {
+        const wchar_t* label;
+        const wchar_t* subKey;
+        HKEY    hKey;
+        HANDLE  hEvent;
+    };
+
+    Slot slots[] = {
+        { L"HKLM\\SOFTWARE\\Microsoft\\OfficeAntiVirus",           L"SOFTWARE\\Microsoft\\OfficeAntiVirus", nullptr, nullptr },
+        { L"HKLM\\SOFTWARE\\Classes\\CLSID\\{mpoav}",              clsidPath,                               nullptr, nullptr },
+        { L"HKLM\\SOFTWARE\\Classes\\CLSID\\{mpoav}\\InProcServer32", inprocPath,                           nullptr, nullptr },
+    };
+
+    auto openSlot = [](Slot& s) {
+        if (s.hKey) { RegCloseKey(s.hKey); s.hKey = nullptr; }
+        RegOpenKeyExW(HKEY_LOCAL_MACHINE, s.subKey, 0, KEY_NOTIFY | KEY_READ, &s.hKey);
+    };
+
+    auto readDefault = [](HKEY hKey) -> std::string {
+        if (!hKey) return {};
+        DWORD type = 0, cb = 0;
+        if (RegQueryValueExW(hKey, nullptr, nullptr, &type, nullptr, &cb) != ERROR_SUCCESS)
+            return {};
+        if (cb == 0 || (type != REG_SZ && type != REG_EXPAND_SZ)) return {};
+        std::vector<BYTE> buf(cb + 2, 0);
+        if (RegQueryValueExW(hKey, nullptr, nullptr, &type, buf.data(), &cb) != ERROR_SUCCESS)
+            return {};
+        const wchar_t* w = reinterpret_cast<const wchar_t*>(buf.data());
+        int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+        std::string s(n > 0 ? n - 1 : 0, '\0');
+        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+        return s;
+    };
+
+    auto emit = [](const std::string& label, const std::string& reason,
+                    DetectionSeverity sev) {
+        std::string details = "Key: " + label + "\nReason: " + reason;
+        PushUiDetectionEvent(
+            "IOfficeAntiVirus (mpoav) registration tampered",
+            details,
+            "Defense-Evasion: Office Macro AV Provider Unregister (T1562.001)",
+            0,
+            sev
+        );
+    };
+
+    std::string refMpoavDll;
+    for (auto& s : slots) {
+        s.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        openSlot(s);
+        if (!s.hKey) {
+            std::string lbl;
+            int n = WideCharToMultiByte(CP_UTF8, 0, s.label, -1, nullptr, 0, nullptr, nullptr);
+            lbl.resize(n > 0 ? n - 1 : 0);
+            if (n > 0) WideCharToMultiByte(CP_UTF8, 0, s.label, -1, &lbl[0], n, nullptr, nullptr);
+            emit(lbl, "Office AV registration key missing at startup — macros may execute unscanned",
+                DetectionSeverity::High);
+        } else if (s.subKey == inprocPath) {
+            refMpoavDll = readDefault(s.hKey);
+        }
+    }
+
+    for (auto& s : slots) {
+        if (s.hKey && s.hEvent) {
+            RegNotifyChangeKeyValue(s.hKey, TRUE,
+                REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME, s.hEvent, TRUE);
+        }
+    }
+
+    while (true) {
+        HANDLE waits[3] = { slots[0].hEvent, slots[1].hEvent, slots[2].hEvent };
+        DWORD nWait = 0;
+        for (auto& s : slots) if (s.hEvent) ++nWait;
+        if (nWait == 0) break;
+        DWORD w = WaitForMultipleObjects(nWait, waits, FALSE, 10000);
+
+        for (auto& s : slots) {
+            HKEY probe = nullptr;
+            LONG rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, s.subKey, 0, KEY_READ, &probe);
+            std::string lbl;
+            int n = WideCharToMultiByte(CP_UTF8, 0, s.label, -1, nullptr, 0, nullptr, nullptr);
+            lbl.resize(n > 0 ? n - 1 : 0);
+            if (n > 0) WideCharToMultiByte(CP_UTF8, 0, s.label, -1, &lbl[0], n, nullptr, nullptr);
+
+            if (rc != ERROR_SUCCESS) {
+                emit(lbl, "Office AV registration deleted — Office will not macro-scan (T1562.001)",
+                    DetectionSeverity::Critical);
+            } else if (s.subKey == inprocPath) {
+                std::string cur = readDefault(probe);
+                if (!refMpoavDll.empty() && !cur.empty() && cur != refMpoavDll) {
+                    emit(lbl,
+                        "mpoav InProcServer32 redirected from '" + refMpoavDll +
+                        "' to '" + cur + "' — Office will load attacker DLL as macro-AV",
+                        DetectionSeverity::Critical);
+                    refMpoavDll = cur;
+                }
+            }
+            if (probe) RegCloseKey(probe);
+
+            if (s.hKey && s.hEvent) {
+                ResetEvent(s.hEvent);
+                rc = RegNotifyChangeKeyValue(s.hKey, TRUE,
+                    REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME, s.hEvent, TRUE);
+                if (rc != ERROR_SUCCESS) {
+                    openSlot(s);
+                    if (s.hKey) {
+                        RegNotifyChangeKeyValue(s.hKey, TRUE,
+                            REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME,
+                            s.hEvent, TRUE);
+                    }
+                }
+            }
+        }
+        (void)w;
+    }
+
+    for (auto& s : slots) {
+        if (s.hKey)   RegCloseKey(s.hKey);
+        if (s.hEvent) CloseHandle(s.hEvent);
+    }
+}
+
+
 static void YaraRuleWatcherThread(std::vector<std::string> dirs) {
     if (dirs.empty()) return;
 
@@ -4845,6 +5557,1209 @@ static void YaraRuleWatcherThread(std::vector<std::string> dirs) {
     }
     CloseHandle(hDir);
 }
+
+// ===========================================================================
+// Deep Office Document Inspection — OLE/CFB + OOXML pipeline
+//
+// Three components:
+//   1. MS-OVBA decompressor (§2.4.1) — decompresses VBA module source
+//   2. CFB/StgOpenStorage extraction — reads VBA streams from legacy .doc/.xls
+//      and from vbaProject.bin (which is itself a CFB)
+//   3. ZIP extraction (zlib-guarded) — inflates entries from OOXML containers
+//
+// The pipeline: file → detect format → extract VBA streams + embedded objects
+// → decompress VBA source → feed to yr_rules_scan_mem + keyword check.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// MS-OVBA §2.4.1 decompression. VBA module source in CFB streams is stored
+// as a compressed container: signature byte 0x01, then a sequence of chunks,
+// each with a 2-byte header and LZ77-style compressed tokens.
+// ---------------------------------------------------------------------------
+static std::vector<BYTE> DecompressVbaStream(const BYTE* data, size_t len) {
+    if (!data || len < 3 || data[0] != 0x01) return {};
+
+    std::vector<BYTE> out;
+    out.reserve(len * 3);
+    size_t pos = 1;
+
+    while (pos + 1 < len) {
+        UINT16 hdr = data[pos] | (data[pos + 1] << 8);
+        pos += 2;
+
+        size_t chunkDataSize = (hdr & 0x0FFF) + 1;
+        bool compressed = (hdr & 0x8000) != 0;
+        UINT16 sig = (hdr >> 12) & 0x07;
+        if (sig != 0x03) break;
+
+        if (pos + chunkDataSize > len) chunkDataSize = len - pos;
+
+        if (!compressed) {
+            out.insert(out.end(), data + pos, data + pos + chunkDataSize);
+            pos += chunkDataSize;
+            continue;
+        }
+
+        size_t chunkStart = out.size();
+        size_t chunkEnd = pos + chunkDataSize;
+
+        while (pos < chunkEnd) {
+            if (pos >= len) break;
+            BYTE flagByte = data[pos++];
+
+            for (int bit = 0; bit < 8 && pos < chunkEnd; ++bit) {
+                if (!(flagByte & (1 << bit))) {
+                    out.push_back(data[pos++]);
+                } else {
+                    if (pos + 1 >= len) goto done;
+                    UINT16 token = data[pos] | (data[pos + 1] << 8);
+                    pos += 2;
+
+                    size_t diff = out.size() - chunkStart;
+                    if (diff == 0) goto done;
+
+                    unsigned bitCount = 4;
+                    while ((1u << bitCount) < diff) ++bitCount;
+                    if (bitCount > 12) bitCount = 12;
+
+                    UINT16 lengthMask = (UINT16)((1u << (16 - bitCount)) - 1);
+                    size_t length = (token & lengthMask) + 3;
+                    size_t offset = (token >> (16 - bitCount)) + 1;
+
+                    if (offset > out.size()) goto done;
+                    size_t srcPos = out.size() - offset;
+                    for (size_t j = 0; j < length; ++j) {
+                        out.push_back(out[srcPos + (j % offset)]);
+                    }
+                }
+            }
+        }
+    }
+done:
+    return out;
+}
+
+// Find the VBA compressed-source start in a module stream. The stream begins
+// with a performance cache of variable length; the compressed container
+// starts at the offset specified by MODULEOFFSET in the dir stream. Without
+// parsing dir, we locate it heuristically: scan for 0x01 followed by a valid
+// CompressedChunkHeader (signature bits 12-14 == 0b011).
+static size_t FindVbaCompressedOffset(const BYTE* data, size_t len) {
+    for (size_t i = 0; i + 2 < len; ++i) {
+        if (data[i] == 0x01) {
+            UINT16 hdr = data[i + 1] | (data[i + 2] << 8);
+            UINT16 sig = (hdr >> 12) & 0x07;
+            if (sig == 0x03) return i;
+        }
+    }
+    return (size_t)-1;
+}
+
+// ---------------------------------------------------------------------------
+// CFB stream extraction via StgOpenStorage (ole32.lib).
+// Opens a CFB file (or an in-memory IStream wrapping a vbaProject.bin),
+// enumerates the "VBA" and "Macros/VBA" storages, reads each module stream,
+// decompresses the VBA source, and returns (name, decompressed_source) pairs.
+// Also extracts "\1Ole10Native" embedded-object payloads.
+// ---------------------------------------------------------------------------
+struct ExtractedStream {
+    std::string name;
+    std::vector<BYTE> data;
+    bool isVbaSource = false;
+    bool isOleObject = false;
+};
+
+static void ExtractVbaFromStorage(IStorage* pStg, const std::wstring& prefix,
+                                  std::vector<ExtractedStream>& results);
+
+static std::vector<BYTE> ReadIStreamFull(IStream* pStream, size_t maxSize = 16 * 1024 * 1024) {
+    STATSTG stat{};
+    if (FAILED(pStream->Stat(&stat, STATFLAG_NONAME))) return {};
+    size_t sz = (size_t)stat.cbSize.QuadPart;
+    if (sz == 0 || sz > maxSize) return {};
+    std::vector<BYTE> buf(sz);
+    ULONG bytesRead = 0;
+    LARGE_INTEGER zero{};
+    pStream->Seek(zero, STREAM_SEEK_SET, nullptr);
+    if (FAILED(pStream->Read(buf.data(), (ULONG)sz, &bytesRead))) return {};
+    buf.resize(bytesRead);
+    return buf;
+}
+
+static void ExtractVbaModulesFromStorage(IStorage* pVbaStg, const std::wstring& prefix,
+                                         std::vector<ExtractedStream>& results) {
+    IEnumSTATSTG* pEnum = nullptr;
+    if (FAILED(pVbaStg->EnumElements(0, nullptr, 0, &pEnum))) return;
+
+    STATSTG stat{};
+    while (pEnum->Next(1, &stat, nullptr) == S_OK) {
+        if (stat.type == STGTY_STREAM && stat.pwcsName) {
+            std::wstring name(stat.pwcsName);
+            // Skip metadata streams — only module streams contain VBA source
+            if (_wcsicmp(name.c_str(), L"dir") != 0 &&
+                _wcsicmp(name.c_str(), L"_VBA_PROJECT") != 0 &&
+                _wcsicmp(name.c_str(), L"PROJECT") != 0 &&
+                _wcsicmp(name.c_str(), L"PROJECTwm") != 0 &&
+                wcsncmp(name.c_str(), L"__SRP_", 6) != 0) {
+
+                IStream* pStream = nullptr;
+                if (SUCCEEDED(pVbaStg->OpenStream(stat.pwcsName, nullptr,
+                        STGM_READ | STGM_SHARE_EXCLUSIVE, 0, &pStream))) {
+                    auto raw = ReadIStreamFull(pStream);
+                    pStream->Release();
+
+                    if (!raw.empty()) {
+                        size_t off = FindVbaCompressedOffset(raw.data(), raw.size());
+                        if (off != (size_t)-1) {
+                            auto src = DecompressVbaStream(raw.data() + off, raw.size() - off);
+                            if (src.size() > 10) {
+                                ExtractedStream es;
+                                es.name = WideToUtf8(prefix + name);
+                                es.data = std::move(src);
+                                es.isVbaSource = true;
+                                results.push_back(std::move(es));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (stat.pwcsName) CoTaskMemFree(stat.pwcsName);
+    }
+    pEnum->Release();
+}
+
+static void ExtractVbaFromStorage(IStorage* pStg, const std::wstring& prefix,
+                                  std::vector<ExtractedStream>& results) {
+    // Try "VBA" sub-storage (standard location)
+    IStorage* pVba = nullptr;
+    if (SUCCEEDED(pStg->OpenStorage(L"VBA", nullptr,
+            STGM_READ | STGM_SHARE_EXCLUSIVE, nullptr, 0, &pVba))) {
+        ExtractVbaModulesFromStorage(pVba, prefix + L"VBA/", results);
+        pVba->Release();
+    }
+
+    // Try "Macros" → "VBA" (some Publisher/Visio documents)
+    IStorage* pMacros = nullptr;
+    if (SUCCEEDED(pStg->OpenStorage(L"Macros", nullptr,
+            STGM_READ | STGM_SHARE_EXCLUSIVE, nullptr, 0, &pMacros))) {
+        IStorage* pMVba = nullptr;
+        if (SUCCEEDED(pMacros->OpenStorage(L"VBA", nullptr,
+                STGM_READ | STGM_SHARE_EXCLUSIVE, nullptr, 0, &pMVba))) {
+            ExtractVbaModulesFromStorage(pMVba, prefix + L"Macros/VBA/", results);
+            pMVba->Release();
+        }
+        pMacros->Release();
+    }
+
+    // Extract \1Ole10Native embedded objects
+    IStream* pOle10 = nullptr;
+    if (SUCCEEDED(pStg->OpenStream(L"\x01Ole10Native", nullptr,
+            STGM_READ | STGM_SHARE_EXCLUSIVE, 0, &pOle10))) {
+        auto raw = ReadIStreamFull(pOle10);
+        pOle10->Release();
+        if (raw.size() > 4) {
+            UINT32 payloadSize = raw[0] | (raw[1] << 8) | (raw[2] << 16) | (raw[3] << 24);
+            if (payloadSize > 0 && payloadSize + 4 <= raw.size()) {
+                ExtractedStream es;
+                es.name = WideToUtf8(prefix) + "Ole10Native";
+                es.data.assign(raw.begin() + 4, raw.begin() + 4 + payloadSize);
+                es.isOleObject = true;
+                results.push_back(std::move(es));
+            }
+        }
+    }
+
+    // Recurse into ObjectPool (embedded OLE objects)
+    IStorage* pPool = nullptr;
+    if (SUCCEEDED(pStg->OpenStorage(L"ObjectPool", nullptr,
+            STGM_READ | STGM_SHARE_EXCLUSIVE, nullptr, 0, &pPool))) {
+        IEnumSTATSTG* pEnum = nullptr;
+        if (SUCCEEDED(pPool->EnumElements(0, nullptr, 0, &pEnum))) {
+            STATSTG stat{};
+            while (pEnum->Next(1, &stat, nullptr) == S_OK) {
+                if (stat.type == STGTY_STORAGE && stat.pwcsName) {
+                    IStorage* pObj = nullptr;
+                    if (SUCCEEDED(pPool->OpenStorage(stat.pwcsName, nullptr,
+                            STGM_READ | STGM_SHARE_EXCLUSIVE, nullptr, 0, &pObj))) {
+                        ExtractVbaFromStorage(pObj, prefix + L"ObjectPool/" +
+                            stat.pwcsName + L"/", results);
+                        pObj->Release();
+                    }
+                }
+                if (stat.pwcsName) CoTaskMemFree(stat.pwcsName);
+            }
+            pEnum->Release();
+        }
+        pPool->Release();
+    }
+}
+
+static std::vector<ExtractedStream> ExtractFromCfbFile(const std::wstring& path) {
+    std::vector<ExtractedStream> results;
+    IStorage* pStg = nullptr;
+    HRESULT hr = StgOpenStorage(path.c_str(), nullptr,
+        STGM_READ | STGM_SHARE_DENY_WRITE, nullptr, 0, &pStg);
+    if (FAILED(hr)) return results;
+
+    ExtractVbaFromStorage(pStg, L"", results);
+    pStg->Release();
+    return results;
+}
+
+// ---------------------------------------------------------------------------
+// OOXML (ZIP) extraction. Parses the ZIP central directory, finds entries
+// matching vbaProject.bin / oleObject*.bin / activeX*.bin, inflates them
+// with zlib, and returns the raw bytes for further CFB parsing or YARA scan.
+// Guarded by NORTONAV_HAS_ZLIB — without zlib, returns empty.
+// ---------------------------------------------------------------------------
+#if NORTONAV_HAS_ZLIB
+
+struct ZipEntry {
+    std::string name;
+    uint32_t    compressedSize;
+    uint32_t    uncompressedSize;
+    uint16_t    method;
+    uint32_t    localHeaderOffset;
+};
+
+static std::vector<ZipEntry> ParseZipCentralDirectory(const BYTE* data, size_t len) {
+    std::vector<ZipEntry> entries;
+    if (len < 22) return entries;
+
+    // Find End of Central Directory record (PK\x05\x06) — scan backwards
+    size_t eocdPos = (size_t)-1;
+    size_t searchStart = (len > 65557) ? len - 65557 : 0;
+    for (size_t i = len - 22; i >= searchStart; --i) {
+        if (data[i] == 0x50 && data[i + 1] == 0x4B &&
+            data[i + 2] == 0x05 && data[i + 3] == 0x06) {
+            eocdPos = i;
+            break;
+        }
+        if (i == 0) break;
+    }
+    if (eocdPos == (size_t)-1) return entries;
+
+    uint16_t numEntries = data[eocdPos + 10] | (data[eocdPos + 11] << 8);
+    uint32_t cdOffset = data[eocdPos + 16] | (data[eocdPos + 17] << 8) |
+                        (data[eocdPos + 18] << 16) | (data[eocdPos + 19] << 24);
+
+    size_t pos = cdOffset;
+    for (uint16_t i = 0; i < numEntries && pos + 46 <= len; ++i) {
+        if (data[pos] != 0x50 || data[pos + 1] != 0x4B ||
+            data[pos + 2] != 0x01 || data[pos + 3] != 0x02) break;
+
+        uint16_t method       = data[pos + 10] | (data[pos + 11] << 8);
+        uint32_t compSize     = data[pos + 20] | (data[pos + 21] << 8) |
+                                (data[pos + 22] << 16) | (data[pos + 23] << 24);
+        uint32_t uncompSize   = data[pos + 24] | (data[pos + 25] << 8) |
+                                (data[pos + 26] << 16) | (data[pos + 27] << 24);
+        uint16_t nameLen      = data[pos + 28] | (data[pos + 29] << 8);
+        uint16_t extraLen     = data[pos + 30] | (data[pos + 31] << 8);
+        uint16_t commentLen   = data[pos + 32] | (data[pos + 33] << 8);
+        uint32_t localOffset  = data[pos + 42] | (data[pos + 43] << 8) |
+                                (data[pos + 44] << 16) | (data[pos + 45] << 24);
+
+        if (pos + 46 + nameLen <= len) {
+            ZipEntry e;
+            e.name.assign(reinterpret_cast<const char*>(data + pos + 46), nameLen);
+            e.compressedSize = compSize;
+            e.uncompressedSize = uncompSize;
+            e.method = method;
+            e.localHeaderOffset = localOffset;
+            entries.push_back(std::move(e));
+        }
+        pos += 46 + nameLen + extraLen + commentLen;
+    }
+    return entries;
+}
+
+static std::vector<BYTE> InflateZipEntry(const BYTE* fileData, size_t fileLen,
+                                          const ZipEntry& entry) {
+    size_t lhPos = entry.localHeaderOffset;
+    if (lhPos + 30 > fileLen) return {};
+    if (fileData[lhPos] != 0x50 || fileData[lhPos + 1] != 0x4B ||
+        fileData[lhPos + 2] != 0x03 || fileData[lhPos + 3] != 0x04) return {};
+
+    uint16_t lhNameLen  = fileData[lhPos + 26] | (fileData[lhPos + 27] << 8);
+    uint16_t lhExtraLen = fileData[lhPos + 28] | (fileData[lhPos + 29] << 8);
+    size_t dataStart = lhPos + 30 + lhNameLen + lhExtraLen;
+    if (dataStart + entry.compressedSize > fileLen) return {};
+
+    if (entry.method == 0) {
+        return std::vector<BYTE>(fileData + dataStart,
+                                 fileData + dataStart + entry.compressedSize);
+    }
+    if (entry.method != 8) return {};
+
+    // Raw deflate → inflate
+    std::vector<BYTE> out(entry.uncompressedSize);
+    z_stream zs{};
+    zs.next_in = const_cast<Bytef*>(fileData + dataStart);
+    zs.avail_in = entry.compressedSize;
+    zs.next_out = out.data();
+    zs.avail_out = (uInt)out.size();
+
+    if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) return {};
+    int ret = inflate(&zs, Z_FINISH);
+    inflateEnd(&zs);
+
+    if (ret != Z_STREAM_END && ret != Z_OK) return {};
+    out.resize(zs.total_out);
+    return out;
+}
+
+static bool IsInterestingZipEntry(const std::string& name) {
+    std::string lower = name;
+    for (auto& c : lower) c = (char)tolower((unsigned char)c);
+    return lower.find("vbaproject.bin") != std::string::npos ||
+           lower.find("oleobject") != std::string::npos ||
+           lower.find("activex") != std::string::npos ||
+           lower.find("embeddings/") != std::string::npos ||
+           lower.find("ole10native") != std::string::npos;
+}
+
+static std::vector<ExtractedStream> ExtractFromOoxmlFile(const std::string& path) {
+    std::vector<ExtractedStream> results;
+
+    HANDLE hf = CreateFileA(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return results;
+
+    LARGE_INTEGER li;
+    GetFileSizeEx(hf, &li);
+    size_t fileSize = (size_t)li.QuadPart;
+    if (fileSize < 22 || fileSize > 256 * 1024 * 1024) { CloseHandle(hf); return results; }
+
+    std::vector<BYTE> fileData(fileSize);
+    DWORD got = 0;
+    BOOL ok = ReadFile(hf, fileData.data(), (DWORD)fileSize, &got, nullptr);
+    CloseHandle(hf);
+    if (!ok || got != fileSize) return results;
+
+    auto entries = ParseZipCentralDirectory(fileData.data(), fileSize);
+    for (const auto& entry : entries) {
+        if (!IsInterestingZipEntry(entry.name)) continue;
+        if (entry.uncompressedSize > 64 * 1024 * 1024) continue;
+
+        auto inflated = InflateZipEntry(fileData.data(), fileSize, entry);
+        if (inflated.empty()) continue;
+
+        std::string lower = entry.name;
+        for (auto& c : lower) c = (char)tolower((unsigned char)c);
+
+        if (lower.find("vbaproject.bin") != std::string::npos) {
+            // vbaProject.bin is itself a CFB — write to temp, parse with StgOpenStorage
+            wchar_t tmpPath[MAX_PATH];
+            GetTempPathW(MAX_PATH, tmpPath);
+            wchar_t tmpFile[MAX_PATH];
+            GetTempFileNameW(tmpPath, L"vba", 0, tmpFile);
+
+            HANDLE hTmp = CreateFileW(tmpFile, GENERIC_WRITE, 0, nullptr,
+                CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+            if (hTmp != INVALID_HANDLE_VALUE) {
+                DWORD written = 0;
+                WriteFile(hTmp, inflated.data(), (DWORD)inflated.size(), &written, nullptr);
+                CloseHandle(hTmp);
+
+                auto vbaStreams = ExtractFromCfbFile(tmpFile);
+                for (auto& s : vbaStreams) {
+                    s.name = entry.name + "/" + s.name;
+                    results.push_back(std::move(s));
+                }
+                DeleteFileW(tmpFile);
+            }
+        } else {
+            // oleObject / activeX / embeddings — raw binary, scan directly
+            ExtractedStream es;
+            es.name = entry.name;
+            es.data = std::move(inflated);
+            es.isOleObject = true;
+            results.push_back(std::move(es));
+        }
+    }
+    return results;
+}
+
+#endif // NORTONAV_HAS_ZLIB
+
+// ---------------------------------------------------------------------------
+// ScanOfficeDocumentDeep — orchestrator. Called from the file-notification
+// block for Office documents. Extracts VBA source and embedded objects,
+// then feeds each to YARA + keyword matching.
+// ---------------------------------------------------------------------------
+static void ScanOfficeDocumentDeep(const std::string& fullPath,
+                                   UINT32 pid, const std::string& procName,
+                                   bool isCfb, bool isOoxml) {
+    std::vector<ExtractedStream> streams;
+
+    if (isCfb) {
+        int wl = MultiByteToWideChar(CP_UTF8, 0, fullPath.c_str(), -1, nullptr, 0);
+        std::wstring wpath(wl - 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, fullPath.c_str(), -1, &wpath[0], wl);
+        streams = ExtractFromCfbFile(wpath);
+    }
+
+#if NORTONAV_HAS_ZLIB
+    if (isOoxml) {
+        auto ooxmlStreams = ExtractFromOoxmlFile(fullPath);
+        streams.insert(streams.end(),
+            std::make_move_iterator(ooxmlStreams.begin()),
+            std::make_move_iterator(ooxmlStreams.end()));
+    }
+#endif
+
+    if (streams.empty()) return;
+
+    for (const auto& es : streams) {
+        // YARA scan the extracted buffer
+        if (rules && !es.data.empty()) {
+            struct DeepCtx {
+                UINT32 pid;
+                std::string procName;
+                std::string streamName;
+                std::string filePath;
+            } ctx{ pid, procName, es.name, fullPath };
+
+            yr_rules_scan_mem(
+                rules,
+                es.data.data(),
+                es.data.size(),
+                0,
+                [](YR_SCAN_CONTEXT* /*context*/, int message,
+                   void* messageData, void* userData) -> int {
+                    if (message != CALLBACK_MSG_RULE_MATCHING) return CALLBACK_CONTINUE;
+                    auto* rule = static_cast<YR_RULE*>(messageData);
+                    auto* c = static_cast<DeepCtx*>(userData);
+
+                    std::string ident = rule->identifier ? rule->identifier : "unknown";
+                    std::string ns = (rule->ns && rule->ns->name) ? rule->ns->name : "";
+                    std::string details = "File: " + c->filePath +
+                        "\nStream: " + c->streamName +
+                        "\nRule: " + ident +
+                        "\nNamespace: " + ns;
+
+                    DetectionSeverity sev = DetectionSeverity::High;
+                    if (ns.find("quarantine") != std::string::npos)
+                        sev = DetectionSeverity::Critical;
+
+                    PushUiDetectionEvent(
+                        "VBA/OLE deep scan: " + ident,
+                        details,
+                        "Deep-Inspect: " + ident,
+                        c->pid,
+                        sev
+                    );
+                    return CALLBACK_CONTINUE;
+                },
+                &ctx,
+                10
+            );
+        }
+
+        // VBA source keyword check (same as AMSI keyword list)
+        if (es.isVbaSource && es.data.size() > 10) {
+            std::string src(es.data.begin(), es.data.end());
+            std::string lower = src;
+            for (auto& c : lower) c = (char)tolower((unsigned char)c);
+
+            static const char* kVbaHighRisk[] = {
+                "shell(", "wscript.shell", "createobject(\"wscript.shell\")",
+                "createobject(\"shell.application\")", "shellexecute",
+                "virtualalloc", "rtlmovememory", "createthread",
+                "createremotethread", "writeprocessmemory",
+                "urldownloadtofile", "msxml2.xmlhttp",
+                "adodb.stream", "powershell", "cmd /c", "cmd.exe /c",
+                "invoke-expression", "invoke-mimikatz", "sekurlsa::",
+                "getobject(\"winmgmts:", "win32_process",
+                "environ(", "callbyname",
+                nullptr
+            };
+
+            for (int i = 0; kVbaHighRisk[i]; ++i) {
+                if (lower.find(kVbaHighRisk[i]) != std::string::npos) {
+                    std::string preview = src.substr(0, 200);
+                    std::string details = "File: " + fullPath +
+                        "\nStream: " + es.name +
+                        "\nKeyword: " + kVbaHighRisk[i] +
+                        "\nPreview: " + preview;
+                    PushUiDetectionEvent(
+                        "VBA high-risk keyword: " + std::string(kVbaHighRisk[i]),
+                        details,
+                        "Deep-Inspect: VBA Keyword '" + std::string(kVbaHighRisk[i]) + "'",
+                        pid,
+                        DetectionSeverity::High
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Embedded OLE object — check for MZ header (dropped PE)
+        if (es.isOleObject && es.data.size() > 2) {
+            if (es.data[0] == 'M' && es.data[1] == 'Z') {
+                std::string details = "File: " + fullPath +
+                    "\nStream: " + es.name +
+                    "\nIndicator: MZ header in embedded OLE object — "
+                    "PE executable staged inside Office document (T1566.001)";
+                PushUiDetectionEvent(
+                    "Embedded PE in OLE: " + es.name,
+                    details,
+                    "Deep-Inspect: Embedded PE in OLE Object",
+                    pid,
+                    DetectionSeverity::Critical
+                );
+            }
+        }
+    }
+}
+
+// Office document shape check. Flags macro-enabled containers and
+// extension/magic mismatches that indicate template injection or renamed
+// macro droppers.
+struct OfficeDocShape {
+    bool        isOfficeDoc     = false;
+    bool        isMacroEnabled  = false;   // extension says macros allowed
+    bool        isCfb           = false;   // OLE2 compound file
+    bool        isOoxml         = false;   // ZIP container
+    bool        extMagicMismatch= false;   // e.g. .docx with CFB magic
+    std::string reason;
+};
+
+static OfficeDocShape InspectOfficeDoc(const std::string& fullPath) {
+    OfficeDocShape out;
+
+    std::string lower = fullPath;
+    for (auto& c : lower) c = (char)tolower((unsigned char)c);
+
+    static const char* kOfficeExts[] = {
+        ".doc", ".docx", ".docm", ".dotm", ".dotx",
+        ".xls", ".xlsx", ".xlsm", ".xlsb", ".xltm", ".xltx", ".xlam",
+        ".ppt", ".pptx", ".pptm", ".pps", ".ppsm", ".ppam", ".potm", ".potx", ".sldm",
+        ".rtf", ".one"
+    };
+    static const char* kMacroExts[] = {
+        ".docm", ".dotm", ".xlsm", ".xltm", ".xlam", ".xlsb",
+        ".pptm", ".ppsm", ".ppam", ".potm", ".sldm"
+    };
+
+    std::string ext;
+    size_t dot = lower.find_last_of('.');
+    if (dot != std::string::npos) ext = lower.substr(dot);
+
+    for (const char* e : kOfficeExts) if (ext == e) { out.isOfficeDoc = true; break; }
+    if (!out.isOfficeDoc) return out;
+
+    for (const char* e : kMacroExts) if (ext == e) { out.isMacroEnabled = true; break; }
+
+    HANDLE hf = CreateFileA(fullPath.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return out;
+
+    BYTE magic[8]{};
+    DWORD got = 0;
+    BOOL ok = ReadFile(hf, magic, sizeof(magic), &got, nullptr);
+    CloseHandle(hf);
+    if (!ok || got < 4) return out;
+
+    static const BYTE kCfbMagic[8]  = { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 };
+    static const BYTE kZipMagic[4]  = { 'P',  'K',  0x03, 0x04 };
+    static const BYTE kZipEmpty[4]  = { 'P',  'K',  0x05, 0x06 };
+
+    if (got >= 8 && memcmp(magic, kCfbMagic, 8) == 0)                  out.isCfb   = true;
+    else if (got >= 4 && (memcmp(magic, kZipMagic, 4) == 0 ||
+                          memcmp(magic, kZipEmpty, 4) == 0))            out.isOoxml = true;
+
+    // OOXML extensions (.docx/.xlsx/.pptx and their macro-enabled variants)
+    // must be ZIP containers; a CFB under that extension is renamed-legacy
+    // and a strong phishing IOC.
+    bool isOoxmlExt = (ext == ".docx" || ext == ".docm" || ext == ".dotx" || ext == ".dotm" ||
+                       ext == ".xlsx" || ext == ".xlsm" || ext == ".xltx" || ext == ".xltm" ||
+                       ext == ".xlam" || ext == ".xlsb" ||
+                       ext == ".pptx" || ext == ".pptm" || ext == ".ppsx" || ext == ".ppsm" ||
+                       ext == ".potx" || ext == ".potm" || ext == ".ppam" || ext == ".sldm");
+    // Legacy OLE extensions must be CFB; a ZIP under .doc/.xls/.ppt is a
+    // renamed macro-enabled container (attacker trick to bypass policy that
+    // whitelists legacy OLE).
+    bool isLegacyExt = (ext == ".doc" || ext == ".xls" || ext == ".ppt" || ext == ".pps");
+
+    if (isOoxmlExt && out.isCfb) {
+        out.extMagicMismatch = true;
+        out.reason = "OOXML extension (" + ext + ") but CFB magic — legacy OLE delivered as OOXML";
+    }
+    if (isLegacyExt && out.isOoxml) {
+        out.extMagicMismatch = true;
+        out.reason = "Legacy OLE extension (" + ext + ") but ZIP magic — OOXML renamed to bypass policy";
+    }
+
+    return out;
+}
+
+// Path-sanity check. Catches filename obfuscation: RTL-override / zero-width
+// Unicode runs (U+202A-E, U+200B-F, U+2066-9, U+FEFF), Alternate Data Streams
+// (":" past the drive letter, "::$DATA"), and double-extension masquerade
+// (.pdf.exe, .doc.scr, .txt.vbs, etc.). Returns a human-readable reason if
+// anything suspicious is found, empty string otherwise.
+static std::string CheckPathObfuscation(const std::string& fullPath) {
+    if (fullPath.empty()) return {};
+
+    // UTF-8 → UTF-16 for Unicode codepoint inspection
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, fullPath.c_str(), (int)fullPath.size(), nullptr, 0);
+    std::wstring w;
+    if (wlen > 0) {
+        w.resize(wlen);
+        MultiByteToWideChar(CP_UTF8, 0, fullPath.c_str(), (int)fullPath.size(), &w[0], wlen);
+    }
+    for (wchar_t wc : w) {
+        if ((wc >= 0x202A && wc <= 0x202E) ||   // LRE/RLE/PDF/LRO/RLO
+            (wc >= 0x200B && wc <= 0x200F) ||   // ZWSP/ZWNJ/ZWJ/LRM/RLM
+            (wc >= 0x2066 && wc <= 0x2069) ||   // isolate controls
+            wc == 0xFEFF) {                     // BOM / ZWNBSP
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "Unicode obfuscation: control codepoint U+%04X in filename", (unsigned)wc);
+            return buf;
+        }
+    }
+
+    // Alternate Data Stream: ':' past the drive-letter position, or literal ::$DATA
+    {
+        std::string p = fullPath;
+        std::string::size_type scanFrom = 0;
+        if (p.size() >= 2 && p[1] == ':') scanFrom = 2;
+        // strip \\?\ or \??\ prefix when present
+        if (p.compare(0, 4, "\\\\?\\") == 0 || p.compare(0, 4, "\\??\\") == 0) scanFrom = 6;
+        std::string::size_type colon = p.find(':', scanFrom);
+        if (colon != std::string::npos) {
+            return "Alternate Data Stream in path: " + p.substr(colon);
+        }
+        // Case-insensitive ::$DATA check (colon check above usually gets it first)
+        for (size_t i = 0; i + 7 <= p.size(); ++i) {
+            if (p[i] == ':' && p[i+1] == ':' &&
+                (p[i+2] == '$') &&
+                (p[i+3] == 'D' || p[i+3] == 'd') &&
+                (p[i+4] == 'A' || p[i+4] == 'a') &&
+                (p[i+5] == 'T' || p[i+5] == 't') &&
+                (p[i+6] == 'A' || p[i+6] == 'a')) {
+                return "NTFS ADS marker ::$DATA in path";
+            }
+        }
+    }
+
+    // Double-extension masquerade: benign-looking extension immediately
+    // followed by an executable extension (.pdf.exe, .doc.scr, ...)
+    {
+        static const char* benign[] = {
+            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+            ".txt", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".rar",
+            ".csv", ".rtf", ".htm", ".html", ".mp3", ".mp4", ".avi"
+        };
+        static const char* dangerous[] = {
+            ".exe", ".scr", ".pif", ".com", ".bat", ".cmd", ".vbs",
+            ".js", ".jse", ".wsf", ".wsh", ".hta", ".lnk", ".ps1",
+            ".cpl", ".msi", ".jar"
+        };
+        std::string lower = fullPath;
+        for (auto& c : lower) c = (char)tolower((unsigned char)c);
+        for (const char* b : benign) {
+            size_t bl = strlen(b);
+            size_t pos = 0;
+            while ((pos = lower.find(b, pos)) != std::string::npos) {
+                size_t after = pos + bl;
+                if (after < lower.size()) {
+                    for (const char* d : dangerous) {
+                        size_t dl = strlen(d);
+                        if (after + dl <= lower.size() &&
+                            lower.compare(after, dl, d) == 0 &&
+                            (after + dl == lower.size() ||
+                             lower[after + dl] == ' ' ||
+                             lower[after + dl] == 0)) {
+                            return std::string("Double-extension masquerade: ") + b + d;
+                        }
+                    }
+                }
+                pos = after;
+            }
+        }
+    }
+
+    return {};
+}
+
+// Timestomp detection. Malware rewrites MFT timestamps (FileBasicInformation)
+// to hide drop events: copy the $STANDARD_INFORMATION timestamps from
+// C:\Windows\System32\kernel32.dll onto the payload so forensic triage sorting
+// by "newest files" skips it entirely (SetMace / timestomp.exe / Metasploit's
+// MACE module). Common giveaways:
+//   - CreationTime > LastWriteTime (a file written-into-existence can't have
+//     been modified before it existed)
+//   - CreationTime wildly before the process that produced the file first
+//     appeared (payload dropped just now, timestamp says 2009)
+//   - All four times identical to whole-second precision (zero 100-ns tail)
+static void CheckFileTimestomp(const std::string& fullPath,
+                               UINT32 notifPid,
+                               const std::string& procName) {
+    int wn = MultiByteToWideChar(CP_UTF8, 0, fullPath.c_str(), (int)fullPath.size(), nullptr, 0);
+    if (wn <= 0) return;
+    std::wstring wPath(wn, 0);
+    MultiByteToWideChar(CP_UTF8, 0, fullPath.c_str(), (int)fullPath.size(), &wPath[0], wn);
+
+    HANDLE h = CreateFileW(wPath.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    FILETIME ftCreate = {}, ftAccess = {}, ftWrite = {};
+    BOOL ok = GetFileTime(h, &ftCreate, &ftAccess, &ftWrite);
+    CloseHandle(h);
+    if (!ok) return;
+
+    auto toU64 = [](const FILETIME& ft) -> ULONGLONG {
+        ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+        return u.QuadPart;
+    };
+    ULONGLONG c = toU64(ftCreate);
+    ULONGLONG w = toU64(ftWrite);
+    ULONGLONG a = toU64(ftAccess);
+    if (c == 0 || w == 0) return;
+
+    std::string reason;
+    DetectionSeverity sev = DetectionSeverity::Medium;
+
+    // (1) Creation strictly after last write — physically impossible unless
+    // one or both timestamps were rewritten
+    if (c > w + (ULONGLONG)60 * 10000000ULL) {  // >60s margin for fs rounding
+        reason = "CreationTime > LastWriteTime (creation dated after modification)";
+        sev = DetectionSeverity::High;
+    }
+
+    // (2) All three timestamps identical to whole-second — the 100-ns tail of
+    // legitimate fs writes is effectively never zero. SetMace's default output
+    // truncates to whole seconds.
+    if (reason.empty()) {
+        ULONGLONG mask = 10000000ULL;  // 1 second in 100-ns units
+        if ((c % mask) == 0 && (w % mask) == 0 && (a % mask) == 0 &&
+            c == w && w == a) {
+            reason = "All MAC times identical and whole-second aligned (SetMace/timestomp signature)";
+            sev = DetectionSeverity::High;
+        }
+    }
+
+    // (3) CreationTime predates the producing process by >30 days
+    if (reason.empty() && notifPid > 0) {
+        time_t procFirstSeen = 0;
+        {
+            std::lock_guard<std::mutex> lk(process_cache_mutex);
+            auto it = g_processCache.find(notifPid);
+            if (it != g_processCache.end()) procFirstSeen = it->second.firstSeen;
+        }
+        if (procFirstSeen > 0) {
+            // Convert FILETIME to unix time: subtract epoch delta, divide by 1e7
+            ULONGLONG epochDelta = 116444736000000000ULL;
+            if (c > epochDelta) {
+                time_t fileCreateUnix = (time_t)((c - epochDelta) / 10000000ULL);
+                // Only alert if file claims creation >30 days before producing
+                // process appeared (and isn't in the future)
+                if (fileCreateUnix + 30ULL * 86400 < (ULONGLONG)procFirstSeen) {
+                    char buf[128];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "File CreationTime %lld > 30 days before producer process firstSeen %lld",
+                        (long long)fileCreateUnix, (long long)procFirstSeen);
+                    reason = buf;
+                    sev = DetectionSeverity::High;
+                }
+            }
+        }
+    }
+
+    if (reason.empty()) return;
+
+    std::string details = "File: " + fullPath +
+                          "\nProcess: " + procName +
+                          "\nReason: " + reason;
+    PushUiDetectionEvent(
+        "Timestomped file: " + BaseNameLower(fullPath),
+        details,
+        "Anti-Forensic: Timestomp",
+        notifPid,
+        sev
+    );
+}
+
+
+// Reparse point inspection. FILE_ATTRIBUTE_REPARSE_POINT on a freshly observed
+// file can be: symlink / mount point / hard link bait / IO_REPARSE_TAG_* used
+// by container / WoF / AppExecutionAlias / MSIX. Flag symlinks and mount
+// points whose target escapes the containing directory or points at
+// security-sensitive paths.
+#ifndef IO_REPARSE_TAG_SYMLINK
+#define IO_REPARSE_TAG_SYMLINK 0xA000000CL
+#endif
+#ifndef IO_REPARSE_TAG_MOUNT_POINT
+#define IO_REPARSE_TAG_MOUNT_POINT 0xA0000003L
+#endif
+#ifndef FSCTL_GET_REPARSE_POINT
+#define FSCTL_GET_REPARSE_POINT 0x900A8
+#endif
+#ifndef MAXIMUM_REPARSE_DATA_BUFFER_SIZE
+#define MAXIMUM_REPARSE_DATA_BUFFER_SIZE (16 * 1024)
+#endif
+
+typedef struct _NAV_REPARSE_DATA_BUFFER {
+    ULONG  ReparseTag;
+    USHORT ReparseDataLength;
+    USHORT Reserved;
+    union {
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            ULONG  Flags;
+            WCHAR  PathBuffer[1];
+        } SymbolicLinkReparseBuffer;
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            WCHAR  PathBuffer[1];
+        } MountPointReparseBuffer;
+        struct {
+            UCHAR  DataBuffer[1];
+        } GenericReparseBuffer;
+    } DUMMYUNIONNAME;
+} NAV_REPARSE_DATA_BUFFER;
+
+static void CheckReparsePoint(const std::string& fullPath,
+                              UINT32 notifPid,
+                              const std::string& procName) {
+    int wn = MultiByteToWideChar(CP_UTF8, 0, fullPath.c_str(), (int)fullPath.size(), nullptr, 0);
+    if (wn <= 0) return;
+    std::wstring wPath(wn, 0);
+    MultiByteToWideChar(CP_UTF8, 0, fullPath.c_str(), (int)fullPath.size(), &wPath[0], wn);
+
+    DWORD attrs = GetFileAttributesW(wPath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return;
+    if (!(attrs & FILE_ATTRIBUTE_REPARSE_POINT)) return;
+
+    HANDLE h = CreateFileW(wPath.c_str(), 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    std::vector<BYTE> buf(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+    DWORD retLen = 0;
+    BOOL ok = DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, nullptr, 0,
+        buf.data(), (DWORD)buf.size(), &retLen, nullptr);
+    CloseHandle(h);
+    if (!ok) return;
+
+    auto* rdb = reinterpret_cast<NAV_REPARSE_DATA_BUFFER*>(buf.data());
+
+    const char* tagName = nullptr;
+    std::wstring target;
+    if (rdb->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
+        tagName = "SYMLINK";
+        const wchar_t* base = rdb->SymbolicLinkReparseBuffer.PathBuffer;
+        USHORT off = rdb->SymbolicLinkReparseBuffer.SubstituteNameOffset / sizeof(WCHAR);
+        USHORT len = rdb->SymbolicLinkReparseBuffer.SubstituteNameLength / sizeof(WCHAR);
+        target.assign(base + off, len);
+    } else if (rdb->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
+        tagName = "MOUNT_POINT";
+        const wchar_t* base = rdb->MountPointReparseBuffer.PathBuffer;
+        USHORT off = rdb->MountPointReparseBuffer.SubstituteNameOffset / sizeof(WCHAR);
+        USHORT len = rdb->MountPointReparseBuffer.SubstituteNameLength / sizeof(WCHAR);
+        target.assign(base + off, len);
+    } else {
+        // Non-symlink tags (AppExecutionAlias, OneDrive placeholder, WoF,
+        // dedup, MSIX, WSL) are legitimate OS features — don't alert.
+        return;
+    }
+
+    // UTF-16 → UTF-8 for the UI
+    int n = WideCharToMultiByte(CP_UTF8, 0, target.c_str(), (int)target.size(),
+        nullptr, 0, nullptr, nullptr);
+    std::string tgt(n, '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, target.c_str(), (int)target.size(),
+        &tgt[0], n, nullptr, nullptr);
+
+    std::string tgtLow = tgt;
+    for (auto& c : tgtLow) c = (char)tolower((unsigned char)c);
+
+    DetectionSeverity sev = DetectionSeverity::Medium;
+    bool hot =
+        tgtLow.find("\\system32\\")          != std::string::npos ||
+        tgtLow.find("\\syswow64\\")          != std::string::npos ||
+        tgtLow.find("\\drivers\\")           != std::string::npos ||
+        tgtLow.find("\\windefend")           != std::string::npos ||
+        tgtLow.find("\\$mft")                != std::string::npos ||
+        tgtLow.find("globalroot")            != std::string::npos ||
+        tgtLow.find("\\device\\")            != std::string::npos ||
+        tgtLow.find("nortonedr")             != std::string::npos;
+    if (hot) sev = DetectionSeverity::High;
+
+    std::string details = "Link: " + fullPath +
+                          "\nTarget: " + tgt +
+                          "\nTag: " + std::string(tagName) +
+                          "\nProcess: " + procName;
+    PushUiDetectionEvent(
+        "Reparse point created: " + BaseNameLower(fullPath),
+        details,
+        "Filesystem: Reparse Point",
+        notifPid,
+        sev
+    );
+}
+
+
+// Base64 decoder with URL-safe alphabet support (accepts both '+'/'/' and
+// '-'/'_'). Returns decoded bytes or empty on malformed input. Stops at
+// first non-alphabet character so it can be called on a cmdline that has
+// the blob inline among other tokens.
+static std::string TryBase64Decode(const std::string& in) {
+    if (in.size() < 16) return {};
+    // Extract contiguous base64-alphabet run (stdlib or URL-safe)
+    size_t best_begin = 0, best_len = 0, cur_begin = 0, cur_len = 0;
+    for (size_t i = 0; i < in.size(); i++) {
+        char c = in[i];
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '+' || c == '/' ||
+                  c == '-' || c == '_' || c == '=';
+        if (ok) {
+            if (cur_len == 0) cur_begin = i;
+            cur_len++;
+        } else {
+            if (cur_len > best_len) { best_begin = cur_begin; best_len = cur_len; }
+            cur_len = 0;
+        }
+    }
+    if (cur_len > best_len) { best_begin = cur_begin; best_len = cur_len; }
+    if (best_len < 20) return {};
+    std::string sub = in.substr(best_begin, best_len);
+
+    // Normalize URL-safe alphabet to standard
+    for (auto& c : sub) {
+        if (c == '-') c = '+';
+        else if (c == '_') c = '/';
+    }
+    // Pad
+    while (sub.size() % 4) sub.push_back('=');
+
+    DWORD outLen = 0;
+    if (!CryptStringToBinaryA(sub.c_str(), (DWORD)sub.size(), CRYPT_STRING_BASE64,
+            nullptr, &outLen, nullptr, nullptr) || outLen == 0) return {};
+    std::string out(outLen, '\0');
+    if (!CryptStringToBinaryA(sub.c_str(), (DWORD)sub.size(), CRYPT_STRING_BASE64,
+            (BYTE*)&out[0], &outLen, nullptr, nullptr)) return {};
+    out.resize(outLen);
+    return out;
+}
+
+// Examines a decoded buffer for malicious-intent markers. Covers: embedded
+// PE (MZ), shellcode syscall stub, PowerShell download-execute, Mimikatz /
+// Rubeus / Empire / AMSI-bypass strings. Returns the matched indicator or
+// empty.
+static std::string IdentifyDecodedIntent(const std::string& bytes) {
+    if (bytes.size() < 4) return {};
+    // PE embedded in base64 blob
+    if (bytes.size() >= 2 && bytes[0] == 'M' && bytes[1] == 'Z')
+        return "Embedded PE (MZ header in base64 payload)";
+    // UTF-16LE-encoded PowerShell (how -EncodedCommand arrives)
+    bool isUtf16 = (bytes.size() >= 4 && bytes[1] == 0 && bytes[3] == 0);
+    std::string narrow;
+    narrow.reserve(bytes.size());
+    if (isUtf16) {
+        for (size_t i = 0; i + 1 < bytes.size(); i += 2) {
+            unsigned char lo = (unsigned char)bytes[i];
+            unsigned char hi = (unsigned char)bytes[i + 1];
+            narrow.push_back(hi == 0 ? (char)tolower(lo) : '?');
+        }
+    } else {
+        for (unsigned char c : bytes) narrow.push_back((char)tolower(c));
+    }
+
+    static const char* const kInnerIocs[] = {
+        "downloadstring(", "downloaddata(", "net.webclient",
+        "invoke-expression", "iex ", "iex(", "|iex",
+        "invoke-mimikatz", "sekurlsa::", "kerberos::", "lsadump::",
+        "frombase64string", "virtualalloc", "createremotethread",
+        "reflection.assembly", "::load(",
+        "amsibypass", "amsiutils", "amsicontext",
+        "start-process", "new-object net.sockets.tcpclient",
+        "rundll32", "regsvr32 /s /u /i:", "scrobj.dll",
+        "mshta http", "bitsadmin /transfer",
+        "-bxor $key[", "-bxor $k[",
+        "shellcode", "meterpreter", "cobaltstrike",
+        "invoke-empire", "psinject", "invoke-reflectivepeinjection",
+        nullptr
+    };
+    for (int i = 0; kInnerIocs[i]; i++) {
+        if (narrow.find(kInnerIocs[i]) != std::string::npos)
+            return std::string("Encoded payload contains: ") + kInnerIocs[i];
+    }
+
+    // Shellcode direct-syscall stub present in the decoded bytes
+    static const unsigned char kSyscallStub[] = { 0x4C, 0x8B, 0xD1, 0xB8 };
+    for (size_t i = 0; i + 11 < bytes.size(); i++) {
+        if (memcmp(bytes.data() + i, kSyscallStub, 4) == 0 &&
+            (unsigned char)bytes[i + 8] == 0x0F &&
+            (unsigned char)bytes[i + 9] == 0x05 &&
+            (unsigned char)bytes[i + 10] == 0xC3) {
+            return "Encoded payload contains x64 syscall stub (Hell's Gate shape)";
+        }
+    }
+    return {};
+}
+
+// Single-byte XOR brute-force over a decoded buffer. Tries all 256 keys (plus
+// a short list of known-offensive 4-byte keys) and returns the first IOC hit.
+// Handles the Empire / Covenant / CS stager shape: base64 wraps an XOR'd
+// payload so the raw decoded bytes look random — trying single-byte keys on
+// the first ~2KB is cheap and recovers the plaintext IOC.
+static std::string TryXorBruteForceForIOC(const std::string& bytes) {
+    if (bytes.size() < 32) return {};
+    const size_t sampleLen = bytes.size() < 4096 ? bytes.size() : 4096;
+    std::string trial(sampleLen, '\0');
+
+    // 1) Single-byte XOR (skip key 0 — already handled as raw)
+    for (int key = 1; key < 256; key++) {
+        for (size_t i = 0; i < sampleLen; i++) {
+            trial[i] = bytes[i] ^ (char)key;
+        }
+        std::string hit = IdentifyDecodedIntent(trial);
+        if (!hit.empty()) {
+            char buf[48];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, " (XOR key=0x%02X)", key);
+            return hit + buf;
+        }
+    }
+
+    // 2) 4-byte rotating XOR — try known Empire / CS / Covenant static keys,
+    // plus the first 4 bytes of the buffer as a heuristic (many stagers
+    // embed the key at the start).
+    static const uint32_t kKnownKeys4[] = {
+        0xDEADBEEF, 0xCAFEBABE, 0xFEEDFACE, 0xBADF00D0,
+        0x12345678, 0xAABBCCDD, 0x31415926,
+        0
+    };
+    uint8_t candidates[8][4];
+    int nKeys = 0;
+    for (int i = 0; kKnownKeys4[i]; i++, nKeys++) {
+        candidates[nKeys][0] = (uint8_t)(kKnownKeys4[i]      );
+        candidates[nKeys][1] = (uint8_t)(kKnownKeys4[i] >>  8);
+        candidates[nKeys][2] = (uint8_t)(kKnownKeys4[i] >> 16);
+        candidates[nKeys][3] = (uint8_t)(kKnownKeys4[i] >> 24);
+    }
+    if (bytes.size() >= 4) {
+        // Heuristic: use the first 4 bytes as a candidate key — often holds
+        // the stager's key prefix or a predictable magic
+        candidates[nKeys][0] = (uint8_t)bytes[0];
+        candidates[nKeys][1] = (uint8_t)bytes[1];
+        candidates[nKeys][2] = (uint8_t)bytes[2];
+        candidates[nKeys][3] = (uint8_t)bytes[3];
+        nKeys++;
+    }
+
+    for (int k = 0; k < nKeys; k++) {
+        for (size_t i = 0; i < sampleLen; i++) {
+            trial[i] = bytes[i] ^ (char)candidates[k][i & 3];
+        }
+        std::string hit = IdentifyDecodedIntent(trial);
+        if (!hit.empty()) {
+            char buf[64];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                " (4-byte XOR key=%02X%02X%02X%02X)",
+                candidates[k][0], candidates[k][1],
+                candidates[k][2], candidates[k][3]);
+            return hit + buf;
+        }
+    }
+
+    return {};
+}
+
+// Scans a command line (or script buffer) for embedded base64 blobs, decodes
+// them up to `maxDepth` layers, and emits a detection if the decoded content
+// matches any malicious-intent marker. Catches PowerShell -EncodedCommand,
+// certutil -decode fetches, and nested-base64 stagers that evade static
+// string matching.
+static void ScanBase64LayersInBuffer(const std::string& buffer,
+                                     UINT32 pid,
+                                     const std::string& procName,
+                                     const std::string& context,
+                                     int maxDepth = 3) {
+    if (buffer.empty()) return;
+    std::string cur = buffer;
+    for (int depth = 0; depth < maxDepth; depth++) {
+        std::string decoded = TryBase64Decode(cur);
+        if (decoded.empty()) return;
+
+        std::string hit = IdentifyDecodedIntent(decoded);
+        if (!hit.empty()) {
+            std::string preview = decoded.substr(0, 180);
+            for (auto& c : preview) if (c < 0x20 || c > 0x7E) c = '.';
+            char buf[64];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%d", depth + 1);
+            std::string details = "Context: " + context +
+                "\nProcess: " + procName +
+                "\nDecode depth: " + buf +
+                "\nIndicator: " + hit +
+                "\nDecoded preview: " + preview;
+            PushUiDetectionEvent(
+                "Base64-obfuscated payload: " + hit,
+                details,
+                "Obfuscation: Base64 Decode (T1027/T1140)",
+                pid,
+                DetectionSeverity::High
+            );
+            return;
+        }
+
+        // Base64 decoded to seemingly-random bytes — try XOR brute force over
+        // the decoded buffer. This is the Empire / Covenant / CS shape:
+        // B64(XOR(plaintext, key)) where the plaintext contains an IEX /
+        // mimikatz / webclient token.
+        std::string xorHit = TryXorBruteForceForIOC(decoded);
+        if (!xorHit.empty()) {
+            char buf[64];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%d", depth + 1);
+            std::string details = "Context: " + context +
+                "\nProcess: " + procName +
+                "\nBase64 depth: " + buf +
+                "\nIndicator: " + xorHit;
+            PushUiDetectionEvent(
+                "Base64+XOR obfuscated payload",
+                details,
+                "Obfuscation: Base64+XOR Decode (T1027.013)",
+                pid,
+                DetectionSeverity::Critical
+            );
+            return;
+        }
+
+        // Continue only if decoded looks like yet another base64 blob
+        if (decoded.size() < 32) return;
+        bool looksB64 = true;
+        size_t checkN = decoded.size() < 128 ? decoded.size() : 128;
+        size_t alphaLike = 0;
+        for (size_t i = 0; i < checkN; i++) {
+            char c = decoded[i];
+            bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') || c == '+' || c == '/' ||
+                      c == '-' || c == '_' || c == '=';
+            if (ok) alphaLike++;
+            if (c < 0x20 || c > 0x7E) { looksB64 = false; break; }
+        }
+        if (!looksB64 || alphaLike < (checkN * 9 / 10)) return;
+        cur = decoded;
+    }
+}
+
 
 void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) {
 
@@ -4930,6 +6845,11 @@ void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) 
 
                         std::string cachedCmdLine = GetProcessCommandLineCached(notifPid);
 
+                        if (!cachedCmdLine.empty()) {
+                            ScanBase64LayersInBuffer(cachedCmdLine, notifPid, notifProcName,
+                                "process command line");
+                        }
+
                         if (notif->isPath) {
 
                             std::string litFileName = msg;
@@ -4946,6 +6866,73 @@ void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) 
 
                             if (benignFSPaths.find(fullPath) != benignFSPaths.end()) {
                                 continue;
+                            }
+
+                            CheckFileTimestomp(fullPath, notifPid, notifProcName);
+                            CheckReparsePoint(fullPath, notifPid, notifProcName);
+
+                            // Path obfuscation: RTL-override chars, ADS separators,
+                            // double-extension masquerade — any one of these is a
+                            // reliable signal a user is being tricked or a payload
+                            // is being hidden under a benign-looking name.
+                            {
+                                std::string reason = CheckPathObfuscation(fullPath);
+                                if (!reason.empty()) {
+                                    std::string details = "Path: " + fullPath +
+                                        "\nProcess: " + notifProcName +
+                                        "\nReason: " + reason;
+                                    PushUiDetectionEvent(
+                                        "Obfuscated filename: " + BaseNameLower(fullPath),
+                                        details,
+                                        "Static: Path Obfuscation",
+                                        notifPid,
+                                        DetectionSeverity::High
+                                    );
+                                }
+                            }
+
+                            // Office document shape check: macro-enabled
+                            // containers, extension/magic mismatches (template
+                            // injection, renamed macro dropper).
+                            {
+                                OfficeDocShape ods = InspectOfficeDoc(fullPath);
+                                if (ods.extMagicMismatch) {
+                                    std::string details = "File: " + fullPath +
+                                        "\nProcess: " + notifProcName +
+                                        "\nReason: " + ods.reason +
+                                        "\nIndicator: extension/magic mismatch on Office "
+                                        "document — may be a renamed macro dropper or "
+                                        "OLE template-injection vehicle (T1221/T1036.007)";
+                                    PushUiDetectionEvent(
+                                        "Office doc mismatch: " + BaseNameLower(fullPath),
+                                        details,
+                                        "Static: Office Extension/Magic Mismatch",
+                                        notifPid,
+                                        DetectionSeverity::High
+                                    );
+                                }
+                                if (ods.isMacroEnabled) {
+                                    std::string details = "File: " + fullPath +
+                                        "\nProcess: " + notifProcName +
+                                        "\nContainer: " + (ods.isCfb ? "OLE2 CFB" : (ods.isOoxml ? "OOXML (ZIP)" : "unknown")) +
+                                        "\nIndicator: macro-enabled Office document "
+                                        "landed on disk (T1566.001)";
+                                    PushUiDetectionEvent(
+                                        "Macro-enabled doc: " + BaseNameLower(fullPath),
+                                        details,
+                                        "Static: Macro-Enabled Office Document",
+                                        notifPid,
+                                        DetectionSeverity::Medium
+                                    );
+                                }
+
+                                // Deep inspection: extract VBA source + embedded
+                                // objects from CFB/OOXML and scan with YARA +
+                                // keyword matching.
+                                if (ods.isOfficeDoc && (ods.isCfb || ods.isOoxml)) {
+                                    ScanOfficeDocumentDeep(fullPath, notifPid,
+                                        notifProcName, ods.isCfb, ods.isOoxml);
+                                }
                             }
 
                             EnqueueYaraFileScan(notif, fullPath);
@@ -4991,6 +6978,47 @@ void ConsumeIOCTLData(LPCWSTR deviceName, DWORD ioctlCode, int sleepDurationMs) 
                                         "Static: High-Entropy Executable Section",
                                         notifPid,
                                         sev
+                                    );
+                                }
+                            }
+
+                            // Hidden-payload entropy: look at overlay bytes (past
+                            // last section) and non-executable sections (.rsrc,
+                            // .rdata, custom) — where donut-style shellcode
+                            // carriers, steganographic loaders, and crypted
+                            // resource blobs hide from packer scanners that only
+                            // inspect .text.
+                            {
+                                PeHiddenPayloadInfo hp = ComputePeHiddenPayloadInfo(fullPath);
+                                bool overlayHot = (hp.overlayEntropy >= 7.5 && hp.overlaySize >= 4096);
+                                bool nonExecHot = (hp.nonExecMaxEnt  >= 7.5);
+                                if (overlayHot || nonExecHot) {
+                                    char entBuf[64];
+                                    std::string details = "File: " + fullPath;
+                                    if (overlayHot) {
+                                        _snprintf_s(entBuf, sizeof(entBuf), _TRUNCATE,
+                                            "\nOverlay entropy: %.3f  size: %zu bytes",
+                                            hp.overlayEntropy, hp.overlaySize);
+                                        details += entBuf;
+                                    }
+                                    if (nonExecHot) {
+                                        _snprintf_s(entBuf, sizeof(entBuf), _TRUNCATE,
+                                            "\nNon-exec section: %s  entropy: %.3f",
+                                            hp.nonExecSecName.c_str(), hp.nonExecMaxEnt);
+                                        details += entBuf;
+                                    }
+                                    details += "\nIndicator: high-entropy data outside executable "
+                                        "sections — embedded shellcode, crypted payload, or stego blob";
+                                    DetectionSeverity sev2 = (hp.overlayEntropy >= 7.8 ||
+                                                              hp.nonExecMaxEnt  >= 7.8)
+                                        ? DetectionSeverity::High
+                                        : DetectionSeverity::Medium;
+                                    PushUiDetectionEvent(
+                                        "Hidden payload: " + BaseNameLower(fullPath),
+                                        details,
+                                        "Static: High-Entropy Overlay/Resource",
+                                        notifPid,
+                                        sev2
                                     );
                                 }
                             }
@@ -5933,6 +7961,213 @@ static void StopKernelProcessSession()
         stopProps.Wnode.BufferSize = sizeof(stopProps);
         ControlTraceW(g_kpSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
         g_kpSessionHandle = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Microsoft-Antimalware-Scan-Interface ETW consumer
+// Provider GUID: {2A576B87-09A7-520E-C21A-4942F0271D67}
+//
+// amsi.dll writes an ETW event on every call to AmsiScanBuffer / AmsiScanString,
+// containing: content name, content size, returned AMSI_RESULT, and the
+// provider CLSID that handled the scan. Consuming this provider gives us a
+// second-opinion telemetry channel that's independent of our IAntimalwareProvider
+// implementation:
+//
+//   - Detect "no-call" bypasses: a process loaded amsi.dll (image-load
+//     callback fired) but emits zero AMSI events while running PowerShell /
+//     running wscript — consistent with FreeLibrary(amsi.dll), patched
+//     AmsiScanBuffer, or corrupted g_amsiContext (the "clean early-return"
+//     path short-circuits before the event is emitted).
+//   - Detect provider hijack: ETW event shows AMSI_RESULT_CLEAN with an
+//     unexpected provider CLSID (not our {C18BED31-...}, not Defender's
+//     {2781761E-...}).
+// ---------------------------------------------------------------------------
+static const GUID kAmsiEtwProviderGuid = {
+    0x2A576B87, 0x09A7, 0x520E,
+    {0xC2, 0x1A, 0x49, 0x42, 0xF0, 0x27, 0x1D, 0x67}
+};
+
+struct AmsiProcStats {
+    ULONG64 scanEvents = 0;
+    ULONG64 cleanResults = 0;
+    ULONG64 detectedResults = 0;
+    time_t  lastEventTime = 0;
+};
+static std::mutex g_amsiStatsMutex;
+static std::unordered_map<UINT32, AmsiProcStats> g_amsiStatsByPid;
+
+static void WINAPI AmsiEtwEventCallback(PEVENT_RECORD pEvent) {
+    if (!pEvent) return;
+    if (!IsEqualGUID(pEvent->EventHeader.ProviderId, kAmsiEtwProviderGuid)) return;
+
+    UINT32 pid = pEvent->EventHeader.ProcessId;
+    USHORT eid = pEvent->EventHeader.EventDescriptor.Id;
+
+    // Walk TDH properties to pull AmsiResult + ContentName where available.
+    // The provider's schema exposes ContentName / ContentSize / AmsiResult /
+    // ProviderCLSID fields on scan events (id=1101 AmsiScanBuffer, id=1102
+    // AmsiScanString on Win10+).
+    ULONG amsiResult = 0;
+    wchar_t contentName[260] = {};
+
+    ULONG bufSize = 0;
+    TdhGetEventInformation(pEvent, 0, nullptr, nullptr, &bufSize);
+    if (bufSize) {
+        std::vector<BYTE> buf(bufSize);
+        auto* info = reinterpret_cast<PTRACE_EVENT_INFO>(buf.data());
+        if (TdhGetEventInformation(pEvent, 0, nullptr, info, &bufSize) == ERROR_SUCCESS) {
+            for (ULONG i = 0; i < info->TopLevelPropertyCount; i++) {
+                const EVENT_PROPERTY_INFO& pi = info->EventPropertyInfoArray[i];
+                PCWSTR name = reinterpret_cast<PCWSTR>(
+                    reinterpret_cast<const BYTE*>(info) + pi.NameOffset);
+                PROPERTY_DATA_DESCRIPTOR pdd{};
+                pdd.PropertyName = reinterpret_cast<ULONGLONG>(name);
+                pdd.ArrayIndex   = ULONG_MAX;
+
+                ULONG propSz = 0;
+                if (TdhGetPropertySize(pEvent, 0, nullptr, 1, &pdd, &propSz) != ERROR_SUCCESS ||
+                    propSz == 0 || propSz > 2048) continue;
+
+                std::vector<BYTE> pv(propSz);
+                if (TdhGetProperty(pEvent, 0, nullptr, 1, &pdd, propSz, pv.data()) != ERROR_SUCCESS)
+                    continue;
+
+                if (_wcsicmp(name, L"AmsiResult") == 0 && propSz >= 4) {
+                    amsiResult = *reinterpret_cast<ULONG*>(pv.data());
+                } else if (_wcsicmp(name, L"ContentName") == 0 && propSz >= 2) {
+                    size_t wcount = propSz / sizeof(wchar_t);
+                    if (wcount >= _countof(contentName)) wcount = _countof(contentName) - 1;
+                    memcpy(contentName, pv.data(), wcount * sizeof(wchar_t));
+                    contentName[wcount] = 0;
+                }
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_amsiStatsMutex);
+        auto& st = g_amsiStatsByPid[pid];
+        st.scanEvents++;
+        st.lastEventTime = time(nullptr);
+        if (amsiResult >= 32768) st.detectedResults++;   // AMSI_RESULT_DETECTED = 32768+
+        else                     st.cleanResults++;
+    }
+
+    (void)eid;
+    (void)contentName;
+}
+
+static void AmsiEtwSubscriberThread() {
+    const wchar_t* kSessionName = L"NortonEDR-AMSI";
+    const size_t nameBufBytes   = (wcslen(kSessionName) + 1) * sizeof(wchar_t);
+    const size_t propBufSize    = sizeof(EVENT_TRACE_PROPERTIES) + nameBufBytes;
+    auto* props = static_cast<PEVENT_TRACE_PROPERTIES>(malloc(propBufSize));
+    if (!props) return;
+
+    auto buildProps = [&]() {
+        ZeroMemory(props, propBufSize);
+        props->Wnode.BufferSize   = static_cast<ULONG>(propBufSize);
+        props->Wnode.Flags        = WNODE_FLAG_TRACED_GUID;
+        props->LogFileMode        = EVENT_TRACE_REAL_TIME_MODE;
+        props->LoggerNameOffset   = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s(reinterpret_cast<wchar_t*>(
+            reinterpret_cast<BYTE*>(props) + props->LoggerNameOffset),
+            wcslen(kSessionName) + 1, kSessionName);
+    };
+
+    buildProps();
+    ULONG status = StartTraceW(&g_amsiSessionHandle, kSessionName, props);
+    if (status == ERROR_ALREADY_EXISTS) {
+        AlertSessionNameSquatted(kSessionName);
+        buildProps();
+        ControlTraceW(0, kSessionName, props, EVENT_TRACE_CONTROL_STOP);
+        buildProps();
+        status = StartTraceW(&g_amsiSessionHandle, kSessionName, props);
+    }
+    free(props);
+
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-AMSI] StartTrace failed: " << status << "\n";
+        return;
+    }
+
+    ENABLE_TRACE_PARAMETERS etp{};
+    etp.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    status = EnableTraceEx2(
+        g_amsiSessionHandle, &kAmsiEtwProviderGuid,
+        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        TRACE_LEVEL_VERBOSE,
+        0xFFFFFFFFFFFFFFFFULL, 0, 0, &etp);
+    if (status != ERROR_SUCCESS) {
+        std::cerr << "[ETW-AMSI] EnableTraceEx2 failed: " << status << "\n";
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_amsiSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_amsiSessionHandle = 0;
+        return;
+    }
+
+    std::cout << "[ETW-AMSI] Session started — consuming AMSI scan events\n";
+
+    EVENT_TRACE_LOGFILEW logFile{};
+    logFile.LoggerName          = const_cast<LPWSTR>(kSessionName);
+    logFile.ProcessTraceMode    = PROCESS_TRACE_MODE_REAL_TIME |
+                                  PROCESS_TRACE_MODE_EVENT_RECORD;
+    logFile.EventRecordCallback = AmsiEtwEventCallback;
+
+    g_amsiTraceHandle = OpenTraceW(&logFile);
+    if (g_amsiTraceHandle == INVALID_PROCESSTRACE_HANDLE) {
+        std::cerr << "[ETW-AMSI] OpenTrace failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    ProcessTrace(&g_amsiTraceHandle, 1, nullptr, nullptr);
+    g_amsiTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+}
+
+static void StopAmsiEtwSession() {
+    if (g_amsiTraceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(g_amsiTraceHandle);
+        g_amsiTraceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_amsiSessionHandle) {
+        EVENT_TRACE_PROPERTIES stopProps{};
+        stopProps.Wnode.BufferSize = sizeof(stopProps);
+        ControlTraceW(g_amsiSessionHandle, nullptr, &stopProps, EVENT_TRACE_CONTROL_STOP);
+        g_amsiSessionHandle = 0;
+    }
+}
+
+// Called periodically (e.g., from a watchdog tick). Flags processes that have
+// amsi.dll loaded, are script-host processes (powershell/wscript/cscript), and
+// have not emitted any AMSI scan events in the last window — a strong
+// indicator of the unload/patch/context-corruption bypass family.
+static void CheckAmsiSilence(const std::unordered_set<UINT32>& amsiLoadedScriptHosts,
+                             time_t now, time_t silenceThresholdSec) {
+    std::lock_guard<std::mutex> lk(g_amsiStatsMutex);
+    for (UINT32 pid : amsiLoadedScriptHosts) {
+        auto it = g_amsiStatsByPid.find(pid);
+        bool silent = (it == g_amsiStatsByPid.end()) ||
+                      (now - it->second.lastEventTime > silenceThresholdSec);
+        if (!silent) continue;
+        std::string procName;
+        {
+            std::lock_guard<std::mutex> pk(process_cache_mutex);
+            auto pit = g_processCache.find(pid);
+            if (pit != g_processCache.end()) procName = pit->second.processName;
+        }
+        char det[256];
+        _snprintf_s(det, sizeof(det), _TRUNCATE,
+            "PID: %u\nProcess: %s\nReason: amsi.dll loaded in script-host but zero AMSI scan events emitted for >%llds",
+            pid, procName.c_str(), (long long)silenceThresholdSec);
+        PushUiDetectionEvent(
+            "AMSI silenced in script host",
+            det,
+            "Defense-Evasion: AMSI ETW Silence",
+            pid,
+            DetectionSeverity::High
+        );
     }
 }
 
@@ -10069,6 +12304,12 @@ static DWORD WINAPI DnsEventCallback(
             { "freegeoip.app",          "Geolocation Lookup",         "T1614",     false },
             { "myexternalip.com",       "External IP Lookup",         "T1614",     false },
             { "wtfismyip.com",          "External IP Lookup",         "T1614",     false },
+
+            // T1219.001: VS Code / Dev Tunnels reverse-tunnel infrastructure
+            { "tunnels.api.visualstudio.com", "VS Code Tunnel API",    "T1219.001", true  },
+            { ".devtunnels.ms",         "Dev Tunnels Relay",          "T1219.001", true  },
+            { "global-relay.codedev.ms","VS Code Tunnel Global Relay","T1219.001", true  },
+            { "tunnel-relay.azurewebsites.net", "VS Code Tunnel Relay","T1219.001", true },
         };
 
         // Build lowercase query for matching
@@ -11781,6 +14022,8 @@ VOID ShowUI() {
     std::thread saclThread(SecurityAuditSubscriberThread);
     std::thread tiThread(EtwTiSubscriberThread);
     std::thread kpThread(KernelProcessSubscriberThread);
+    std::thread amsiEtwThread(AmsiEtwSubscriberThread);
+    amsiEtwThread.detach();
     std::thread psThread(PowerShellSubscriberThread);
     std::thread dnsThread(DnsSubscriberThread);
     std::thread winrmThread(WinRmSubscriberThread);
@@ -12437,6 +14680,9 @@ int main(int argc, char* argv[]) {
 
     // CLR profiler registry watcher (T1574.012 persistence)
     std::thread(ClrProfilerRegistryWatcherThread).detach();
+    std::thread(PendingFileRenameWatcherThread).detach();
+    std::thread(AmsiProviderTamperWatcherThread).detach();
+    std::thread(OfficeAntiVirusTamperWatcherThread).detach();
 
     system("pause");
 

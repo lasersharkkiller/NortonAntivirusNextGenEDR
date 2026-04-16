@@ -2045,14 +2045,36 @@ VOID SyscallsUtils::NtContinueHandler(
 
 	// DR register manipulation via NtContinue — same technique as NtSetContextThread
 	// but avoids that syscall entirely by using exception → NtContinue path.
+	// This is actually the preferred Coburn technique variant because it avoids
+	// NtSetContextThread monitoring entirely.
 	if ((ctxFlags & CONTEXT_DEBUG_REGISTERS) && (dr0 || dr1 || dr2 || dr3)) {
-		char msg[256];
-		RtlStringCbPrintfA(msg, sizeof(msg),
-			"NtContinue: CONTEXT_DEBUG_REGISTERS Dr0=0x%llX Dr1=0x%llX "
-			"Dr2=0x%llX Dr3=0x%llX — hardware BP bypass via exception+NtContinue path",
-			(unsigned long long)dr0, (unsigned long long)dr1,
-			(unsigned long long)dr2, (unsigned long long)dr3);
-		EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, FALSE);
+		HANDLE curPid = PsGetCurrentProcessId();
+		BOOLEAN amsiTargeted = FALSE;
+		ULONG64 drVals[4] = { dr0, dr1, dr2, dr3 };
+		for (int di = 0; di < 4; di++) {
+			if (drVals[di] && AmsiDetector::IsAddressInAmsiDll(curPid, drVals[di])) {
+				amsiTargeted = TRUE;
+				break;
+			}
+		}
+
+		if (amsiTargeted) {
+			char msg[300];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtContinue: AMSI hardware breakpoint bypass (Ceri Coburn technique) — "
+				"DR register points into amsi.dll Dr0=0x%llX Dr1=0x%llX Dr2=0x%llX Dr3=0x%llX",
+				(unsigned long long)dr0, (unsigned long long)dr1,
+				(unsigned long long)dr2, (unsigned long long)dr3);
+			EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, TRUE /* Critical */);
+		} else {
+			char msg[256];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtContinue: CONTEXT_DEBUG_REGISTERS Dr0=0x%llX Dr1=0x%llX "
+				"Dr2=0x%llX Dr3=0x%llX — hardware BP bypass via exception+NtContinue path",
+				(unsigned long long)dr0, (unsigned long long)dr1,
+				(unsigned long long)dr2, (unsigned long long)dr3);
+			EmitSyscallNotif(0, msg, IoGetCurrentProcess(), nullptr, FALSE);
+		}
 	}
 
 	// Only inspect user-mode addresses for shellcode redirect
@@ -2153,15 +2175,40 @@ VOID SyscallsUtils::NtSetContextThreadHandler(
 	// to fire before the inline-hook JMP executes.  A registered VEH can then
 	// redirect RIP past the hook — bypassing our detour entirely.
 	if ((ctxFlags & CONTEXT_DEBUG_REGISTERS) && (dr0 || dr1 || dr2 || dr3)) {
-		char msg[256];
-		RtlStringCbPrintfA(msg, sizeof(msg),
-			"NtSetContextThread: CONTEXT_DEBUG_REGISTERS Dr0=0x%llX Dr1=0x%llX "
-			"Dr2=0x%llX Dr3=0x%llX — hardware BP may bypass inline hooks via VEH%s",
-			(unsigned long long)dr0, (unsigned long long)dr1,
-			(unsigned long long)dr2, (unsigned long long)dr3,
-			crossProcess ? " (cross-process)" : "");
-		EmitSyscallNotif(0, msg, callerProcess, crossProcess ? targetProcess : nullptr,
-			crossProcess /* cross-process = Critical, same-process = Warning */);
+		// Ceri Coburn technique: check if any DR register points into amsi.dll
+		// for the target process.  If so, this is a high-confidence AMSI HW
+		// breakpoint bypass — escalate to Critical regardless of cross-process.
+		HANDLE targetPid = PsGetProcessId(targetProcess);
+		BOOLEAN amsiTargeted = FALSE;
+		ULONG64 drVals[4] = { dr0, dr1, dr2, dr3 };
+		for (int di = 0; di < 4; di++) {
+			if (drVals[di] && AmsiDetector::IsAddressInAmsiDll(targetPid, drVals[di])) {
+				amsiTargeted = TRUE;
+				break;
+			}
+		}
+
+		if (amsiTargeted) {
+			char msg[300];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtSetContextThread: AMSI hardware breakpoint bypass (Ceri Coburn technique) — "
+				"DR register points into amsi.dll Dr0=0x%llX Dr1=0x%llX Dr2=0x%llX Dr3=0x%llX",
+				(unsigned long long)dr0, (unsigned long long)dr1,
+				(unsigned long long)dr2, (unsigned long long)dr3);
+			EmitSyscallNotif(0, msg, callerProcess,
+				crossProcess ? targetProcess : nullptr, TRUE /* always Critical */);
+		} else {
+			char msg[256];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"NtSetContextThread: CONTEXT_DEBUG_REGISTERS Dr0=0x%llX Dr1=0x%llX "
+				"Dr2=0x%llX Dr3=0x%llX — hardware BP may bypass inline hooks via VEH%s",
+				(unsigned long long)dr0, (unsigned long long)dr1,
+				(unsigned long long)dr2, (unsigned long long)dr3,
+				crossProcess ? " (cross-process)" : "");
+			EmitSyscallNotif(0, msg, callerProcess,
+				crossProcess ? targetProcess : nullptr,
+				crossProcess /* cross-process = Critical, same-process = Warning */);
+		}
 	}
 
 	ObDereferenceObject(targetThread);
@@ -3473,7 +3520,31 @@ VOID SyscallsUtils::NtSetInformationThreadHandler(
 	PVOID  ThreadInformation,
 	ULONG  ThreadInformationLength)
 {
-	// Only interested in ThreadImpersonationToken (0x5)
+	// -----------------------------------------------------------------------
+	// ThreadHideFromDebugger (class 0x11 = 17)
+	//
+	// Attackers call NtSetInformationThread(GetCurrentThread(), 0x11, NULL, 0)
+	// to make the thread invisible to debuggers.  This is a prerequisite for
+	// hardware breakpoint AMSI/ETW bypass: once hidden, anti-debug tools
+	// can't inspect the thread's DR registers.  Also used by packers,
+	// anti-analysis malware, and sandbox evasion.
+	//
+	// Ceri Coburn's toolkit and most HW BP AMSI bypass PoCs call this before
+	// installing breakpoints to prevent detection by user-mode tools.
+	// -----------------------------------------------------------------------
+	if (ThreadInformationClass == 0x11) { // ThreadHideFromDebugger
+		PEPROCESS caller = IoGetCurrentProcess();
+		char* procName = PsGetProcessImageFileName(caller);
+
+		char msg[160];
+		RtlStringCbPrintfA(msg, sizeof(msg),
+			"NtSetInformationThread(ThreadHideFromDebugger) — thread hiding from debugger, "
+			"possible HW breakpoint bypass setup or anti-analysis");
+		EmitSyscallNotif(0, msg, caller, nullptr, FALSE);
+		return;
+	}
+
+	// Only interested in ThreadImpersonationToken (0x5) below this point
 	if (ThreadInformationClass != 0x5) return;
 
 	PEPROCESS caller = IoGetCurrentProcess();

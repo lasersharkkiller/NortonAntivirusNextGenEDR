@@ -31,6 +31,11 @@
 #define HOOK_TYPE_JMP_FAR  0x02
 #define HOOK_TYPE_MOV_JMP  0x03
 #define HOOK_TYPE_PUSH_RET 0x04
+#define HOOK_TYPE_CALL_TRAMPOLINE  0x05  // E8 rel32 CALL-based detour
+#define HOOK_TYPE_INT3_PATCH       0x06  // CC (INT3) breakpoint hook
+#define HOOK_TYPE_NOP_SLIDE        0x07  // 90 90 ... NOP-padded to skip prologue
+#define HOOK_TYPE_MOV_CR_JMP       0x08  // 49 BA imm64 + 41 FF E2 (MOV R10,imm64+JMP R10)
+#define HOOK_TYPE_RET_IMMEDIATE    0x09  // C3 (RET at entry — function neutered)
 
 #define MAX_SSDT_ENTRIES 4096
 

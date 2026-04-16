@@ -1089,7 +1089,15 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 					 strcmp(parentName, "eventvwr.exe") == 0 ||
 					 strcmp(parentName, "computerdef") == 0 ||    // computerdefaults.exe (truncated)
 					 strcmp(parentName, "sdclt.exe") == 0 ||
-					 strcmp(parentName, "slui.exe") == 0));
+					 strcmp(parentName, "slui.exe") == 0 ||
+					 strcmp(parentName, "wsreset.exe") == 0 ||
+					 strcmp(parentName, "dccw.exe") == 0 ||
+					 strcmp(parentName, "CompMgmtLau") == 0 ||    // compmgmtlauncher.exe (truncated)
+					 strcmp(parentName, "msconfig.exe") == 0 ||
+					 strcmp(parentName, "silentclean") == 0 ||    // silentcleanup.exe (truncated)
+					 strcmp(parentName, "changepk.exe") == 0 ||
+					 strcmp(parentName, "iscsicpl.exe") == 0 ||
+					 strcmp(parentName, "perfmon.exe") == 0));
 
 				if (isUacBypassHost) {
 					char* childName = PsGetProcessImageFileName(Process);
@@ -2205,6 +2213,8 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				L"bore.exe",           // Minimal tunnel
 				L"revsocks.exe",       // Reverse SOCKS5 proxy
 				L"rsocx.exe",          // Rust SOCKS proxy
+				L"code-tunnel.exe",    // VS Code standalone tunnel CLI
+				L"devtunnel.exe",      // Microsoft Dev Tunnels CLI
 				nullptr
 			};
 
@@ -2469,6 +2479,81 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"bitsadmin /addfile",    "BITS AddFile — file staging via BITS job (T1197)",                           FALSE },
 				{ L"bitsadmin /rawreturn",  "BITS RawReturn — suppress output for stealth BITS operations",              FALSE },
 				{ L"/i:http",               "msiexec /i:http remote install lolbin",               TRUE  },
+				// --- T1059.001 / T1105: download cradles ---
+				{ L"downloaddata(",         "PowerShell DownloadData -- in-memory byte fetch (cradle T1105)",          TRUE  },
+				{ L"downloadfile(",         "PowerShell DownloadFile -- disk-staged fetch (cradle T1105)",              TRUE  },
+				{ L"invoke-webrequest",     "Invoke-WebRequest cradle (T1105)",                                         TRUE  },
+				{ L"invoke-restmethod",     "Invoke-RestMethod cradle (T1105)",                                         TRUE  },
+				{ L"iwr -uri",              "PS iwr alias cradle (T1105)",                                              TRUE  },
+				{ L"irm -uri",              "PS irm alias cradle (T1105)",                                              TRUE  },
+				{ L"iwr http",              "PS iwr http cradle (T1105)",                                               TRUE  },
+				{ L"irm http",              "PS irm http cradle (T1105)",                                               TRUE  },
+				{ L"start-bitstransfer",    "Start-BitsTransfer cradle (T1197/T1105)",                                  TRUE  },
+				{ L"import-module bitstransfer", "BitsTransfer module import — cradle staging (T1197)",                 FALSE },
+				{ L"msxml2.xmlhttp",        "MSXML2.XMLHTTP COM cradle (JScript/VBS/PS T1059)",                         TRUE  },
+				{ L"msxml2.serverxmlhttp",  "MSXML2.ServerXMLHTTP COM cradle (T1059)",                                  TRUE  },
+				{ L"winhttp.winhttprequest",  "WinHttp.WinHttpRequest COM cradle (T1059)",                              TRUE  },
+				{ L"-comobject msxml2",     "New-Object -ComObject MSXML2 cradle (T1059.001)",                          TRUE  },
+				{ L"-com msxml2",           "New-Object -Com MSXML2 cradle (T1059.001)",                                TRUE  },
+				{ L"-com winhttp",          "New-Object -Com WinHttp cradle (T1059.001)",                               TRUE  },
+				{ L"certutil -urlcache -split -f", "certutil urlcache split -f cradle (T1105)",                         TRUE  },
+				{ L"certutil.exe -urlcache", "certutil urlcache cradle (T1105)",                                        TRUE  },
+				{ L"certutil -urlcache -f", "certutil urlcache -f cradle (T1105)",                                      TRUE  },
+				{ L"mshta http",            "mshta HTTP cradle — remote .hta exec (T1218.005)",                         TRUE  },
+				{ L"mshta vbscript:",       "mshta vbscript: URI cradle (T1218.005)",                                   TRUE  },
+				{ L"mshta javascript:",     "mshta javascript: URI cradle (T1218.005)",                                 TRUE  },
+				{ L"regsvr32 /s /n /u /i:http", "regsvr32 scrobj URL cradle — Squiblydoo (T1218.010)",                  TRUE  },
+				{ L"rundll32 javascript:",  "rundll32 javascript: URI cradle (T1218.011)",                              TRUE  },
+				{ L"rundll32.exe javascript:", "rundll32.exe javascript: URI cradle (T1218.011)",                       TRUE  },
+				{ L"rundll32 url.dll,openurl", "rundll32 url.dll OpenURL — browser-less URL fetch (T1218.011)",         TRUE  },
+				{ L"rundll32 url.dll,fileprotocolhandler", "rundll32 url.dll FileProtocolHandler — LOLBin cradle",      TRUE  },
+				{ L"curl.exe -o",           "curl.exe -o download cradle (T1105)",                                      FALSE },
+				{ L"curl -s http",          "curl -s silent download cradle (T1105)",                                   FALSE },
+				{ L"wget http",             "wget http download cradle (T1105)",                                        FALSE },
+				{ L"wsl -e curl",           "wsl -e curl cradle — WSL-proxied download (T1202)",                        TRUE  },
+				{ L"wsl curl http",         "wsl curl http cradle — WSL-proxied download (T1202)",                      TRUE  },
+				{ L"iex (new-object",       "IEX (New-Object ...) — cradle-to-exec chain (T1059.001)",                  TRUE  },
+				{ L"iex(new-object",        "IEX(New-Object ...) — cradle-to-exec chain (T1059.001)",                   TRUE  },
+				{ L"iex (iwr",              "IEX (iwr ...) — cradle-to-exec chain (T1059.001)",                         TRUE  },
+				{ L"iex(iwr",               "IEX(iwr ...) — cradle-to-exec chain (T1059.001)",                          TRUE  },
+				{ L"iex (invoke-webrequest", "IEX (Invoke-WebRequest ...) — cradle-to-exec chain (T1059.001)",          TRUE  },
+				{ L"[reflection.assembly]::load((new-object", "Reflective Assembly.Load from WebClient bytes (T1620)", TRUE },
+				{ L"[system.reflection.assembly]::load((new-object", "Reflective Assembly.Load from WebClient bytes (T1620)", TRUE },
+				{ L"resolve-dnsname -type txt", "Resolve-DnsName TXT — DNS cradle / TXT-record payload (T1071.004)",    TRUE  },
+				{ L"invoke-dnsexfiltrator",  "Invoke-DNSExfiltrator — DNS cradle framework (T1071.004)",                TRUE  },
+				// Char-split obfuscated cradles (Invoke-Obfuscation / Empire)
+				{ L"\"download\"+\"string\"", "Char-split DownloadString — Invoke-Obfuscation cradle",                  TRUE  },
+				{ L"\"downloads\"+\"tring\"", "Char-split DownloadString variant — Invoke-Obfuscation cradle",          TRUE  },
+				{ L"\"down\"+\"loadstring\"", "Char-split DownloadString variant — Invoke-Obfuscation cradle",          TRUE  },
+				{ L"\"invoke\"+\"-expression\"", "Char-split Invoke-Expression — Invoke-Obfuscation cradle",            TRUE  },
+				// --- Fileless / in-memory-only script execution (T1059.001 + T1027.011) ---
+				{ L"[scriptblock]::create(",      "ScriptBlock::Create — in-memory-only script compile (T1059.001)",           TRUE  },
+				{ L"[system.management.automation.scriptblock]::create(", "FQN ScriptBlock::Create — in-memory script compile", TRUE  },
+				{ L"$executioncontext.invokecommand.invokescript", "$ExecutionContext.InvokeCommand.InvokeScript — fileless exec", TRUE },
+				{ L"$executioncontext.invokecommand.newscriptblock", "$ExecutionContext NewScriptBlock — fileless exec",       TRUE },
+				{ L".addscript(",                "PowerShell.AddScript — Runspace-hosted in-memory script exec",              TRUE  },
+				{ L"[powershell]::create()",     "[PowerShell]::Create() — embedded PS runspace (fileless host)",              TRUE  },
+				{ L"[runspacefactory]::createrunspace", "RunspaceFactory::CreateRunspace — embedded PS runtime (fileless)",   TRUE  },
+				{ L"[runspacefactory]::createrunspacepool", "RunspaceFactory::CreateRunspacePool — embedded multi-script host", TRUE },
+				{ L"& ([scriptblock]::create(",  "& ScriptBlock::Create — in-memory script invocation chain",                  TRUE  },
+				{ L". ([scriptblock]::create(",  ". ScriptBlock::Create — in-memory script dot-source chain",                  TRUE  },
+				{ L"iex $",                       "IEX on variable — payload lives as string before exec (T1027.011)",         TRUE  },
+				{ L"invoke-expression $",        "Invoke-Expression on variable — fileless string exec (T1027.011)",           TRUE  },
+				{ L"[appdomain]::currentdomain.load(", "AppDomain.Load — fileless .NET assembly load from byte buffer (T1620)", TRUE },
+				{ L"[parser]::parseinput(",      "[Parser]::ParseInput — AST-based dynamic script construction (fileless)",    TRUE  },
+				// --- T1562.001: IOfficeAntiVirus (mpoav) disable/redirect ---
+				{ L"hklm\\software\\microsoft\\officeantivirus", "HKLM OfficeAntiVirus key touch — potential macro AV disable (T1562.001)", TRUE },
+				{ L"hkey_local_machine\\software\\microsoft\\officeantivirus", "HKLM OfficeAntiVirus key touch — macro AV disable (T1562.001)", TRUE },
+				{ L"\\clsid\\{2781761e-28e0-4109-99fe-b9d127c57afe}", "Defender mpoav CLSID touch — IOfficeAntiVirus provider tamper (T1562.001)", TRUE },
+				{ L"{2781761e-28e0-4109-99fe-b9d127c57afe}", "Defender mpoav CLSID reference — IOfficeAntiVirus tamper target", TRUE },
+				{ L"component categories\\{56ffcc30-d398-11d0-b2ae-00a0c908fa49}", "IOfficeAntiVirus component category reference — provider tamper", TRUE },
+				{ L"reg delete \"hklm\\software\\microsoft\\officeantivirus\"", "reg delete OfficeAntiVirus — macro AV unregister (T1562.001)", TRUE },
+				{ L"reg add \"hklm\\software\\microsoft\\office\" /v disableav", "Office DisableAV registry tamper (T1562.001)", TRUE },
+				{ L"officeantivirus /v disabled", "OfficeAntiVirus Disabled value set (T1562.001)",                             TRUE  },
+				{ L"applicationguard /v enabled /t reg_dword /d 0", "ApplicationGuard disable — macro sandbox bypass",           TRUE  },
+				{ L"disableattachmentscanning", "DisableAttachmentScanning — Office/Outlook macro AV bypass",                  TRUE  },
+				{ L"vbawarnings /t reg_dword /d 1", "Office VBAWarnings=1 (Enable all macros) — macro policy bypass (T1562.001)", TRUE },
+				{ L"accessvbom /t reg_dword /d 1",  "Office AccessVBOM=1 — VBA project model access bypass",                    TRUE  },
 				{ L"javascript:",           "javascript: URI -- script execution via shell",        TRUE  },
 				{ L"vbscript:",             "vbscript: URI -- script execution via shell",          TRUE  },
 				{ L"//e:vbscript",          "wscript/cscript //E:vbscript engine override",         TRUE  },
@@ -2476,6 +2561,38 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"installutil",           "InstallUtil lolbin -- bypasses AppLocker/SRP",         TRUE  },
 				{ L"regsvr32 /s /u /i:",    "Squiblydoo: regsvr32 COM scriptlet download",          TRUE  },
 				{ L"scrobj.dll",            "scrobj.dll COM scriptlet execution",                   TRUE  },
+				// --- T1219.001 / T1059: VS Code malware abuse taxonomy ---
+				// code-tunnel.exe is the standalone CLI — no full VS Code install needed
+				{ L"code-tunnel",               "code-tunnel.exe standalone CLI tunnel (T1219.001)",                           TRUE  },
+				{ L"devtunnel.exe",             "Microsoft Dev Tunnels CLI — reverse tunnel (T1219.001)",                     TRUE  },
+				{ L"devtunnel host",            "devtunnel host — start Dev Tunnel listener (T1219.001)",                    TRUE  },
+				{ L"code serve-web",            "code serve-web — VS Code web server (T1219.001)",                            TRUE  },
+				{ L"code.exe serve-web",        "code.exe serve-web — VS Code web server (T1219.001)",                       TRUE  },
+				// Silent extension install — attackers push trojanized .vsix
+				{ L"--install-extension",       "VS Code --install-extension — silent extension sideload (T1059)",             TRUE  },
+				{ L"code --install-extension",  "code --install-extension — extension install (T1059)",                        TRUE  },
+				{ L"code-insiders --install-extension", "code-insiders --install-extension — extension install",               TRUE  },
+				// Extension dir override — loads extensions from attacker-controlled path
+				{ L"--extensions-dir",          "VS Code --extensions-dir override — extension sideload from custom path",    TRUE  },
+				// VS Code tunnel service registration (persistence)
+				{ L"tunnel service install",    "VS Code tunnel service install — persistent tunnel registration (T1543)",     TRUE  },
+				{ L"tunnel service uninstall",  "VS Code tunnel service uninstall — cleanup after tunnel use",                FALSE },
+				{ L"tunnel --accept-server-license-terms", "VS Code tunnel auto-accept — non-interactive tunnel setup",       TRUE  },
+				{ L"tunnel --name",             "VS Code tunnel --name — named tunnel (hands-on-keyboard indicator)",         TRUE  },
+				// VS Code tasks.json / launch.json command injection
+				{ L"\"command\":",              "VS Code tasks/launch.json command field — potential auto-exec",               FALSE },
+				{ L"tasks.json",                "VS Code tasks.json reference — potential auto-exec configuration",            FALSE },
+				// code.exe spawning shell processes (common C2-over-tunnel pattern)
+				{ L"code.exe --ms-enable-electron-run-as-node", "VS Code Electron run-as-node — Node.js exec from code.exe", TRUE  },
+				{ L"--ms-enable-electron-run-as-node", "Electron run-as-node flag — code.exe/electron shell escape",          TRUE  },
+				// --- T1562.001: AMSI provider enumeration / tampering (WhoAMSI recon) ---
+				{ L"\\microsoft\\amsi\\providers", "AMSI Providers registry path — provider enumeration / WhoAMSI recon (T1562.001)", TRUE },
+				{ L"hklm\\software\\microsoft\\amsi", "HKLM AMSI registry path — provider enumeration / tampering (T1562.001)", TRUE },
+				{ L"reg query \"hklm\\software\\microsoft\\amsi\"", "reg query AMSI — provider enumeration (WhoAMSI technique)", TRUE },
+				{ L"get-childitem \"hklm:\\software\\microsoft\\amsi", "PS Get-ChildItem AMSI — provider enumeration (T1562.001)", TRUE },
+				{ L"get-itemproperty \"hklm:\\software\\classes\\clsid\\{", "PS Get-ItemProperty CLSID — InProcServer32 recon", FALSE },
+				{ L"remove-item \"hklm:\\software\\microsoft\\amsi", "PS Remove-Item AMSI — provider deletion attack (T1562.001)", TRUE },
+				{ L"reg delete \"hklm\\software\\microsoft\\amsi", "reg delete AMSI — provider deletion attack (T1562.001)", TRUE },
 				// --- Warning: evasion / stealth options ---
 				{ L"invoke-expression",       "Invoke-Expression (IEX) -- dynamic execution",      FALSE },
 				{ L"-executionpolicy bypass", "PowerShell ExecutionPolicy bypass",                 FALSE },
@@ -2714,6 +2831,115 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				{ L"certutil -decodehex",       "certutil -decodehex — hex decoding (T1027/T1140)",                TRUE  },
 				{ L"certutil /decodehex",       "certutil /decodehex — hex decoding variant (T1027)",              TRUE  },
 				{ L"-nop -w hidden -e",         "PowerShell -nop -w hidden -e — obfuscated stager (T1027)",        TRUE  },
+				// PowerShell Empire launcher signatures
+				{ L"-noni -nop -w hidden",      "PowerShell -NonInteractive -NoProfile -WindowStyle Hidden — classic Empire launcher prologue", TRUE  },
+				{ L"-noni -w hidden -e",        "PowerShell -NonInteractive -WindowStyle Hidden -EncodedCommand — Empire stager shape",          TRUE  },
+				{ L"\\syswow64\\windowspowershell", "WoW64 PowerShell redirection — Empire launcher targets 32-bit PS for AMSI-bypass-on-old-hosts", TRUE },
+				{ L"/s /c powershell -nop",     "cmd /s /c powershell -nop — Empire bat launcher wrapper",                                         TRUE  },
+
+				// --- Extended LOLBAS coverage (T1218 Signed Binary Proxy Execution) ---
+				{ L"pubprn.vbs",                "pubprn.vbs — signed-script proxy exec LOLBAS (T1216.002)",                                        TRUE  },
+				{ L"syncappvpublishingserver",  "SyncAppvPublishingServer proxy-exec — PowerShell launch via AppV publishing helper",              TRUE  },
+				{ L"cl_invocation.ps1",         "cl_invocation.ps1 — signed-script LOLBAS for script execution proxy",                             TRUE  },
+				{ L"cl_mutexverifiers.ps1",     "cl_mutexverifiers.ps1 — signed-script LOLBAS for PS payload proxy",                               TRUE  },
+				{ L"manage-bde.wsf",            "manage-bde.wsf — signed-script LOLBAS (T1216.002 proxy execution)",                               TRUE  },
+				{ L"pester.bat",                "Pester.bat LOLBAS — arbitrary command exec via test harness",                                      TRUE  },
+
+				// Signed-binary proxy exec (T1218)
+				{ L"mavinject.exe",             "mavinject.exe — DLL injection via AppV bootstrapper (T1218.013)",                                 TRUE  },
+				{ L"atbroker.exe",              "atbroker.exe — accessibility-tool launcher, GUI-less exec primitive",                             TRUE  },
+				{ L"scriptrunner.exe",          "ScriptRunner.exe LOLBAS — arbitrary script/exec proxy",                                            TRUE  },
+				{ L"presentationhost.exe",      "PresentationHost.exe — XBAP exec LOLBAS (T1218)",                                                   TRUE  },
+				{ L"ieexec.exe",                "IEExec.exe — .NET-via-IE LOLBAS for remote binary execution (T1218)",                              TRUE  },
+				{ L"ie4uinit.exe -basesettings","ie4uinit.exe -BaseSettings — proxy-exec LOLBAS pattern",                                            TRUE  },
+				{ L"cdb.exe -cf",               "cdb.exe -cf — Windows debugger command-file exec (payload via debugger)",                         TRUE  },
+				{ L"wsl.exe -e",                "wsl.exe -e — arbitrary-exec via WSL1/2 (T1202 indirect cmd exec)",                                 TRUE  },
+				{ L"wsl.exe --exec",            "wsl.exe --exec variant",                                                                            TRUE  },
+				{ L"dnscmd.exe",                "dnscmd.exe — potential ServerLevelPluginDll DLL-load abuse on DNS server",                         FALSE },
+				{ L"/serverlevelplugindll",     "dnscmd /ServerLevelPluginDll — load attacker DLL in dns.exe (T1574)",                              TRUE  },
+				{ L"print.exe /d:\\\\",          "print.exe /D:\\\\ — WebDAV file copy LOLBAS (T1105)",                                             TRUE  },
+				{ L"finger.exe",                "finger.exe — rare binary used as ingress-tool transfer proxy (T1105)",                            TRUE  },
+				{ L"wt.exe -- ",                "wt.exe -- — Windows Terminal command proxy-exec (T1202)",                                          TRUE  },
+				{ L"wt.exe new-tab",            "wt.exe new-tab — Terminal profile-based exec primitive",                                            TRUE  },
+				{ L"diskshadow.exe /s",         "diskshadow.exe /s — script-mode VSS abuse (shadow mount + exfil)",                                 TRUE  },
+				{ L"ftp.exe -s:",               "ftp.exe -s: — script-mode FTP command LOLBAS (T1105 ingress)",                                    TRUE  },
+
+				// msbuild XML-inline code execution (T1127.001)
+				{ L"msbuild.exe ",              "msbuild.exe — possible C#-via-XML inline task exec (T1127.001)",                                  FALSE },
+				{ L".xml -nologo",              "msbuild -nologo with .xml project — inline task exec (T1127.001)",                                 TRUE  },
+				{ L".csproj -nologo",           "msbuild inline .csproj exec",                                                                       TRUE  },
+				{ L"<usingtask",                "MSBuild UsingTask inline-task signature in cmdline (T1127.001)",                                    TRUE  },
+
+				// regsvcs/regasm COM-registration exec (T1218.009/.010)
+				{ L"regsvcs.exe",               "regsvcs.exe — .NET COM+ registration exec LOLBAS (T1218.009)",                                     TRUE  },
+				{ L"regasm.exe /u",             "regasm.exe /u — .NET assembly unregistration proxy exec (T1218.010)",                              TRUE  },
+
+				// WMI + COM proxy execution
+				{ L"xwizard.exe runwizard",     "xwizard.exe RunWizard — COM proxy exec LOLBAS",                                                    TRUE  },
+				{ L"verclsid.exe /s /c",        "verclsid.exe /S /C — COM class verifier proxy exec",                                               TRUE  },
+				{ L"odbcconf.exe /a",           "odbcconf.exe /A — DLL loader LOLBAS (REGSVR / CONFIGDRIVER)",                                      TRUE  },
+				{ L"configsysdsn",              "odbcconf ConfigSysDsn — driver DLL load from attacker path",                                        TRUE  },
+				{ L"cmstp.exe /s ",             "cmstp.exe /s — INF-based proxy exec + UAC bypass (T1218.003)",                                     TRUE  },
+				{ L"cmstp.exe /au ",            "cmstp.exe /au — INF-driven auto-install exec path",                                                 TRUE  },
+
+				// LOLScript launches (extension-based)
+				{ L"wscript.exe //e:vbscript ", "wscript //E:VBScript — script-host override launcher (T1059.005)",                                 FALSE },
+				{ L"cscript.exe //nologo ",     "cscript //NoLogo — scripted-task launcher signature",                                               FALSE },
+				{ L"mshta.exe http",            "mshta.exe http(s):// — remote HTA exec (T1218.005)",                                               TRUE  },
+				{ L"mshta.exe javascript:",     "mshta.exe javascript: — inline JS exec via HTA engine (T1218.005)",                                TRUE  },
+				{ L"mshta.exe vbscript:",       "mshta.exe vbscript: — inline VBS exec via HTA engine",                                              TRUE  },
+
+				// Signed-script proxy exec (T1216) — developer command-line tools
+				{ L"winrm.vbs -r:",             "winrm.vbs -r: — WinRM command-proxy LOLBAS",                                                        TRUE  },
+				{ L"slmgr.vbs",                 "slmgr.vbs — WMI-host script-invocation primitive",                                                 FALSE },
+				{ L"gpscript.exe",              "gpscript.exe — Group Policy script runner proxy-exec LOLBAS",                                      TRUE  },
+
+				// LOLBin-loads-DLL-from-userwritable (Side-Loading T1574.002 tells)
+				{ L"rundll32.exe ,",            "rundll32 <dll>,<ordinal> with no dll path — abuses search-order (T1574.002)",                     FALSE },
+				{ L"rundll32 javascript:",      "rundll32 javascript: mshtml,RunHTMLApplication — Poweliks pattern (T1218.011)",                   TRUE  },
+				{ L"url.dll,fileprotocolhandler", "rundll32 url.dll,FileProtocolHandler — remote-URL handler exec",                                 TRUE  },
+				{ L"shell32.dll,shellexec_rundll", "rundll32 shell32.dll,ShellExec_RunDLL — chained exec primitive",                                TRUE  },
+				{ L"zipfldr.dll,routethecall",  "rundll32 zipfldr.dll,RouteTheCall — shell proxy exec LOLBAS",                                      TRUE  },
+				{ L"pcwutl.dll,launchapplication", "rundll32 pcwutl.dll,LaunchApplication — app-compat proxy exec",                                 TRUE  },
+				{ L"comsvcs.dll,minidump",      "rundll32 comsvcs.dll MiniDump — lsass credential dump LOLBAS (T1003.001)",                         TRUE  },
+				{ L"advpack.dll,launchinfsection", "rundll32 advpack.dll,LaunchINFSection — INF-driven exec",                                       TRUE  },
+				{ L"setupapi.dll,installhinfsection", "rundll32 setupapi.dll,InstallHinfSection — INF-driven registry write / exec",                TRUE  },
+				{ L"ieadvpack.dll,launchinfsection", "rundll32 ieadvpack.dll,LaunchINFSection — IE variant INF proxy exec",                         TRUE  },
+				{ L"davclnt.dll,davsetcookie",  "rundll32 davclnt.dll — WebDAV cookie-set payload-fetch primitive",                                  TRUE  },
+
+				// HTML-Help compiled help abuse (T1218.001)
+				{ L"hh.exe http",               "hh.exe http(s):// — remote .chm exec (T1218.001)",                                                 TRUE  },
+				{ L".chm::",                    ".chm:: — in-CHM script exec URI (HtmlHelp)",                                                       TRUE  },
+
+				// Control panel applet abuse (T1218.002)
+				{ L"control.exe ",              "control.exe — .cpl applet exec vector (T1218.002)",                                                FALSE },
+				{ L".cpl,",                     ".cpl,@<entry> — CPL applet entry-point exec",                                                      TRUE  },
+
+				// --- Additional base64 obfuscation shapes (T1027 / T1140) ---
+				{ L"-e JAB",                    "PowerShell -EncodedCommand starting with UTF-16LE '$' (JAB*) — canonical base64-of-PS header",  TRUE  },
+				{ L"-e IAB",                    "PowerShell -EncodedCommand starting with UTF-16LE ' ' (IAB*) — whitespace-prefixed encoded block", TRUE },
+				{ L"-e SQBF",                   "PowerShell -EncodedCommand starting with UTF-16LE 'IE' (SQBFAFg) — IEX base64 header",          TRUE  },
+				{ L"-encodedcommand jab",       "PowerShell -EncodedCommand JAB* — base64-of-UTF-16 PowerShell variable prefix",                   TRUE  },
+				{ L"-encodedcommand sqbf",      "PowerShell -EncodedCommand SQBF* — base64 IEX header",                                            TRUE  },
+				{ L"-encodedcommand iab",       "PowerShell -EncodedCommand IAB* — whitespace-prefixed encoded command",                          TRUE  },
+				{ L"-encodedcommand cwbl",      "PowerShell -EncodedCommand cwBl* — 'se'-prefixed (Set-/Select-) encoded header",                 FALSE },
+				{ L"-encodedcommand abi",       "PowerShell -EncodedCommand AB*I — base64-of-UTF16 'I' prefix",                                   FALSE },
+				{ L"certutil -decode",          "certutil -decode — base64-decoded dropper stage (T1140)",                                         TRUE  },
+				{ L"certutil -decodehex",       "certutil -decodehex — hex-decoded dropper stage (T1140)",                                         TRUE  },
+				{ L"certutil /decode",          "certutil /decode — base64 decode (slash form)",                                                   TRUE  },
+				{ L"certutil -f -decode",       "certutil -f -decode — forced base64 decode (dropper)",                                           TRUE  },
+				{ L"[convert]::frombase64",     "[Convert]::FromBase64String — inline PS base64 decode",                                          TRUE  },
+				{ L"tobase64string(",           "ToBase64String( — PS base64 encode call (outbound exfil staging)",                              FALSE },
+				{ L"-e JABw",                   "PowerShell -e JABw — base64-of-UTF16 '$p' (Empire's $powershell variable prefix)",              TRUE  },
+				{ L"-e JABj",                   "PowerShell -e JABj — base64-of-UTF16 '$c' (common Empire/CS beacon variable)",                   TRUE  },
+				{ L"-e JABh",                   "PowerShell -e JABh — base64-of-UTF16 '$a' (common stager variable)",                            TRUE  },
+				{ L"[system.convert]::frombase64string", "[System.Convert]::FromBase64String full form — base64 payload decode",                TRUE  },
+				{ L"[text.encoding]::ascii.getstring([convert]::frombase64", "Compact base64→UTF8→IEX decode sandwich",                           TRUE  },
+
+				// Classic CS/Empire stager stub prefix (literal once b64'd)
+				{ L"TVqQAAMAAAAEAAAA",          "TVqQAAMAAAAEAAAA — base64 of 'MZ\\x90\\x00\\x03…' (embedded PE header in script/registry)",    TRUE  },
+				{ L"TVpQAAIAAAAEAA",            "TVpQAAIAAAAEAA — base64 of DOS 'MZP' PE header variant",                                         TRUE  },
+				{ L"UEsDB",                     "UEsDB — base64 of 'PK\\x03\\x04' (ZIP/Office document embedded in script/registry)",            FALSE },
 				{ L"[convert]::tobase64",       "[Convert]::ToBase64String — PS Base64 encoding (T1027)",          FALSE },
 				{ L"[convert]::frombase64",     "[Convert]::FromBase64String — PS Base64 decoding (T1027/T1140)",  FALSE },
 
@@ -2858,6 +3084,503 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 				// SetEnvironmentVariable API call patterns in PowerShell
 				{ L"setenvironmentvariable(\"complus_etw", "SetEnvironmentVariable(COMPlus_ETW*) — API-based CLR ETW disable (T1562.002)", TRUE },
 				{ L"setenvironmentvariable(\"dotnet_etw",  "SetEnvironmentVariable(DOTNET_ETW*) — API-based .NET 6+ ETW disable (T1562.002)", TRUE },
+
+				// --- T1059.001: PowerShell Constrained Language Mode bypass ---
+				{ L"languagemode",              "LanguageMode reference — potential CLM bypass probe (T1059.001)",              FALSE },
+				{ L"fulllanguage",              "FullLanguage mode set — CLM bypass restoring unrestricted PS (T1059.001)",    TRUE  },
+				{ L"$executioncontext.sessionstate.languagemode", "$ExecutionContext.SessionState.LanguageMode — CLM bypass (T1059.001)", TRUE },
+				{ L"constrainedlanguage",       "ConstrainedLanguage reference — CLM bypass recon/set (T1059.001)",            TRUE  },
+
+				// --- T1059.001: PowerShell downgrade attack (v2 lacks AMSI) ---
+				{ L"powershell -version 2",     "PowerShell -Version 2 downgrade — bypasses AMSI/ScriptBlock logging (T1059.001)", TRUE },
+				{ L"powershell.exe -version 2", "PowerShell.exe -Version 2 downgrade — bypasses AMSI (T1059.001)",            TRUE  },
+				{ L"powershell -v 2",           "PowerShell -v 2 downgrade — bypasses AMSI (T1059.001)",                       TRUE  },
+				{ L"powershell.exe -v 2",       "PowerShell.exe -v 2 downgrade — bypasses AMSI (T1059.001)",                  TRUE  },
+				{ L"-version 2.0",              "PowerShell -Version 2.0 downgrade — bypasses AMSI (T1059.001)",               TRUE  },
+
+				// --- T1059.001: Add-Type C# compilation (arbitrary P/Invoke) ---
+				{ L"add-type -typedefinition",  "Add-Type -TypeDefinition — inline C# compilation (T1059.001)",                TRUE  },
+				{ L"add-type -memberdefinition","Add-Type -MemberDefinition — inline P/Invoke definition (T1059.001)",         TRUE  },
+				{ L"add-type -assemblyname",    "Add-Type -AssemblyName — .NET assembly load (T1059.001)",                     FALSE },
+				{ L"add-type -path",            "Add-Type -Path — C# file compilation (T1059.001)",                            FALSE },
+				{ L"[dllimport(",               "[DllImport( — P/Invoke declaration in PS Add-Type (T1059.001)",               TRUE  },
+
+				// --- T1059.001: Reflection / Marshal interop ---
+				{ L"[system.runtime.interopservices.marshal]::", "System.Runtime.InteropServices.Marshal — memory manipulation (T1059.001)", TRUE },
+				{ L"getdelegateforfunctionpointer", "GetDelegateForFunctionPointer — native function call from managed code",  TRUE  },
+				{ L"allochglobal",              "Marshal.AllocHGlobal — unmanaged memory allocation from PS",                  TRUE  },
+				{ L"structuretoptr",            "Marshal.StructureToPtr — managed-to-native struct marshal",                   TRUE  },
+
+				// --- T1546.003: WMI event subscription persistence (PS cmdlets) ---
+				{ L"register-wmievent",         "Register-WmiEvent — WMI event subscription persistence (T1546.003)",          TRUE  },
+				{ L"set-wmiinstance",           "Set-WmiInstance — WMI instance creation/persistence (T1546.003)",             TRUE  },
+				{ L"__eventfilter",             "__EventFilter — WMI event filter (T1546.003)",                                TRUE  },
+				{ L"__eventconsumer",           "__EventConsumer — WMI event consumer (T1546.003)",                            TRUE  },
+				{ L"commandlineeventconsumer",  "CommandLineEventConsumer — WMI command exec on event (T1546.003)",            TRUE  },
+				{ L"activescripteventconsumer", "ActiveScriptEventConsumer — WMI script exec on event (T1546.003)",            TRUE  },
+				{ L"__filtertoconsumerbinding", "__FilterToConsumerBinding — WMI persistence binding (T1546.003)",             TRUE  },
+
+				// --- T1546.013: PowerShell profile persistence ---
+				{ L"$profile",                  "$PROFILE — PowerShell profile reference (T1546.013 persistence)",             FALSE },
+				{ L"profile.ps1",               "profile.ps1 — PowerShell profile file (T1546.013 persistence)",               TRUE  },
+				{ L"microsoft.powershell_profile.ps1", "Microsoft.PowerShell_profile.ps1 — all-users PS profile (T1546.013)", TRUE  },
+				{ L"microsoft.powershellise_profile.ps1", "Microsoft.PowerShellISE_profile.ps1 — ISE profile (T1546.013)",    TRUE  },
+				{ L"set-content $profile",      "Set-Content $PROFILE — PS profile write / backdoor (T1546.013)",              TRUE  },
+				{ L"add-content $profile",      "Add-Content $PROFILE — PS profile append / backdoor (T1546.013)",             TRUE  },
+
+				// --- T1059.001: Alternate PowerShell hosts ---
+				{ L"powershell_ise.exe",        "PowerShell ISE — alternate PS host (T1059.001)",                              FALSE },
+				{ L"system.management.automation.dll", "System.Management.Automation.dll — PS runtime loaded by non-PS host (T1059.001)", TRUE },
+
+				// --- T1555 / T1552: Credential access PowerShell cmdlets ---
+				{ L"get-credential",            "Get-Credential — interactive credential prompt (T1552)",                       FALSE },
+				{ L"convertto-securestring",    "ConvertTo-SecureString — credential handling (T1552)",                        FALSE },
+				{ L"convertfrom-securestring",  "ConvertFrom-SecureString — credential extraction (T1552)",                    TRUE  },
+				{ L"[net.networkcredential]",   "[Net.NetworkCredential] — credential extraction from SecureString (T1552)",   TRUE  },
+				{ L"cmdkey /add",               "cmdkey /add — stored credential creation (T1555.004)",                        TRUE  },
+				{ L"cmdkey /list",              "cmdkey /list — stored credential enumeration (T1555.004)",                    FALSE },
+				{ L"vaultcmd /listcreds",       "vaultcmd /listcreds — Windows Vault credential extraction (T1555.004)",      TRUE  },
+				{ L"vaultcmd /listproperties",  "vaultcmd /listproperties — Windows Vault credential recon (T1555.004)",      TRUE  },
+				{ L"dpapi::masterkey",          "DPAPI MasterKey — Mimikatz DPAPI credential decryption (T1555.001)",         TRUE  },
+				{ L"dpapi::cred",               "DPAPI Cred — Mimikatz DPAPI credential extraction (T1555.001)",              TRUE  },
+
+				// --- T1547.001: Registry persistence via PowerShell ---
+				{ L"set-itemproperty",          "Set-ItemProperty — registry value set (potential persistence T1547.001)",     FALSE },
+				{ L"new-itemproperty",          "New-ItemProperty — registry value create (potential persistence T1547.001)",  FALSE },
+				{ L"currentversion\\run",       "CurrentVersion\\Run — autorun registry path (T1547.001)",                     TRUE  },
+				{ L"currentversion\\runonce",   "CurrentVersion\\RunOnce — autorun registry path (T1547.001)",                TRUE  },
+				{ L"currentversion\\winlogon",  "CurrentVersion\\Winlogon — Winlogon persistence (T1547.004)",                TRUE  },
+				{ L"\\environment\\userinitmprlogonscript", "UserInitMprLogonScript — logon script persistence (T1037.001)",   TRUE  },
+
+				// --- T1053.005: Scheduled task creation via PowerShell ---
+				{ L"register-scheduledtask",    "Register-ScheduledTask — PS scheduled task creation (T1053.005)",             TRUE  },
+				{ L"new-scheduledtaskaction",   "New-ScheduledTaskAction — PS scheduled task action (T1053.005)",              TRUE  },
+				{ L"new-scheduledtasktrigger",  "New-ScheduledTaskTrigger — PS scheduled task trigger (T1053.005)",            TRUE  },
+				{ L"new-scheduledtasksettingsset", "New-ScheduledTaskSettingsSet — PS scheduled task settings (T1053.005)",    FALSE },
+				{ L"schtasks /create",          "schtasks /create — scheduled task creation (T1053.005)",                      TRUE  },
+				{ L"schtasks.exe /create",      "schtasks.exe /create — scheduled task creation (T1053.005)",                  TRUE  },
+				{ L"schtasks /change",          "schtasks /change — scheduled task modification (T1053.005)",                  TRUE  },
+
+				// --- T1562.001: PS logging evasion (registry-based) ---
+				{ L"$env:psmoduleanalysiscachepath", "$env:PSModuleAnalysisCachePath — module analysis cache redirect (T1562.001)", TRUE },
+				{ L"psmoduleanalysiscachepath", "PSModuleAnalysisCachePath — module analysis cache redirect (T1562.001)",      TRUE  },
+				{ L"scriptblocklogging",        "ScriptBlockLogging — PS logging policy reference (T1562.001)",                TRUE  },
+				{ L"enablescriptblocklogging",  "EnableScriptBlockLogging — PS ScriptBlock logging policy (T1562.001)",        TRUE  },
+				{ L"enablescriptblockinvocationlogging", "EnableScriptBlockInvocationLogging — PS invocation logging policy",  TRUE  },
+
+				// =====================================================================
+				// .NET malware techniques (T1218 / T1059.001 / T1055 / T1027.004)
+				// =====================================================================
+
+				// --- Unmanaged CLR hosting — load CLR into native process (T1218) ---
+				{ L"clrcreateinstance",         "CLRCreateInstance — unmanaged CLR hosting (T1218)",                            TRUE  },
+				{ L"corbindtoruntimeex",        "CorBindToRuntimeEx — legacy unmanaged CLR hosting (T1218)",                   TRUE  },
+				{ L"iclrruntimehost",           "ICLRRuntimeHost — unmanaged CLR execute-assembly (T1218)",                    TRUE  },
+				{ L"executeindefaultappdomain",  "ExecuteInDefaultAppDomain — CLR host code execution (T1218)",                TRUE  },
+				{ L"icorruntimehost",           "ICorRuntimeHost — legacy CLR hosting interface (T1218)",                      TRUE  },
+				{ L"clrruntimehost",            "CLRRuntimeHost — unmanaged CLR hosting class (T1218)",                        TRUE  },
+				{ L"mscoree.dll",               "mscoree.dll — CLR shim loader reference (T1218)",                             FALSE },
+
+				// --- .NET LOLBin abuse (T1218) ---
+				{ L"regsvcs.exe",               "RegSvcs.exe — .NET LOLBin (T1218.009)",                                      TRUE  },
+				{ L"regsvcs /u",                "RegSvcs /U unregister — .NET LOLBin abuse (T1218.009)",                       TRUE  },
+				{ L"regasm.exe",                "RegAsm.exe — .NET COM registration LOLBin (T1218.009)",                       TRUE  },
+				{ L"regasm /u",                 "RegAsm /U unregister — .NET LOLBin abuse (T1218.009)",                        TRUE  },
+				{ L"installutil /logfile= /logtoconsole=false", "InstallUtil silent exec — .NET LOLBin (T1218.004)",           TRUE  },
+				{ L"installutil.exe /logfile= /logtoconsole=false", "InstallUtil.exe silent exec (T1218.004)",                 TRUE  },
+				{ L"addinprocess.exe",          "AddInProcess.exe — .NET LOLBin for code execution (T1218)",                   TRUE  },
+				{ L"addinprocess32.exe",        "AddInProcess32.exe — .NET LOLBin 32-bit (T1218)",                             TRUE  },
+				{ L"addinutil.exe",             "AddInUtil.exe — .NET add-in utility LOLBin (T1218)",                          TRUE  },
+				{ L"csc.exe /noconfig /fullpaths", "csc.exe /noconfig — suspicious C# compilation flags (T1027.004)",          TRUE  },
+				{ L"vbc.exe /noconfig /fullpaths", "vbc.exe /noconfig — suspicious VB compilation flags (T1027.004)",          TRUE  },
+
+				// --- .NET runtime compilation (T1027.004) ---
+				{ L"csharpcodeprovider",        "CSharpCodeProvider — runtime C# compilation (T1027.004)",                     TRUE  },
+				{ L"compileassemblyfromsource",  "CompileAssemblyFromSource — runtime code compilation (T1027.004)",            TRUE  },
+				{ L"codedomprovider",           "CodeDomProvider — .NET CodeDOM runtime compilation (T1027.004)",              TRUE  },
+				{ L"generateinmemory",          "GenerateInMemory — compile assembly to memory only (T1027.004)",              TRUE  },
+
+				// --- .NET dynamic type/IL generation (T1055) ---
+				{ L"activator.createinstance",   "Activator.CreateInstance — dynamic .NET type instantiation (T1055)",          TRUE  },
+				{ L"system.reflection.emit",    "System.Reflection.Emit — dynamic IL generation (T1055)",                     TRUE  },
+				{ L"definemethod",              "DefineMethod — IL method builder (T1055)",                                    FALSE },
+				{ L"definetype",                "DefineType — dynamic type builder (T1055)",                                   FALSE },
+				{ L"dynamicmethod",             "DynamicMethod — anonymous IL method creation (T1055)",                        TRUE  },
+				{ L"ilgenerator",               "ILGenerator — IL instruction emitter (T1055)",                                TRUE  },
+				{ L"opcodes.calli",             "OpCodes.Calli — indirect function call via IL (T1055)",                       TRUE  },
+
+				// --- .NET assembly manipulation libraries ---
+				{ L"dnlib.dotnet",              "dnlib.DotNet — runtime PE/.NET assembly manipulation",                        TRUE  },
+				{ L"mono.cecil",                "Mono.Cecil — runtime PE/.NET assembly manipulation",                          TRUE  },
+
+				// --- .NET GAC hijacking (T1574.001) ---
+				{ L"gacutil /i",                "gacutil /i — Global Assembly Cache install (T1574.001)",                       TRUE  },
+				{ L"gacutil.exe /i",            "gacutil.exe /i — GAC install (T1574.001)",                                    TRUE  },
+				{ L"\\assembly\\gac_msil\\",    "GAC_MSIL path — Global Assembly Cache reference (T1574.001)",                 TRUE  },
+				{ L"\\assembly\\gac_64\\",      "GAC_64 path — Global Assembly Cache reference (T1574.001)",                   TRUE  },
+
+				// --- COR_PROFILER .NET hijack env vars (T1574.012) ---
+				{ L"cor_enable_profiling=1",    "COR_ENABLE_PROFILING=1 — .NET profiler hijack (T1574.012)",                   TRUE  },
+				{ L"cor_profiler=",             "COR_PROFILER= — .NET profiler CLSID hijack (T1574.012)",                      TRUE  },
+				{ L"cor_profiler_path=",        "COR_PROFILER_PATH= — .NET profiler DLL path (T1574.012)",                     TRUE  },
+				{ L"coreclr_enable_profiling=1", "CORECLR_ENABLE_PROFILING=1 — .NET Core profiler hijack (T1574.012)",         TRUE  },
+				{ L"coreclr_profiler=",         "CORECLR_PROFILER= — .NET Core profiler CLSID (T1574.012)",                    TRUE  },
+
+				// --- AppDomainManager injection (T1574.014) ---
+				{ L"appdomainmanagerassembly",   "appDomainManagerAssembly — AppDomainManager injection (T1574.014)",           TRUE  },
+				{ L"appdomainmanagertype",       "appDomainManagerType — AppDomainManager hijack (T1574.014)",                  TRUE  },
+
+				// --- Donut loader / shellcode .NET signatures ---
+				{ L"donut_instance",            "Donut_Instance — Donut shellcode .NET loader",                                TRUE  },
+				{ L"module_exe",                "module_exe — Donut module type (in-memory .NET execution)",                    TRUE  },
+				{ L"amsi_result_clean",         "AMSI_RESULT_CLEAN — hardcoded AMSI bypass in loader",                         TRUE  },
+
+				// --- TypeConfuseDelegate (T1055) ---
+				{ L"typeconfusedelegate",        "TypeConfuseDelegate — .NET type confusion exploit (T1055)",                   TRUE  },
+
+				// --- .NET COM hijacking (T1546.015) ---
+				{ L"inprocserver32",            "InProcServer32 — COM in-process server registration (T1546.015)",             FALSE },
+
+				// =====================================================================
+				// Malicious JavaScript / Windows Script Host (T1059.007 / T1059.005)
+				// =====================================================================
+
+				// --- WSH execution with suspicious flags ---
+				{ L"wscript.exe /b /e:jscript", "WScript silent JScript exec — batch mode (T1059.007)",                       TRUE  },
+				{ L"cscript.exe /b /e:jscript",  "CScript silent JScript exec — batch mode (T1059.007)",                      TRUE  },
+				{ L"wscript.exe /b /e:vbscript", "WScript silent VBScript exec — batch mode (T1059.005)",                     TRUE  },
+				{ L"cscript.exe /b /e:vbscript",  "CScript silent VBScript exec — batch mode (T1059.005)",                    TRUE  },
+				{ L"wscript //b //e:jscript",    "WScript //B //E:JScript — silent engine override (T1059.007)",              TRUE  },
+				{ L"cscript //b //e:jscript",    "CScript //B //E:JScript — silent engine override (T1059.007)",              TRUE  },
+				{ L".jse",                       ".jse — JScript.Encode encoded script file (T1059.007)",                      TRUE  },
+				{ L".vbe",                       ".vbe — VBScript.Encode encoded script file (T1059.005)",                     TRUE  },
+				{ L".wsf",                       ".wsf — Windows Script File polyglot (T1059.007)",                            FALSE },
+				{ L".wsh",                       ".wsh — Windows Script Host settings file (T1059.007)",                       FALSE },
+				{ L"//e:jscript",                "//E:JScript — WSH engine override to JScript (T1059.007)",                   TRUE  },
+				{ L"//e:vbscript",               "//E:VBScript — WSH engine override to VBScript (T1059.005)",                 TRUE  },
+				{ L"rundll32 javascript:",        "rundll32 javascript: — inline JS execution via rundll32 (T1218.011)",       TRUE  },
+
+				// --- Node.js abuse (T1059.007) ---
+				{ L"node.exe -e",               "node.exe -e — Node.js inline eval execution (T1059.007)",                     TRUE  },
+				{ L"node.exe --eval",            "node.exe --eval — Node.js inline eval execution (T1059.007)",                TRUE  },
+				{ L"node -e \"",                "node -e — Node.js inline eval execution (T1059.007)",                         TRUE  },
+				{ L"node --eval",               "node --eval — Node.js inline eval execution (T1059.007)",                     TRUE  },
+				{ L"child_process",             "child_process — Node.js command execution module (T1059.007)",                TRUE  },
+				{ L"npm run preinstall",         "npm run preinstall — npm lifecycle hook abuse (T1059.007)",                   TRUE  },
+				{ L"npm run postinstall",        "npm run postinstall — npm lifecycle hook abuse (T1059.007)",                  TRUE  },
+
+				// --- JScript.NET / jsc.exe (T1059.007) ---
+				{ L"jsc.exe",                   "jsc.exe — JScript.NET compilation LOLBin (T1059.007)",                        TRUE  },
+				{ L"jsc /nologo",               "jsc /nologo — JScript.NET silent compilation (T1059.007)",                    TRUE  },
+
+				// --- MSScriptControl (T1059.007) ---
+				{ L"msscriptcontrol.scriptcontrol", "MSScriptControl.ScriptControl — COM-based script engine (T1059.007)",     TRUE  },
+				{ L"scriptcontrol.language",     "ScriptControl.Language — COM script engine language set (T1059.007)",         TRUE  },
+
+				// --- XSL script processing (T1220) ---
+				{ L"wmic /format:",             "WMIC /format: — remote XSL loading (T1220)",                                  TRUE  },
+				{ L"wmic os get /format:",      "WMIC os get /format: — XSL execution via WMIC (T1220)",                       TRUE  },
+				{ L"wmic process call create",  "WMIC process call create — WMI process creation (T1047)",                     TRUE  },
+
+				// --- JS dropper persistence patterns ---
+				{ L"wscript.shell",             "WScript.Shell — COM shell execution object (T1059.007)",                      FALSE },
+				{ L"shell.application",         "Shell.Application — COM shell execution (T1059.007)",                         FALSE },
+				{ L"schedule.service",          "Schedule.Service — COM task scheduler (T1053.005)",                            TRUE  },
+				{ L"shellexecute",              "ShellExecute — COM shell execution method (T1059.007)",                        FALSE },
+
+				// =====================================================================
+				// VBScript-specific malware techniques (T1059.005)
+				// =====================================================================
+
+				// --- VBScript runtime code execution ---
+				{ L"executeglobal",             "ExecuteGlobal — VBScript runtime code execution (T1059.005)",                  TRUE  },
+				{ L"execute(",                  "Execute( — VBScript runtime code execution (T1059.005)",                       TRUE  },
+				{ L"execute request(",          "Execute Request( — VBScript web shell pattern (T1059.005)",                    TRUE  },
+				{ L"getref(",                   "GetRef( — VBScript function pointer creation (T1059.005)",                     TRUE  },
+
+				// --- VBScript obfuscation ---
+				{ L"chr(",                      "Chr( — VBScript character code obfuscation (T1027)",                           FALSE },
+				{ L"chrw(",                     "Chrw( — VBScript wide character obfuscation (T1027)",                          FALSE },
+				{ L"strreverse(",               "StrReverse( — VBScript string reversal deobfuscation (T1027)",                 TRUE  },
+				{ L"execute(replace(",          "Execute(Replace( — VBScript deobfuscation chain (T1027)",                      TRUE  },
+				{ L"clng(\"&h\"",               "CLng(\"&H\" — VBScript hex decode pattern (T1027)",                            TRUE  },
+
+				// --- VBScript self-reference / self-deletion ---
+				{ L"wscript.scriptfullname",    "WScript.ScriptFullName — VBScript self-reference (T1059.005)",                 TRUE  },
+				{ L"wscript.scriptname",        "WScript.ScriptName — VBScript self-reference (T1059.005)",                     FALSE },
+				{ L"deletefile(wscript.",        "DeleteFile(WScript. — VBScript self-deletion (T1070.004)",                    TRUE  },
+
+				// --- VBScript sandbox evasion ---
+				{ L"wscript.sleep",             "WScript.Sleep — VBScript sleep-based sandbox evasion (T1497.003)",             FALSE },
+				{ L"wscript.arguments",         "WScript.Arguments — VBScript parameter-driven payload (T1059.005)",            FALSE },
+
+				// --- InternetExplorer.Application COM ---
+				{ L"internetexplorer.application", "InternetExplorer.Application — hidden IE COM for HTTP (T1071.001)",         TRUE  },
+
+				// --- DCOM lateral movement ---
+				{ L"mmc20.application",         "MMC20.Application — DCOM lateral movement (T1021.003)",                        TRUE  },
+				{ L"shellbrowserwindow",        "ShellBrowserWindow — DCOM lateral movement (T1021.003)",                       TRUE  },
+				{ L"shellwindows",              "ShellWindows — DCOM lateral movement (T1021.003)",                             TRUE  },
+
+				// --- MSXML2.DOMDocument Base64 decode ---
+				{ L"msxml2.domdocument",        "MSXML2.DOMDocument — VBScript Base64 decode via XML transform (T1140)",        TRUE  },
+				{ L"nodetypedvalue",            "NodeTypedValue — MSXML2 Base64 decode extraction (T1140)",                     TRUE  },
+
+				// --- VBScript class auto-exec ---
+				{ L"class_initialize",          "Class_Initialize — VBScript class auto-execution (T1059.005)",                 TRUE  },
+				{ L"class_terminate",           "Class_Terminate — VBScript class cleanup auto-exec (T1059.005)",               TRUE  },
+
+				// =====================================================================
+				// VBA macro malware techniques (T1059.005 / T1137)
+				// =====================================================================
+
+				// --- VBA callback / delayed execution ---
+				{ L"application.ontime",        "Application.OnTime — VBA delayed/callback execution (T1137)",                  TRUE  },
+				{ L"application.onkey",         "Application.OnKey — VBA keystroke-triggered execution (T1137)",                 TRUE  },
+
+				// --- VBA anti-analysis ---
+				{ L"application.enableevents = false", "Application.EnableEvents=False — VBA event suppression (T1564)",        TRUE  },
+				{ L"application.screenupdating = false", "Application.ScreenUpdating=False — VBA UI hiding (T1564)",            TRUE  },
+				{ L"application.displayalerts = false", "Application.DisplayAlerts=False — VBA dialog suppression (T1564)",     TRUE  },
+
+				// --- VBA programmatic DDE ---
+				{ L"ddeinitiate",               "DDEInitiate — VBA programmatic DDE channel (T1559.002)",                       TRUE  },
+				{ L"ddeexecute",                "DDEExecute — VBA DDE command execution (T1559.002)",                           TRUE  },
+				{ L"ddepoke",                   "DDEPoke — VBA DDE data injection (T1559.002)",                                 TRUE  },
+
+				// --- VBA self-modification ---
+				{ L"vbproject.vbcomponents",    "VBProject.VBComponents — VBA self-modifying code (T1137.001)",                 TRUE  },
+				{ L"vbcomponents.add",          "VBComponents.Add — VBA runtime module injection (T1137.001)",                  TRUE  },
+				{ L"codemodule.insertlines",    "CodeModule.InsertLines — VBA runtime code injection (T1137.001)",              TRUE  },
+				{ L"codemodule.addfrombuffer",   "CodeModule.AddFromBuffer — VBA runtime code load (T1137.001)",                TRUE  },
+
+				// --- VBA keystroke injection ---
+				{ L"sendkeys",                  "SendKeys — VBA keystroke injection (T1059.005)",                               TRUE  },
+
+				// --- VBA persistence ---
+				{ L"savesetting",               "SaveSetting — VBA registry persistence (T1547.001)",                           TRUE  },
+				{ L"getsetting",                "GetSetting — VBA registry read (T1547.001)",                                   FALSE },
+				{ L"application.macrooptions",  "Application.MacroOptions — VBA macro UI hiding (T1564)",                       TRUE  },
+
+				// =====================================================================
+				// Windows Script Host infrastructure abuse (T1059.005 / T1059.007)
+				// =====================================================================
+
+				// --- COM scriptlet (.sct/.wsc) execution ---
+				{ L".sct",                      ".sct — COM scriptlet file (T1218.010)",                                        TRUE  },
+				{ L".wsc",                      ".wsc — Windows Script Component file (T1218.010)",                             TRUE  },
+				{ L"scrobj.dll",                "scrobj.dll — COM scriptlet runtime DLL (T1218.010)",                            TRUE  },
+				{ L"regsvr32 /i:",              "regsvr32 /i: — scriptlet registration Squiblydoo (T1218.010)",                 TRUE  },
+				{ L"regsvr32.exe /i:",          "regsvr32.exe /i: — scriptlet registration Squiblydoo (T1218.010)",             TRUE  },
+				{ L"regsvr32 /s /n /u /i:",     "regsvr32 /s /n /u /i: — Squiblydoo silent scriptlet (T1218.010)",             TRUE  },
+
+				// --- script: moniker (remote/local scriptlet load) ---
+				{ L"getobject(\"script:",       "GetObject(\"script: — COM scriptlet moniker load (T1218.010)",                 TRUE  },
+				{ L"getobject(\"script:http",   "GetObject(\"script:http — remote scriptlet load (T1218.010)",                  TRUE  },
+
+				// --- WSH remote execution ---
+				{ L"wshcontroller",             "WshController — WSH remote script execution (T1021.006)",                      TRUE  },
+				{ L"wshremote",                 "WshRemote — WSH remote script object (T1021.006)",                             TRUE  },
+				{ L"createscript(",             "CreateScript( — WshController remote script launch (T1021.006)",                TRUE  },
+				{ L"wscript.connectobject",     "WScript.ConnectObject — WSH event sink attachment (T1059)",                    TRUE  },
+				{ L"wscript.disconnectobject",  "WScript.DisconnectObject — WSH event sink detach (T1059)",                     FALSE },
+
+				// --- WSH flag abuse ---
+				{ L"//d ",                      "//D — WSH debugger flag (T1059)",                                              TRUE  },
+				{ L"//h:cscript",               "//H:CScript — change default WSH host (T1059)",                                TRUE  },
+				{ L"//h:wscript",               "//H:WScript — change default WSH host (T1059)",                                TRUE  },
+				{ L"//job:",                    "//Job: — WSF job selection flag (T1059)",                                       TRUE  },
+				{ L"//s",                       "//S — save WSH settings as default (T1059)",                                   FALSE },
+				{ L"wscript.timeout",           "WScript.Timeout — WSH timeout setting (sandbox evasion T1497)",                TRUE  },
+
+				// --- Remote DCOM instantiation ---
+				{ L"getobject(\"new:",          "GetObject(\"new: — DCOM CLSID instantiation (T1021.003)",                      TRUE  },
+				{ L"winmgmts:\\\\",             "winmgmts:\\\\ — remote WMI namespace connection (T1047)",                     TRUE  },
+				{ L"\\\\root\\cimv2",           "\\\\root\\cimv2 — remote WMI CIMv2 namespace (T1047)",                        TRUE  },
+
+				// --- WSH network / lateral movement ---
+				{ L"wscript.network",           "WScript.Network — WSH network enumeration (T1016)",                            FALSE },
+				{ L".mapnetworkdrive(",         ".MapNetworkDrive( — WSH network drive mapping (T1021.002)",                    TRUE  },
+				{ L".removenetworkdrive(",      ".RemoveNetworkDrive( — WSH network drive removal (T1070)",                     FALSE },
+
+				// --- WSH policy tampering ---
+				{ L"\\windows script host\\settings", "Windows Script Host\\Settings — WSH policy registry (T1562)",            TRUE  },
+				{ L"trustpolicy",               "TrustPolicy — WSH trust policy setting (T1562)",                               TRUE  },
+
+				// =====================================================================
+				// UAC bypass techniques (T1548.002)
+				// =====================================================================
+
+				// --- HKCU class handler registry hijack (auto-elevate abuse) ---
+				{ L"ms-settings\\shell\\open\\command", "ms-settings handler hijack — UAC bypass (T1548.002)",                  TRUE  },
+				{ L"mscfile\\shell\\open\\command",     "mscfile handler hijack — eventvwr UAC bypass (T1548.002)",             TRUE  },
+				{ L"exefile\\shell\\open\\command",     "exefile handler hijack — sdclt UAC bypass (T1548.002)",                TRUE  },
+				{ L"\\shell\\open\\command",            "Shell\\Open\\command — handler hijack pattern (T1548.002)",            TRUE  },
+				{ L"delegateexecute",           "DelegateExecute — UAC bypass delegation value (T1548.002)",                    TRUE  },
+
+				// --- Environment variable UAC bypass ---
+				{ L"\\environment\\windir",     "HKCU\\Environment\\windir — env var UAC bypass (T1548.002)",                   TRUE  },
+				{ L"\\environment\\systemroot",  "HKCU\\Environment\\systemroot — env var UAC bypass (T1548.002)",              TRUE  },
+
+				// --- COM object UAC bypass CLSIDs ---
+				{ L"{3e5fc7f9-9a51-4367-9063-a120244fbec7}", "CMSTPLUA CLSID — COM UAC bypass (T1548.002)",                    TRUE  },
+				{ L"{d2e7025f-8b69-4ae6-a3b1-c2bc0f92a3b2}", "ColorDataProxy CLSID — COM UAC bypass (T1548.002)",             TRUE  },
+				{ L"cmstplua",                  "CMSTPLUA — COM UAC bypass interface (T1548.002)",                              TRUE  },
+				{ L"icmluautil",                "ICMLuaUtil — COM UAC bypass ShellExec method (T1548.002)",                     TRUE  },
+
+				// --- AMSI FeatureBits tamper (T1562.001) ---
+				{ L"amsi\\featurebits",         "AMSI\\FeatureBits — AMSI enable/disable registry key (T1562.001)",             TRUE  },
+				{ L"\\microsoft\\amsi",         "\\Microsoft\\AMSI — AMSI registry hive reference (T1562.001)",                 TRUE  },
+
+				// --- UAC policy tampering ---
+				{ L"enablelua",                 "EnableLUA — UAC disable policy key (T1548.002)",                               TRUE  },
+				{ L"consentpromptbehavioradmin", "ConsentPromptBehaviorAdmin — UAC prompt policy (T1548.002)",                  TRUE  },
+				{ L"promptonsecuredesktop",     "PromptOnSecureDesktop — UAC secure desktop disable (T1548.002)",              TRUE  },
+
+				// --- DLL hijack for UAC bypass (trusted directory) ---
+				{ L"windows \\system32",        "C:\\Windows \\System32 — trailing space trusted directory DLL hijack (T1548.002)", TRUE },
+				{ L"sysprep\\",                 "sysprep\\ — UAC DLL hijack target directory (T1548.002)",                      FALSE },
+
+				// --- Token manipulation APIs ---
+				{ L"createprocesswithtokenw",    "CreateProcessWithTokenW — token impersonation process create (T1134.001)",    TRUE  },
+				{ L"createprocesswithlogonw",    "CreateProcessWithLogonW — logon token process create (T1134.002)",            TRUE  },
+				{ L"ntsetinformationtoken",      "NtSetInformationToken — token manipulation (T1134)",                          TRUE  },
+
+				// --- Auto-elevating binary invocation from script ---
+				{ L"fodhelper.exe",             "fodhelper.exe — auto-elevating binary invoked from script (T1548.002)",         TRUE  },
+				{ L"wsreset.exe",               "wsreset.exe — file-less UAC bypass binary (T1548.002)",                        TRUE  },
+				{ L"computerdefaults.exe",      "computerdefaults.exe — auto-elevating binary (T1548.002)",                     TRUE  },
+				{ L"changepk.exe",              "changepk.exe — auto-elevating binary (T1548.002)",                             TRUE  },
+
+				// =====================================================================
+				// AMSI / Authenticode / code-signing tampering (T1562.001 / T1553)
+				// =====================================================================
+
+				// --- AMSI in-memory / DLL tampering ---
+				{ L"amsiscanbuffer",            "AmsiScanBuffer — AMSI scan function reference (T1562.001)",                    TRUE  },
+				{ L"amsiscanstring",            "AmsiScanString — AMSI scan function reference (T1562.001)",                    TRUE  },
+				{ L"amsiopensession",           "AmsiOpenSession — AMSI session function reference (T1562.001)",                TRUE  },
+				{ L"amsi.dll",                  "amsi.dll — AMSI runtime DLL reference (T1562.001)",                            TRUE  },
+				{ L"amsiinitfailed",            "amsiInitFailed — AMSI context bypass field (T1562.001)",                       TRUE  },
+				{ L"amsiclosesession",          "AmsiCloseSession — AMSI session teardown target (T1562.001)",                  TRUE  },
+				{ L"amsiuacscan",               "AmsiUacScan — undocumented AMSI UAC scan function (T1562.001)",                TRUE  },
+
+				// --- AMSI reflection bypass (Matt Graeber / rasta-mouse) ---
+				{ L"system.management.automation.amsiutils", "System.Management.Automation.AmsiUtils — reflection AMSI bypass target (T1562.001)", TRUE },
+				{ L"getfield('amsiinitfailed'",  "GetField('amsiInitFailed') — reflection AMSI bypass (T1562.001)",             TRUE  },
+				{ L"getfield(\"amsiinitfailed\"", "GetField(\"amsiInitFailed\") — reflection AMSI bypass (T1562.001)",          TRUE  },
+				{ L"getfield('amsicontext'",     "GetField('amsiContext') — reflection AMSI context bypass (T1562.001)",        TRUE  },
+				{ L"getfield(\"amsicontext\"",   "GetField(\"amsiContext\") — reflection AMSI context bypass (T1562.001)",      TRUE  },
+				{ L"getfield('amsisession'",     "GetField('amsiSession') — reflection AMSI session bypass (T1562.001)",        TRUE  },
+				{ L".setvalue($null,$true)",      "SetValue($null,$true) — reflection field flip (T1562.001)",                  TRUE  },
+				{ L".setvalue($null, $true)",     "SetValue($null, $true) — reflection field flip (T1562.001)",                 TRUE  },
+				{ L"[ref].assembly.gettype",     "[Ref].Assembly.GetType — reflection type lookup (T1562.001)",                 TRUE  },
+
+				// --- AMSI parameter corruption / return forcing ---
+				{ L"0x80070057",                "E_INVALIDARG (0x80070057) — AMSI return value forcing (T1562.001)",             TRUE  },
+				{ L"amsi_result_clean",         "AMSI_RESULT_CLEAN — AMSI result override constant (T1562.001)",                TRUE  },
+				{ L"addvectoredexceptionhandler", "AddVectoredExceptionHandler — VEH for HW breakpoint AMSI bypass (T1562.001)", TRUE },
+				{ L"setunhandledexceptionfilter", "SetUnhandledExceptionFilter — alternate exception handler for AMSI bypass (T1562.001)", TRUE },
+				{ L"setthreadcontext",          "SetThreadContext — debug register manipulation for AMSI bypass (T1562.001)",    TRUE  },
+				{ L"getthreadcontext",          "GetThreadContext — read debug registers for HW BP enumeration (T1562.001)",     TRUE  },
+				{ L"ntsetcontextthread",        "NtSetContextThread — direct syscall debug register manipulation (T1562.001)",   TRUE  },
+				{ L"ntgetcontextthread",        "NtGetContextThread — direct syscall DR register read (T1562.001)",              TRUE  },
+				{ L"ntcontinue",                "NtContinue — exception path debug register installation (T1562.001)",           TRUE  },
+				{ L"context_debug_registers",   "CONTEXT_DEBUG_REGISTERS — HW breakpoint context flag (T1562.001)",              TRUE  },
+				{ L"exception_single_step",     "EXCEPTION_SINGLE_STEP — HW breakpoint exception code (T1562.001)",              TRUE  },
+				{ L"threadhidefromdebugger",    "ThreadHideFromDebugger — anti-debug before HW BP install (T1562.001)",          TRUE  },
+				{ L"loadlibrary(\"amsi",        "LoadLibrary(\"amsi.dll\") — force AMSI load for patching (T1562.001)",          TRUE  },
+				{ L"getmodulehandle(\"amsi.dll\")", "GetModuleHandle(\"amsi.dll\") — resolve amsi.dll base for HW BP (T1562.001)", TRUE },
+
+				// --- AMSI alternate bypass techniques ---
+				{ L"dotnettojscript",           "DotNetToJScript — .NET code via JScript bypassing AMSI (T1562.001)",          TRUE  },
+				{ L"gadgettojscript",           "GadgetToJScript — .NET gadget chain via JScript (T1562.001)",                 TRUE  },
+				{ L"uselegacyv2runtimeactivationpolicy", "useLegacyV2RuntimeActivationPolicy — force legacy CLR to skip AMSI (T1562.001)", TRUE },
+				{ L"initialsessionstate.create()", "InitialSessionState.Create() — blank session without AMSI (T1562.001)",    TRUE  },
+				{ L"amsiutils.scanstring",       "AmsiUtils.ScanString — internal .NET AMSI call site (T1562.001)",            TRUE  },
+				{ L"amsiutils.scancontent",      "AmsiUtils.ScanContent — internal .NET AMSI call site (T1562.001)",           TRUE  },
+				{ L"amsiutils.amsiinitialized",  "AmsiUtils.amsiInitialized — internal .NET AMSI init field (T1562.001)",      TRUE  },
+				{ L"test-path variable:amsiinitfailed", "Test-Path variable:amsiInitFailed — AMSI bypass probe (T1562.001)",   TRUE  },
+				{ L"system.management.automation.dll", "System.Management.Automation.dll — PS engine DLL reference (T1562.001)", FALSE },
+
+				// --- AMSI internal COM method / vtable patching ---
+				{ L"camsiantimalware",          "CAmsiAntimalware — AMSI internal COM class reference (T1562.001)",             TRUE  },
+				{ L"camsistream",               "CAmsiStream — AMSI internal stream class reference (T1562.001)",              TRUE  },
+				{ L"camsibufferstream",          "CAmsiBufferStream — AMSI internal buffer stream class (T1562.001)",          TRUE  },
+				{ L"amsiantimalware::scan",      "CAmsiAntimalware::Scan — internal provider-iteration method (T1562.001)",    TRUE  },
+				{ L"amsi!camsi",                "amsi!CAmsi — WinDbg-qualified AMSI internal method (T1562.001)",              TRUE  },
+				{ L"iamsistream",               "IAmsiStream — AMSI COM interface reference (T1562.001)",                      TRUE  },
+				{ L"iantimalware",              "IAntimalware — AMSI COM interface reference (T1562.001)",                      TRUE  },
+
+				// --- AMSI attribute tampering ---
+				{ L"amsi_attribute_content_size",    "AMSI_ATTRIBUTE_CONTENT_SIZE — attribute tamper target (T1562.001)",        TRUE  },
+				{ L"amsi_attribute_content_address", "AMSI_ATTRIBUTE_CONTENT_ADDRESS — attribute tamper target (T1562.001)",     TRUE  },
+				{ L"amsi_attribute_content_name",    "AMSI_ATTRIBUTE_CONTENT_NAME — attribute tamper target (T1562.001)",        TRUE  },
+				{ L"amsi_attribute_session",         "AMSI_ATTRIBUTE_SESSION — attribute tamper target (T1562.001)",             TRUE  },
+				{ L"amsi_attribute_app_name",        "AMSI_ATTRIBUTE_APP_NAME — attribute tamper target (T1562.001)",            TRUE  },
+				{ L"amsi_attribute_quiet",           "AMSI_ATTRIBUTE_QUIET — silence AMSI scanning (T1562.001)",                TRUE  },
+
+				// --- AMSI string obfuscation evasion (T1027 / T1562.001) ---
+				{ L"\"am\"+\"si\"",              "String concat 'Am'+'si' — AMSI bypass obfuscation (T1562.001)",               TRUE  },
+				{ L"'am'+'si'",                  "String concat 'am'+'si' — AMSI bypass obfuscation (T1562.001)",               TRUE  },
+				{ L"-f 'amsi'",                  "Format-string -f 'amsi' — AMSI bypass obfuscation (T1562.001)",               TRUE  },
+				{ L"-f \"amsi\"",                "Format-string -f \"amsi\" — AMSI bypass obfuscation (T1562.001)",             TRUE  },
+				{ L"a`m`s`i",                    "Backtick A`m`s`i — AMSI bypass tick obfuscation (T1562.001)",                 TRUE  },
+				{ L"am`si",                      "Backtick am`si — AMSI bypass tick obfuscation (T1562.001)",                   TRUE  },
+				{ L"[char]65,[char]109,[char]115,[char]105", "[char] array 'AMSI' construction (T1562.001)",                    TRUE  },
+				{ L"]-join''",                   "]-join'' — env-var char extraction obfuscation (T1027)",                       FALSE },
+				{ L"]-join\"\"",                 "]-join\"\" — env-var char extraction obfuscation (T1027)",                     FALSE },
+				{ L"$env:comspec[",              "$env:comspec char extraction — string obfuscation (T1027)",                    FALSE },
+
+				// --- AMSI provider in-process patching (T1562.001) ---
+				{ L"iantimalwareprovider",       "IAntimalwareProvider interface — AMSI provider vtable target (T1562.001)",     TRUE  },
+				{ L"b2cabfe3-fe04-42b1",         "IAntimalwareProvider GUID — COM provider enumeration (T1562.001)",            TRUE  },
+				{ L"freelibrary",                "FreeLibrary — potential AMSI provider DLL unload (T1562.001)",                FALSE },
+				{ L"ldrunloaddll",               "LdrUnloadDll — ntdll provider DLL unload (T1562.001)",                       TRUE  },
+				{ L"marshal.readintptr",         "Marshal.ReadIntPtr — COM vtable read for patching (T1562.001)",               TRUE  },
+				{ L"marshal.writeintptr",        "Marshal.WriteIntPtr — COM vtable write/redirect (T1562.001)",                 TRUE  },
+
+				{ L"setdlldirectory",           "SetDllDirectory — DLL search order redirect (T1574.001)",                      TRUE  },
+				{ L"adddlldirectory",           "AddDllDirectory — DLL search path manipulation (T1574.001)",                   TRUE  },
+
+				// --- WLDP (Windows Lockdown Policy) bypass ---
+				{ L"wldpquerydynamiccodetrust",  "WldpQueryDynamicCodeTrust — WLDP bypass target (T1553)",                     TRUE  },
+				{ L"wldpisclassinapprovedlist",  "WldpIsClassInApprovedList — WLDP bypass target (T1553)",                     TRUE  },
+				{ L"wldp.dll",                  "wldp.dll — Windows Lockdown Policy DLL (T1553)",                               TRUE  },
+
+				// --- SIP (Subject Interface Package) hijack ---
+				{ L"cryptsipdll",               "CryptSIPDll — SIP DLL registry path (T1553.003)",                              TRUE  },
+				{ L"cryptsipdllverifyindirectdata", "CryptSIPDllVerifyIndirectData — SIP verification hijack (T1553.003)",      TRUE  },
+				{ L"cryptsipdllgetsigneddatamsg", "CryptSIPDllGetSignedDataMsg — SIP signed data hijack (T1553.003)",           TRUE  },
+				{ L"\\cryptography\\oid\\",     "Cryptography\\OID — OID registry path (T1553.003)",                            TRUE  },
+
+				// --- Trust provider / WinVerifyTrust tampering ---
+				{ L"winverifytrust",            "WinVerifyTrust — Authenticode verification API (T1553.003)",                   TRUE  },
+				{ L"wintrust.dll",              "wintrust.dll — Windows Trust DLL reference (T1553.003)",                       TRUE  },
+
+				// --- Certificate store manipulation ---
+				{ L"certutil -addstore root",    "certutil -addstore root — root CA injection (T1553.004)",                     TRUE  },
+				{ L"certutil -addstore trustedpublisher", "certutil -addstore TrustedPublisher — trusted publisher injection (T1553.004)", TRUE },
+				{ L"certutil -delstore",         "certutil -delstore — certificate removal from store (T1553.004)",             TRUE  },
+				{ L"certutil -importpfx",        "certutil -importPFX — PFX certificate import (T1553.004)",                   TRUE  },
+				{ L"import-certificate",         "Import-Certificate — PS certificate import cmdlet (T1553.004)",               TRUE  },
+				{ L"export-certificate",         "Export-Certificate — PS certificate export cmdlet (T1553.004)",               TRUE  },
+				{ L"\\systemcertificates\\root", "SystemCertificates\\ROOT — root CA store path (T1553.004)",                   TRUE  },
+				{ L"\\systemcertificates\\trustedpublisher", "SystemCertificates\\TrustedPublisher — trusted publisher store (T1553.004)", TRUE },
+				{ L"\\systemcertificates\\disallowed", "SystemCertificates\\Disallowed — certificate blocklist store (T1553.004)", TRUE },
+
+				// --- Catalog file tampering ---
+				{ L"\\catroot\\",               "CatRoot — catalog file directory (T1553.003)",                                 FALSE },
+				{ L"\\catroot2\\",              "CatRoot2 — catalog database directory (T1553.003)",                             FALSE },
+				{ L"cryptcatadmin",             "CryptCATAdmin — catalog admin API (T1553.003)",                                TRUE  },
+
+				// --- Code Integrity / Device Guard / HVCI ---
+				{ L"bcdedit /set nointegritychecks", "bcdedit /set nointegritychecks — disable Code Integrity (T1553.006)",     TRUE  },
+				{ L"bcdedit /set testsigning",   "bcdedit /set testsigning — enable test-signed drivers (T1553.006)",           TRUE  },
+				{ L"bcdedit /set hypervisorlaunchtype off", "bcdedit /set hypervisorlaunchtype off — disable HVCI (T1553.006)", TRUE  },
+				{ L"bcdedit /set vsmlaunchtype off", "bcdedit /set vsmlaunchtype off — disable VBS (T1553.006)",                TRUE  },
+				{ L"ci.dll",                    "ci.dll — Code Integrity DLL reference (T1553.006)",                            TRUE  },
+				{ L"set-ruleOption",            "Set-RuleOption — WDAC policy modification cmdlet (T1553.006)",                 TRUE  },
 
 				{ nullptr, nullptr, FALSE }
 			};
@@ -3089,12 +3812,14 @@ VOID ProcessUtils::CreateProcessNotifyEx(
 		}
 
 	} else {
-		// Process exit — free the cmdline record, fork-run tracker, taint, and ntdll tracker slots.
+		// Process exit — free the cmdline record, fork-run tracker, taint, ntdll tracker,
+		// and AMSI image base slots.
 		ULONG exitPid = HandleToUlong(PsGetProcessId(Process));
 		ImageUtils::RemoveCmdLineRec(exitPid);
 		ImageUtils::RemoveSecondaryNtdll(exitPid);
 		ForkRunTracker::Remove(PsGetProcessId(Process));
 		InjectionTaintTracker::Remove(PsGetProcessId(Process));
+		AmsiDetector::RemoveAmsiImageBase(PsGetProcessId(Process));
 	}
 }
 

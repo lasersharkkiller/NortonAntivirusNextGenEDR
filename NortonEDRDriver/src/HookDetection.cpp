@@ -112,17 +112,53 @@ UCHAR HookDetector::DetectInlineHookType(PVOID functionAddress) {
     __try {
         PUCHAR b = (PUCHAR)functionAddress;
 
+        // E9 xx xx xx xx — JMP rel32 (most common inline hook)
         if (b[0] == 0xE9)
             return HOOK_TYPE_JMP_NEAR;
 
+        // FF 25 xx xx xx xx — JMP [RIP+disp32] (indirect jump)
         if (b[0] == 0xFF && b[1] == 0x25)
             return HOOK_TYPE_JMP_FAR;
 
+        // 48 B8 imm64 + FF E0 — MOV RAX,imm64 + JMP RAX (long detour)
         if (b[0] == 0x48 && b[1] == 0xB8 && b[10] == 0xFF && b[11] == 0xE0)
             return HOOK_TYPE_MOV_JMP;
 
+        // 68 imm32 + C3 — PUSH imm32 + RET (32-bit push-ret detour)
         if (b[0] == 0x68 && b[5] == 0xC3)
             return HOOK_TYPE_PUSH_RET;
+
+        // E8 xx xx xx xx — CALL rel32 (CALL-based trampoline detour).
+        // Legitimate function prologues rarely start with CALL.  Hooking
+        // frameworks (Detours, MinHook) sometimes use CALL+pop to get RIP.
+        if (b[0] == 0xE8)
+            return HOOK_TYPE_CALL_TRAMPOLINE;
+
+        // CC — INT3 at function entry (debug breakpoint hook).
+        // BYOVD drivers set INT3 and register an IDT/exception handler to
+        // redirect execution.  Also used by KDP-based hooking.
+        if (b[0] == 0xCC)
+            return HOOK_TYPE_INT3_PATCH;
+
+        // 90 90 90 90 90 — NOP slide (5+ consecutive NOPs at entry).
+        // Attacker NOP-pads the prologue to skip security checks or
+        // to create a landing pad for a secondary hook further in.
+        if (b[0] == 0x90 && b[1] == 0x90 && b[2] == 0x90 &&
+            b[3] == 0x90 && b[4] == 0x90)
+            return HOOK_TYPE_NOP_SLIDE;
+
+        // 49 BA imm64 + 41 FF E2 — MOV R10,imm64 + JMP R10.
+        // Common in x64 kernel hooks that avoid clobbering RAX (used for
+        // return values).  R10 is caller-saved and safe to overwrite.
+        if (b[0] == 0x49 && b[1] == 0xBA && b[10] == 0x41 &&
+            b[11] == 0xFF && b[12] == 0xE2)
+            return HOOK_TYPE_MOV_CR_JMP;
+
+        // C3 — bare RET at function entry (function neutered).
+        // Simplest possible patch: function returns immediately without
+        // executing any logic.  Different from PUSH_RET (no target address).
+        if (b[0] == 0xC3)
+            return HOOK_TYPE_RET_IMMEDIATE;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 
@@ -159,6 +195,23 @@ PVOID HookDetector::ResolveHookTarget(PVOID functionAddress, UCHAR hookType) {
 
         case HOOK_TYPE_PUSH_RET:
             return (PVOID)(ULONG_PTR)(*(PULONG)(b + 1));
+
+        case HOOK_TYPE_CALL_TRAMPOLINE: {
+            // E8 rel32 — CALL target is RIP + 5 + rel32
+            LONG rel32 = *(PLONG)(b + 1);
+            return (PVOID)((ULONG_PTR)functionAddress + 5 + rel32);
+        }
+
+        case HOOK_TYPE_MOV_CR_JMP:
+            // 49 BA imm64 — target address is the 8-byte immediate at offset 2
+            return *(PVOID*)(b + 2);
+
+        case HOOK_TYPE_INT3_PATCH:
+        case HOOK_TYPE_NOP_SLIDE:
+        case HOOK_TYPE_RET_IMMEDIATE:
+            // No resolvable target — the hook redirects via exception handler
+            // (INT3), skips logic (NOP), or neuters the function (RET).
+            return nullptr;
 
         default:
             return nullptr;
@@ -1534,9 +1587,13 @@ static VOID EmitPsCallbackAlert(BufferQueue* bufQueue, const char* msg, PVOID ad
 
 VOID HookDetector::TakeObCallbackSnapshot()
 {
-    const struct { const WCHAR* name; ObCallbackSnapshot* snap; } types[] = {
-        { L"PsProcessType", &s_ProcessCbSnapshot },
-        { L"PsThreadType",  &s_ThreadCbSnapshot  },
+    const struct {
+        const WCHAR*       name;
+        ObCallbackSnapshot* snap;
+        PVOID              ourPreOp;
+    } types[] = {
+        { L"PsProcessType", &s_ProcessCbSnapshot, (PVOID)ObjectUtils::ProcessPreCallback },
+        { L"PsThreadType",  &s_ThreadCbSnapshot,  (PVOID)ObjectUtils::ThreadPreCallback  },
     };
 
     for (int i = 0; i < 2; i++) {
@@ -1551,8 +1608,19 @@ VOID HookDetector::TakeObCallbackSnapshot()
             types[i].snap->preOpPointers,
             OB_CALLBACK_SNAPSHOT_MAX);
 
-        DbgPrint("[+] HookDetector: %ws snapshot — %lu PreOp entries\n",
-            types[i].name, types[i].snap->count);
+        // Record our callback's execution order position (index in the list).
+        // If an attacker inserts a callback before ours, our index increases.
+        types[i].snap->ourIndex = (ULONG)-1;  // sentinel: not found
+        for (ULONG j = 0; j < types[i].snap->count; j++) {
+            if (types[i].snap->preOpPointers[j] == types[i].ourPreOp) {
+                types[i].snap->ourIndex = j;
+                break;
+            }
+        }
+
+        DbgPrint("[+] HookDetector: %ws snapshot — %lu PreOp entries, ours at index %lu\n",
+            types[i].name, types[i].snap->count,
+            types[i].snap->ourIndex);
     }
 
     s_CbSnapshotTaken = TRUE;
@@ -1603,8 +1671,24 @@ VOID HookDetector::TakePsCallbackSnapshot()
 		if (arr) {
 			desc[i].snap->arrayBase = arr;
 			desc[i].snap->valid     = TRUE;
-			DbgPrint("[+] HookDetector: Ps notify array for %ws at %p\n",
-				desc[i].setFnName, arr);
+
+			// Record our callback's slot index for order tracking
+			desc[i].snap->ourSlotIndex = (ULONG)-1;
+			__try {
+				PUCHAR base = (PUCHAR)arr;
+				for (ULONG slot = 0; slot < 64; slot++) {
+					PVOID* slotPtr = (PVOID*)(base + slot * 8);
+					if (!MmIsAddressValid(slotPtr)) break;
+					PVOID fn = ExCallbackGetFunction(*slotPtr);
+					if (fn == desc[i].ourCallback) {
+						desc[i].snap->ourSlotIndex = slot;
+						break;
+					}
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+			DbgPrint("[+] HookDetector: Ps notify array for %ws at %p (our slot=%lu)\n",
+				desc[i].setFnName, arr, desc[i].snap->ourSlotIndex);
 		} else {
 			DbgPrint("[-] HookDetector: LEA scan failed for %ws\n", desc[i].setFnName);
 		}
@@ -1634,6 +1718,7 @@ VOID HookDetector::CheckPsCallbackIntegrity(BufferQueue* bufQueue)
 		BOOLEAN found     = FALSE;
 		BOOLEAN slotEmpty = TRUE;   // was our slot zeroed (unlink) or replaced (overwrite)?
 		PVOID   replacedWith = nullptr;
+		ULONG   currentSlot  = (ULONG)-1;
 		PUCHAR arr = (PUCHAR)snap->arrayBase;
 
 		__try {
@@ -1642,7 +1727,11 @@ VOID HookDetector::CheckPsCallbackIntegrity(BufferQueue* bufQueue)
 				if (!MmIsAddressValid(slotPtr)) break;
 				PVOID raw = *slotPtr;
 				PVOID fn  = ExCallbackGetFunction(raw);
-				if (fn == snap->ourCallback) { found = TRUE; break; }
+				if (fn == snap->ourCallback) {
+					found = TRUE;
+					currentSlot = slot;
+					break;
+				}
 
 				// If we find a non-NULL slot with a function pointer that is NOT
 				// ours and not NULL, track it — one of these might be an overwrite.
@@ -1674,6 +1763,22 @@ VOID HookDetector::CheckPsCallbackIntegrity(BufferQueue* bufQueue)
 					"EDR telemetry silenced (PsRemoveCreate*NotifyRoutine or slot zeroed)",
 					checks[i].label);
 			}
+			EmitPsCallbackAlert(bufQueue, msg, snap->ourCallback);
+		}
+
+		// --- Execution order check ---
+		// PsNotify callbacks are invoked in slot order.  If our callback was moved
+		// to a later slot, an attacker-registered callback now runs before ours and
+		// can modify process/thread state before our notification handler sees it.
+		if (found && snap->ourSlotIndex != (ULONG)-1 &&
+		    currentSlot != (ULONG)-1 && currentSlot > snap->ourSlotIndex)
+		{
+			char msg[280];
+			RtlStringCbPrintfA(msg, sizeof(msg),
+				"CALLBACK REORDER: Ps%sNotify callback moved from slot %lu to %lu "
+				"— attacker inserted %lu callback(s) ahead of EDR in PspCreate%sNotifyRoutine",
+				checks[i].label, snap->ourSlotIndex, currentSlot,
+				currentSlot - snap->ourSlotIndex, checks[i].label);
 			EmitPsCallbackAlert(bufQueue, msg, snap->ourCallback);
 		}
 	}
@@ -1759,6 +1864,35 @@ VOID HookDetector::CheckObCallbackIntegrity(BufferQueue* bufQueue)
                 "— may strip handle rights from defenders / protect attacker process",
                 checks[i].label, current[j]);
             EmitObAlert(bufQueue, msg, current[j]);
+        }
+
+        // --- Check 3: execution order manipulation ---
+        // If our callback moved to a later position in the list, an attacker
+        // inserted a callback before ours.  That callback runs first and can
+        // strip handle rights before our PreOp sees the request.  This is more
+        // subtle than foreign-callback detection: even a known-good callback
+        // that was reordered ahead of ours is a problem.
+        if (ourFound && checks[i].snap->ourIndex != (ULONG)-1) {
+            ULONG currentIndex = (ULONG)-1;
+            for (ULONG j = 0; j < currentCount; j++) {
+                if (current[j] == checks[i].expectedPreOp) {
+                    currentIndex = j;
+                    break;
+                }
+            }
+
+            if (currentIndex != (ULONG)-1 &&
+                currentIndex > checks[i].snap->ourIndex) {
+                char msg[280];
+                RtlStringCbPrintfA(msg, sizeof(msg),
+                    "CALLBACK REORDER: Ob%sCallback execution position changed from "
+                    "index %lu to %lu — %lu callback(s) inserted before ours! "
+                    "Attacker callback may be stripping handle rights before EDR PreOp.",
+                    checks[i].label,
+                    checks[i].snap->ourIndex, currentIndex,
+                    currentIndex - checks[i].snap->ourIndex);
+                EmitObAlert(bufQueue, msg, checks[i].expectedPreOp);
+            }
         }
     }
 }
@@ -1970,6 +2104,22 @@ VOID HookDetector::CheckCmCallbackIntegrity(BufferQueue* bufQueue)
                 s_CmCbSnap.callbacks[i]);
             EmitCmCallbackAlert(bufQueue, msg, s_CmCbSnap.callbacks[i], TRUE);
         }
+    }
+
+    // --- Check 4: callback count decrease (slots zeroed without full unlink) ---
+    // An attacker may zero out callback slots in CmpCallBackVector without removing
+    // the EX_CALLBACK_ROUTINE_BLOCK — the array shrinks but no single callback
+    // appears "hijacked" because the pointer was simply nulled.  The individual
+    // checks above catch per-entry disappearance, but a bulk wipe (e.g., zeroing
+    // the first N slots at once) deserves its own distinct alert.
+    if (currentCount < s_CmCbSnap.count) {
+        ULONG delta = s_CmCbSnap.count - currentCount;
+        char msg[220];
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "CmCallback COUNT DECREASE: %lu callbacks at init, now %lu "
+            "(%lu removed) — bulk callback suppression attack on CmpCallBackVector",
+            s_CmCbSnap.count, currentCount, delta);
+        EmitCmCallbackAlert(bufQueue, msg, s_CmCbSnap.arrayBase, TRUE);
     }
 
     DbgPrint("[+] HookDetector: CmCallback check done — live=%lu snapshot=%lu our=%s\n",
