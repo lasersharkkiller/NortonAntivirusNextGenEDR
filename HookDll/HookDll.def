@@ -1,4 +1,0 @@
-LIBRARY HookDll
-EXPORTS
-    InstallHooks
-    RemoveHooks

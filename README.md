@@ -216,19 +216,9 @@ Targeted detections for Sygnia-documented Weaver Ant (Chinese-nexus APT) techniq
 
 ### Running pre-built binaries (GitHub Releases)
 
-Pre-compiled binaries are available on the [Releases](../../releases) page. Because the drivers are test-signed (not production-signed), the target machine must have test signing enabled before loading them:
+Pre-compiled binaries are available on the [Releases](../../releases) page. The kernel driver is signed through **Microsoft's Windows Hardware Compatibility Program** (attestation signing) — it chains to the *Microsoft Windows Hardware Compatibility Publisher* root, so it loads on stock production and Secure Boot systems **without enabling test signing**. No `bcdedit` changes are required.
 
-```
-bcdedit /set testsigning on
-```
-
-Reboot after running this command. To disable test signing after use:
-
-```
-bcdedit /set testsigning off
-```
-
-**Additional runtime requirements:**
+**Runtime requirements:**
 - Windows 10 20H1 or later (x64)
 - Intel CPU with VT-x and EPT support (for `NortonEDRHypervisor.sys`)
 - `capa.exe` (FLARE) on `PATH` or alongside `NortonEDR.exe` for capabilities scanning
