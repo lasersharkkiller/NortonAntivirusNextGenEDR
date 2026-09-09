@@ -216,12 +216,14 @@ Targeted detections for Sygnia-documented Weaver Ant (Chinese-nexus APT) techniq
 
 ### Running pre-built binaries (GitHub Releases)
 
-Pre-compiled binaries are available on the [Releases](../../releases) page. The kernel driver is signed through **Microsoft's Windows Hardware Compatibility Program** (attestation signing) — it chains to the *Microsoft Windows Hardware Compatibility Publisher* root, so it loads on stock production and Secure Boot systems **without enabling test signing**. No `bcdedit` changes are required.
+Pre-compiled binaries are available on the [Releases](../../releases) page. The release ships the core EDR: the kernel driver (`nortonav.sys`), the user-mode agent (`nortonav.exe`), and its user-mode components (`HookDll.dll`, `AmsiProvider.dll`). The kernel driver is signed through **Microsoft's Windows Hardware Compatibility Program** (attestation signing) — it chains to the *Microsoft Windows Hardware Compatibility Publisher* root, so it loads on stock production and Secure Boot systems **without enabling test signing**. The user-mode binaries are EV code-signed. No `bcdedit` changes are required.
+
+> **Note:** the optional **hypervisor** (`NortonEDRHypervisor.sys` — EPT-based memory monitoring) and **ELAM** (`NortonEDRElam.sys` — boot-driver classification) components are **build-from-source only** and are *not* included in the pre-built release.
 
 **Runtime requirements:**
 - Windows 10 20H1 or later (x64)
-- Intel CPU with VT-x and EPT support (for `NortonEDRHypervisor.sys`)
 - `capa.exe` (FLARE) on `PATH` or alongside `NortonEDR.exe` for capabilities scanning
+- Intel CPU with VT-x and EPT support — only if building and loading the optional hypervisor component
 
 ### Building from source
 
